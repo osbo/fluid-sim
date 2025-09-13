@@ -93,7 +93,7 @@ public class FluidSimulator : MonoBehaviour
         
         // Create auxiliary buffers for multi-block prefix sum (Metal-compatible)
         int threadgroupSize = 512;
-        int numThreadgroups = (PARTICLE_COUNT + (threadgroupSize * 2) - 1) / (threadgroupSize * 2);
+        int numThreadgroups = Mathf.CeilToInt(PARTICLE_COUNT / (float)(threadgroupSize * 2));
         int requiredAuxSize = Mathf.Max(1, numThreadgroups);
         
         auxBuffer = new ComputeBuffer(requiredAuxSize, sizeof(uint)); // Block sums
@@ -195,13 +195,14 @@ public class FluidSimulator : MonoBehaviour
         // Set element count
         radixSortShader.SetInt("elementCount", PARTICLE_COUNT);
         
-        Debug.Log($"=== RADIX SORT START ===");
-        VerifyStep(-1, "Initial"); // Initial verification
-        
         // Calculate threadgroup sizes (Metal-compatible)
         int threadgroupSize = 512;
-        int numThreadgroups = (PARTICLE_COUNT + (threadgroupSize * 2) - 1) / (threadgroupSize * 2);
-        int scatterThreadGroups = Mathf.CeilToInt(PARTICLE_COUNT / 512.0f);
+        int numThreadgroups = Mathf.CeilToInt(PARTICLE_COUNT / (float)(threadgroupSize * 2));
+        int scatterThreadGroups = Mathf.CeilToInt(PARTICLE_COUNT / 256.0f);
+        
+        Debug.Log($"=== RADIX SORT START ===");
+        Debug.Log($"Particle count: {PARTICLE_COUNT}, Threadgroups: {numThreadgroups}, Scatter groups: {scatterThreadGroups}");
+        VerifyStep(-1, "Initial"); // Initial verification
         
         // Perform radix sort (32 passes for 32-bit morton codes)
         for (int bit = 0; bit < 32; bit++)
@@ -234,6 +235,9 @@ public class FluidSimulator : MonoBehaviour
             radixSortShader.Dispatch(splitPrepKernel, scatterThreadGroups, 1, 1);
             VerifyStep(bit, "SplitPrep");
             
+            // Clear fBuffer before prefix sum
+            ClearBuffer(fBuffer, PARTICLE_COUNT);
+            
             // Step 2: Calculate prefix sums (multi-block approach)
             if (numThreadgroups <= 1)
             {
@@ -247,9 +251,11 @@ public class FluidSimulator : MonoBehaviour
                 radixSortShader.Dispatch(prefixSumKernel, numThreadgroups, 1, 1);
                 
                 // Second pass: scan the block sums (auxBuffer -> aux2Buffer)
+                ClearBuffer(aux2Buffer, numThreadgroups); // Clear aux2Buffer before second pass
                 radixSortShader.SetBuffer(prefixSumKernel, "eBuffer", auxBuffer);
                 radixSortShader.SetBuffer(prefixSumKernel, "fBuffer", aux2Buffer);
-                radixSortShader.SetBuffer(prefixSumKernel, "auxBuffer", aux2Buffer); // Use aux2Buffer as aux for this pass
+                radixSortShader.SetBuffer(prefixSumKernel, "auxBuffer", auxBuffer); // Keep auxBuffer as aux for this pass
+                radixSortShader.SetInt("elementCount", numThreadgroups);
                 radixSortShader.Dispatch(prefixSumKernel, 1, 1, 1);
                 
                 // Third pass: fixup the results
@@ -257,10 +263,13 @@ public class FluidSimulator : MonoBehaviour
                 radixSortShader.SetBuffer(prefixFixupKernel, "aux2Buffer", aux2Buffer);
                 radixSortShader.Dispatch(prefixFixupKernel, numThreadgroups, 1, 1);
                 
-                // Reset buffers for next iteration
+                Debug.Log($"Multi-block prefix sum: {numThreadgroups} blocks, fixup applied");
+                
+                // Reset buffers and element count for next iteration
                 radixSortShader.SetBuffer(prefixSumKernel, "eBuffer", eBuffer);
                 radixSortShader.SetBuffer(prefixSumKernel, "fBuffer", fBuffer);
                 radixSortShader.SetBuffer(prefixSumKernel, "auxBuffer", auxBuffer);
+                radixSortShader.SetInt("elementCount", PARTICLE_COUNT);
             }
             VerifyStep(bit, "PrefixSum");
             
@@ -278,6 +287,13 @@ public class FluidSimulator : MonoBehaviour
         
         // No copying needed! The main buffers (mortonCodesBuffer and particleIndicesBuffer) 
         // are already sorted in place
+    }
+    
+    // Clear a buffer with zeros
+    private void ClearBuffer(ComputeBuffer buffer, int count)
+    {
+        uint[] zeros = new uint[count];
+        buffer.SetData(zeros);
     }
     
     
@@ -356,6 +372,17 @@ public class FluidSimulator : MonoBehaviour
         
         eBuffer.GetData(eBufferData, 0, 0, eBufferData.Length);
         fBuffer.GetData(fBufferData, 0, 0, fBufferData.Length);
+        
+        // Debug: Log first 10 elements of eBuffer and fBuffer
+        string eBufferDebug = "eBuffer[0-9]: ";
+        string fBufferDebug = "fBuffer[0-9]: ";
+        for (int i = 0; i < Math.Min(10, eBufferData.Length); i++)
+        {
+            eBufferDebug += $"{eBufferData[i]} ";
+            fBufferDebug += $"{fBufferData[i]} ";
+        }
+        Debug.Log($"Bit {bit} PrefixSum Debug - {eBufferDebug}");
+        Debug.Log($"Bit {bit} PrefixSum Debug - {fBufferDebug}");
         
         // Calculate expected exclusive prefix sums manually
         // fBuffer[i] should contain the sum of eBuffer[0] to eBuffer[i-1] (exclusive)

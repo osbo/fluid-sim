@@ -27,6 +27,7 @@ int currentBit;
 groupshared uint scan_array[1024]; // SCAN_BLOCKSIZE << 1
 
 // Prepare bit flags for current bit position
+// Uses SV_DispatchThreadID because each thread processes one element sequentially
 [numthreads(256, 1, 1)]
 void SplitPrep(uint3 id : SV_DispatchThreadID)
 {
@@ -41,6 +42,7 @@ void SplitPrep(uint3 id : SV_DispatchThreadID)
 }
 
 // Scatter elements based on prefix sums (like the working Metal implementation)
+// Uses SV_DispatchThreadID because each thread processes one element sequentially
 [numthreads(256, 1, 1)]
 void ScatterElements(uint3 id : SV_DispatchThreadID)
 {
@@ -52,6 +54,8 @@ void ScatterElements(uint3 id : SV_DispatchThreadID)
     uint particleIndex = inputIndices[index];
     
     // Calculate total falses (elements with bit = 0)
+    // For exclusive prefix sum, totalFalses = fBuffer[last] + eBuffer[last]
+    // This gives us the inclusive prefix sum of the last element
     uint totalFalses = fBuffer[elementCount - 1] + eBuffer[elementCount - 1];
     
     // Check if bit is set
@@ -74,6 +78,7 @@ void ScatterElements(uint3 id : SV_DispatchThreadID)
 }
 
 // Copy buffer contents
+// Uses SV_DispatchThreadID because each thread processes one element sequentially
 [numthreads(256, 1, 1)]
 void CopyBuffer(uint3 id : SV_DispatchThreadID)
 {
@@ -85,12 +90,13 @@ void CopyBuffer(uint3 id : SV_DispatchThreadID)
     inputIndices[index] = outputIndices[index];
 }
 
-// Prefix sum kernel (based on working Metal implementation)
+// Prefix sum kernel (simplified and corrected implementation)
+// Uses SV_GroupID and SV_GroupThreadID because threads work in blocks with shared memory
 [numthreads(512, 1, 1)]
-void PrefixSum(uint3 id : SV_DispatchThreadID)
+void PrefixSum(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
 {
-    int threadIdx = (int)id.x;
-    int blockIdx = (int)id.y;
+    int threadIdx = (int)Gtid.x;
+    int blockIdx = (int)Gid.x;
     
     // Each thread handles 2 elements
     int t1 = threadIdx + 2 * blockIdx * 512;
@@ -101,7 +107,7 @@ void PrefixSum(uint3 id : SV_DispatchThreadID)
     scan_array[threadIdx + 512] = (t2 < elementCount) ? eBuffer[t2] : 0;
     GroupMemoryBarrierWithGroupSync();
     
-    // Up-sweep phase
+    // Up-sweep phase (reduction)
     for (int stride = 1; stride <= 512; stride <<= 1)
     {
         int index = (threadIdx + 1) * stride * 2 - 1;
@@ -110,7 +116,16 @@ void PrefixSum(uint3 id : SV_DispatchThreadID)
         GroupMemoryBarrierWithGroupSync();
     }
     
-    // Down-sweep phase
+    // Store the total sum before clearing
+    uint totalSum = scan_array[1023];
+    
+    // Clear the last element to 0 for exclusive prefix sum
+    if (threadIdx == 0) {
+        scan_array[1023] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Down-sweep phase (distribution)
     for (int stride = 512 >> 1; stride > 0; stride >>= 1)
     {
         int index = (threadIdx + 1) * stride * 2 - 1;
@@ -120,24 +135,25 @@ void PrefixSum(uint3 id : SV_DispatchThreadID)
     }
     GroupMemoryBarrierWithGroupSync();
     
-    // Write results (exclusive prefix sum - zeroff = 1)
-    if (t1 + 1 < elementCount) fBuffer[t1 + 1] = scan_array[threadIdx];
-    if (t2 + 1 < elementCount) fBuffer[t2 + 1] = (threadIdx == 511) ? 0 : scan_array[threadIdx + 512];
+    // Write results (exclusive prefix sum)
+    // For exclusive prefix sum, we need to shift the results by one position
+    if (t1 < elementCount) fBuffer[t1] = (threadIdx == 0) ? 0 : scan_array[threadIdx - 1];
+    if (t2 < elementCount) fBuffer[t2] = scan_array[threadIdx + 512 - 1];
     
-    // Set first element to 0 for exclusive prefix sum
+    // Store block sum for multi-block prefix sum
     if (threadIdx == 0)
     {
-        fBuffer[0] = 0;
-        auxBuffer[blockIdx] = scan_array[1023]; // Last element of the block
+        auxBuffer[blockIdx] = totalSum; // Store the original total sum
     }
 }
 
 // Prefix fixup kernel for multi-block scans (Metal-compatible)
+// Uses SV_GroupID and SV_GroupThreadID because threads work in blocks
 [numthreads(512, 1, 1)]
-void PrefixFixup(uint3 id : SV_DispatchThreadID)
+void PrefixFixup(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
 {
-    int threadIdx = (int)id.x;
-    int blockIdx = (int)id.y;
+    int threadIdx = (int)Gtid.x;
+    int blockIdx = (int)Gid.x;
     
     int t1 = threadIdx + 2 * blockIdx * 512;
     int t2 = t1 + 512;
@@ -146,5 +162,5 @@ void PrefixFixup(uint3 id : SV_DispatchThreadID)
     // Add block sum to all elements EXCEPT the first element of the first block
     // (which should remain 0 for exclusive prefix sums)
     if (t1 < elementCount && !(blockIdx == 0 && t1 == 0)) fBuffer[t1] += block_sum;
-    if (t2 < elementCount) fBuffer[t2] += block_sum;
+    if (t2 < elementCount && !(blockIdx == 0 && t2 == 0)) fBuffer[t2] += block_sum;
 }
