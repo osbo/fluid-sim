@@ -10,12 +10,27 @@ public class FluidSimulator : MonoBehaviour
     
     // Compute shader and kernel
     [SerializeField] private ComputeShader fluidKernels;
+    [SerializeField] private ComputeShader radixSortShader;
     private int initializeParticlesKernel;
+    
+    // Radix sort kernel indices
+    private int splitPrepKernel;
+    private int scatterElementsKernel;
+    private int copyBufferKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
-    private ComputeBuffer mortonCodesBuffer;
+    private ComputeBuffer mortonCodesBuffer;  // Separate morton codes buffer
+    private ComputeBuffer particleIndicesBuffer;  // Separate indices buffer
     private ComputeBuffer nodeFlagsBuffer; // Packed: 00(unique)(active)
+    
+    // Radix sort buffers (separate keys and indices like the working Metal implementation)
+    private ComputeBuffer inputKeysBuffer;
+    private ComputeBuffer inputIndicesBuffer;
+    private ComputeBuffer outputKeysBuffer;
+    private ComputeBuffer outputIndicesBuffer;
+    private ComputeBuffer eBuffer;  // Bit flags
+    private ComputeBuffer fBuffer;  // Prefix sums
     
     // Particle struct (must match compute shader)
     private struct Particle
@@ -31,21 +46,46 @@ public class FluidSimulator : MonoBehaviour
     void Start()
     {
         InitializeParticleSystem();
+        
+        // Test radix sort functionality
+        Debug.Log("=== Testing Radix Sort ===");
+        VerifySort(); // Should show unsorted initially
+        
+        RadixSort(); // Sort the morton codes
+        VerifySort(); // Should show sorted after
     }
     
     private void InitializeParticleSystem()
     {
-        // Get kernel index
+        // Get kernel indices
         initializeParticlesKernel = fluidKernels.FindKernel("InitializeParticles");
+        
+        // Get radix sort kernel indices
+        if (radixSortShader != null)
+        {
+            splitPrepKernel = radixSortShader.FindKernel("SplitPrep");
+            scatterElementsKernel = radixSortShader.FindKernel("ScatterElements");
+            copyBufferKernel = radixSortShader.FindKernel("CopyBuffer");
+        }
         
         // Create buffers
         particlesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 32 bytes
-        mortonCodesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint) + sizeof(uint)); // 8 bytes
+        mortonCodesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // 4 bytes (morton codes only)
+        particleIndicesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // 4 bytes (indices only)
         nodeFlagsBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // 4 bytes (packed flags)
+        
+        // Create radix sort buffers (separate keys and indices)
+        inputKeysBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Morton codes
+        inputIndicesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Particle indices
+        outputKeysBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Output morton codes
+        outputIndicesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Output indices
+        eBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Bit flags (0 or 1)
+        fBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Prefix sums
         
         // Set buffer data to compute shader
         fluidKernels.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
         fluidKernels.SetBuffer(initializeParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
+        fluidKernels.SetBuffer(initializeParticlesKernel, "particleIndicesBuffer", particleIndicesBuffer);
         fluidKernels.SetBuffer(initializeParticlesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
         
         // Calculate bounds
@@ -127,6 +167,149 @@ public class FluidSimulator : MonoBehaviour
         
     }
     
+    // Simple radix sort for morton codes
+    public void RadixSort()
+    {
+        if (radixSortShader == null) return;
+        
+        // No copying needed! Use the existing separate buffers directly
+        // mortonCodesBuffer and particleIndicesBuffer are already separate
+        
+        // Set element count
+        radixSortShader.SetInt("elementCount", PARTICLE_COUNT);
+        
+        // Perform radix sort (32 passes for 32-bit morton codes)
+        for (int bit = 0; bit < 32; bit++)
+        {
+            // Set current bit
+            radixSortShader.SetInt("currentBit", bit);
+            
+            // Set buffers for all kernels - use the main buffers directly
+            radixSortShader.SetBuffer(splitPrepKernel, "inputKeys", mortonCodesBuffer);
+            radixSortShader.SetBuffer(splitPrepKernel, "eBuffer", eBuffer);
+            
+            radixSortShader.SetBuffer(scatterElementsKernel, "inputKeys", mortonCodesBuffer);
+            radixSortShader.SetBuffer(scatterElementsKernel, "inputIndices", particleIndicesBuffer);
+            radixSortShader.SetBuffer(scatterElementsKernel, "outputKeys", outputKeysBuffer);
+            radixSortShader.SetBuffer(scatterElementsKernel, "outputIndices", outputIndicesBuffer);
+            radixSortShader.SetBuffer(scatterElementsKernel, "eBuffer", eBuffer);
+            radixSortShader.SetBuffer(scatterElementsKernel, "fBuffer", fBuffer);
+            
+            radixSortShader.SetBuffer(copyBufferKernel, "inputKeys", outputKeysBuffer);
+            radixSortShader.SetBuffer(copyBufferKernel, "inputIndices", outputIndicesBuffer);
+            radixSortShader.SetBuffer(copyBufferKernel, "outputKeys", mortonCodesBuffer);
+            radixSortShader.SetBuffer(copyBufferKernel, "outputIndices", particleIndicesBuffer);
+            
+            // Dispatch kernels
+            int threadGroups = Mathf.CeilToInt(PARTICLE_COUNT / 256.0f);
+            
+            // Step 1: Prepare bit flags
+            radixSortShader.Dispatch(splitPrepKernel, threadGroups, 1, 1);
+            
+            // Step 2: Calculate prefix sums (simple scan)
+            CalculatePrefixSum();
+            
+            // Step 3: Scatter elements
+            radixSortShader.Dispatch(scatterElementsKernel, threadGroups, 1, 1);
+            
+            // Step 4: Copy output back to input for next iteration
+            radixSortShader.Dispatch(copyBufferKernel, threadGroups, 1, 1);
+        }
+        
+        // No copying needed! The main buffers (mortonCodesBuffer and particleIndicesBuffer) 
+        // are already sorted in place
+    }
+    
+    // Simple prefix sum calculation (CPU-based for now)
+    private void CalculatePrefixSum()
+    {
+        uint[] eData = new uint[PARTICLE_COUNT];
+        eBuffer.GetData(eData);
+        
+        uint[] fData = new uint[PARTICLE_COUNT];
+        uint sum = 0;
+        for (int i = 0; i < PARTICLE_COUNT; i++)
+        {
+            fData[i] = sum;
+            sum += eData[i];
+        }
+        
+        fBuffer.SetData(fData);
+    }
+    
+    // Verify that the morton codes are properly sorted
+    public void VerifySort()
+    {
+        if (mortonCodesBuffer == null || particleIndicesBuffer == null) return;
+        
+        // Read morton codes and indices from GPU
+        uint[] mortonCodes = new uint[PARTICLE_COUNT];
+        uint[] particleIndices = new uint[PARTICLE_COUNT];
+        mortonCodesBuffer.GetData(mortonCodes);
+        particleIndicesBuffer.GetData(particleIndices);
+        
+        // Check if morton codes are in ascending order
+        bool isSorted = true;
+        uint firstOutOfOrder = 0;
+        uint previousMortonCode = 0;
+        
+        for (int i = 0; i < PARTICLE_COUNT; i++)
+        {
+            if (i > 0 && mortonCodes[i] < previousMortonCode)
+            {
+                isSorted = false;
+                firstOutOfOrder = (uint)i;
+                break;
+            }
+            previousMortonCode = mortonCodes[i];
+        }
+        
+        // Print verification result
+        if (isSorted)
+        {
+            Debug.Log("✅ SORT VERIFICATION: YES - Morton codes are properly sorted");
+        }
+        else
+        {
+            Debug.LogError($"❌ SORT VERIFICATION: NO - Morton codes are NOT sorted. First out-of-order element at index {firstOutOfOrder}");
+            Debug.LogError($"   Previous morton code: {mortonCodes[firstOutOfOrder - 1]}, Current: {mortonCodes[firstOutOfOrder]}");
+        }
+        
+        // Additional verification: Check that all particle indices are still present
+        bool allIndicesPresent = true;
+        bool[] indexFound = new bool[PARTICLE_COUNT];
+        
+        for (int i = 0; i < PARTICLE_COUNT; i++)
+        {
+            if (particleIndices[i] >= PARTICLE_COUNT)
+            {
+                allIndicesPresent = false;
+                Debug.LogError($"❌ INDEX VERIFICATION: NO - Invalid particle index {particleIndices[i]} at position {i}");
+                break;
+            }
+            indexFound[particleIndices[i]] = true;
+        }
+        
+        if (allIndicesPresent)
+        {
+            // Check for missing indices
+            for (int i = 0; i < PARTICLE_COUNT; i++)
+            {
+                if (!indexFound[i])
+                {
+                    allIndicesPresent = false;
+                    Debug.LogError($"❌ INDEX VERIFICATION: NO - Missing particle index {i}");
+                    break;
+                }
+            }
+        }
+        
+        if (allIndicesPresent)
+        {
+            Debug.Log("✅ INDEX VERIFICATION: YES - All particle indices are present and valid");
+        }
+    }
+    
     // Simple debug visualization using Gizmos
     private void OnDrawGizmos()
     {
@@ -192,6 +375,15 @@ public class FluidSimulator : MonoBehaviour
         // Clean up buffers
         particlesBuffer?.Release();
         mortonCodesBuffer?.Release();
+        particleIndicesBuffer?.Release();
         nodeFlagsBuffer?.Release();
+        
+        // Clean up radix sort buffers
+        inputKeysBuffer?.Release();
+        inputIndicesBuffer?.Release();
+        outputKeysBuffer?.Release();
+        outputIndicesBuffer?.Release();
+        eBuffer?.Release();
+        fBuffer?.Release();
     }
 }
