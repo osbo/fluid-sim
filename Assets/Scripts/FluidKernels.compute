@@ -46,7 +46,8 @@ struct MortonCode
 
 // Buffer definitions
 RWStructuredBuffer<Particle> particlesBuffer;
-RWStructuredBuffer<MortonCode> mortonCodesBuffer;
+RWStructuredBuffer<uint> mortonCodesBuffer;  // Separate morton codes buffer
+RWStructuredBuffer<uint> particleIndicesBuffer;  // Separate indices buffer
 RWStructuredBuffer<uint> nodeFlagsBuffer; // Packed: 00(unique)(active)
 
 // Parameters for particle initialization (pre-calculated on CPU)
@@ -95,6 +96,9 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     gridY = min(gridY, (uint)gridDimensions.y - 1);
     gridZ = min(gridZ, (uint)gridDimensions.z - 1);
     
+    // Reverse X axis to make particles initially unsorted
+    gridX = (uint)gridDimensions.x - 1 - gridX;
+    
     // Convert grid position to world position
     // Use grid spacing to position particles evenly within the bounds
     float3 gridOffset = float3(gridX, gridY, gridZ) * gridSpacing;
@@ -112,11 +116,9 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // Write particle to buffer
     particlesBuffer[index] = particle;
     
-    // Write morton code struct to separate buffer
-    MortonCode mortonCodeStruct;
-    mortonCodeStruct.mortonCode = particle.mortonCode;
-    mortonCodeStruct.index = index;
-    mortonCodesBuffer[index] = mortonCodeStruct;
+    // Write morton code and index to separate buffers
+    mortonCodesBuffer[index] = particle.mortonCode;
+    particleIndicesBuffer[index] = index;
     
     // Initialize node flags buffer (packed: 00(unique)(active))
     // Both active and unique are false (0), so packed value is 0

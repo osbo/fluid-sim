@@ -1,0 +1,77 @@
+// Metal-compatible radix sort based on proven implementation
+#pragma kernel SplitPrep
+#pragma kernel ScatterElements
+#pragma kernel CopyBuffer
+
+// Separate key and index buffers (like the working Metal implementation)
+RWStructuredBuffer<uint> inputKeys;
+RWStructuredBuffer<uint> inputIndices;
+RWStructuredBuffer<uint> outputKeys;
+RWStructuredBuffer<uint> outputIndices;
+
+// Temporary buffers for radix sort
+RWStructuredBuffer<uint> eBuffer;  // Bit flags (0 or 1)
+RWStructuredBuffer<uint> fBuffer;  // Prefix sums
+
+// Parameters
+int elementCount;
+int currentBit;
+
+// Prepare bit flags for current bit position
+[numthreads(256, 1, 1)]
+void SplitPrep(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x;
+    if (index >= elementCount) return;
+    
+    // Get morton code
+    uint mortonCode = inputKeys[index];
+    
+    // Extract bit at current position and store as 0 or 1
+    eBuffer[index] = ((mortonCode >> (uint)currentBit) & 1) == 0 ? 1 : 0;
+}
+
+// Scatter elements based on prefix sums (like the working Metal implementation)
+[numthreads(256, 1, 1)]
+void ScatterElements(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x;
+    if (index >= elementCount) return;
+    
+    // Get morton code and index
+    uint mortonCode = inputKeys[index];
+    uint particleIndex = inputIndices[index];
+    
+    // Calculate total falses (elements with bit = 0)
+    uint totalFalses = fBuffer[elementCount - 1] + eBuffer[elementCount - 1];
+    
+    // Check if bit is set
+    bool isBitSet = ((mortonCode >> (uint)currentBit) & 1) != 0;
+    
+    // Calculate destination index
+    uint destIndex;
+    if (isBitSet)
+    {
+        destIndex = totalFalses + (index - fBuffer[index]);
+    }
+    else
+    {
+        destIndex = fBuffer[index];
+    }
+    
+    // Write to output buffers
+    outputKeys[destIndex] = mortonCode;
+    outputIndices[destIndex] = particleIndex;
+}
+
+// Copy buffer contents
+[numthreads(256, 1, 1)]
+void CopyBuffer(uint3 id : SV_DispatchThreadID)
+{
+    int index = (int)id.x;
+    if (index >= elementCount) return;
+    
+    // Copy from output back to input for next iteration
+    inputKeys[index] = outputKeys[index];
+    inputIndices[index] = outputIndices[index];
+}
