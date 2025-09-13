@@ -1,0 +1,125 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma kernel InitializeParticles
+
+// Morton code encoding function for 3D (returns uint for 32-bit morton codes)
+uint EncodeMorton3D(float3 pos)
+{
+    uint x = (uint)pos.x;
+    uint y = (uint)pos.y;
+    uint z = (uint)pos.z;
+    
+    // Spread bits for morton encoding (10 bits max per axis for 32-bit total)
+    x = (x | (x << 16)) & 0x030000FF;
+    x = (x | (x << 8)) & 0x0300F00F;
+    x = (x | (x << 4)) & 0x030C30C3;
+    x = (x | (x << 2)) & 0x09249249;
+    
+    y = (y | (y << 16)) & 0x030000FF;
+    y = (y | (y << 8)) & 0x0300F00F;
+    y = (y | (y << 4)) & 0x030C30C3;
+    y = (y | (y << 2)) & 0x09249249;
+    
+    z = (z | (z << 16)) & 0x030000FF;
+    z = (z | (z << 8)) & 0x0300F00F;
+    z = (z | (z << 4)) & 0x030C30C3;
+    z = (z | (z << 2)) & 0x09249249;
+    
+    // Combine into single uint
+    return x | (y << 1) | (z << 2);
+}
+
+// Particle struct definition
+struct Particle
+{
+    float3 position;    // 3-component position vector
+    float3 velocity;    // 3-component velocity vector
+    uint layer;         // Layer units
+    uint mortonCode;    // Morton code for spatial indexing
+};
+
+struct MortonCode
+{
+    uint mortonCode;
+    uint index;
+};
+
+// Buffer definitions
+RWStructuredBuffer<Particle> particlesBuffer;
+RWStructuredBuffer<MortonCode> mortonCodesBuffer;
+RWStructuredBuffer<uint> nodeFlagsBuffer; // Packed: 00(unique)(active)
+
+// Parameters for particle initialization (pre-calculated on CPU)
+float3 fluidInitialBoundsMin;
+float3 fluidInitialBoundsMax;
+float3 simulationBoundsMin;
+float3 simulationBoundsMax;
+float3 mortonNormalizationFactor;
+float mortonMaxValue;
+
+// Grid parameters for even particle distribution
+uint3 gridDimensions;
+float3 gridSpacing;
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // TODO: insert actual code here!
+
+    Result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 0.0);
+}
+
+[numthreads(64,1,1)]
+void InitializeParticles (uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    
+    // Initialize particle with zero values
+    Particle particle;
+    particle.velocity = float3(0.0, 0.0, 0.0);
+    particle.layer = 0;
+    
+    // Calculate grid position using morton code major order (Z, Y, X)
+    // This ensures particles are distributed evenly throughout the volume
+    uint gridZ = index / (gridDimensions.x * gridDimensions.y);
+    uint remaining = index % (gridDimensions.x * gridDimensions.y);
+    uint gridY = remaining / gridDimensions.x;
+    uint gridX = remaining % gridDimensions.x;
+    
+    // Clamp grid position to valid range
+    gridX = min(gridX, (uint)gridDimensions.x - 1);
+    gridY = min(gridY, (uint)gridDimensions.y - 1);
+    gridZ = min(gridZ, (uint)gridDimensions.z - 1);
+    
+    // Convert grid position to world position
+    // Use grid spacing to position particles evenly within the bounds
+    float3 gridOffset = float3(gridX, gridY, gridZ) * gridSpacing;
+    particle.position = fluidInitialBoundsMin + gridOffset;
+    
+    // Normalize position to morton code range using pre-calculated factors
+    float3 normalizedPos = (particle.position - simulationBoundsMin) * mortonNormalizationFactor;
+    
+    // Clamp to valid range using pre-calculated max value
+    normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
+    
+    // Generate morton code from normalized position
+    particle.mortonCode = EncodeMorton3D(normalizedPos);
+    
+    // Write particle to buffer
+    particlesBuffer[index] = particle;
+    
+    // Write morton code struct to separate buffer
+    MortonCode mortonCodeStruct;
+    mortonCodeStruct.mortonCode = particle.mortonCode;
+    mortonCodeStruct.index = index;
+    mortonCodesBuffer[index] = mortonCodeStruct;
+    
+    // Initialize node flags buffer (packed: 00(unique)(active))
+    // Both active and unique are false (0), so packed value is 0
+    nodeFlagsBuffer[index] = 0;
+}
+
