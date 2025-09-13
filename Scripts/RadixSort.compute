@@ -2,6 +2,8 @@
 #pragma kernel SplitPrep
 #pragma kernel ScatterElements
 #pragma kernel CopyBuffer
+#pragma kernel PrefixSum
+#pragma kernel PrefixFixup
 
 // Separate key and index buffers (like the working Metal implementation)
 RWStructuredBuffer<uint> inputKeys;
@@ -13,9 +15,16 @@ RWStructuredBuffer<uint> outputIndices;
 RWStructuredBuffer<uint> eBuffer;  // Bit flags (0 or 1)
 RWStructuredBuffer<uint> fBuffer;  // Prefix sums
 
+// Auxiliary buffers for multi-block prefix sum (like Metal implementation)
+RWStructuredBuffer<uint> auxBuffer;    // Auxiliary buffer for block sums
+RWStructuredBuffer<uint> aux2Buffer;   // Second auxiliary buffer
+
 // Parameters
 int elementCount;
 int currentBit;
+
+// Shared memory for prefix sum (must be declared at global scope for Metal)
+groupshared uint scan_array[1024]; // SCAN_BLOCKSIZE << 1
 
 // Prepare bit flags for current bit position
 [numthreads(256, 1, 1)]
@@ -74,4 +83,68 @@ void CopyBuffer(uint3 id : SV_DispatchThreadID)
     // Copy from output back to input for next iteration
     inputKeys[index] = outputKeys[index];
     inputIndices[index] = outputIndices[index];
+}
+
+// Prefix sum kernel (based on working Metal implementation)
+[numthreads(512, 1, 1)]
+void PrefixSum(uint3 id : SV_DispatchThreadID)
+{
+    int threadIdx = (int)id.x;
+    int blockIdx = (int)id.y;
+    
+    // Each thread handles 2 elements
+    int t1 = threadIdx + 2 * blockIdx * 512;
+    int t2 = t1 + 512;
+    
+    // Load data into shared memory
+    scan_array[threadIdx] = (t1 < elementCount) ? eBuffer[t1] : 0;
+    scan_array[threadIdx + 512] = (t2 < elementCount) ? eBuffer[t2] : 0;
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Up-sweep phase
+    for (int stride = 1; stride <= 512; stride <<= 1)
+    {
+        int index = (threadIdx + 1) * stride * 2 - 1;
+        if (index < 1024)
+            scan_array[index] += scan_array[index - stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    
+    // Down-sweep phase
+    for (int stride = 512 >> 1; stride > 0; stride >>= 1)
+    {
+        int index = (threadIdx + 1) * stride * 2 - 1;
+        if (index + stride < 1024)
+            scan_array[index + stride] += scan_array[index];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Write results (exclusive prefix sum - zeroff = 1)
+    if (t1 + 1 < elementCount) fBuffer[t1 + 1] = scan_array[threadIdx];
+    if (t2 + 1 < elementCount) fBuffer[t2 + 1] = (threadIdx == 511) ? 0 : scan_array[threadIdx + 512];
+    
+    // Set first element to 0 for exclusive prefix sum
+    if (threadIdx == 0)
+    {
+        fBuffer[0] = 0;
+        auxBuffer[blockIdx] = scan_array[1023]; // Last element of the block
+    }
+}
+
+// Prefix fixup kernel for multi-block scans (Metal-compatible)
+[numthreads(512, 1, 1)]
+void PrefixFixup(uint3 id : SV_DispatchThreadID)
+{
+    int threadIdx = (int)id.x;
+    int blockIdx = (int)id.y;
+    
+    int t1 = threadIdx + 2 * blockIdx * 512;
+    int t2 = t1 + 512;
+    uint block_sum = aux2Buffer[blockIdx]; // Use aux2Buffer (contains the block sums)
+    
+    // Add block sum to all elements EXCEPT the first element of the first block
+    // (which should remain 0 for exclusive prefix sums)
+    if (t1 < elementCount && !(blockIdx == 0 && t1 == 0)) fBuffer[t1] += block_sum;
+    if (t2 < elementCount) fBuffer[t2] += block_sum;
 }
