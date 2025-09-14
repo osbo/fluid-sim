@@ -35,9 +35,10 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer eBuffer;  // Bit flags
     private ComputeBuffer fBuffer;  // Prefix sums
     
-    // Auxiliary buffers for multi-block prefix sum (like Metal implementation)
-    private ComputeBuffer auxBuffer;    // Auxiliary buffer for block sums
-    private ComputeBuffer aux2Buffer;   // Second auxiliary buffer
+    // Auxiliary buffers for multi-block prefix sum (like Metal)
+    private ComputeBuffer auxBuffer;        // For block sums
+    private ComputeBuffer aux2Buffer;       // For the scan of block sums
+    private ComputeBuffer auxSmallBuffer;   // For the recursive scan's single-element aux output
     
     // Particle struct (must match compute shader)
     private struct Particle
@@ -84,10 +85,10 @@ public class FluidSimulator : MonoBehaviour
         nodeFlagsBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // 4 bytes (packed flags)
         
         // Create radix sort buffers (separate keys and indices)
-        inputKeysBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Morton codes
-        inputIndicesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Particle indices
-        outputKeysBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Output morton codes
-        outputIndicesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Output indices
+        inputKeysBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint));
+        inputIndicesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint));
+        outputKeysBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint));
+        outputIndicesBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint));
         eBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Bit flags (0 or 1)
         fBuffer = new ComputeBuffer(PARTICLE_COUNT, sizeof(uint)); // Prefix sums
         
@@ -96,8 +97,9 @@ public class FluidSimulator : MonoBehaviour
         int numThreadgroups = Mathf.CeilToInt(PARTICLE_COUNT / (float)(threadgroupSize * 2));
         int requiredAuxSize = Mathf.Max(1, numThreadgroups);
         
-        auxBuffer = new ComputeBuffer(requiredAuxSize, sizeof(uint)); // Block sums
-        aux2Buffer = new ComputeBuffer(requiredAuxSize, sizeof(uint)); // Second auxiliary
+        auxBuffer = new ComputeBuffer(requiredAuxSize, sizeof(uint));
+        aux2Buffer = new ComputeBuffer(requiredAuxSize, sizeof(uint));
+        auxSmallBuffer = new ComputeBuffer(1, sizeof(uint)); // Single element for recursive scan
         
         // Set buffer data to compute shader
         fluidKernels.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
@@ -171,11 +173,6 @@ public class FluidSimulator : MonoBehaviour
         // Dispatch the kernel
         int threadGroups = Mathf.CeilToInt(PARTICLE_COUNT / 64.0f);
         fluidKernels.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
-        
-        // Debug.Log($"Initialized {PARTICLE_COUNT} particles with bounds: simulation({simulationBoundsMin} to {simulationBoundsMax}), fluid initial({fluidInitialBoundsMin} to {fluidInitialBoundsMax}), morton normalization factor: {mortonNormalizationFactor}, max morton value: {mortonMaxValue}, grid dimensions: {gridDimensions}, grid spacing: {actualGridSpacing}");
-        
-        // Read back and print first 10 elements of each buffer
-        // ReadAndPrintBufferData();
     }
 
     // Update is called once per frame
@@ -188,105 +185,105 @@ public class FluidSimulator : MonoBehaviour
     public void RadixSort()
     {
         if (radixSortShader == null) return;
-        
-        // No copying needed! Use the existing separate buffers directly
-        // mortonCodesBuffer and particleIndicesBuffer are already separate
-        
-        // Set element count
+
+        Debug.Log($"=== RADIX SORT START ===");
         radixSortShader.SetInt("elementCount", PARTICLE_COUNT);
-        
-        // Calculate threadgroup sizes (Metal-compatible)
         int threadgroupSize = 512;
         int numThreadgroups = Mathf.CeilToInt(PARTICLE_COUNT / (float)(threadgroupSize * 2));
         int scatterThreadGroups = Mathf.CeilToInt(PARTICLE_COUNT / 256.0f);
+        Debug.Log($"Particle count: {PARTICLE_COUNT}, PrefixSum groups: {numThreadgroups}, Scatter groups: {scatterThreadGroups}");
+
+        // This loop implements a ping-pong swap between the main buffers (mortonCodes/particleIndices)
+        // and the temporary output buffers (outputKeys/outputIndices).
+        ComputeBuffer keysIn = mortonCodesBuffer;
+        ComputeBuffer indicesIn = particleIndicesBuffer;
+        ComputeBuffer keysOut = outputKeysBuffer;
+        ComputeBuffer indicesOut = outputIndicesBuffer;
+
+        // Copy initial data into a temporary buffer so we don't read and write from the same buffer.
+        radixSortShader.SetBuffer(copyBufferKernel, "outputKeys", keysIn);
+        radixSortShader.SetBuffer(copyBufferKernel, "outputIndices", indicesIn);
+        radixSortShader.SetBuffer(copyBufferKernel, "inputKeys", keysOut);
+        radixSortShader.SetBuffer(copyBufferKernel, "inputIndices", indicesOut);
+        radixSortShader.Dispatch(copyBufferKernel, scatterThreadGroups, 1, 1);
         
-        Debug.Log($"=== RADIX SORT START ===");
-        Debug.Log($"Particle count: {PARTICLE_COUNT}, Threadgroups: {numThreadgroups}, Scatter groups: {scatterThreadGroups}");
-        VerifyStep(-1, "Initial"); // Initial verification
-        
-        // Perform radix sort (32 passes for 32-bit morton codes)
+        // Swap so the first real iteration reads from the copied data.
+        var swapKeys = keysIn; keysIn = keysOut; keysOut = swapKeys;
+        var swapIndices = indicesIn; indicesIn = indicesOut; indicesOut = swapIndices;
+
+
         for (int bit = 0; bit < 32; bit++)
         {
-            // Set current bit
             radixSortShader.SetInt("currentBit", bit);
-            
-            // Set buffers for all kernels - use the main buffers directly
-            radixSortShader.SetBuffer(splitPrepKernel, "inputKeys", mortonCodesBuffer);
+            radixSortShader.SetInt("zeroff", 1);
+
+            // Set buffers for the current iteration's read/write operations
+            radixSortShader.SetBuffer(splitPrepKernel, "inputKeys", keysIn);
+            radixSortShader.SetBuffer(scatterElementsKernel, "inputKeys", keysIn);
+            radixSortShader.SetBuffer(scatterElementsKernel, "inputIndices", indicesIn);
+            radixSortShader.SetBuffer(scatterElementsKernel, "outputKeys", keysOut);
+            radixSortShader.SetBuffer(scatterElementsKernel, "outputIndices", indicesOut);
+
+            // Set common buffers
             radixSortShader.SetBuffer(splitPrepKernel, "eBuffer", eBuffer);
-            
-            radixSortShader.SetBuffer(scatterElementsKernel, "inputKeys", mortonCodesBuffer);
-            radixSortShader.SetBuffer(scatterElementsKernel, "inputIndices", particleIndicesBuffer);
-            radixSortShader.SetBuffer(scatterElementsKernel, "outputKeys", outputKeysBuffer);
-            radixSortShader.SetBuffer(scatterElementsKernel, "outputIndices", outputIndicesBuffer);
             radixSortShader.SetBuffer(scatterElementsKernel, "eBuffer", eBuffer);
             radixSortShader.SetBuffer(scatterElementsKernel, "fBuffer", fBuffer);
-            
-            radixSortShader.SetBuffer(copyBufferKernel, "inputKeys", outputKeysBuffer);
-            radixSortShader.SetBuffer(copyBufferKernel, "inputIndices", outputIndicesBuffer);
-            radixSortShader.SetBuffer(copyBufferKernel, "outputKeys", mortonCodesBuffer);
-            radixSortShader.SetBuffer(copyBufferKernel, "outputIndices", particleIndicesBuffer);
-            
-            // Set buffers for prefix sum kernels
-            radixSortShader.SetBuffer(prefixSumKernel, "eBuffer", eBuffer);
-            radixSortShader.SetBuffer(prefixSumKernel, "fBuffer", fBuffer);
-            radixSortShader.SetBuffer(prefixSumKernel, "auxBuffer", auxBuffer);
-            
+
             // Step 1: Prepare bit flags
             radixSortShader.Dispatch(splitPrepKernel, scatterThreadGroups, 1, 1);
-            VerifyStep(bit, "SplitPrep");
-            
-            // Clear fBuffer before prefix sum
-            ClearBuffer(fBuffer, PARTICLE_COUNT);
-            
+
             // Step 2: Calculate prefix sums (multi-block approach)
             if (numThreadgroups <= 1)
             {
-                // Single block case
+                radixSortShader.SetInt("elementCount", PARTICLE_COUNT);
+                radixSortShader.SetBuffer(prefixSumKernel, "eBuffer", eBuffer);
+                radixSortShader.SetBuffer(prefixSumKernel, "fBuffer", fBuffer);
+                radixSortShader.SetBuffer(prefixSumKernel, "auxBuffer", auxBuffer);
                 radixSortShader.Dispatch(prefixSumKernel, 1, 1, 1);
             }
             else
             {
-                // Multi-block case
-                // First pass: scan each block
-                radixSortShader.Dispatch(prefixSumKernel, numThreadgroups, 1, 1);
-                
-                // Second pass: scan the block sums (auxBuffer -> aux2Buffer)
-                ClearBuffer(aux2Buffer, numThreadgroups); // Clear aux2Buffer before second pass
-                radixSortShader.SetBuffer(prefixSumKernel, "eBuffer", auxBuffer);
-                radixSortShader.SetBuffer(prefixSumKernel, "fBuffer", aux2Buffer);
-                radixSortShader.SetBuffer(prefixSumKernel, "auxBuffer", auxBuffer); // Keep auxBuffer as aux for this pass
-                radixSortShader.SetInt("elementCount", numThreadgroups);
-                radixSortShader.Dispatch(prefixSumKernel, 1, 1, 1);
-                
-                // Third pass: fixup the results
-                radixSortShader.SetBuffer(prefixFixupKernel, "fBuffer", fBuffer);
-                radixSortShader.SetBuffer(prefixFixupKernel, "aux2Buffer", aux2Buffer);
-                radixSortShader.Dispatch(prefixFixupKernel, numThreadgroups, 1, 1);
-                
-                Debug.Log($"Multi-block prefix sum: {numThreadgroups} blocks, fixup applied");
-                
-                // Reset buffers and element count for next iteration
+                radixSortShader.SetInt("elementCount", PARTICLE_COUNT);
                 radixSortShader.SetBuffer(prefixSumKernel, "eBuffer", eBuffer);
                 radixSortShader.SetBuffer(prefixSumKernel, "fBuffer", fBuffer);
                 radixSortShader.SetBuffer(prefixSumKernel, "auxBuffer", auxBuffer);
-                radixSortShader.SetInt("elementCount", PARTICLE_COUNT);
+                radixSortShader.Dispatch(prefixSumKernel, numThreadgroups, 1, 1);
+
+                radixSortShader.SetInt("elementCount", numThreadgroups);
+                radixSortShader.SetBuffer(prefixSumKernel, "eBuffer", auxBuffer);
+                radixSortShader.SetBuffer(prefixSumKernel, "fBuffer", aux2Buffer);
+                radixSortShader.SetBuffer(prefixSumKernel, "auxBuffer", auxSmallBuffer);
+                radixSortShader.Dispatch(prefixSumKernel, 1, 1, 1);
+
+                radixSortShader.SetBuffer(prefixFixupKernel, "fBuffer", fBuffer);
+                radixSortShader.SetBuffer(prefixFixupKernel, "aux2Buffer", aux2Buffer);
+                radixSortShader.Dispatch(prefixFixupKernel, numThreadgroups, 1, 1);
             }
-            VerifyStep(bit, "PrefixSum");
-            
+
             // Step 3: Scatter elements
+            radixSortShader.SetInt("elementCount", PARTICLE_COUNT);
             radixSortShader.Dispatch(scatterElementsKernel, scatterThreadGroups, 1, 1);
-            VerifyStep(bit, "ScatterElements");
-            
-            // Step 4: Copy output back to input for next iteration
-            radixSortShader.Dispatch(copyBufferKernel, scatterThreadGroups, 1, 1);
-            VerifyStep(bit, "CopyBuffer");
+
+            // Step 4: Swap In/Out buffers for the next iteration (ping-pong)
+            var tempKeys = keysIn;
+            keysIn = keysOut;
+            keysOut = tempKeys;
+
+            var tempIndices = indicesIn;
+            indicesIn = indicesOut;
+            indicesOut = tempIndices;
         }
-        
+
+        // After the loop, the final sorted data is in the 'keysIn'/'indicesIn' buffers.
+        // We must copy the data back to the main buffers.
+        radixSortShader.SetBuffer(copyBufferKernel, "outputKeys", keysIn);
+        radixSortShader.SetBuffer(copyBufferKernel, "outputIndices", indicesIn);
+        radixSortShader.SetBuffer(copyBufferKernel, "inputKeys", mortonCodesBuffer);
+        radixSortShader.SetBuffer(copyBufferKernel, "inputIndices", particleIndicesBuffer);
+        radixSortShader.Dispatch(copyBufferKernel, scatterThreadGroups, 1, 1);
+
         Debug.Log($"=== RADIX SORT COMPLETE ===");
-        VerifySort(); // Final full verification
-        
-        // No copying needed! The main buffers (mortonCodesBuffer and particleIndicesBuffer) 
-        // are already sorted in place
+        VerifySort();
     }
     
     // Clear a buffer with zeros
@@ -447,7 +444,7 @@ public class FluidSimulator : MonoBehaviour
             uint expectedDestIndex;
             if (isBitSet)
             {
-                expectedDestIndex = totalFalses + (uint)i - fBufferData[i];
+                expectedDestIndex = totalFalses + ((uint)i - fBufferData[i]);
             }
             else
             {
@@ -672,5 +669,6 @@ public class FluidSimulator : MonoBehaviour
         // Clean up auxiliary buffers
         auxBuffer?.Release();
         aux2Buffer?.Release();
+        auxSmallBuffer?.Release();
     }
 }
