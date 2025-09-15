@@ -9,7 +9,7 @@
 // Buffers
 RWStructuredBuffer<uint> sortedMortonCodes;      // input: sorted morton codes
 RWStructuredBuffer<uint> sortedIndices;          // input: sorted particle indices (same order as codes)
-RWStructuredBuffer<uint> nodeFlagsBuffer;        // in/out: bit 1 (value 2) marks unique
+// nodeFlagsBuffer moved to Nodes.compute
 
 RWStructuredBuffer<uint> uniqueIndicators;       // temp: e (0/1) whether entry is unique
 RWStructuredBuffer<uint> prefixSums;             // temp: f (exclusive scan)
@@ -41,11 +41,7 @@ void markUniques(uint3 id : SV_DispatchThreadID)
 
     uniqueIndicators[i] = isUnique;
 
-    // set node flag bit1 (value 2) when unique
-    if (isUnique == 1u) {
-        // OR in the unique bit
-        nodeFlagsBuffer[i] = nodeFlagsBuffer[i] | 2u;
-    }
+    // Note: node flag setting moved to Nodes.compute
 }
 
 [numthreads(SCAN_BLOCKSIZE, 1, 1)]
