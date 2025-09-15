@@ -59,6 +59,9 @@ float3 gridSpacing;
 // with cs.SetTexture
 RWTexture2D<float4> Result;
 
+// Total number of particles to initialize
+uint count;
+
 [numthreads(8,8,1)]
 void CSMain (uint3 id : SV_DispatchThreadID)
 {
@@ -71,6 +74,7 @@ void CSMain (uint3 id : SV_DispatchThreadID)
 void InitializeParticles (uint3 id : SV_DispatchThreadID)
 {
     uint index = id.x;
+    if (index >= count) return;
     
     // Initialize particle with zero values
     Particle particle;
