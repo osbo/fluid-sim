@@ -7,10 +7,19 @@ public class FluidSimulator : MonoBehaviour
     
     public ComputeShader radixSortShader;
     public ComputeShader fluidKernelsShader;
+    public ComputeShader leavesShader;
     public int numParticles = 10000;
     
     private RadixSort radixSort;
     private int initializeParticlesKernel;
+    private int markUniquesKernel;
+    private int leavesPrefixSumKernel;      // not used after simplification, but kept for reference
+    private int leavesPrefixFixupKernel;    // not used after simplification, but kept for reference
+    private int scatterUniquesKernel;
+    private int writeUniqueCountKernel;
+    // Reuse proven radix kernels for scan
+    private int radixPrefixSumKernelId;
+    private int radixPrefixFixupKernelId;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -19,6 +28,13 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer nodeFlagsBuffer; // Packed: 00(unique)(active)
     private ComputeBuffer sortedMortonCodes;
     private ComputeBuffer sortedParticleIndices;
+    private ComputeBuffer uniqueIndicators;
+    private ComputeBuffer leavesPrefixSums;
+    private ComputeBuffer leavesAux;
+    private ComputeBuffer leavesAux2;
+    private ComputeBuffer uniqueIndices;
+    private ComputeBuffer uniqueCount;
+    private ComputeBuffer leavesAuxSmall;
     
     // Particle struct (must match compute shader)
     private struct Particle
@@ -33,6 +49,7 @@ public class FluidSimulator : MonoBehaviour
     {
         InitializeParticleSystem();
         SortParticles();
+        PrefixSumLeaves();
     }
     
     private void InitializeParticleSystem()
@@ -53,6 +70,7 @@ public class FluidSimulator : MonoBehaviour
         fluidKernelsShader.SetBuffer(initializeParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
         fluidKernelsShader.SetBuffer(initializeParticlesKernel, "particleIndicesBuffer", particleIndicesBuffer);
         fluidKernelsShader.SetBuffer(initializeParticlesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
+        fluidKernelsShader.SetInt("count", numParticles);
         
         // Calculate bounds
         Vector3 simulationBoundsMin = simulationBounds.bounds.min;
@@ -122,9 +140,9 @@ public class FluidSimulator : MonoBehaviour
         int threadGroups = Mathf.CeilToInt(numParticles / 64.0f);
         fluidKernelsShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
         
-        Debug.Log($"Initialized {numParticles} particles with bounds: simulation({simulationBoundsMin} to {simulationBoundsMax}), fluid initial({fluidInitialBoundsMin} to {fluidInitialBoundsMax})");
-        Debug.Log($"Morton normalization factors: {mortonNormalizationFactor}, max value: {mortonMaxValue}");
-        Debug.Log($"Grid dimensions: {gridDimensions}, grid spacing: {actualGridSpacing}");
+        // Debug.Log($"Initialized {numParticles} particles with bounds: simulation({simulationBoundsMin} to {simulationBoundsMax}), fluid initial({fluidInitialBoundsMin} to {fluidInitialBoundsMax})");
+        // Debug.Log($"Morton normalization factors: {mortonNormalizationFactor}, max value: {mortonMaxValue}");
+        // Debug.Log($"Grid dimensions: {gridDimensions}, grid spacing: {actualGridSpacing}");
     }
     
     private void SortParticles()
@@ -135,39 +153,156 @@ public class FluidSimulator : MonoBehaviour
         // Sort the morton codes and their corresponding indices
         radixSort.Sort(mortonCodesBuffer, particleIndicesBuffer, sortedMortonCodes, sortedParticleIndices, (uint)numParticles);
         
-        // Debug: Log sorted codes and indices
-        uint[] sortedMortonCodesArray = new uint[numParticles];
-        sortedMortonCodes.GetData(sortedMortonCodesArray);
+        // // Debug: Log sorted codes and indices
+        // uint[] sortedMortonCodesArray = new uint[numParticles];
+        // sortedMortonCodes.GetData(sortedMortonCodesArray);
         
-        uint[] sortedIndicesArray = new uint[numParticles];
-        sortedParticleIndices.GetData(sortedIndicesArray);
+        // uint[] sortedIndicesArray = new uint[numParticles];
+        // sortedParticleIndices.GetData(sortedIndicesArray);
         
-        // Get particle data
-        Particle[] particlesArray = new Particle[numParticles];
-        particlesBuffer.GetData(particlesArray);
+        // // Get particle data
+        // Particle[] particlesArray = new Particle[numParticles];
+        // particlesBuffer.GetData(particlesArray);
         
-        string sorted_output = "Sorted Morton Codes (first 20): ";
-        string indices_output = "Corresponding Indices (first 20): ";
-        for (int i = 0; i < Mathf.Min(20, numParticles); i++)
-        {
-            sorted_output += sortedMortonCodesArray[i] + " ";
-            indices_output += sortedIndicesArray[i] + " ";
-        }
-        Debug.Log(sorted_output);
-        Debug.Log(indices_output);
+        // string sorted_output = "Sorted Morton Codes (first 20): ";
+        // string indices_output = "Corresponding Indices (first 20): ";
+        // for (int i = 0; i < Mathf.Min(20, numParticles); i++)
+        // {
+        //     sorted_output += sortedMortonCodesArray[i] + " ";
+        //     indices_output += sortedIndicesArray[i] + " ";
+        // }
+        // Debug.Log(sorted_output);
+        // Debug.Log(indices_output);
         
-        // Print particle data for first 20 sorted particles
-        Debug.Log("=== First 20 Sorted Particles ===");
-        for (int i = 0; i < Mathf.Min(20, numParticles); i++)
-        {
-            uint particleIndex = sortedIndicesArray[i];
-            Particle particle = particlesArray[particleIndex];
+        // // Print particle data for first 20 sorted particles
+        // Debug.Log("=== First 20 Sorted Particles ===");
+        // for (int i = 0; i < Mathf.Min(20, numParticles); i++)
+        // {
+        //     uint particleIndex = sortedIndicesArray[i];
+        //     Particle particle = particlesArray[particleIndex];
             
-            Debug.Log($"Sorted Position {i}: Particle[{particleIndex}] - " +
-                     $"Pos=({particle.position.x:F3}, {particle.position.y:F3}, {particle.position.z:F3}), " +
-                     $"Vel=({particle.velocity.x:F3}, {particle.velocity.y:F3}, {particle.velocity.z:F3}), " +
-                     $"Layer={particle.layer}, MortonCode={particle.mortonCode}");
+        //     Debug.Log($"Sorted Position {i}: Particle[{particleIndex}] - " +
+        //              $"Pos=({particle.position.x:F3}, {particle.position.y:F3}, {particle.position.z:F3}), " +
+        //              $"Vel=({particle.velocity.x:F3}, {particle.velocity.y:F3}, {particle.velocity.z:F3}), " +
+        //              $"Layer={particle.layer}, MortonCode={particle.mortonCode}");
+        // }
+    }
+
+    private void PrefixSumLeaves()
+    {
+        int count = numParticles;
+        if (count == 0) return;
+
+        if (leavesShader == null)
+        {
+            Debug.LogError("Leaves compute shader is not assigned. Please assign `leavesShader` in the inspector.");
+            return;
         }
+
+        // Find kernels
+        markUniquesKernel = leavesShader.FindKernel("markUniques");
+        leavesPrefixSumKernel = leavesShader.FindKernel("prefixSum");
+        leavesPrefixFixupKernel = leavesShader.FindKernel("prefixFixup");
+        scatterUniquesKernel = leavesShader.FindKernel("scatterUniques");
+        writeUniqueCountKernel = leavesShader.FindKernel("writeUniqueCount");
+
+        if (markUniquesKernel < 0 || leavesPrefixSumKernel < 0 || leavesPrefixFixupKernel < 0 ||
+            scatterUniquesKernel < 0 || writeUniqueCountKernel < 0)
+        {
+            Debug.LogError("One or more kernels not found in Leaves.compute. Verify #pragma kernel names and shader assignment.");
+            return;
+        }
+
+        // Allocate leaves buffers
+        uniqueIndicators = new ComputeBuffer(count, sizeof(uint));
+        leavesPrefixSums = new ComputeBuffer(count, sizeof(uint));
+
+        uint tgSize = 512u;
+        uint numThreadgroups = (uint)((count + (tgSize * 2) - 1) / (tgSize * 2));
+        uint auxSize = (uint)System.Math.Max(1, (int)numThreadgroups);
+        leavesAux = new ComputeBuffer((int)auxSize, sizeof(uint));
+        leavesAux2 = new ComputeBuffer((int)auxSize, sizeof(uint));
+
+        uniqueIndices = new ComputeBuffer(count, sizeof(uint));
+        uniqueCount = new ComputeBuffer(1, sizeof(uint));
+
+        // mark uniques
+        leavesShader.SetBuffer(markUniquesKernel, "sortedMortonCodes", sortedMortonCodes);
+        leavesShader.SetBuffer(markUniquesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
+        leavesShader.SetBuffer(markUniquesKernel, "uniqueIndicators", uniqueIndicators);
+        leavesShader.SetInt("count", count);
+        int groupsLinear = (count + 511) / 512;
+        leavesShader.Dispatch(markUniquesKernel, groupsLinear, 1, 1);
+
+        // Reuse proven radix scan kernels for uniqueIndicators scan
+        radixPrefixSumKernelId = radixSortShader.FindKernel("prefixSum");
+        radixPrefixFixupKernelId = radixSortShader.FindKernel("prefixFixup");
+
+        // First-level scan: uniqueIndicators -> leavesPrefixSums
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", uniqueIndicators);
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", leavesPrefixSums);
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", leavesAux);
+        radixSortShader.SetInt("len", count);
+        radixSortShader.SetInt("zeroff", 1);
+        radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
+
+        if (numThreadgroups > 1)
+        {
+            // Scan aux -> leavesAux2
+            if (leavesAuxSmall == null) leavesAuxSmall = new ComputeBuffer(1, sizeof(uint));
+            uint auxThreadgroups = 1; // aux length is small
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", leavesAux);
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", leavesAux2);
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", leavesAuxSmall);
+            radixSortShader.SetInt("len", (int)auxSize);
+            radixSortShader.SetInt("zeroff", 1);
+            radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
+
+            // Fixup: add scanned aux into leavesPrefixSums
+            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", leavesPrefixSums);
+            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", leavesAux2);
+            radixSortShader.SetInt("len", count);
+            radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
+        }
+
+        // scatter uniques -> uniqueIndices (store corresponding particle index)
+        leavesShader.SetBuffer(scatterUniquesKernel, "uniqueIndicators", uniqueIndicators);
+        leavesShader.SetBuffer(scatterUniquesKernel, "prefixSums", leavesPrefixSums);
+        leavesShader.SetBuffer(scatterUniquesKernel, "sortedIndices", sortedParticleIndices);
+        leavesShader.SetBuffer(scatterUniquesKernel, "uniqueIndices", uniqueIndices);
+        leavesShader.SetInt("count", count);
+        leavesShader.Dispatch(scatterUniquesKernel, groupsLinear, 1, 1);
+
+        // write unique count
+        leavesShader.SetBuffer(writeUniqueCountKernel, "uniqueIndicators", uniqueIndicators);
+        leavesShader.SetBuffer(writeUniqueCountKernel, "prefixSums", leavesPrefixSums);
+        leavesShader.SetBuffer(writeUniqueCountKernel, "uniqueCount", uniqueCount);
+        leavesShader.SetInt("count", count);
+        leavesShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
+
+        // Debug output
+        uint[] uniqueCountCpu = new uint[1];
+        uniqueCount.GetData(uniqueCountCpu);
+        int uniques = (int)uniqueCountCpu[0];
+        Debug.Log($"Particles created: {numParticles}, Unique morton codes: {uniques}");
+
+        int toPrint = Mathf.Min(20, uniques);
+        uint[] uniqueIdxCpu = new uint[toPrint];
+        uniqueIndices.GetData(uniqueIdxCpu, 0, 0, toPrint);
+        uint[] sortedCodesCpu = new uint[Mathf.Min(count, 200)];
+        sortedMortonCodes.GetData(sortedCodesCpu, 0, 0, Mathf.Min(count, 200));
+
+        string uIdx = "First unique indices (particle indices): ";
+        string uCodes = "First unique morton codes: ";
+        for (int i = 0; i < toPrint; i++)
+        {
+            uIdx += uniqueIdxCpu[i] + " ";
+            // recover code value by finding start position i in sorted arrays: prefixSums where uniqueIndicators==1
+            // For quick check, print sortedMortonCodes[i] which corresponds to ith unique
+            uCodes += sortedCodesCpu[i] + " ";
+        }
+        Debug.Log(uIdx);
+        Debug.Log(uCodes);
     }
 
     // Simple debug visualization using Gizmos
