@@ -1,0 +1,88 @@
+#pragma kernel CreateNodes
+
+// Particle struct (must match C# struct)
+struct Particle
+{
+    float3 position;    // 12 bytes
+    float3 velocity;    // 12 bytes
+    uint layer;         // 4 bytes
+    uint mortonCode;    // 4 bytes
+};
+
+// Node struct (must match C# struct)
+struct Node
+{
+    float3 position;    // 12 bytes
+    float3 velocity;    // 12 bytes
+    uint layer;         // 4 bytes
+    uint mortonCode;    // 4 bytes
+};
+
+// Input buffers
+RWStructuredBuffer<Particle> particlesBuffer;           // input: all particles
+RWStructuredBuffer<uint> sortedParticleIndices;         // input: sorted unique particle indices
+
+// Output buffers
+RWStructuredBuffer<Node> nodesBuffer;                   // output: aggregated nodes
+RWStructuredBuffer<uint> nodeMortonCodes;               // output: morton codes for nodes
+RWStructuredBuffer<uint> nodeIndices;                   // output: indices for nodes (0, 1, 2, ...)
+RWStructuredBuffer<uint> nodeFlagsBuffer;               // output: initialized to 00 (packed flags)
+
+uint numUniqueNodes;                                    // number of unique morton codes
+uint numParticles;                                      // total number of particles
+
+[numthreads(64, 1, 1)]
+void CreateNodes(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numUniqueNodes) return;
+    
+    // Get the particle index for this unique morton code
+    uint firstParticleIndex = sortedParticleIndices[threadIndex];
+    
+    // Get the morton code for this node
+    uint mortonCode = particlesBuffer[firstParticleIndex].mortonCode;
+    
+    // Find how many particles share this morton code
+    uint particleCount = 1;
+    uint nextUniqueIndex = sortedParticleIndices[threadIndex + 1];
+    
+    // Aggregate particle data with weighted average
+    float3 weightedPosition = float3(0, 0, 0);
+    float3 weightedVelocity = float3(0, 0, 0);
+    float totalWeight = 0.0;
+    uint minLayer = 10;
+    
+    // Process all particles with this morton code
+    for (uint i = firstParticleIndex; i < nextUniqueIndex && i < numParticles; i++)
+    {
+        Particle particle = particlesBuffer[i];
+        
+        // Weight = 8^(particle.layer), but since layer is always 0, weight = 8^0 = 1
+        float weight = pow(8.0, (float)particle.layer);
+        
+        weightedPosition += particle.position * weight;
+        weightedVelocity += particle.velocity * weight;
+        totalWeight += weight;
+        
+        // Track minimum layer
+        minLayer = min(minLayer, particle.layer);
+    }
+    
+    // Normalize by total weight (center of mass)
+    weightedPosition /= totalWeight;
+    weightedVelocity /= totalWeight;
+    
+    // Create the node
+    Node node;
+    node.position = weightedPosition;
+    node.velocity = weightedVelocity;
+    node.layer = minLayer;  // Use the minimum layer found
+    node.mortonCode = mortonCode;
+    
+    // Write outputs
+    nodesBuffer[threadIndex] = node;
+    nodeMortonCodes[threadIndex] = mortonCode;
+    nodeIndices[threadIndex] = threadIndex;  // Simple 0, 1, 2, ... sequence
+    nodeFlagsBuffer[threadIndex] = 0;      // Initialize to 00
+}
