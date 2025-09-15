@@ -2,31 +2,24 @@
 #pragma kernel CSMain
 #pragma kernel InitializeParticles
 
-// Morton code encoding function for 3D (returns uint for 32-bit morton codes)
+// 32-bit Morton code encoding function (adapted from 64-bit Swift/Metal version)
 uint EncodeMorton3D(float3 pos)
 {
-    uint x = (uint)pos.x;
-    uint y = (uint)pos.y;
-    uint z = (uint)pos.z;
+    // Convert to uint32 and mask to 10 bits per axis (0x3FF = 1023 = 2^10-1)
+    uint x = (uint)pos.x & 0x3FF;
+    uint y = (uint)pos.y & 0x3FF;
+    uint z = (uint)pos.z & 0x3FF;
     
-    // Spread bits for morton encoding (10 bits max per axis for 32-bit total)
-    x = (x | (x << 16)) & 0x030000FF;
-    x = (x | (x << 8)) & 0x0300F00F;
-    x = (x | (x << 4)) & 0x030C30C3;
-    x = (x | (x << 2)) & 0x09249249;
+    uint result = 0;
     
-    y = (y | (y << 16)) & 0x030000FF;
-    y = (y | (y << 8)) & 0x0300F00F;
-    y = (y | (y << 4)) & 0x030C30C3;
-    y = (y | (y << 2)) & 0x09249249;
+    // Interleave bits for 32-bit Morton code (10 bits per axis = 30 bits total)
+    for (int i = 0; i < 10; i++) {
+        result |= ((x & (1U << i)) << (2 * i));
+        result |= ((y & (1U << i)) << (2 * i + 1));
+        result |= ((z & (1U << i)) << (2 * i + 2));
+    }
     
-    z = (z | (z << 16)) & 0x030000FF;
-    z = (z | (z << 8)) & 0x0300F00F;
-    z = (z | (z << 4)) & 0x030C30C3;
-    z = (z | (z << 2)) & 0x09249249;
-    
-    // Combine into single uint
-    return x | (y << 1) | (z << 2);
+    return result;
 }
 
 // Particle struct definition
