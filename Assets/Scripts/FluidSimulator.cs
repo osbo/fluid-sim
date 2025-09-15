@@ -8,6 +8,7 @@ public class FluidSimulator : MonoBehaviour
     public ComputeShader radixSortShader;
     public ComputeShader fluidKernelsShader;
     public ComputeShader leavesShader;
+    public ComputeShader nodesShader;
     public int numParticles = 10000;
     
     private RadixSort radixSort;
@@ -20,6 +21,7 @@ public class FluidSimulator : MonoBehaviour
     // Reuse proven radix kernels for scan
     private int radixPrefixSumKernelId;
     private int radixPrefixFixupKernelId;
+    private int createNodesKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -35,9 +37,21 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer uniqueIndices;
     private ComputeBuffer uniqueCount;
     private ComputeBuffer leavesAuxSmall;
+    private ComputeBuffer nodesBuffer;
+    private ComputeBuffer nodeMortonCodes;
+    private ComputeBuffer nodeIndices;
     
     // Particle struct (must match compute shader)
     private struct Particle
+    {
+        public Vector3 position;    // 12 bytes
+        public Vector3 velocity;    // 12 bytes
+        public uint layer;          // 4 bytes
+        public uint mortonCode;     // 4 bytes
+    }
+
+    // Node struct (must match compute shader)
+    private struct Node
     {
         public Vector3 position;    // 12 bytes
         public Vector3 velocity;    // 12 bytes
@@ -50,6 +64,7 @@ public class FluidSimulator : MonoBehaviour
         InitializeParticleSystem();
         SortParticles();
         PrefixSumLeaves();
+        CreateNodes();
     }
     
     private void InitializeParticleSystem()
@@ -61,7 +76,7 @@ public class FluidSimulator : MonoBehaviour
         particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 32 bytes
         mortonCodesBuffer = new ComputeBuffer(numParticles, sizeof(uint));
         particleIndicesBuffer = new ComputeBuffer(numParticles, sizeof(uint));
-        nodeFlagsBuffer = new ComputeBuffer(numParticles, sizeof(uint)); // 4 bytes (packed flags)
+        // nodeFlagsBuffer created later in CreateNodes() with correct size
         sortedMortonCodes = new ComputeBuffer(numParticles, sizeof(uint));
         sortedParticleIndices = new ComputeBuffer(numParticles, sizeof(uint));
         
@@ -69,7 +84,7 @@ public class FluidSimulator : MonoBehaviour
         fluidKernelsShader.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
         fluidKernelsShader.SetBuffer(initializeParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
         fluidKernelsShader.SetBuffer(initializeParticlesKernel, "particleIndicesBuffer", particleIndicesBuffer);
-        fluidKernelsShader.SetBuffer(initializeParticlesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
+        // nodeFlagsBuffer not set here - created later in CreateNodes()
         fluidKernelsShader.SetInt("count", numParticles);
         
         // Calculate bounds
@@ -153,26 +168,26 @@ public class FluidSimulator : MonoBehaviour
         // Sort the morton codes and their corresponding indices
         radixSort.Sort(mortonCodesBuffer, particleIndicesBuffer, sortedMortonCodes, sortedParticleIndices, (uint)numParticles);
         
-        // // Debug: Log sorted codes and indices
-        // uint[] sortedMortonCodesArray = new uint[numParticles];
-        // sortedMortonCodes.GetData(sortedMortonCodesArray);
+        // Debug: Log sorted codes and indices
+        uint[] sortedMortonCodesArray = new uint[numParticles];
+        sortedMortonCodes.GetData(sortedMortonCodesArray);
         
-        // uint[] sortedIndicesArray = new uint[numParticles];
-        // sortedParticleIndices.GetData(sortedIndicesArray);
+        uint[] sortedIndicesArray = new uint[numParticles];
+        sortedParticleIndices.GetData(sortedIndicesArray);
         
         // // Get particle data
         // Particle[] particlesArray = new Particle[numParticles];
         // particlesBuffer.GetData(particlesArray);
         
-        // string sorted_output = "Sorted Morton Codes (first 20): ";
-        // string indices_output = "Corresponding Indices (first 20): ";
-        // for (int i = 0; i < Mathf.Min(20, numParticles); i++)
-        // {
-        //     sorted_output += sortedMortonCodesArray[i] + " ";
-        //     indices_output += sortedIndicesArray[i] + " ";
-        // }
-        // Debug.Log(sorted_output);
-        // Debug.Log(indices_output);
+        string sorted_output = "Sorted Morton Codes (first 20): ";
+        string indices_output = "Corresponding Indices (first 20): ";
+        for (int i = 0; i < Mathf.Min(20, numParticles); i++)
+        {
+            sorted_output += sortedMortonCodesArray[i] + " ";
+            indices_output += sortedIndicesArray[i] + " ";
+        }
+        Debug.Log(sorted_output);
+        Debug.Log(indices_output);
         
         // // Print particle data for first 20 sorted particles
         // Debug.Log("=== First 20 Sorted Particles ===");
@@ -228,7 +243,6 @@ public class FluidSimulator : MonoBehaviour
 
         // mark uniques
         leavesShader.SetBuffer(markUniquesKernel, "sortedMortonCodes", sortedMortonCodes);
-        leavesShader.SetBuffer(markUniquesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
         leavesShader.SetBuffer(markUniquesKernel, "uniqueIndicators", uniqueIndicators);
         leavesShader.SetInt("count", count);
         int groupsLinear = (count + 511) / 512;
@@ -281,25 +295,137 @@ public class FluidSimulator : MonoBehaviour
         leavesShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
 
         // Debug output (disabled in production)
-        // uint[] uniqueCountCpu = new uint[1];
-        // uniqueCount.GetData(uniqueCountCpu);
-        // int uniques = (int)uniqueCountCpu[0];
-        // Debug.Log($"Particles created: {numParticles}, Unique morton codes: {uniques}");
-        // int toPrint = Mathf.Min(20, uniques);
-        // uint[] uniqueIdxCpu = new uint[toPrint];
-        // uniqueIndices.GetData(uniqueIdxCpu, 0, 0, toPrint);
-        // uint[] sortedCodesCpu = new uint[Mathf.Min(count, 200)];
-        // sortedMortonCodes.GetData(sortedCodesCpu, 0, 0, Mathf.Min(count, 200));
-        // string uIdx = "First unique indices (particle indices): ";
-        // string uCodes = "First unique morton codes: ";
-        // for (int i = 0; i < toPrint; i++)
-        // {
-        //     uIdx += uniqueIdxCpu[i] + " ";
-        //     uCodes += sortedCodesCpu[i] + " ";
-        // }
-        // Debug.Log(uIdx);
-        // Debug.Log(uCodes);
-        // VerifyLeavesOnCPU(count, uniques);
+        uint[] uniqueCountCpu = new uint[1];
+        uniqueCount.GetData(uniqueCountCpu);
+        int uniques = (int)uniqueCountCpu[0];
+        Debug.Log($"Particles created: {numParticles}, Unique morton codes: {uniques}");
+        int toPrint = Mathf.Min(20, uniques);
+        uint[] uniqueIdxCpu = new uint[toPrint];
+        uniqueIndices.GetData(uniqueIdxCpu, 0, 0, toPrint);
+        uint[] sortedCodesCpu = new uint[Mathf.Min(count, 200)];
+        sortedMortonCodes.GetData(sortedCodesCpu, 0, 0, Mathf.Min(count, 200));
+        string uIdx = "First unique indices (particle indices): ";
+        string uCodes = "First unique morton codes: ";
+        for (int i = 0; i < toPrint; i++)
+        {
+            uIdx += uniqueIdxCpu[i] + " ";
+            uCodes += sortedCodesCpu[i] + " ";
+        }
+        Debug.Log(uIdx);
+        Debug.Log(uCodes);
+        VerifyLeavesOnCPU(count, uniques);
+    }
+
+    private void CreateNodes()
+    {
+        if (nodesShader == null)
+        {
+            Debug.LogError("Nodes compute shader is not assigned. Please assign `nodesShader` in the inspector.");
+            return;
+        }
+
+        // Get unique count from GPU
+        uint[] uniqueCountCpu = new uint[1];
+        uniqueCount.GetData(uniqueCountCpu);
+        int numUniqueNodes = (int)uniqueCountCpu[0];
+
+        if (numUniqueNodes == 0) return;
+
+        // Find kernel
+        createNodesKernel = nodesShader.FindKernel("CreateNodes");
+
+        // Create node buffers
+        nodesBuffer = new ComputeBuffer(numUniqueNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 32 bytes
+        nodeMortonCodes = new ComputeBuffer(numUniqueNodes, sizeof(uint));
+        nodeIndices = new ComputeBuffer(numUniqueNodes, sizeof(uint));
+        nodeFlagsBuffer = new ComputeBuffer(numUniqueNodes, sizeof(uint)); // 4 bytes (packed flags)
+
+        // Set buffer data to compute shader
+        nodesShader.SetBuffer(createNodesKernel, "particlesBuffer", particlesBuffer);
+        nodesShader.SetBuffer(createNodesKernel, "sortedParticleIndices", sortedParticleIndices);
+        nodesShader.SetBuffer(createNodesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(createNodesKernel, "nodeMortonCodes", nodeMortonCodes);
+        nodesShader.SetBuffer(createNodesKernel, "nodeIndices", nodeIndices);
+        nodesShader.SetBuffer(createNodesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
+        nodesShader.SetInt("numUniqueNodes", numUniqueNodes);
+        nodesShader.SetInt("numParticles", numParticles);
+
+        // Dispatch the kernel
+        int threadGroups = Mathf.CeilToInt(numUniqueNodes / 64.0f);
+        nodesShader.Dispatch(createNodesKernel, threadGroups, 1, 1);
+
+        Debug.Log($"Created {numUniqueNodes} nodes from {numParticles} particles");
+        
+        // Debug: Print first few nodes and aggregated nodes
+        PrintNodeDebugInfo(numUniqueNodes);
+    }
+    
+    private void PrintNodeDebugInfo(int numUniqueNodes)
+    {
+        if (numUniqueNodes == 0) return;
+        
+        // Read back node data
+        Node[] nodes = new Node[Mathf.Min(numUniqueNodes, 20)]; // First 20 nodes
+        uint[] nodeMortonCodesData = new uint[Mathf.Min(numUniqueNodes, 20)];
+        uint[] nodeIndicesData = new uint[Mathf.Min(numUniqueNodes, 20)];
+        
+        nodesBuffer.GetData(nodes, 0, 0, nodes.Length);
+        nodeMortonCodes.GetData(nodeMortonCodesData, 0, 0, nodeMortonCodesData.Length);
+        nodeIndices.GetData(nodeIndicesData, 0, 0, nodeIndicesData.Length);
+        
+        // Print first few nodes
+        Debug.Log("=== First 10 Nodes ===");
+        for (int i = 0; i < Mathf.Min(10, nodes.Length); i++)
+        {
+            Debug.Log($"Node {i}: Pos=({nodes[i].position.x:F2}, {nodes[i].position.y:F2}, {nodes[i].position.z:F2}), " +
+                     $"Vel=({nodes[i].velocity.x:F2}, {nodes[i].velocity.y:F2}, {nodes[i].velocity.z:F2}), " +
+                     $"Layer={nodes[i].layer}, MortonCode={nodeMortonCodesData[i]}");
+        }
+        
+        // Find nodes that aggregated multiple particles by checking particle counts
+        Debug.Log("=== Nodes with Multiple Particles ===");
+        int aggregatedCount = 0;
+        
+        // Read back particle data to analyze aggregation
+        uint[] sortedMortonCodesData = new uint[numParticles];
+        uint[] sortedParticleIndicesData = new uint[numParticles];
+        uint[] uniqueIndicesData = new uint[numUniqueNodes];
+        
+        sortedMortonCodes.GetData(sortedMortonCodesData);
+        sortedParticleIndices.GetData(sortedParticleIndicesData);
+        uniqueIndices.GetData(uniqueIndicesData);
+        
+        for (int i = 0; i < numUniqueNodes && aggregatedCount < 10; i++)
+        {
+            uint mortonCode = nodeMortonCodesData[i];
+            uint firstParticleIndex = uniqueIndicesData[i];
+            
+            // Count how many particles share this morton code
+            int particleCount = 1;
+            for (int j = (int)firstParticleIndex + 1; j < numParticles; j++)
+            {
+                if (sortedMortonCodesData[j] == mortonCode)
+                {
+                    particleCount++;
+                }
+                else
+                {
+                    break; // Consecutive particles with same code
+                }
+            }
+            
+            if (particleCount > 1)
+            {
+                Debug.Log($"Node {i}: Aggregated {particleCount} particles, MortonCode={mortonCode}, " +
+                         $"Pos=({nodes[i].position.x:F2}, {nodes[i].position.y:F2}, {nodes[i].position.z:F2})");
+                aggregatedCount++;
+            }
+        }
+        
+        if (aggregatedCount == 0)
+        {
+            Debug.Log("No nodes aggregated multiple particles (all nodes represent single particles)");
+        }
     }
 
     private void VerifyLeavesOnCPU(int count, int uniques)
@@ -400,6 +526,16 @@ public class FluidSimulator : MonoBehaviour
         nodeFlagsBuffer?.Release();
         sortedMortonCodes?.Release();
         sortedParticleIndices?.Release();
+        uniqueIndicators?.Release();
+        leavesPrefixSums?.Release();
+        leavesAux?.Release();
+        leavesAux2?.Release();
+        leavesAuxSmall?.Release();
+        uniqueIndices?.Release();
+        uniqueCount?.Release();
+        nodesBuffer?.Release();
+        nodeMortonCodes?.Release();
+        nodeIndices?.Release();
     }
 }
 

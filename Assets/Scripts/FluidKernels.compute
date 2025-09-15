@@ -35,7 +35,7 @@ struct Particle
 RWStructuredBuffer<Particle> particlesBuffer;
 RWStructuredBuffer<uint> mortonCodesBuffer;  // Separate morton codes buffer
 RWStructuredBuffer<uint> particleIndicesBuffer;  // Separate indices buffer
-RWStructuredBuffer<uint> nodeFlagsBuffer; // Packed: 00(unique)(active)
+// nodeFlagsBuffer moved to Nodes.compute
 
 // Parameters for particle initialization (pre-calculated on CPU)
 float3 fluidInitialBoundsMin;
@@ -111,8 +111,6 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     mortonCodesBuffer[index] = particle.mortonCode;
     particleIndicesBuffer[index] = index;
     
-    // Initialize node flags buffer (packed: 00(unique)(active))
-    // Both active and unique are false (0), so packed value is 0
-    nodeFlagsBuffer[index] = 0;
+    // Note: nodeFlagsBuffer initialization moved to CreateNodes() in Nodes.compute
 }
 
