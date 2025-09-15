@@ -27,6 +27,13 @@ public class FluidSimulator : MonoBehaviour
             particleIndicesArray[i] = i;
         }
 
+        string unsorted_output = "Unsorted Morton Codes (first 100): ";
+        for (int i = 0; i < Mathf.Min(100, numParticles); i++)
+        {
+            unsorted_output += mortonCodesArray[i] + " ";
+        }
+        Debug.Log(unsorted_output);
+
         mortonCodes.SetData(mortonCodesArray);
         particleIndices.SetData(particleIndicesArray);
 
@@ -147,6 +154,7 @@ public class RadixSort
         for (int i = 0; i < 32; i++)
         {
             EncodeSplit(keysIn, indicesIn, keysOut, indicesOut, (uint)i, actualCount);
+
             (keysIn, keysOut) = (keysOut, keysIn);
             (indicesIn, indicesOut) = (indicesOut, indicesIn);
         }
