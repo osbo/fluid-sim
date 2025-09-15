@@ -1,0 +1,140 @@
+#pragma kernel prefixSum
+#pragma kernel prefixFixup
+#pragma kernel split_prep
+#pragma kernel split_scatter
+#pragma kernel copyBuffer
+#pragma kernel copyIndices
+#pragma kernel clearBuffer32
+#pragma kernel clearBuffer64
+
+#define SCAN_BLOCKSIZE 512
+
+RWStructuredBuffer<uint> input;
+RWStructuredBuffer<uint> output;
+RWStructuredBuffer<uint> aux;
+uint len;
+uint zeroff;
+
+RWStructuredBuffer<uint> inputIndices;
+RWStructuredBuffer<uint> outputIndices;
+uint count;
+uint bit;
+RWStructuredBuffer<uint> e;
+RWStructuredBuffer<uint> f;
+
+[numthreads(SCAN_BLOCKSIZE, 1, 1)]
+void prefixFixup(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIdx = id.x;
+    uint blockIdx = id.y;
+    uint start = threadIdx + 2 * blockIdx * SCAN_BLOCKSIZE;
+    uint block_sum = aux[blockIdx];
+
+    if (start < len)                    input[start] += block_sum;
+    if (start + SCAN_BLOCKSIZE < len)   input[start + SCAN_BLOCKSIZE] += block_sum;
+}
+
+groupshared uint scan_array[SCAN_BLOCKSIZE * 2];
+
+[numthreads(SCAN_BLOCKSIZE, 1, 1)]
+void prefixSum(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIdx = id.x;
+    uint blockIdx = id.y;
+    uint t1 = threadIdx + 2 * blockIdx * SCAN_BLOCKSIZE;
+    uint t2 = t1 + SCAN_BLOCKSIZE;
+
+    scan_array[threadIdx] = (t1 < len) ? input[t1] : 0;
+    scan_array[threadIdx + SCAN_BLOCKSIZE] = (t2 < len) ? input[t2] : 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s1 = 1; s1 <= SCAN_BLOCKSIZE; s1 <<= 1)
+    {
+        uint index = (threadIdx + 1) * s1 * 2 - 1;
+        if (index < 2 * SCAN_BLOCKSIZE)
+            scan_array[index] += scan_array[index - s1];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    for (uint s2 = SCAN_BLOCKSIZE >> 1; s2 > 0; s2 >>= 1)
+    {
+        uint index = (threadIdx + 1) * s2 * 2 - 1;
+        if (index + s2 < 2 * SCAN_BLOCKSIZE)
+            scan_array[index + s2] += scan_array[index];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (t1 + zeroff < len)    output[t1 + zeroff] = scan_array[threadIdx];
+    if (t2 + zeroff < len)    output[t2 + zeroff] = (threadIdx == SCAN_BLOCKSIZE - 1 && zeroff) ? 0 : scan_array[threadIdx + SCAN_BLOCKSIZE];
+    if (threadIdx == 0)
+    {
+        if (zeroff) output[0] = 0;
+        aux[blockIdx] = scan_array[2 * SCAN_BLOCKSIZE - 1];
+    }
+}
+
+[numthreads(512, 1, 1)]
+void split_prep(uint3 id : SV_DispatchThreadID)
+{
+    uint tid = id.x;
+    if (tid >= count) {
+        return;
+    }
+
+    e[tid] = (input[tid] & (1U << bit)) == 0;
+}
+
+[numthreads(512, 1, 1)]
+void split_scatter(uint3 id : SV_DispatchThreadID)
+{
+    uint tid = id.x;
+    if (tid >= count) {
+        return;
+    }
+
+    uint totalFalses = f[count - 1] + e[count - 1];
+
+    bool isBitSet = (input[tid] & (1U << bit)) != 0;
+
+    uint destinationIndex;
+    if (isBitSet) {
+        destinationIndex = totalFalses + (tid - f[tid]);
+    }
+    else {
+        destinationIndex = f[tid];
+    }
+
+    output[destinationIndex] = input[tid];
+    outputIndices[destinationIndex] = inputIndices[tid];
+}
+
+[numthreads(512, 1, 1)]
+void copyBuffer(uint3 id : SV_DispatchThreadID)
+{
+    uint tid = id.x;
+    if (tid >= count) return;
+    output[tid] = input[tid];
+}
+
+[numthreads(512, 1, 1)]
+void copyIndices(uint3 id : SV_DispatchThreadID)
+{
+    uint tid = id.x;
+    if (tid >= count) return;
+    outputIndices[tid] = inputIndices[tid];
+}
+
+[numthreads(64, 1, 1)]
+void clearBuffer32(uint3 id : SV_DispatchThreadID)
+{
+    uint tid = id.x;
+    output[tid] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void clearBuffer64(uint3 id : SV_DispatchThreadID)
+{
+    uint tid = id.x;
+    output[tid] = 0;
+}
