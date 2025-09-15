@@ -2,63 +2,204 @@ using UnityEngine;
 
 public class FluidSimulator : MonoBehaviour
 {
+    [SerializeField] private BoxCollider simulationBounds;
+    [SerializeField] private GameObject fluidInitialBounds;
+    
     public ComputeShader radixSortShader;
     public ComputeShader fluidKernelsShader;
     public int numParticles = 10000;
+    
     private RadixSort radixSort;
-    private ComputeBuffer mortonCodes;
-    private ComputeBuffer particleIndices;
+    private int initializeParticlesKernel;
+    
+    // GPU Buffers
+    private ComputeBuffer particlesBuffer;
+    private ComputeBuffer mortonCodesBuffer;
+    private ComputeBuffer particleIndicesBuffer;
+    private ComputeBuffer nodeFlagsBuffer; // Packed: 00(unique)(active)
     private ComputeBuffer sortedMortonCodes;
     private ComputeBuffer sortedParticleIndices;
+    
+    // Particle struct (must match compute shader)
+    private struct Particle
+    {
+        public Vector3 position;    // 12 bytes
+        public Vector3 velocity;    // 12 bytes
+        public uint layer;          // 4 bytes
+        public uint mortonCode;     // 4 bytes
+    }
 
     void Start()
     {
-        radixSort = new RadixSort(radixSortShader, (uint)numParticles);
-        mortonCodes = new ComputeBuffer(numParticles, sizeof(uint));
-        particleIndices = new ComputeBuffer(numParticles, sizeof(uint));
+        InitializeParticleSystem();
+        SortParticles();
+    }
+    
+    private void InitializeParticleSystem()
+    {
+        // Get kernel index
+        initializeParticlesKernel = fluidKernelsShader.FindKernel("InitializeParticles");
+        
+        // Create buffers
+        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 32 bytes
+        mortonCodesBuffer = new ComputeBuffer(numParticles, sizeof(uint));
+        particleIndicesBuffer = new ComputeBuffer(numParticles, sizeof(uint));
+        nodeFlagsBuffer = new ComputeBuffer(numParticles, sizeof(uint)); // 4 bytes (packed flags)
         sortedMortonCodes = new ComputeBuffer(numParticles, sizeof(uint));
         sortedParticleIndices = new ComputeBuffer(numParticles, sizeof(uint));
-
-        uint[] mortonCodesArray = new uint[numParticles];
-        uint[] particleIndicesArray = new uint[numParticles];
-        for (uint i = 0; i < numParticles; i++)
+        
+        // Set buffer data to compute shader
+        fluidKernelsShader.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
+        fluidKernelsShader.SetBuffer(initializeParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
+        fluidKernelsShader.SetBuffer(initializeParticlesKernel, "particleIndicesBuffer", particleIndicesBuffer);
+        fluidKernelsShader.SetBuffer(initializeParticlesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
+        
+        // Calculate bounds
+        Vector3 simulationBoundsMin = simulationBounds.bounds.min;
+        Vector3 simulationBoundsMax = simulationBounds.bounds.max;
+        
+        // Get fluid initial bounds from the GameObject's transform
+        Vector3 fluidInitialBoundsMin = fluidInitialBounds.transform.position - fluidInitialBounds.transform.localScale * 0.5f;
+        Vector3 fluidInitialBoundsMax = fluidInitialBounds.transform.position + fluidInitialBounds.transform.localScale * 0.5f;
+        
+        // Calculate morton code normalization factors on CPU
+        Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        
+        // For 32-bit Morton codes: 10 bits per axis = 1024 possible values (0-1023)
+        // Normalize each axis to 0-1023 range
+        Vector3 mortonNormalizationFactor = new Vector3(
+            1023.0f / simulationSize.x,
+            1023.0f / simulationSize.y,
+            1023.0f / simulationSize.z
+        );
+        
+        // Max morton value is 1023 for each axis
+        float mortonMaxValue = 1023.0f;
+        
+        // Calculate grid dimensions for even particle distribution
+        Vector3 fluidInitialSize = fluidInitialBoundsMax - fluidInitialBoundsMin;
+        
+        // Calculate grid dimensions that will fit numParticles particles
+        // Use the same major order as morton code (Z, Y, X)
+        float volumePerParticle = (fluidInitialSize.x * fluidInitialSize.y * fluidInitialSize.z) / numParticles;
+        float gridSpacing = Mathf.Pow(volumePerParticle, 1.0f / 3.0f);
+        
+        Vector3Int gridDimensions = new Vector3Int(
+            Mathf.Max(1, Mathf.RoundToInt(fluidInitialSize.x / gridSpacing)),
+            Mathf.Max(1, Mathf.RoundToInt(fluidInitialSize.y / gridSpacing)),
+            Mathf.Max(1, Mathf.RoundToInt(fluidInitialSize.z / gridSpacing))
+        );
+        
+        // Adjust grid dimensions to ensure we don't exceed numParticles
+        while (gridDimensions.x * gridDimensions.y * gridDimensions.z > numParticles)
         {
-            mortonCodesArray[i] = (uint)Random.Range(0, int.MaxValue);
-            particleIndicesArray[i] = i;
+            if (gridDimensions.x > 1) gridDimensions.x--;
+            else if (gridDimensions.y > 1) gridDimensions.y--;
+            else if (gridDimensions.z > 1) gridDimensions.z--;
+            else break;
         }
-
-        // Debug: Log unsorted codes
-        // string unsorted_output = "Unsorted Morton Codes (first 100): ";
-        // for (int i = 0; i < Mathf.Min(100, numParticles); i++)
-        // {
-        //     unsorted_output += mortonCodesArray[i] + " ";
-        // }
-        // Debug.Log(unsorted_output);
-
-        mortonCodes.SetData(mortonCodesArray);
-        particleIndices.SetData(particleIndicesArray);
-
-        radixSort.Sort(mortonCodes, particleIndices, sortedMortonCodes, sortedParticleIndices, (uint)numParticles);
-
+        
+        // Calculate actual grid spacing based on final dimensions
+        Vector3 actualGridSpacing = new Vector3(
+            fluidInitialSize.x / Mathf.Max(1, gridDimensions.x - 1),
+            fluidInitialSize.y / Mathf.Max(1, gridDimensions.y - 1),
+            fluidInitialSize.z / Mathf.Max(1, gridDimensions.z - 1)
+        );
+        
+        // Set bounds parameters to compute shader
+        fluidKernelsShader.SetVector("simulationBoundsMin", simulationBoundsMin);
+        fluidKernelsShader.SetVector("simulationBoundsMax", simulationBoundsMax);
+        fluidKernelsShader.SetVector("fluidInitialBoundsMin", fluidInitialBoundsMin);
+        fluidKernelsShader.SetVector("fluidInitialBoundsMax", fluidInitialBoundsMax);
+        fluidKernelsShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
+        fluidKernelsShader.SetFloat("mortonMaxValue", mortonMaxValue);
+        
+        // Set grid parameters to compute shader
+        fluidKernelsShader.SetInts("gridDimensions", new int[] { (int)gridDimensions.x, (int)gridDimensions.y, (int)gridDimensions.z });
+        fluidKernelsShader.SetVector("gridSpacing", actualGridSpacing);
+        
+        // Dispatch the kernel
+        int threadGroups = Mathf.CeilToInt(numParticles / 64.0f);
+        fluidKernelsShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
+        
+        Debug.Log($"Initialized {numParticles} particles with bounds: simulation({simulationBoundsMin} to {simulationBoundsMax}), fluid initial({fluidInitialBoundsMin} to {fluidInitialBoundsMax})");
+        Debug.Log($"Morton normalization factors: {mortonNormalizationFactor}, max value: {mortonMaxValue}");
+        Debug.Log($"Grid dimensions: {gridDimensions}, grid spacing: {actualGridSpacing}");
+    }
+    
+    private void SortParticles()
+    {
+        // Initialize radix sort
+        radixSort = new RadixSort(radixSortShader, (uint)numParticles);
+        
+        // Sort the morton codes and their corresponding indices
+        radixSort.Sort(mortonCodesBuffer, particleIndicesBuffer, sortedMortonCodes, sortedParticleIndices, (uint)numParticles);
+        
+        // Debug: Log sorted codes and indices
         uint[] sortedMortonCodesArray = new uint[numParticles];
         sortedMortonCodes.GetData(sortedMortonCodesArray);
+        
+        uint[] sortedIndicesArray = new uint[numParticles];
+        sortedParticleIndices.GetData(sortedIndicesArray);
+        
+        // Get particle data
+        Particle[] particlesArray = new Particle[numParticles];
+        particlesBuffer.GetData(particlesArray);
+        
+        string sorted_output = "Sorted Morton Codes (first 20): ";
+        string indices_output = "Corresponding Indices (first 20): ";
+        for (int i = 0; i < Mathf.Min(20, numParticles); i++)
+        {
+            sorted_output += sortedMortonCodesArray[i] + " ";
+            indices_output += sortedIndicesArray[i] + " ";
+        }
+        Debug.Log(sorted_output);
+        Debug.Log(indices_output);
+        
+        // Print particle data for first 20 sorted particles
+        Debug.Log("=== First 20 Sorted Particles ===");
+        for (int i = 0; i < Mathf.Min(20, numParticles); i++)
+        {
+            uint particleIndex = sortedIndicesArray[i];
+            Particle particle = particlesArray[particleIndex];
+            
+            Debug.Log($"Sorted Position {i}: Particle[{particleIndex}] - " +
+                     $"Pos=({particle.position.x:F3}, {particle.position.y:F3}, {particle.position.z:F3}), " +
+                     $"Vel=({particle.velocity.x:F3}, {particle.velocity.y:F3}, {particle.velocity.z:F3}), " +
+                     $"Layer={particle.layer}, MortonCode={particle.mortonCode}");
+        }
+    }
 
-        // Debug: Log sorted codes
-        // string sorted_output = "Sorted Morton Codes (first 100): ";
-        // for (int i = 0; i < Mathf.Min(100, numParticles); i++)
-        // {
-        //     sorted_output += sortedMortonCodesArray[i] + " ";
-        // }
-        // Debug.Log(sorted_output);
+    // Simple debug visualization using Gizmos
+    private void OnDrawGizmos()
+    {
+        if (particlesBuffer == null) return;
+        
+        // Read particle data back to CPU for visualization
+        Particle[] particles = new Particle[numParticles];
+        particlesBuffer.GetData(particles);
+        
+        // Set gizmo color to blue
+        Gizmos.color = Color.blue;
+        
+        // Draw each particle as a small sphere
+        for (int i = 0; i < numParticles; i++)
+        {
+            float size = Mathf.Pow(8.0f, particles[i].layer) * 0.002f; // Scale down the size
+            Gizmos.DrawSphere(particles[i].position, size);
+        }
     }
 
     void OnDestroy()
     {
-        radixSort.ReleaseBuffers();
-        mortonCodes.Release();
-        particleIndices.Release();
-        sortedMortonCodes.Release();
-        sortedParticleIndices.Release();
+        // Clean up buffers
+        radixSort?.ReleaseBuffers();
+        particlesBuffer?.Release();
+        mortonCodesBuffer?.Release();
+        particleIndicesBuffer?.Release();
+        nodeFlagsBuffer?.Release();
+        sortedMortonCodes?.Release();
+        sortedParticleIndices?.Release();
     }
 }
 
@@ -234,21 +375,6 @@ public class RadixSort
             sortShader.Dispatch(prefixFixupKernel, (int)numThreadgroups, 1, 1);
         }
     }
-    
-    // Debug method - can be removed or commented out
-    // private void VerifyPrefixSum(ComputeBuffer prefixSumBuffer, uint N, uint bit)
-    // {
-    //     uint[] data = new uint[N];
-    //     prefixSumBuffer.GetData(data);
-    //
-    //     Debug.Log($"Prefix Sum Verification for bit {bit}:");
-    //     string output = "Prefix Sum (first 100): ";
-    //     for (int i = 0; i < Mathf.Min(100, N); i++)
-    //     {
-    //         output += data[i] + " ";
-    //     }
-    //     Debug.Log(output);
-    // }
 
 
     private void ClearBuffer(ComputeBuffer buffer, uint count)
