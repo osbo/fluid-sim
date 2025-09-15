@@ -23,10 +23,10 @@ RWStructuredBuffer<uint> e;
 RWStructuredBuffer<uint> f;
 
 [numthreads(SCAN_BLOCKSIZE, 1, 1)]
-void prefixFixup(uint3 id : SV_DispatchThreadID)
+void prefixFixup(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
 {
-    uint threadIdx = id.x;
-    uint blockIdx = id.y;
+    uint threadIdx = Gtid.x;
+    uint blockIdx = Gid.x;
     uint start = threadIdx + 2 * blockIdx * SCAN_BLOCKSIZE;
     uint block_sum = aux[blockIdx];
 
@@ -37,10 +37,10 @@ void prefixFixup(uint3 id : SV_DispatchThreadID)
 groupshared uint scan_array[SCAN_BLOCKSIZE * 2];
 
 [numthreads(SCAN_BLOCKSIZE, 1, 1)]
-void prefixSum(uint3 id : SV_DispatchThreadID)
+void prefixSum(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
 {
-    uint threadIdx = id.x;
-    uint blockIdx = id.y;
+    uint threadIdx = Gtid.x;
+    uint blockIdx = Gid.x;
     uint t1 = threadIdx + 2 * blockIdx * SCAN_BLOCKSIZE;
     uint t2 = t1 + SCAN_BLOCKSIZE;
 
@@ -104,9 +104,6 @@ void split_scatter(uint3 id : SV_DispatchThreadID)
     else {
         destinationIndex = f[tid];
     }
-
-    output[destinationIndex] = input[tid];
-    outputIndices[destinationIndex] = inputIndices[tid];
 }
 
 [numthreads(512, 1, 1)]
