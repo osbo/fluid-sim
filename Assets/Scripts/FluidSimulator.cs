@@ -27,12 +27,13 @@ public class FluidSimulator : MonoBehaviour
             particleIndicesArray[i] = i;
         }
 
-        string unsorted_output = "Unsorted Morton Codes (first 100): ";
-        for (int i = 0; i < Mathf.Min(100, numParticles); i++)
-        {
-            unsorted_output += mortonCodesArray[i] + " ";
-        }
-        Debug.Log(unsorted_output);
+        // Debug: Log unsorted codes
+        // string unsorted_output = "Unsorted Morton Codes (first 100): ";
+        // for (int i = 0; i < Mathf.Min(100, numParticles); i++)
+        // {
+        //     unsorted_output += mortonCodesArray[i] + " ";
+        // }
+        // Debug.Log(unsorted_output);
 
         mortonCodes.SetData(mortonCodesArray);
         particleIndices.SetData(particleIndicesArray);
@@ -42,12 +43,13 @@ public class FluidSimulator : MonoBehaviour
         uint[] sortedMortonCodesArray = new uint[numParticles];
         sortedMortonCodes.GetData(sortedMortonCodesArray);
 
-        string sorted_output = "Sorted Morton Codes (first 100): ";
-        for (int i = 0; i < Mathf.Min(100, numParticles); i++)
-        {
-            sorted_output += sortedMortonCodesArray[i] + " ";
-        }
-        Debug.Log(sorted_output);
+        // Debug: Log sorted codes
+        // string sorted_output = "Sorted Morton Codes (first 100): ";
+        // for (int i = 0; i < Mathf.Min(100, numParticles); i++)
+        // {
+        //     sorted_output += sortedMortonCodesArray[i] + " ";
+        // }
+        // Debug.Log(sorted_output);
     }
 
     void OnDestroy()
@@ -231,27 +233,28 @@ public class RadixSort
             sortShader.SetInt("len", (int)length);
             sortShader.Dispatch(prefixFixupKernel, (int)numThreadgroups, 1, 1);
         }
-        VerifyPrefixSum(output, length, bit);
     }
     
-    private void VerifyPrefixSum(ComputeBuffer prefixSumBuffer, uint N, uint bit)
-    {
-        uint[] data = new uint[N];
-        prefixSumBuffer.GetData(data);
-
-        Debug.Log($"Prefix Sum Verification for bit {bit}:");
-        string output = "Prefix Sum (first 100): ";
-        for (int i = 0; i < Mathf.Min(100, N); i++)
-        {
-            output += data[i] + " ";
-        }
-        Debug.Log(output);
-    }
+    // Debug method - can be removed or commented out
+    // private void VerifyPrefixSum(ComputeBuffer prefixSumBuffer, uint N, uint bit)
+    // {
+    //     uint[] data = new uint[N];
+    //     prefixSumBuffer.GetData(data);
+    //
+    //     Debug.Log($"Prefix Sum Verification for bit {bit}:");
+    //     string output = "Prefix Sum (first 100): ";
+    //     for (int i = 0; i < Mathf.Min(100, N); i++)
+    //     {
+    //         output += data[i] + " ";
+    //     }
+    //     Debug.Log(output);
+    // }
 
 
     private void ClearBuffer(ComputeBuffer buffer, uint count)
     {
         sortShader.SetBuffer(clearBuffer32Kernel, "output", buffer);
+        sortShader.SetInt("count", (int)count);
         int threadGroups = (int)((count + 63) / 64);
         sortShader.Dispatch(clearBuffer32Kernel, threadGroups, 1, 1);
     }
