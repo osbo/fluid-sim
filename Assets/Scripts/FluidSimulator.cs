@@ -280,29 +280,94 @@ public class FluidSimulator : MonoBehaviour
         leavesShader.SetInt("count", count);
         leavesShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
 
-        // Debug output
-        uint[] uniqueCountCpu = new uint[1];
-        uniqueCount.GetData(uniqueCountCpu);
-        int uniques = (int)uniqueCountCpu[0];
-        Debug.Log($"Particles created: {numParticles}, Unique morton codes: {uniques}");
+        // Debug output (disabled in production)
+        // uint[] uniqueCountCpu = new uint[1];
+        // uniqueCount.GetData(uniqueCountCpu);
+        // int uniques = (int)uniqueCountCpu[0];
+        // Debug.Log($"Particles created: {numParticles}, Unique morton codes: {uniques}");
+        // int toPrint = Mathf.Min(20, uniques);
+        // uint[] uniqueIdxCpu = new uint[toPrint];
+        // uniqueIndices.GetData(uniqueIdxCpu, 0, 0, toPrint);
+        // uint[] sortedCodesCpu = new uint[Mathf.Min(count, 200)];
+        // sortedMortonCodes.GetData(sortedCodesCpu, 0, 0, Mathf.Min(count, 200));
+        // string uIdx = "First unique indices (particle indices): ";
+        // string uCodes = "First unique morton codes: ";
+        // for (int i = 0; i < toPrint; i++)
+        // {
+        //     uIdx += uniqueIdxCpu[i] + " ";
+        //     uCodes += sortedCodesCpu[i] + " ";
+        // }
+        // Debug.Log(uIdx);
+        // Debug.Log(uCodes);
+        // VerifyLeavesOnCPU(count, uniques);
+    }
 
-        int toPrint = Mathf.Min(20, uniques);
-        uint[] uniqueIdxCpu = new uint[toPrint];
-        uniqueIndices.GetData(uniqueIdxCpu, 0, 0, toPrint);
-        uint[] sortedCodesCpu = new uint[Mathf.Min(count, 200)];
-        sortedMortonCodes.GetData(sortedCodesCpu, 0, 0, Mathf.Min(count, 200));
+    private void VerifyLeavesOnCPU(int count, int uniques)
+    {
+        // Read back required GPU buffers
+        uint[] codes = new uint[count];
+        uint[] sortedIdx = new uint[count];
+        sortedMortonCodes.GetData(codes);
+        sortedParticleIndices.GetData(sortedIdx);
 
-        string uIdx = "First unique indices (particle indices): ";
-        string uCodes = "First unique morton codes: ";
-        for (int i = 0; i < toPrint; i++)
+        uint[] gpuUniqueParticleIdx = new uint[uniques];
+        if (uniques > 0)
         {
-            uIdx += uniqueIdxCpu[i] + " ";
-            // recover code value by finding start position i in sorted arrays: prefixSums where uniqueIndicators==1
-            // For quick check, print sortedMortonCodes[i] which corresponds to ith unique
-            uCodes += sortedCodesCpu[i] + " ";
+            uniqueIndices.GetData(gpuUniqueParticleIdx, 0, 0, uniques);
         }
-        Debug.Log(uIdx);
-        Debug.Log(uCodes);
+
+        // Build CPU reference list: particle indices at the start of each unique code run
+        System.Collections.Generic.List<uint> cpuUniqueParticleIdx = new System.Collections.Generic.List<uint>(uniques);
+        for (int i = 0; i < count; i++)
+        {
+            if (i == 0 || codes[i] != codes[i - 1])
+            {
+                cpuUniqueParticleIdx.Add(sortedIdx[i]);
+            }
+        }
+
+        // Compare counts
+        if (cpuUniqueParticleIdx.Count != uniques)
+        {
+            Debug.LogError($"Leaves verification FAILED: GPU uniques={uniques}, CPU uniques={cpuUniqueParticleIdx.Count}");
+            return;
+        }
+
+        // Compare lists element-wise (order should match the sorted order)
+        int maxCheck = cpuUniqueParticleIdx.Count;
+        for (int i = 0; i < maxCheck; i++)
+        {
+            if (gpuUniqueParticleIdx[i] != cpuUniqueParticleIdx[i])
+            {
+                Debug.LogError($"Leaves verification FAILED at {i}: GPU particleIdx={gpuUniqueParticleIdx[i]} vs CPU={cpuUniqueParticleIdx[i]}");
+                return;
+            }
+        }
+
+        Debug.Log("Leaves verification: OK (GPU unique indices match CPU reference)");
+
+        // Also print the Morton codes that are not unique (distinct values with frequency > 1)
+        System.Collections.Generic.List<uint> nonUniqueCodes = new System.Collections.Generic.List<uint>();
+        int idx = 0;
+        while (idx < count)
+        {
+            uint code = codes[idx];
+            int runStart = idx;
+            while (idx + 1 < count && codes[idx + 1] == code) idx++;
+            int runLen = idx - runStart + 1;
+            if (runLen > 1)
+            {
+                nonUniqueCodes.Add(code);
+            }
+            idx++;
+        }
+
+        string nonUniqueMsg = "Non-unique Morton codes (distinct, count=" + nonUniqueCodes.Count + "): ";
+        for (int i = 0; i < nonUniqueCodes.Count; i++)
+        {
+            nonUniqueMsg += nonUniqueCodes[i] + (i + 1 < nonUniqueCodes.Count ? " " : "");
+        }
+        Debug.Log(nonUniqueMsg);
     }
 
     // Simple debug visualization using Gizmos
