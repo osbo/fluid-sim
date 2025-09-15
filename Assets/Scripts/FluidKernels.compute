@@ -31,12 +31,6 @@ struct Particle
     uint mortonCode;    // Morton code for spatial indexing
 };
 
-struct MortonCode
-{
-    uint mortonCode;
-    uint index;
-};
-
 // Buffer definitions
 RWStructuredBuffer<Particle> particlesBuffer;
 RWStructuredBuffer<uint> mortonCodesBuffer;  // Separate morton codes buffer
