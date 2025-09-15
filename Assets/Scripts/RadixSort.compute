@@ -104,6 +104,9 @@ void split_scatter(uint3 id : SV_DispatchThreadID)
     else {
         destinationIndex = f[tid];
     }
+
+    output[destinationIndex] = input[tid];
+    outputIndices[destinationIndex] = inputIndices[tid];
 }
 
 [numthreads(512, 1, 1)]
@@ -126,12 +129,16 @@ void copyIndices(uint3 id : SV_DispatchThreadID)
 void clearBuffer32(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
-    output[tid] = 0;
+    if (tid < count) {
+        output[tid] = 0;
+    }
 }
 
 [numthreads(64, 1, 1)]
 void clearBuffer64(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
-    output[tid] = 0;
+    if (tid < count) {
+        output[tid] = 0;
+    }
 }
