@@ -20,8 +20,8 @@ struct Node
 
 // Input buffers
 RWStructuredBuffer<Particle> particlesBuffer;           // input: all particles
-RWStructuredBuffer<uint> sortedParticleIndices;         // input: sorted unique particle indices
-
+RWStructuredBuffer<uint> sortedParticleIndices;         // input: sorted particle indices
+RWStructuredBuffer<uint> uniqueIndices;                 // input: indices of first occurrence of each unique code
 // Output buffers
 RWStructuredBuffer<Node> nodesBuffer;                   // output: aggregated nodes
 RWStructuredBuffer<uint> nodeMortonCodes;               // output: morton codes for nodes
@@ -37,15 +37,12 @@ void CreateNodes(uint3 id : SV_DispatchThreadID)
     uint threadIndex = id.x;
     if (threadIndex >= numUniqueNodes) return;
     
-    // Get the particle index for this unique morton code
-    uint firstParticleIndex = sortedParticleIndices[threadIndex];
-    
-    // Get the morton code for this node
-    uint mortonCode = particlesBuffer[firstParticleIndex].mortonCode;
+    // Get the index into sorted arrays for this unique morton code
+    uint sortedArrayIndex = uniqueIndices[threadIndex];
     
     // Find how many particles share this morton code
     uint particleCount = 1;
-    uint nextUniqueIndex = sortedParticleIndices[threadIndex + 1];
+    uint nextUniqueIndex = uniqueIndices[threadIndex + 1];
     
     // Aggregate particle data with weighted average
     float3 weightedPosition = float3(0, 0, 0);
@@ -54,9 +51,10 @@ void CreateNodes(uint3 id : SV_DispatchThreadID)
     uint minLayer = 10;
     
     // Process all particles with this morton code
-    for (uint i = firstParticleIndex; i < nextUniqueIndex && i < numParticles; i++)
+    for (uint i = sortedArrayIndex; i < nextUniqueIndex; i++)
     {
-        Particle particle = particlesBuffer[i];
+        uint particleIndex = sortedParticleIndices[i];
+        Particle particle = particlesBuffer[particleIndex];
         
         // Weight = 8^(particle.layer), but since layer is always 0, weight = 8^0 = 1
         float weight = pow(8.0, (float)particle.layer);
@@ -72,12 +70,15 @@ void CreateNodes(uint3 id : SV_DispatchThreadID)
     // Normalize by total weight (center of mass)
     weightedPosition /= totalWeight;
     weightedVelocity /= totalWeight;
+
+    uint mortonCode = particlesBuffer[sortedParticleIndices[sortedArrayIndex]].mortonCode;
     
     // Create the node
     Node node;
     node.position = weightedPosition;
     node.velocity = weightedVelocity;
     node.layer = minLayer;  // Use the minimum layer found
+    // node.layer = totalWeight;
     node.mortonCode = mortonCode;
     
     // Write outputs

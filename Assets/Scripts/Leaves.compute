@@ -107,7 +107,7 @@ void scatterUniques(uint3 id : SV_DispatchThreadID)
 
     if (uniqueIndicators[i] == 1u) {
         uint dst = prefixSums[i];
-        uniqueIndices[dst] = sortedIndices[i];
+        uniqueIndices[dst] = i;  // Write the index into sorted arrays, not the particle index
     }
 }
 
