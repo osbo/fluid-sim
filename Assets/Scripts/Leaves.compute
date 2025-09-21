@@ -1,4 +1,5 @@
 #pragma kernel markUniques
+#pragma kernel markUniquesPrefix
 #pragma kernel prefixSum
 #pragma kernel prefixFixup
 #pragma kernel scatterUniques
@@ -20,6 +21,7 @@ RWStructuredBuffer<uint> uniqueIndices;          // output: indices of first occ
 RWStructuredBuffer<uint> uniqueCount;            // output: [0] = number of unique codes
 
 uint count;                                      // total number of items
+uint prefixBits;                                 // number of bits to shift right for prefix comparison
 
 // groupshared for scan
 groupshared uint scan_array[SCAN_BLOCKSIZE * 2];
@@ -42,6 +44,24 @@ void markUniques(uint3 id : SV_DispatchThreadID)
     uniqueIndicators[i] = isUnique;
 
     // Note: node flag setting moved to Nodes.compute
+}
+
+[numthreads(512, 1, 1)]
+void markUniquesPrefix(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= count) return;
+
+    uint isUnique = 0;
+    if (i == 0) {
+        isUnique = 1;
+    } else {
+        uint curr = sortedMortonCodes[i] >> prefixBits;
+        uint prev = sortedMortonCodes[i - 1] >> prefixBits;
+        isUnique = (curr != prev) ? 1u : 0u;
+    }
+
+    uniqueIndicators[i] = isUnique;
 }
 
 [numthreads(SCAN_BLOCKSIZE, 1, 1)]
