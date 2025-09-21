@@ -9,11 +9,12 @@ public class FluidSimulator : MonoBehaviour
     public ComputeShader fluidKernelsShader;
     public ComputeShader leavesShader;
     public ComputeShader nodesShader;
-    public int numParticles = 10000;
+    public int numParticles;
     
     private RadixSort radixSort;
     private int initializeParticlesKernel;
     private int markUniquesKernel;
+    private int markUniquesPrefixKernel;
     private int leavesPrefixSumKernel;      // not used after simplification, but kept for reference
     private int leavesPrefixFixupKernel;    // not used after simplification, but kept for reference
     private int scatterUniquesKernel;
@@ -68,6 +69,10 @@ public class FluidSimulator : MonoBehaviour
         SortParticles();
         PrefixSumLeaves();
         CreateNodes();
+        for (int layer = 1; layer < 10; layer++)
+        {
+            prefixSumNodes(layer);
+        }
     }
     
     private void InitializeParticleSystem()
@@ -82,7 +87,7 @@ public class FluidSimulator : MonoBehaviour
         // nodeFlagsBuffer created later in CreateNodes() with correct size
         sortedMortonCodes = new ComputeBuffer(numParticles, sizeof(uint));
         sortedParticleIndices = new ComputeBuffer(numParticles, sizeof(uint));
-        
+
         // Set buffer data to compute shader
         fluidKernelsShader.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
         fluidKernelsShader.SetBuffer(initializeParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
@@ -115,31 +120,48 @@ public class FluidSimulator : MonoBehaviour
         // Calculate grid dimensions for even particle distribution
         Vector3 fluidInitialSize = fluidInitialBoundsMax - fluidInitialBoundsMin;
         
-        // Calculate grid dimensions that will fit numParticles particles
-        // Use the same major order as morton code (Z, Y, X)
-        float volumePerParticle = (fluidInitialSize.x * fluidInitialSize.y * fluidInitialSize.z) / numParticles;
-        float gridSpacing = Mathf.Pow(volumePerParticle, 1.0f / 3.0f);
+        // Calculate optimal grid dimensions to fit numParticles as evenly as possible
+        // Start with cubic root and adjust for aspect ratio
+        float cubeRoot = Mathf.Pow(numParticles, 1.0f / 3.0f);
+        
+        // Calculate aspect ratio normalized dimensions
+        float maxSize = Mathf.Max(fluidInitialSize.x, fluidInitialSize.y, fluidInitialSize.z);
+        Vector3 normalizedSize = fluidInitialSize / maxSize;
         
         Vector3Int gridDimensions = new Vector3Int(
-            Mathf.Max(1, Mathf.RoundToInt(fluidInitialSize.x / gridSpacing)),
-            Mathf.Max(1, Mathf.RoundToInt(fluidInitialSize.y / gridSpacing)),
-            Mathf.Max(1, Mathf.RoundToInt(fluidInitialSize.z / gridSpacing))
+            Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.x)),
+            Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.y)),
+            Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.z))
         );
         
-        // Adjust grid dimensions to ensure we don't exceed numParticles
-        while (gridDimensions.x * gridDimensions.y * gridDimensions.z > numParticles)
+        // Ensure we have enough grid cells for all particles
+        // If we have too few cells, increase dimensions
+        while (gridDimensions.x * gridDimensions.y * gridDimensions.z < numParticles)
         {
-            if (gridDimensions.x > 1) gridDimensions.x--;
-            else if (gridDimensions.y > 1) gridDimensions.y--;
-            else if (gridDimensions.z > 1) gridDimensions.z--;
-            else break;
+            if (gridDimensions.x <= gridDimensions.y && gridDimensions.x <= gridDimensions.z)
+                gridDimensions.x++;
+            else if (gridDimensions.y <= gridDimensions.z)
+                gridDimensions.y++;
+            else
+                gridDimensions.z++;
         }
         
-        // Calculate actual grid spacing based on final dimensions
+        // If we have too many cells, reduce dimensions
+        while (gridDimensions.x * gridDimensions.y * gridDimensions.z > numParticles)
+        {
+            if (gridDimensions.x >= gridDimensions.y && gridDimensions.x >= gridDimensions.z)
+                gridDimensions.x = Mathf.Max(1, gridDimensions.x - 1);
+            else if (gridDimensions.y >= gridDimensions.z)
+                gridDimensions.y = Mathf.Max(1, gridDimensions.y - 1);
+            else
+                gridDimensions.z = Mathf.Max(1, gridDimensions.z - 1);
+        }
+        
+        // Calculate grid spacing to fill the entire fluid bounds
         Vector3 actualGridSpacing = new Vector3(
-            fluidInitialSize.x / Mathf.Max(1, gridDimensions.x - 1),
-            fluidInitialSize.y / Mathf.Max(1, gridDimensions.y - 1),
-            fluidInitialSize.z / Mathf.Max(1, gridDimensions.z - 1)
+            fluidInitialSize.x / Mathf.Max(1, gridDimensions.x),
+            fluidInitialSize.y / Mathf.Max(1, gridDimensions.y),
+            fluidInitialSize.z / Mathf.Max(1, gridDimensions.z)
         );
         
         // Set bounds parameters to compute shader
@@ -157,6 +179,16 @@ public class FluidSimulator : MonoBehaviour
         // Dispatch the kernel
         int threadGroups = Mathf.CeilToInt(numParticles / 64.0f);
         fluidKernelsShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
+        
+        // Debug: Check improved grid calculation
+        int totalGridCells = gridDimensions.x * gridDimensions.y * gridDimensions.z;
+        Debug.Log($"Grid calculation: {gridDimensions} (total: {totalGridCells}) for {numParticles} particles");
+        Debug.Log($"Grid spacing: {actualGridSpacing}");
+        Debug.Log($"Fluid size: {fluidInitialSize}");
+        if (totalGridCells < numParticles)
+        {
+            Debug.LogWarning($"WARNING: Grid can only hold {totalGridCells} particles, but {numParticles} requested!");
+        }
     }
     
     private void SortParticles()
@@ -181,12 +213,13 @@ public class FluidSimulator : MonoBehaviour
 
         // Find kernels
         markUniquesKernel = leavesShader.FindKernel("markUniques");
+        markUniquesPrefixKernel = leavesShader.FindKernel("markUniquesPrefix");
         leavesPrefixSumKernel = leavesShader.FindKernel("prefixSum");
         leavesPrefixFixupKernel = leavesShader.FindKernel("prefixFixup");
         scatterUniquesKernel = leavesShader.FindKernel("scatterUniques");
         writeUniqueCountKernel = leavesShader.FindKernel("writeUniqueCount");
 
-        if (markUniquesKernel < 0 || leavesPrefixSumKernel < 0 || leavesPrefixFixupKernel < 0 ||
+        if (markUniquesKernel < 0 || markUniquesPrefixKernel < 0 || leavesPrefixSumKernel < 0 || leavesPrefixFixupKernel < 0 ||
             scatterUniquesKernel < 0 || writeUniqueCountKernel < 0)
         {
             Debug.LogError("One or more kernels not found in Leaves.compute. Verify #pragma kernel names and shader assignment.");
@@ -298,6 +331,102 @@ public class FluidSimulator : MonoBehaviour
         // Dispatch the kernel
         int threadGroups = Mathf.CeilToInt(numUniqueNodes / 64.0f);
         nodesShader.Dispatch(createNodesKernel, threadGroups, 1, 1);
+    }
+
+    private void prefixSumNodes(int layer)
+    {
+        if (leavesShader == null)
+        {
+            Debug.LogError("Leaves compute shader is not assigned. Please assign `leavesShader` in the inspector.");
+            return;
+        }
+
+        // Calculate prefix bits: shift right by 3 * layer bits
+        int prefixBits = layer * 3;
+        
+        // Mark uniques with prefix comparison
+        leavesShader.SetBuffer(markUniquesPrefixKernel, "sortedMortonCodes", sortedMortonCodes);
+        leavesShader.SetBuffer(markUniquesPrefixKernel, "uniqueIndicators", uniqueIndicators);
+        leavesShader.SetInt("count", numParticles);
+        leavesShader.SetInt("prefixBits", prefixBits);
+        int groupsLinear = (numParticles + 511) / 512;
+        leavesShader.Dispatch(markUniquesPrefixKernel, groupsLinear, 1, 1);
+
+        // Reuse proven radix scan kernels for uniqueIndicators scan
+        uint tgSize = 512u;
+        uint numThreadgroups = (uint)((numParticles + (tgSize * 2) - 1) / (tgSize * 2));
+        uint auxSize = (uint)System.Math.Max(1, (int)numThreadgroups);
+
+        // First-level scan: uniqueIndicators -> leavesPrefixSums
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", uniqueIndicators);
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", leavesPrefixSums);
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", leavesAux);
+        radixSortShader.SetInt("len", numParticles);
+        radixSortShader.SetInt("zeroff", 1);
+        radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
+
+        if (numThreadgroups > 1)
+        {
+            // Scan aux -> leavesAux2
+            if (leavesAuxSmall == null) leavesAuxSmall = new ComputeBuffer(1, sizeof(uint));
+            uint auxThreadgroups = 1; // aux length is small
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", leavesAux);
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", leavesAux2);
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", leavesAuxSmall);
+            radixSortShader.SetInt("len", (int)auxSize);
+            radixSortShader.SetInt("zeroff", 1);
+            radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
+
+            // Fixup: add scanned aux into leavesPrefixSums
+            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", leavesPrefixSums);
+            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", leavesAux2);
+            radixSortShader.SetInt("len", numParticles);
+            radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
+        }
+
+        // Scatter unique indices
+        leavesShader.SetBuffer(scatterUniquesKernel, "uniqueIndicators", uniqueIndicators);
+        leavesShader.SetBuffer(scatterUniquesKernel, "prefixSums", leavesPrefixSums);
+        leavesShader.SetBuffer(scatterUniquesKernel, "uniqueIndices", uniqueIndices);
+        leavesShader.SetInt("count", numParticles);
+        leavesShader.Dispatch(scatterUniquesKernel, groupsLinear, 1, 1);
+
+        // Write unique count
+        leavesShader.SetBuffer(writeUniqueCountKernel, "uniqueIndicators", uniqueIndicators);
+        leavesShader.SetBuffer(writeUniqueCountKernel, "prefixSums", leavesPrefixSums);
+        leavesShader.SetBuffer(writeUniqueCountKernel, "uniqueCount", uniqueCount);
+        leavesShader.SetInt("count", numParticles);
+        leavesShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
+
+        // Read back unique count
+        uint[] uniqueCountCpu = new uint[1];
+        uniqueCount.GetData(uniqueCountCpu);
+        int numUniquePrefixes = (int)uniqueCountCpu[0];
+        
+        Debug.Log($"Layer {layer}: Prefix sum with {prefixBits} bits: Found {numUniquePrefixes} unique prefixes");
+        
+        // Read back and print up to 10 unique Morton codes for this layer
+        if (numUniquePrefixes > 0)
+        {
+            int numToPrint = Mathf.Min(10, numUniquePrefixes);
+            uint[] uniqueIndicesData = new uint[numUniquePrefixes];
+            uint[] sortedMortonCodesData = new uint[numParticles];
+            
+            uniqueIndices.GetData(uniqueIndicesData, 0, 0, numUniquePrefixes);
+            sortedMortonCodes.GetData(sortedMortonCodesData);
+            
+            string mortonCodesStr = $"Layer {layer} unique Morton codes (last {numToPrint}): ";
+            int startIndex = Mathf.Max(0, numUniquePrefixes - numToPrint);
+            for (int i = startIndex; i < numUniquePrefixes; i++)
+            {
+                uint index = uniqueIndicesData[i];
+                uint mortonCode = sortedMortonCodesData[index];
+                uint prefix = mortonCode >> prefixBits;
+                mortonCodesStr += $"{mortonCode} ({prefix})";
+                if (i < numUniquePrefixes - 1) mortonCodesStr += ", ";
+            }
+            Debug.Log(mortonCodesStr);
+        }
     }
 
     // Simple debug visualization using Gizmos
