@@ -73,7 +73,6 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // Initialize particle with zero values
     Particle particle;
     particle.velocity = float3(0.0, 0.0, 0.0);
-    particle.layer = 0;
     
     // Calculate grid position using morton code major order (Z, Y, X)
     // This ensures particles are distributed evenly throughout the volume
@@ -86,6 +85,13 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     gridX = min(gridX, (uint)gridDimensions.x - 1);
     gridY = min(gridY, (uint)gridDimensions.y - 1);
     gridZ = min(gridZ, (uint)gridDimensions.z - 1);
+    
+    // Set layer based on position: far vertical face (Z=0) gets layer 0, others get layer 9
+    if (gridZ == 0) {
+        particle.layer = 0;  // Far vertical face
+    } else {
+        particle.layer = 9;  // All other particles
+    }
     
     // Reverse X axis to make particles initially unsorted
     gridX = (uint)gridDimensions.x - 1 - gridX;
@@ -103,6 +109,8 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     
     // Generate morton code from normalized position
     particle.mortonCode = EncodeMorton3D(normalizedPos);
+
+    // particle.layer = particle.mortonCode % 10;
     
     // Write particle to buffer
     particlesBuffer[index] = particle;

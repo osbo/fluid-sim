@@ -41,6 +41,9 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer nodeMortonCodes;
     private ComputeBuffer nodeIndices;
     
+    // Number of unique nodes (set during CreateNodes)
+    private int numUniqueNodes;
+    
     // Particle struct (must match compute shader)
     private struct Particle
     {
@@ -167,40 +170,6 @@ public class FluidSimulator : MonoBehaviour
         
         // Sort the morton codes and their corresponding indices
         radixSort.Sort(mortonCodesBuffer, particleIndicesBuffer, sortedMortonCodes, sortedParticleIndices, (uint)numParticles);
-        
-        // Debug: Log sorted codes and indices
-        uint[] sortedMortonCodesArray = new uint[numParticles];
-        sortedMortonCodes.GetData(sortedMortonCodesArray);
-        
-        uint[] sortedIndicesArray = new uint[numParticles];
-        sortedParticleIndices.GetData(sortedIndicesArray);
-        
-        // // Get particle data
-        // Particle[] particlesArray = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesArray);
-        
-        string sorted_output = "Sorted Morton Codes (first 20): ";
-        string indices_output = "Corresponding Indices (first 20): ";
-        for (int i = 0; i < Mathf.Min(20, numParticles); i++)
-        {
-            sorted_output += sortedMortonCodesArray[i] + " ";
-            indices_output += sortedIndicesArray[i] + " ";
-        }
-        Debug.Log(sorted_output);
-        Debug.Log(indices_output);
-        
-        // // Print particle data for first 20 sorted particles
-        // Debug.Log("=== First 20 Sorted Particles ===");
-        // for (int i = 0; i < Mathf.Min(20, numParticles); i++)
-        // {
-        //     uint particleIndex = sortedIndicesArray[i];
-        //     Particle particle = particlesArray[particleIndex];
-            
-        //     Debug.Log($"Sorted Position {i}: Particle[{particleIndex}] - " +
-        //              $"Pos=({particle.position.x:F3}, {particle.position.y:F3}, {particle.position.z:F3}), " +
-        //              $"Vel=({particle.velocity.x:F3}, {particle.velocity.y:F3}, {particle.velocity.z:F3}), " +
-        //              $"Layer={particle.layer}, MortonCode={particle.mortonCode}");
-        // }
     }
 
     private void PrefixSumLeaves()
@@ -293,27 +262,6 @@ public class FluidSimulator : MonoBehaviour
         leavesShader.SetBuffer(writeUniqueCountKernel, "uniqueCount", uniqueCount);
         leavesShader.SetInt("count", count);
         leavesShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
-
-        // Debug output (disabled in production)
-        uint[] uniqueCountCpu = new uint[1];
-        uniqueCount.GetData(uniqueCountCpu);
-        int uniques = (int)uniqueCountCpu[0];
-        Debug.Log($"Particles created: {numParticles}, Unique morton codes: {uniques}");
-        int toPrint = Mathf.Min(20, uniques);
-        uint[] uniqueIdxCpu = new uint[toPrint];
-        uniqueIndices.GetData(uniqueIdxCpu, 0, 0, toPrint);
-        uint[] sortedCodesCpu = new uint[Mathf.Min(count, 200)];
-        sortedMortonCodes.GetData(sortedCodesCpu, 0, 0, Mathf.Min(count, 200));
-        string uIdx = "First unique indices (particle indices): ";
-        string uCodes = "First unique morton codes: ";
-        for (int i = 0; i < toPrint; i++)
-        {
-            uIdx += uniqueIdxCpu[i] + " ";
-            uCodes += sortedCodesCpu[i] + " ";
-        }
-        Debug.Log(uIdx);
-        Debug.Log(uCodes);
-        VerifyLeavesOnCPU(count, uniques);
     }
 
     private void CreateNodes()
@@ -327,7 +275,7 @@ public class FluidSimulator : MonoBehaviour
         // Get unique count from GPU
         uint[] uniqueCountCpu = new uint[1];
         uniqueCount.GetData(uniqueCountCpu);
-        int numUniqueNodes = (int)uniqueCountCpu[0];
+        numUniqueNodes = (int)uniqueCountCpu[0];
 
         if (numUniqueNodes == 0) return;
 
@@ -343,6 +291,7 @@ public class FluidSimulator : MonoBehaviour
         // Set buffer data to compute shader
         nodesShader.SetBuffer(createNodesKernel, "particlesBuffer", particlesBuffer);
         nodesShader.SetBuffer(createNodesKernel, "sortedParticleIndices", sortedParticleIndices);
+        nodesShader.SetBuffer(createNodesKernel, "uniqueIndices", uniqueIndices);
         nodesShader.SetBuffer(createNodesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(createNodesKernel, "nodeMortonCodes", nodeMortonCodes);
         nodesShader.SetBuffer(createNodesKernel, "nodeIndices", nodeIndices);
@@ -353,167 +302,69 @@ public class FluidSimulator : MonoBehaviour
         // Dispatch the kernel
         int threadGroups = Mathf.CeilToInt(numUniqueNodes / 64.0f);
         nodesShader.Dispatch(createNodesKernel, threadGroups, 1, 1);
-
-        Debug.Log($"Created {numUniqueNodes} nodes from {numParticles} particles");
-        
-        // Debug: Print first few nodes and aggregated nodes
-        PrintNodeDebugInfo(numUniqueNodes);
-    }
-    
-    private void PrintNodeDebugInfo(int numUniqueNodes)
-    {
-        if (numUniqueNodes == 0) return;
-        
-        // Read back node data
-        Node[] nodes = new Node[Mathf.Min(numUniqueNodes, 20)]; // First 20 nodes
-        uint[] nodeMortonCodesData = new uint[Mathf.Min(numUniqueNodes, 20)];
-        uint[] nodeIndicesData = new uint[Mathf.Min(numUniqueNodes, 20)];
-        
-        nodesBuffer.GetData(nodes, 0, 0, nodes.Length);
-        nodeMortonCodes.GetData(nodeMortonCodesData, 0, 0, nodeMortonCodesData.Length);
-        nodeIndices.GetData(nodeIndicesData, 0, 0, nodeIndicesData.Length);
-        
-        // Print first few nodes
-        Debug.Log("=== First 10 Nodes ===");
-        for (int i = 0; i < Mathf.Min(10, nodes.Length); i++)
-        {
-            Debug.Log($"Node {i}: Pos=({nodes[i].position.x:F2}, {nodes[i].position.y:F2}, {nodes[i].position.z:F2}), " +
-                     $"Vel=({nodes[i].velocity.x:F2}, {nodes[i].velocity.y:F2}, {nodes[i].velocity.z:F2}), " +
-                     $"Layer={nodes[i].layer}, MortonCode={nodeMortonCodesData[i]}");
-        }
-        
-        // Find nodes that aggregated multiple particles by checking particle counts
-        Debug.Log("=== Nodes with Multiple Particles ===");
-        int aggregatedCount = 0;
-        
-        // Read back particle data to analyze aggregation
-        uint[] sortedMortonCodesData = new uint[numParticles];
-        uint[] sortedParticleIndicesData = new uint[numParticles];
-        uint[] uniqueIndicesData = new uint[numUniqueNodes];
-        
-        sortedMortonCodes.GetData(sortedMortonCodesData);
-        sortedParticleIndices.GetData(sortedParticleIndicesData);
-        uniqueIndices.GetData(uniqueIndicesData);
-        
-        for (int i = 0; i < numUniqueNodes && aggregatedCount < 10; i++)
-        {
-            uint mortonCode = nodeMortonCodesData[i];
-            uint firstParticleIndex = uniqueIndicesData[i];
-            
-            // Count how many particles share this morton code
-            int particleCount = 1;
-            for (int j = (int)firstParticleIndex + 1; j < numParticles; j++)
-            {
-                if (sortedMortonCodesData[j] == mortonCode)
-                {
-                    particleCount++;
-                }
-                else
-                {
-                    break; // Consecutive particles with same code
-                }
-            }
-            
-            if (particleCount > 1)
-            {
-                Debug.Log($"Node {i}: Aggregated {particleCount} particles, MortonCode={mortonCode}, " +
-                         $"Pos=({nodes[i].position.x:F2}, {nodes[i].position.y:F2}, {nodes[i].position.z:F2})");
-                aggregatedCount++;
-            }
-        }
-        
-        if (aggregatedCount == 0)
-        {
-            Debug.Log("No nodes aggregated multiple particles (all nodes represent single particles)");
-        }
-    }
-
-    private void VerifyLeavesOnCPU(int count, int uniques)
-    {
-        // Read back required GPU buffers
-        uint[] codes = new uint[count];
-        uint[] sortedIdx = new uint[count];
-        sortedMortonCodes.GetData(codes);
-        sortedParticleIndices.GetData(sortedIdx);
-
-        uint[] gpuUniqueParticleIdx = new uint[uniques];
-        if (uniques > 0)
-        {
-            uniqueIndices.GetData(gpuUniqueParticleIdx, 0, 0, uniques);
-        }
-
-        // Build CPU reference list: particle indices at the start of each unique code run
-        System.Collections.Generic.List<uint> cpuUniqueParticleIdx = new System.Collections.Generic.List<uint>(uniques);
-        for (int i = 0; i < count; i++)
-        {
-            if (i == 0 || codes[i] != codes[i - 1])
-            {
-                cpuUniqueParticleIdx.Add(sortedIdx[i]);
-            }
-        }
-
-        // Compare counts
-        if (cpuUniqueParticleIdx.Count != uniques)
-        {
-            Debug.LogError($"Leaves verification FAILED: GPU uniques={uniques}, CPU uniques={cpuUniqueParticleIdx.Count}");
-            return;
-        }
-
-        // Compare lists element-wise (order should match the sorted order)
-        int maxCheck = cpuUniqueParticleIdx.Count;
-        for (int i = 0; i < maxCheck; i++)
-        {
-            if (gpuUniqueParticleIdx[i] != cpuUniqueParticleIdx[i])
-            {
-                Debug.LogError($"Leaves verification FAILED at {i}: GPU particleIdx={gpuUniqueParticleIdx[i]} vs CPU={cpuUniqueParticleIdx[i]}");
-                return;
-            }
-        }
-
-        Debug.Log("Leaves verification: OK (GPU unique indices match CPU reference)");
-
-        // Also print the Morton codes that are not unique (distinct values with frequency > 1)
-        System.Collections.Generic.List<uint> nonUniqueCodes = new System.Collections.Generic.List<uint>();
-        int idx = 0;
-        while (idx < count)
-        {
-            uint code = codes[idx];
-            int runStart = idx;
-            while (idx + 1 < count && codes[idx + 1] == code) idx++;
-            int runLen = idx - runStart + 1;
-            if (runLen > 1)
-            {
-                nonUniqueCodes.Add(code);
-            }
-            idx++;
-        }
-
-        string nonUniqueMsg = "Non-unique Morton codes (distinct, count=" + nonUniqueCodes.Count + "): ";
-        for (int i = 0; i < nonUniqueCodes.Count; i++)
-        {
-            nonUniqueMsg += nonUniqueCodes[i] + (i + 1 < nonUniqueCodes.Count ? " " : "");
-        }
-        Debug.Log(nonUniqueMsg);
     }
 
     // Simple debug visualization using Gizmos
     private void OnDrawGizmos()
     {
-        if (particlesBuffer == null) return;
-        
-        // Read particle data back to CPU for visualization
-        Particle[] particles = new Particle[numParticles];
-        particlesBuffer.GetData(particles);
-        
-        // Set gizmo color to blue
-        Gizmos.color = Color.blue;
-        
-        // Draw each particle as a small sphere
-        for (int i = 0; i < numParticles; i++)
+        if (nodesBuffer == null) return;
+
+        Node[] nodes = new Node[numUniqueNodes];
+        nodesBuffer.GetData(nodes);
+
+        // Define 10 colors for different layers
+        Color[] layerColors = new Color[]
         {
-            float size = Mathf.Pow(8.0f, particles[i].layer) * 0.002f; // Scale down the size
-            Gizmos.DrawSphere(particles[i].position, size);
+            Color.red,      // Layer 0
+            Color.green,    // Layer 1
+            Color.blue,     // Layer 2
+            Color.yellow,   // Layer 3
+            Color.magenta,  // Layer 4
+            Color.cyan,     // Layer 5
+            Color.white,    // Layer 6
+            Color.gray,     // Layer 7
+            new Color(1f, 0.5f, 0f), // Orange - Layer 8
+            new Color(0.5f, 0f, 1f)  // Purple - Layer 9
+        };
+        
+        for (int i = 0; i < numUniqueNodes; i++)
+        {
+            int layerIndex = Mathf.Clamp((int)nodes[i].layer, 0, layerColors.Length - 1);
+            Gizmos.color = layerColors[layerIndex];
+            Gizmos.DrawWireCube(DecodeMorton3D(nodes[i].mortonCode), Vector3.one * 0.02f);
         }
+    }
+
+    private Vector3 DecodeMorton3D(uint mortonCode)
+    {
+        uint x = 0, y = 0, z = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            x |= ((mortonCode >> (i * 3 + 0)) & 1) << i;
+            y |= ((mortonCode >> (i * 3 + 1)) & 1) << i;
+            z |= ((mortonCode >> (i * 3 + 2)) & 1) << i;
+        }
+        
+        // Convert normalized coordinates (0-1023) back to world space
+        Vector3 normalizedPos = new Vector3(x, y, z);
+        Vector3 simulationBoundsMin = simulationBounds.bounds.min;
+        Vector3 simulationBoundsMax = simulationBounds.bounds.max;
+        Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        
+        // Reverse the normalization: worldPos = normalizedPos / mortonNormalizationFactor + simulationBoundsMin
+        Vector3 mortonNormalizationFactor = new Vector3(
+            1023.0f / simulationSize.x,
+            1023.0f / simulationSize.y,
+            1023.0f / simulationSize.z
+        );
+        
+        Vector3 worldPos = new Vector3(
+            normalizedPos.x / mortonNormalizationFactor.x,
+            normalizedPos.y / mortonNormalizationFactor.y,
+            normalizedPos.z / mortonNormalizationFactor.z
+        ) + simulationBoundsMin;
+        
+        return worldPos;
     }
 
     void OnDestroy()
