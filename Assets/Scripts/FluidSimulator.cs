@@ -157,10 +157,6 @@ public class FluidSimulator : MonoBehaviour
         // Dispatch the kernel
         int threadGroups = Mathf.CeilToInt(numParticles / 64.0f);
         fluidKernelsShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
-        
-        // Debug.Log($"Initialized {numParticles} particles with bounds: simulation({simulationBoundsMin} to {simulationBoundsMax}), fluid initial({fluidInitialBoundsMin} to {fluidInitialBoundsMax})");
-        // Debug.Log($"Morton normalization factors: {mortonNormalizationFactor}, max value: {mortonMaxValue}");
-        // Debug.Log($"Grid dimensions: {gridDimensions}, grid spacing: {actualGridSpacing}");
     }
     
     private void SortParticles()
