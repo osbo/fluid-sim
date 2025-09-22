@@ -92,6 +92,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     } else {
         particle.layer = 9;  // All other particles
     }
+    // particle.layer = 9;
     
     // Reverse X axis to make particles initially unsorted
     gridX = (uint)gridDimensions.x - 1 - gridX;
