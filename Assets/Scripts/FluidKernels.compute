@@ -87,11 +87,10 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     gridZ = min(gridZ, (uint)gridDimensions.z - 1);
     
     // Set layer based on position: far vertical face (Z=0) gets layer 0, others get layer 11
-    if (gridZ == 0) {
-        particle.layer = 0;  // Far vertical face
-    } else {
-        particle.layer = 11;  // All other particles
-    }
+    // bool onBoundary = (gridX == 0) || (gridY == 0) || (gridZ == 0) ||
+	// 	(gridX == (uint)gridDimensions.x - 1) || (gridY == (uint)gridDimensions.y - 1) || (gridZ == (uint)gridDimensions.z - 1);
+    bool onBoundary = (gridX == 0) || (gridY == 0) || (gridZ == 0);
+	particle.layer = onBoundary ? 0 : 11;
     // particle.layer = 9;
     
     // Reverse X axis to make particles initially unsorted
