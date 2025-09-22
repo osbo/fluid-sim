@@ -86,11 +86,11 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     gridY = min(gridY, (uint)gridDimensions.y - 1);
     gridZ = min(gridZ, (uint)gridDimensions.z - 1);
     
-    // Set layer based on position: far vertical face (Z=0) gets layer 0, others get layer 9
+    // Set layer based on position: far vertical face (Z=0) gets layer 0, others get layer 11
     if (gridZ == 0) {
         particle.layer = 0;  // Far vertical face
     } else {
-        particle.layer = 9;  // All other particles
+        particle.layer = 11;  // All other particles
     }
     // particle.layer = 9;
     
