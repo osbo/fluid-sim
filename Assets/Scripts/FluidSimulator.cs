@@ -402,23 +402,26 @@ public class FluidSimulator : MonoBehaviour
         uniqueCount.GetData(uniqueCountCpu);
         int numUniquePrefixes = (int)uniqueCountCpu[0];
 
-        // uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
-        // uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
-        // Node[] nodes = new Node[numUniquePrefixes];
-        // nodesBuffer.GetData(nodes, 0, 0, numUniquePrefixes);
-        // string nodesStr = $"Layer {layer}:\n";
-        // uint uniqueCounter = 0;
-        // for (int i = 0; i < Mathf.Min(50, numUniquePrefixes); i++)
-        // {
-        //     bool isUnique = false;
-        //     if (uniqueIndicesCpu[uniqueCounter] == i)
-        //     {
-        //         uniqueCounter++;
-        //         isUnique = true;
-        //     }
-        //     nodesStr += $"Index: {i}, Morton Code: {nodes[i].mortonCode}, Unique? {isUnique}\n";
-        // }
-        // Debug.Log(nodesStr);
+        if (layer == 10)
+        {
+            uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
+            uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
+            Node[] nodes = new Node[numUniquePrefixes];
+            nodesBuffer.GetData(nodes, 0, 0, numUniquePrefixes);
+            string nodesStr = $"Layer {layer}:\n";
+            uint uniqueCounter = 0;
+            for (int i = 0; i < Mathf.Min(50, numUniquePrefixes); i++)
+            {
+                bool isUnique = false;
+                if (uniqueIndicesCpu[uniqueCounter] == i)
+                {
+                    uniqueCounter++;
+                    isUnique = true;
+                }
+                nodesStr += $"Index: {i}, Morton Code: {nodes[i].mortonCode}, Unique? {isUnique}\n";
+            }
+            Debug.Log(nodesStr);
+        }
 
         // Find the kernel for processing nodes at this level
         int processNodesKernel = nodesShader.FindKernel("ProcessNodes");
@@ -434,36 +437,62 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(processNodesKernel, "nodeIndices", nodeIndices);
         nodesShader.SetBuffer(processNodesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
         nodesShader.SetInt("numUniqueNodes", numUniquePrefixes);
+        nodesShader.SetInt("numNodes", numUniqueNodes);
         nodesShader.SetInt("numParticles", numParticles);
         nodesShader.SetInt("layer", layer);
-        nodesShader.SetInt("prefixBits", prefixBits);
         
         // Dispatch one thread per unique node
         int threadGroups = Mathf.CeilToInt(numUniquePrefixes / 64.0f);
         nodesShader.Dispatch(processNodesKernel, threadGroups, 1, 1);
 
-        uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
-        uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
-        Node[] nodes = new Node[numUniqueNodes];
-        nodesBuffer.GetData(nodes, 0, 0, numUniqueNodes);
-        uint[] nodeFlagsBufferCpu = new uint[numUniqueNodes];
-        nodeFlagsBuffer.GetData(nodeFlagsBufferCpu, 0, 0, numUniqueNodes);
-        string nodesStr = $"Layer {layer}:\n";
-        uint uniqueCounter = 0;
-        for (int i = 0; i < Mathf.Min(50, numUniqueNodes); i++)
+        // uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
+        // uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
+        // Node[] nodes = new Node[numUniqueNodes];
+        // nodesBuffer.GetData(nodes, 0, 0, numUniqueNodes);
+        // uint[] nodeFlagsBufferCpu = new uint[numUniqueNodes];
+        // nodeFlagsBuffer.GetData(nodeFlagsBufferCpu, 0, 0, numUniqueNodes);
+        // string nodesStr = $"Layer {layer}:\n";
+        // uint uniqueCounter = 0;
+        // for (int i = 0; i < Mathf.Min(50, numUniqueNodes); i++)
+        // {
+        //     bool isUnique = false;
+        //     if (uniqueIndicesCpu[uniqueCounter] == i)
+        //     {
+        //         if (uniqueCounter < numUniquePrefixes -1) {
+        //             isUnique = true;
+        //             uniqueCounter++;
+        //         }
+        //     }
+        //     nodesStr += $"Index: {i}, Morton Code: {nodes[i].mortonCode}, Unique? {isUnique}, Active? {nodeFlagsBufferCpu[i]}, Layer: {nodes[i].layer}\n";
+
+        //     // Debug.Log($"Layer: {layer}, Side length: {Mathf.Pow(2, nodes[i].layer)}");
+        // }
+        // Debug.Log(nodesStr);
+
+        Debug.Log($"Layer: {layer}, numUniquePrefixes: {numUniquePrefixes}");
+
+        if (layer == 10)
         {
-            bool isUnique = false;
-            if (uniqueIndicesCpu[uniqueCounter] == i)
+            for (int printLayer = 0; printLayer <= 10; printLayer++)
             {
-                if (uniqueCounter < numUniquePrefixes -1) {
-                    isUnique = true;
-                    uniqueCounter++;
+                Debug.Log($"Layer: {printLayer}");
+                uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
+                uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
+                Node[] nodes = new Node[numUniqueNodes];
+                nodesBuffer.GetData(nodes, 0, 0, numUniqueNodes);
+                uint[] nodeFlagsBufferCpu = new uint[numUniqueNodes];
+                nodeFlagsBuffer.GetData(nodeFlagsBufferCpu, 0, 0, numUniqueNodes);
+                int counter = 0;
+                for (int i = 0; i < numUniqueNodes  && counter < 50; i++)
+                {
+                    if (nodes[i].layer == printLayer && nodeFlagsBufferCpu[i] == 1)
+                    {
+                        Debug.Log($"Layer: {nodes[i].layer}, Index: {i}, Morton Code: {nodes[i].mortonCode}, Position: {nodes[i].position}");
+                        counter++;
+                    }
                 }
             }
-            nodesStr += $"Index: {i}, Morton Code: {nodes[i].mortonCode}, Unique? {isUnique}, Active? {nodeFlagsBufferCpu[i]}, Layer: {nodes[i].layer}\n";
         }
-        Debug.Log(nodesStr);
-        
     }
 
     // Simple debug visualization using Gizmos
@@ -473,8 +502,18 @@ public class FluidSimulator : MonoBehaviour
 
         Node[] nodes = new Node[numUniqueNodes];
         nodesBuffer.GetData(nodes);
-
-        // Define 10 colors for different layers
+        uint[] nodeFlagsBufferCpu = new uint[numUniqueNodes];
+        nodeFlagsBuffer.GetData(nodeFlagsBufferCpu, 0, 0, numUniqueNodes);
+        
+        // Calculate the maximum detail cell size (smallest possible cell)
+        // With 10 bits per axis, we have 1024 possible values (0-1023)
+        // The maximum detail cell size is simulation bounds divided by 1024
+        Vector3 simulationBoundsMin = simulationBounds.bounds.min;
+        Vector3 simulationBoundsMax = simulationBounds.bounds.max;
+        Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        float maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
+        
+        // Define 11 colors for different layers (0-10)
         Color[] layerColors = new Color[]
         {
             Color.red,      // Layer 0
@@ -486,47 +525,77 @@ public class FluidSimulator : MonoBehaviour
             Color.white,    // Layer 6
             Color.gray,     // Layer 7
             new Color(1f, 0.5f, 0f), // Orange - Layer 8
-            new Color(0.5f, 0f, 1f)  // Purple - Layer 9
+            new Color(0.5f, 0f, 1f), // Purple - Layer 9
+            new Color(0f, 0.5f, 0.5f) // Teal - Layer 10
         };
         
         for (int i = 0; i < numUniqueNodes; i++)
         {
             int layerIndex = Mathf.Clamp((int)nodes[i].layer, 0, layerColors.Length - 1);
             Gizmos.color = layerColors[layerIndex];
-            Gizmos.DrawWireCube(DecodeMorton3D(nodes[i].mortonCode), Vector3.one * 0.02f);
+            if (nodeFlagsBufferCpu[i] == 1)
+            {
+                Gizmos.DrawWireCube(DecodeMorton3D(nodes[i]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, nodes[i].layer), 0.01f));
+                // Gizmos.DrawWireCube(nodes[i].position, Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, nodes[i].layer), 0.01f));
+            }
         }
     }
 
-    private Vector3 DecodeMorton3D(uint mortonCode)
+    private Vector3 DecodeMorton3D(Node node)
     {
+        // Step 1: Create masked morton code by shifting right then left to mask off detail
+        int shiftBits = 3 * (int)node.layer;
+        uint maskedMortonCode = (node.mortonCode >> shiftBits) << shiftBits;
+        
+        // Step 2: Decode morton code to Vector3 coordinates
+        // This is the exact reverse of the EncodeMorton3D function from FluidKernels.compute
         uint x = 0, y = 0, z = 0;
+        
+        // Deinterleave the bits (reverse of the encoding process)
+        // Original encoding: result |= ((x & (1U << i)) << (2 * i));
+        // So decoding: extract bit from position (2 * i) and put it at position i
         for (int i = 0; i < 10; i++)
         {
-            x |= ((mortonCode >> (i * 3 + 0)) & 1) << i;
-            y |= ((mortonCode >> (i * 3 + 1)) & 1) << i;
-            z |= ((mortonCode >> (i * 3 + 2)) & 1) << i;
+            x |= ((maskedMortonCode >> (2 * i)) & 1) << i;
+            y |= ((maskedMortonCode >> (2 * i + 1)) & 1) << i;
+            z |= ((maskedMortonCode >> (2 * i + 2)) & 1) << i;
         }
         
-        // Convert normalized coordinates (0-1023) back to world space
+        // Step 3: Convert to normalized coordinates (0-1023 range)
+        // The morton code represents the corner of a cell, so we need to move to center
         Vector3 normalizedPos = new Vector3(x, y, z);
+        
+        // Step 4: Move from corner to center in normalized space
+        // Calculate the cell size in normalized space for this layer
+        // At layer 0: cell size = 1024/1 = 1024 (entire space)
+        // At layer 1: cell size = 1024/2 = 512
+        // At layer n: cell size = 1024/(2^n)
+        float normalizedCellSize = 1024.0f / Mathf.Pow(2, node.layer);
+        Vector3 normalizedCenterOffset = new Vector3(normalizedCellSize * 0.5f, normalizedCellSize * 0.5f, normalizedCellSize * 0.5f);
+        Vector3 normalizedCenter = normalizedPos + normalizedCenterOffset;
+        
+        // Step 5: Renormalize to simulation bounds (reverse of the encoding process)
         Vector3 simulationBoundsMin = simulationBounds.bounds.min;
         Vector3 simulationBoundsMax = simulationBounds.bounds.max;
         Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
         
-        // Reverse the normalization: worldPos = normalizedPos / mortonNormalizationFactor + simulationBoundsMin
+        // Convert from morton code range (0-1023) to simulation bounds
+        // This reverses: normalizedPos = (particle.position - simulationBoundsMin) * mortonNormalizationFactor;
+        // So: particle.position = simulationBoundsMin + normalizedPos / mortonNormalizationFactor
         Vector3 mortonNormalizationFactor = new Vector3(
             1023.0f / simulationSize.x,
             1023.0f / simulationSize.y,
             1023.0f / simulationSize.z
         );
         
-        Vector3 worldPos = new Vector3(
-            normalizedPos.x / mortonNormalizationFactor.x,
-            normalizedPos.y / mortonNormalizationFactor.y,
-            normalizedPos.z / mortonNormalizationFactor.z
-        ) + simulationBoundsMin;
+        // Convert back to world coordinates using component-wise division
+        Vector3 centerPos = simulationBoundsMin + new Vector3(
+            normalizedCenter.x / mortonNormalizationFactor.x,
+            normalizedCenter.y / mortonNormalizationFactor.y,
+            normalizedCenter.z / mortonNormalizationFactor.z
+        );
         
-        return worldPos;
+        return centerPos;
     }
 
     void OnDestroy()
