@@ -69,7 +69,7 @@ public class FluidSimulator : MonoBehaviour
         SortParticles();
         PrefixSumLeaves();
         CreateNodes();
-        for (int layer = 1; layer < 10; layer++)
+        for (int layer = 0; layer <= 10; layer++)
         {
             prefixSumNodes(layer);
         }
@@ -398,35 +398,72 @@ public class FluidSimulator : MonoBehaviour
         leavesShader.SetInt("count", numParticles);
         leavesShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
 
-        // Read back unique count
         uint[] uniqueCountCpu = new uint[1];
         uniqueCount.GetData(uniqueCountCpu);
         int numUniquePrefixes = (int)uniqueCountCpu[0];
+
+        // uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
+        // uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
+        // Node[] nodes = new Node[numUniquePrefixes];
+        // nodesBuffer.GetData(nodes, 0, 0, numUniquePrefixes);
+        // string nodesStr = $"Layer {layer}:\n";
+        // uint uniqueCounter = 0;
+        // for (int i = 0; i < Mathf.Min(50, numUniquePrefixes); i++)
+        // {
+        //     bool isUnique = false;
+        //     if (uniqueIndicesCpu[uniqueCounter] == i)
+        //     {
+        //         uniqueCounter++;
+        //         isUnique = true;
+        //     }
+        //     nodesStr += $"Index: {i}, Morton Code: {nodes[i].mortonCode}, Unique? {isUnique}\n";
+        // }
+        // Debug.Log(nodesStr);
+
+        // Find the kernel for processing nodes at this level
+        int processNodesKernel = nodesShader.FindKernel("ProcessNodes");
         
-        Debug.Log($"Layer {layer}: Prefix sum with {prefixBits} bits: Found {numUniquePrefixes} unique prefixes");
+        // Set buffers for the node processing kernel
+        nodesShader.SetBuffer(processNodesKernel, "particlesBuffer", particlesBuffer);
+        nodesShader.SetBuffer(processNodesKernel, "sortedMortonCodes", sortedMortonCodes);
+        nodesShader.SetBuffer(processNodesKernel, "sortedParticleIndices", sortedParticleIndices);
+        nodesShader.SetBuffer(processNodesKernel, "uniqueIndices", uniqueIndices);
+        nodesShader.SetBuffer(processNodesKernel, "uniqueCount", uniqueCount);
+        nodesShader.SetBuffer(processNodesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(processNodesKernel, "nodeMortonCodes", nodeMortonCodes);
+        nodesShader.SetBuffer(processNodesKernel, "nodeIndices", nodeIndices);
+        nodesShader.SetBuffer(processNodesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
+        nodesShader.SetInt("numUniqueNodes", numUniquePrefixes);
+        nodesShader.SetInt("numParticles", numParticles);
+        nodesShader.SetInt("layer", layer);
+        nodesShader.SetInt("prefixBits", prefixBits);
         
-        // Read back and print up to 10 unique Morton codes for this layer
-        if (numUniquePrefixes > 0)
+        // Dispatch one thread per unique node
+        int threadGroups = Mathf.CeilToInt(numUniquePrefixes / 64.0f);
+        nodesShader.Dispatch(processNodesKernel, threadGroups, 1, 1);
+
+        uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
+        uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
+        Node[] nodes = new Node[numUniqueNodes];
+        nodesBuffer.GetData(nodes, 0, 0, numUniqueNodes);
+        uint[] nodeFlagsBufferCpu = new uint[numUniqueNodes];
+        nodeFlagsBuffer.GetData(nodeFlagsBufferCpu, 0, 0, numUniqueNodes);
+        string nodesStr = $"Layer {layer}:\n";
+        uint uniqueCounter = 0;
+        for (int i = 0; i < Mathf.Min(50, numUniqueNodes); i++)
         {
-            int numToPrint = Mathf.Min(10, numUniquePrefixes);
-            uint[] uniqueIndicesData = new uint[numUniquePrefixes];
-            uint[] sortedMortonCodesData = new uint[numParticles];
-            
-            uniqueIndices.GetData(uniqueIndicesData, 0, 0, numUniquePrefixes);
-            sortedMortonCodes.GetData(sortedMortonCodesData);
-            
-            string mortonCodesStr = $"Layer {layer} unique Morton codes (last {numToPrint}): ";
-            int startIndex = Mathf.Max(0, numUniquePrefixes - numToPrint);
-            for (int i = startIndex; i < numUniquePrefixes; i++)
+            bool isUnique = false;
+            if (uniqueIndicesCpu[uniqueCounter] == i)
             {
-                uint index = uniqueIndicesData[i];
-                uint mortonCode = sortedMortonCodesData[index];
-                uint prefix = mortonCode >> prefixBits;
-                mortonCodesStr += $"{mortonCode} ({prefix})";
-                if (i < numUniquePrefixes - 1) mortonCodesStr += ", ";
+                if (uniqueCounter < numUniquePrefixes -1) {
+                    isUnique = true;
+                    uniqueCounter++;
+                }
             }
-            Debug.Log(mortonCodesStr);
+            nodesStr += $"Index: {i}, Morton Code: {nodes[i].mortonCode}, Unique? {isUnique}, Active? {nodeFlagsBufferCpu[i]}, Layer: {nodes[i].layer}\n";
         }
+        Debug.Log(nodesStr);
+        
     }
 
     // Simple debug visualization using Gizmos
