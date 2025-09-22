@@ -402,26 +402,26 @@ public class FluidSimulator : MonoBehaviour
         uniqueCount.GetData(uniqueCountCpu);
         int numUniquePrefixes = (int)uniqueCountCpu[0];
 
-        // if (layer == 10)
-        // {
-        //     uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
-        //     uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
-        //     Node[] nodes = new Node[numUniquePrefixes];
-        //     nodesBuffer.GetData(nodes, 0, 0, numUniquePrefixes);
-        //     string nodesStr = $"Layer {layer}:\n";
-        //     uint uniqueCounter = 0;
-        //     for (int i = 0; i < Mathf.Min(50, numUniquePrefixes); i++)
-        //     {
-        //         bool isUnique = false;
-        //         if (uniqueIndicesCpu[uniqueCounter] == i)
-        //         {
-        //             uniqueCounter++;
-        //             isUnique = true;
-        //         }
-        //         nodesStr += $"Index: {i}, Morton Code: {nodes[i].mortonCode}, Unique? {isUnique}\n";
-        //     }
-        //     Debug.Log(nodesStr);
-        // }
+        if (layer == 10)
+        {
+            uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
+            uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
+            Node[] nodes = new Node[numUniquePrefixes];
+            nodesBuffer.GetData(nodes, 0, 0, numUniquePrefixes);
+            string nodesStr = $"Layer {layer}:\n";
+            uint uniqueCounter = 0;
+            for (int i = 0; i < Mathf.Min(50, numUniquePrefixes); i++)
+            {
+                bool isUnique = false;
+                if (uniqueIndicesCpu[uniqueCounter] == i)
+                {
+                    uniqueCounter++;
+                    isUnique = true;
+                }
+                nodesStr += $"Index: {i}, Morton Code: {nodes[i].mortonCode}, Unique? {isUnique}\n";
+            }
+            Debug.Log(nodesStr);
+        }
 
         // Find the kernel for processing nodes at this level
         int processNodesKernel = nodesShader.FindKernel("ProcessNodes");
@@ -471,28 +471,28 @@ public class FluidSimulator : MonoBehaviour
 
         // Debug.Log($"Layer: {layer}, numUniquePrefixes: {numUniquePrefixes}");
 
-        // if (layer == 10)
-        // {
-        //     for (int printLayer = 0; printLayer <= 10; printLayer++)
-        //     {
-        //         Debug.Log($"Layer: {printLayer}");
-        //         uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
-        //         uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
-        //         Node[] nodes = new Node[numUniqueNodes];
-        //         nodesBuffer.GetData(nodes, 0, 0, numUniqueNodes);
-        //         uint[] nodeFlagsBufferCpu = new uint[numUniqueNodes];
-        //         nodeFlagsBuffer.GetData(nodeFlagsBufferCpu, 0, 0, numUniqueNodes);
-        //         int counter = 0;
-        //         for (int i = 0; i < numUniqueNodes  && counter < 50; i++)
-        //         {
-        //             if (nodes[i].layer == printLayer && nodeFlagsBufferCpu[i] == 1)
-        //             {
-        //                 Debug.Log($"Layer: {nodes[i].layer}, Index: {i}, Morton Code: {nodes[i].mortonCode}, Position: {nodes[i].position}");
-        //                 counter++;
-        //             }
-        //         }
-        //     }
-        // }
+        if (layer == 10)
+        {
+            for (int printLayer = 8; printLayer <= 10; printLayer++)
+            {
+                Debug.Log($"Layer: {printLayer}");
+                uint[] uniqueIndicesCpu = new uint[numUniquePrefixes];
+                uniqueIndices.GetData(uniqueIndicesCpu, 0, 0, numUniquePrefixes);
+                Node[] nodes = new Node[numUniqueNodes];
+                nodesBuffer.GetData(nodes, 0, 0, numUniqueNodes);
+                uint[] nodeFlagsBufferCpu = new uint[numUniqueNodes];
+                nodeFlagsBuffer.GetData(nodeFlagsBufferCpu, 0, 0, numUniqueNodes);
+                int counter = 0;
+                for (int i = 0; i < numUniqueNodes  && counter < 50; i++)
+                {
+                    if (nodes[i].layer == printLayer && nodeFlagsBufferCpu[i] == 1)
+                    {
+                        Debug.Log($"Layer: {nodes[i].layer}, Index: {i}, Morton Code: {nodes[i].mortonCode}, Position: {nodes[i].position}");
+                        counter++;
+                    }
+                }
+            }
+        }
     }
 
     // Simple debug visualization using Gizmos
@@ -581,7 +581,7 @@ public class FluidSimulator : MonoBehaviour
             quantizedPos.y / mortonNormalizationFactor.y,
             quantizedPos.z / mortonNormalizationFactor.z
         );
-        
+
         return quantizedWorldPos;
     }
 

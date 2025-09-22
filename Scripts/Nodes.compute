@@ -46,14 +46,13 @@ void CreateNodes(uint3 id : SV_DispatchThreadID)
     uint sortedArrayIndex = uniqueIndices[threadIndex];
     
     // Find how many particles share this morton code
-    uint particleCount = 1;
     uint nextUniqueIndex = threadIndex + 1 < numUniqueNodes ? uniqueIndices[threadIndex + 1] : numNodes;
     
     // Aggregate particle data with weighted average
     float3 weightedPosition = float3(0, 0, 0);
     float3 weightedVelocity = float3(0, 0, 0);
     float totalWeight = 0.0;
-    uint minLayer = 10;
+    uint minLayer = 11;
     
     // Process all particles with this morton code
     for (uint i = sortedArrayIndex; i < nextUniqueIndex; i++)
@@ -83,7 +82,6 @@ void CreateNodes(uint3 id : SV_DispatchThreadID)
     node.position = weightedPosition;
     node.velocity = weightedVelocity;
     node.layer = minLayer;  // Use the minimum layer found
-    // node.layer = totalWeight;
     node.mortonCode = mortonCode;
     
     // Write outputs
@@ -101,7 +99,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
     
     // Get the index into the nodes buffer for this unique prefix
     uint nodeBufferIndex = uniqueIndices[nodeIndex];
-    uint nextNodeBufferIndex = nodeIndex +1 < numUniqueNodes ? uniqueIndices[nodeIndex + 1] : numNodes;
+    uint nextNodeBufferIndex = nodeIndex + 1 < numUniqueNodes ? uniqueIndices[nodeIndex + 1] : numNodes;
     
     uint activeNodes[8];
     uint numActiveNodes = 0;
