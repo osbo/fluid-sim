@@ -1,4 +1,5 @@
-#pragma kernel CreateNodes
+#pragma kernel CreateLeaves
+#pragma kernel ProcessLeaves
 #pragma kernel ProcessNodes
 
 // Particle struct (must match C# struct)
@@ -171,6 +172,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
     uint nextUniqueActiveIndex = threadIndex + 1 < numUniqueActiveNodes ? uniqueIndices[threadIndex + 1] : numActiveNodes;
 
     uint numNodesInGroup = 0;
+    bool coarsen = true;
 
     for (uint i = uniqueActiveIndex; i < nextUniqueActiveIndex; i++)
     {
