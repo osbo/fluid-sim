@@ -532,8 +532,8 @@ MonoBehaviour:
   simulationBounds: {fileID: 72561709}
   fluidInitialBounds: {fileID: 1326165318}
   radixSortShader: {fileID: 7200000, guid: 2adf52e88e342442488eba44ee38e2aa, type: 3}
-  fluidKernelsShader: {fileID: 7200000, guid: 1020587fe5d52438c9cbe9b200b71fb8, type: 3}
-  leavesShader: {fileID: 7200000, guid: 9490e7c39d2774f0fa78b6a4416db47f, type: 3}
+  particlesShader: {fileID: 7200000, guid: 50811f54569ba494198b8c6b696cff81, type: 3}
+  nodesPrefixSumsShader: {fileID: 7200000, guid: c32ad71b0afda4f7d827eb945c910544, type: 3}
   nodesShader: {fileID: 7200000, guid: eab82c62a627a4a2295451473985b296, type: 3}
   numParticles: 10000
 --- !u!1 &832575517
