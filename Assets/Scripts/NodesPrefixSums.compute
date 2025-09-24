@@ -8,7 +8,8 @@
 #pragma kernel scatterActives
 #pragma kernel writeUniqueCount
 #pragma kernel writeActiveCount
-#pragma kernel clearBuffers
+#pragma kernel clearUniqueBuffers
+#pragma kernel clearActiveBuffers
 
 #define SCAN_BLOCKSIZE 512
 
@@ -194,17 +195,21 @@ void writeActiveCount(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(512, 1, 1)]
-void clearBuffers(uint3 id : SV_DispatchThreadID)
+void clearUniqueBuffers(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i >= len) return;
-    // if (i == 0) {
-    //     uniqueCount[0] = 0;
-    //     activeCount[0] = 0;
-    // }
 
     indicators[i] = 0;
-    // prefixSums[i] = 0;
     uniqueIndices[i] = 0;
-    // activeIndices[i] = 0;
+}
+
+[numthreads(512, 1, 1)]
+void clearActiveBuffers(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= len) return;
+
+    indicators[i] = 0;
+    activeIndices[i] = 0;
 }
