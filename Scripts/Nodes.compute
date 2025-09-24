@@ -44,7 +44,7 @@ uint layer;                                             // current hierarchical 
 void CreateLeaves(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
-    if (threadIndex >= numUniqueActiveNodes) return;
+    if (threadIndex >= numNodes) return;
     
     // Get the index into sorted arrays for this unique morton code
     uint sortedArrayIndex = uniqueIndices[threadIndex];
@@ -103,24 +103,19 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
 
     uint sortedArrayIndex = uniqueIndices[threadIndex];
     uint nextUniqueIndex = threadIndex + 1 < numUniqueActiveNodes ? uniqueIndices[threadIndex + 1] : numNodes;
+    uint numNodesInGroup = nextUniqueIndex - sortedArrayIndex;
 
-    uint numNodesInGroup = 0;
+    if (numNodesInGroup == 0) return;
+
     bool coarsen = true;
-
     for (uint i = sortedArrayIndex; i < nextUniqueIndex; i++)
     {
         Node node = nodesBuffer[i];
-        if (node.layer >= layer) {
-            numNodesInGroup++;
-            if (node.layer == layer) {
-                coarsen = false;
-            }
-        } else {
+        if (node.layer <= layer) {
             coarsen = false;
+            break;
         }
     }
-
-    if (numNodesInGroup == 0) return;
 
     if (coarsen)
     {
@@ -129,9 +124,9 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
         float totalWeight = 0.0;
         uint minLayer = 11;
 
-        for (uint i = 0; i < numNodesInGroup; i++)
+        for (uint i = sortedArrayIndex; i < nextUniqueIndex; i++)
         {
-            Node node = nodesBuffer[sortedArrayIndex + i];
+            Node node = nodesBuffer[i];
             weightedPosition += node.position * pow(8.0, (float)node.layer);
             weightedVelocity += node.velocity * pow(8.0, (float)node.layer);
             totalWeight += pow(8.0, (float)node.layer);
@@ -154,9 +149,9 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
             nodeFlagsBuffer[sortedArrayIndex + i] = 0;
         }
     } else {
-        for (uint i = 0; i < numNodesInGroup; i++)
+        for (uint i = sortedArrayIndex; i < nextUniqueIndex; i++)
         {
-            nodesBuffer[sortedArrayIndex + i].layer = layer;
+            nodesBuffer[i].layer = layer;
         }
     }
 }
@@ -164,30 +159,24 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void ProcessNodes(uint3 id : SV_DispatchThreadID)
 {
-    // Fill nodesIndices, size numNodes, index i = I'th active current-layer node -> j, which references the j'th node in the nodes buffer. Not fully filled array.
     uint threadIndex = id.x;
     if (threadIndex >= numUniqueActiveNodes) return;
 
     uint uniqueActiveIndex = uniqueIndices[threadIndex];
     uint nextUniqueActiveIndex = threadIndex + 1 < numUniqueActiveNodes ? uniqueIndices[threadIndex + 1] : numActiveNodes;
+    uint numNodesInGroup = nextUniqueActiveIndex - uniqueActiveIndex;
 
-    uint numNodesInGroup = 0;
+    if (numNodesInGroup == 0) return;
+
     bool coarsen = true;
-
     for (uint i = uniqueActiveIndex; i < nextUniqueActiveIndex; i++)
     {
         Node node = nodesBuffer[activeIndices[i]];
-        if (node.layer >= layer) {
-            numNodesInGroup++;
-            if (node.layer == layer) {
-                coarsen = false;
-            }
-        } else {
+        if (node.layer <= layer) {
             coarsen = false;
+            break;
         }
     }
-
-    if (numNodesInGroup == 0) return;
 
     if (coarsen)
     {
@@ -196,7 +185,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         float totalWeight = 0.0;
         uint minLayer = 11;
 
-        for (uint i = 0; i < numNodesInGroup; i++)
+        for (uint i = uniqueActiveIndex; i < nextUniqueActiveIndex; i++)
         {
             Node node = nodesBuffer[activeIndices[i]];
             weightedPosition += node.position * pow(8.0, (float)node.layer);
@@ -221,9 +210,9 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             nodeFlagsBuffer[activeIndices[uniqueActiveIndex + i]] = 0;
         }
     } else {
-        for (uint i = 0; i < numNodesInGroup; i++)
+        for (uint i = uniqueActiveIndex; i < nextUniqueActiveIndex; i++)
         {
-            nodesBuffer[activeIndices[uniqueActiveIndex + i]].layer = layer;
+            nodesBuffer[activeIndices[i]].layer = layer;
         }
     }
 }
