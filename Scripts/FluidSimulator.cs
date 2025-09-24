@@ -91,8 +91,9 @@ public class FluidSimulator : MonoBehaviour
         nodesBuffer.GetData(nodesCPU);
         uint[] flagsCPU = new uint[numNodes];
         nodeFlagsBuffer.GetData(flagsCPU);
-        string str = "Layer 0: First 20 nodes:\n";
-        for (int i = 0; i < 20 && i < numNodes; i++)
+        int displayNum = 20;
+        string str = $"Layer 0: First {displayNum} nodes:\n";
+        for (int i = 0; i < displayNum && i < numNodes; i++)
         {
             str += $"Node {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {flagsCPU[i]}\n";
         }
@@ -116,7 +117,7 @@ public class FluidSimulator : MonoBehaviour
         Debug.Log(str);
 
         // for (layer = 2; layer <= 10; layer++)
-        for (layer = 2; layer <= 8; layer++)
+        for (layer = 2; layer <= 7; layer++)
         {
             prefixSumActiveNodes();
 
@@ -138,15 +139,28 @@ public class FluidSimulator : MonoBehaviour
             // Debug: print numUniqueActiveNodes
             Debug.Log($"Num Unique Morton Codes (Layer {layer}: {30 - layer * 3} bits): {numUniqueActiveNodes}");
 
+            // Debug: print unique active indices
+            uint[] uniqueIndicesCPU = new uint[numActiveNodes];
+            uniqueIndices.GetData(uniqueIndicesCPU);
+            str = $"Layer {layer}: First 20 unique active indices:\n";
+            for (int i = 0; i < 20; i++)
+            {
+                str += $"Unique Active Index {i}: {uniqueIndicesCPU[i]} (Particle Index: {activeIndicesCPU[uniqueIndicesCPU[i]]})\n";
+            }
+            Debug.Log(str);
+
             ProcessNodes();
 
             // Debug: print nodes buffer
             nodesBuffer.GetData(nodesCPU);
             nodeFlagsBuffer.GetData(flagsCPU);
-            str = $"Layer {layer}: First 20 nodes:\n";
-            for (int i = 0; i < 20 && i < numActiveNodes; i++)
+            displayNum = numNodes;
+            str = $"Layer {layer}: First {displayNum} nodes:\n";
+            for (int i = 0; i < displayNum && i < numActiveNodes; i++)
             {
-                str += $"Node {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {flagsCPU[i]}\n";
+                if (nodesCPU[i].layer != 0) {
+                    str += $"Node {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {flagsCPU[i]}\n";
+                }
             }
             Debug.Log(str);
         }
@@ -282,8 +296,6 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // ClearBuffers();
-
         // Find kernels
         markUniqueParticlesKernel = nodesPrefixSumsShader.FindKernel("markUniqueParticles");
         markUniquesPrefixKernel = nodesPrefixSumsShader.FindKernel("markUniquesPrefix");
@@ -416,7 +428,7 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // ClearBuffers();
+        ClearUniqueBuffers();
 
         int prefixBits = 3;
 
@@ -526,7 +538,7 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // ClearBuffers();
+        ClearActiveBuffers();
 
         // Find kernels
         markActiveNodesKernel = nodesPrefixSumsShader.FindKernel("markActiveNodes");
@@ -702,7 +714,7 @@ public class FluidSimulator : MonoBehaviour
 
         if (numActiveNodes == 0) return;
 
-        // ClearBuffers();
+        ClearUniqueBuffers();
 
         // Calculate prefix bits: shift right by 3 * layer bits
         int prefixBits = layer * 3;
@@ -810,24 +822,38 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.Dispatch(processNodesKernel, threadGroups, 1, 1);
     }
 
-    private void ClearBuffers()
+    private void ClearUniqueBuffers()
     {
         if (nodesPrefixSumsShader == null)
         {
             Debug.LogError("NodesPrefixSums compute shader is not assigned. Please assign `nodesPrefixSumsShader` in the inspector.");
             return;
         }
+        if (numParticles == 0) return;
 
-        int clearBuffersKernel = nodesPrefixSumsShader.FindKernel("clearBuffers");
-        nodesPrefixSumsShader.SetBuffer(clearBuffersKernel, "indicators", indicators);
-        nodesPrefixSumsShader.SetBuffer(clearBuffersKernel, "prefixSums", prefixSums);
-        nodesPrefixSumsShader.SetBuffer(clearBuffersKernel, "uniqueIndices", uniqueIndices);
-        nodesPrefixSumsShader.SetBuffer(clearBuffersKernel, "activeIndices", activeIndices);
-        nodesPrefixSumsShader.SetBuffer(clearBuffersKernel, "uniqueCount", uniqueCount);
-        nodesPrefixSumsShader.SetBuffer(clearBuffersKernel, "activeCount", activeCount);
+        int clearUniqueBuffersKernel = nodesPrefixSumsShader.FindKernel("clearUniqueBuffers");
+        nodesPrefixSumsShader.SetBuffer(clearUniqueBuffersKernel, "indicators", indicators);
+        nodesPrefixSumsShader.SetBuffer(clearUniqueBuffersKernel, "uniqueIndices", uniqueIndices);
         nodesPrefixSumsShader.SetInt("len", numParticles);
         int groupsLinear = (numParticles + 511) / 512;
-        nodesPrefixSumsShader.Dispatch(clearBuffersKernel, groupsLinear, 1, 1);
+        nodesPrefixSumsShader.Dispatch(clearUniqueBuffersKernel, groupsLinear, 1, 1);
+    }
+
+    private void ClearActiveBuffers()
+    {
+        if (nodesPrefixSumsShader == null)
+        {
+            Debug.LogError("NodesPrefixSums compute shader is not assigned. Please assign `nodesPrefixSumsShader` in the inspector.");
+            return;
+        }
+        if (numParticles == 0) return;
+        
+        int clearActiveBuffersKernel = nodesPrefixSumsShader.FindKernel("clearActiveBuffers");
+        nodesPrefixSumsShader.SetBuffer(clearActiveBuffersKernel, "indicators", indicators);
+        nodesPrefixSumsShader.SetBuffer(clearActiveBuffersKernel, "activeIndices", activeIndices);
+        nodesPrefixSumsShader.SetInt("len", numParticles);
+        int groupsLinear = (numParticles + 511) / 512;
+        nodesPrefixSumsShader.Dispatch(clearActiveBuffersKernel, groupsLinear, 1, 1);
     }
 
     // Simple debug visualization using Gizmos
