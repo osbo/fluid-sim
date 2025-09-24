@@ -151,7 +151,10 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
     } else {
         for (uint i = sortedArrayIndex; i < nextUniqueIndex; i++)
         {
-            nodesBuffer[i].layer = layer;
+            Node node = nodesBuffer[i];
+            if (node.layer > layer) {
+                node.layer = layer;
+            }
         }
     }
 }
@@ -212,7 +215,10 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
     } else {
         for (uint i = uniqueActiveIndex; i < nextUniqueActiveIndex; i++)
         {
-            nodesBuffer[activeIndices[i]].layer = layer;
+            Node node = nodesBuffer[activeIndices[i]];
+            if (node.layer > layer) {
+                nodesBuffer[activeIndices[i]].layer = layer;
+            }
         }
     }
 }
