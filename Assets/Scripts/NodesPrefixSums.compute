@@ -1,4 +1,4 @@
-#pragma kernel markUniques
+#pragma kernel markUniqueParticles
 #pragma kernel markUniquesPrefix
 #pragma kernel markActiveNodes
 #pragma kernel markActiveUniquesPrefix
@@ -8,6 +8,7 @@
 #pragma kernel scatterActives
 #pragma kernel writeUniqueCount
 #pragma kernel writeActiveCount
+#pragma kernel clearBuffers
 
 #define SCAN_BLOCKSIZE 512
 
@@ -15,6 +16,7 @@
 RWStructuredBuffer<uint> sortedMortonCodes;      // input: sorted morton codes
 RWStructuredBuffer<uint> sortedIndices;          // input: sorted particle indices (same order as codes)
 RWStructuredBuffer<uint> nodeFlagsBuffer;        // input: node flags
+RWStructuredBuffer<uint> nodeMortonCodes;        // input: morton codes for nodes
 
 RWStructuredBuffer<uint> indicators;             // temp: e (0/1) indicators
 RWStructuredBuffer<uint> prefixSums;             // temp: f (exclusive scan)
@@ -33,7 +35,7 @@ uint prefixBits;                                 // number of bits to shift righ
 groupshared uint scan_array[SCAN_BLOCKSIZE * 2];
 
 [numthreads(512, 1, 1)]
-void markUniques(uint3 id : SV_DispatchThreadID)
+void markUniqueParticles(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i >= len) return;
@@ -60,8 +62,8 @@ void markUniquesPrefix(uint3 id : SV_DispatchThreadID)
     if (i == 0) {
         isUnique = 1;
     } else {
-        uint curr = sortedMortonCodes[i] >> prefixBits;
-        uint prev = sortedMortonCodes[i - 1] >> prefixBits;
+        uint curr = nodeMortonCodes[i] >> prefixBits;
+        uint prev = nodeMortonCodes[i - 1] >> prefixBits;
         isUnique = (curr != prev) ? 1u : 0u;
     }
 
@@ -79,8 +81,8 @@ void markActiveUniquesPrefix(uint3 id : SV_DispatchThreadID)
     if (i == 0) {
         isUnique = 1;
     } else {
-        uint curr = sortedMortonCodes[activeIndices[i]] >> prefixBits;
-        uint prev = sortedMortonCodes[activeIndices[i - 1]] >> prefixBits;
+        uint curr = nodeMortonCodes[activeIndices[i]] >> prefixBits;
+        uint prev = nodeMortonCodes[activeIndices[i - 1]] >> prefixBits;
         isUnique = (curr != prev) ? 1u : 0u;
     }
 
@@ -189,4 +191,20 @@ void writeActiveCount(uint3 id : SV_DispatchThreadID)
     if (len == 0) { activeCount[0] = 0; return; }
     uint last = len - 1;
     activeCount[0] = prefixSums[last] + indicators[last];
+}
+
+[numthreads(512, 1, 1)]
+void clearBuffers(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= len) return;
+    // if (i == 0) {
+    //     uniqueCount[0] = 0;
+    //     activeCount[0] = 0;
+    // }
+
+    indicators[i] = 0;
+    // prefixSums[i] = 0;
+    uniqueIndices[i] = 0;
+    // activeIndices[i] = 0;
 }
