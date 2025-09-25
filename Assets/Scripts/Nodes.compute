@@ -50,7 +50,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     uint sortedArrayIndex = uniqueIndices[threadIndex];
     
     // Find how many particles share this morton code
-    uint nextUniqueIndex = threadIndex + 1 < numUniqueActiveNodes ? uniqueIndices[threadIndex + 1] : numNodes;
+    uint nextUniqueIndex = threadIndex + 1 < numNodes ? uniqueIndices[threadIndex + 1] : numParticles;
     
     // Aggregate particle data with weighted average
     float3 weightedPosition = float3(0, 0, 0);
@@ -133,8 +133,11 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
             minLayer = min(minLayer, node.layer);
         }
         
-        weightedPosition /= totalWeight;
-        weightedVelocity /= totalWeight;
+        // Safety check: prevent division by zero
+        if (totalWeight > 0.0) {
+            weightedPosition /= totalWeight;
+            weightedVelocity /= totalWeight;
+        }
 
         Node aggregatedNode;
         aggregatedNode.position = weightedPosition;
@@ -197,8 +200,11 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             minLayer = min(minLayer, node.layer);
         }
 
-        weightedPosition /= totalWeight;
-        weightedVelocity /= totalWeight;
+        // Safety check: prevent division by zero
+        if (totalWeight > 0.0) {
+            weightedPosition /= totalWeight;
+            weightedVelocity /= totalWeight;
+        }
 
         Node aggregatedNode;
         aggregatedNode.position = weightedPosition;
