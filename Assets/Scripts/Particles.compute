@@ -1,6 +1,7 @@
 // Each #kernel tells which function to compile; you can have many kernels
 #pragma kernel CSMain
 #pragma kernel InitializeParticles
+#pragma kernel AdvectParticles
 
 // 32-bit Morton code encoding function (adapted from 64-bit Swift/Metal version)
 uint EncodeMorton3D(float3 pos)
@@ -22,11 +23,21 @@ uint EncodeMorton3D(float3 pos)
     return result;
 }
 
+struct faceVelocities
+{
+    float left;
+    float right;
+    float bottom;
+    float top;
+    float front;
+    float back;
+};
+
 // Particle struct definition
 struct Particle
 {
     float3 position;    // 3-component position vector
-    float3 velocity;    // 3-component velocity vector
+    faceVelocities velocities;    // float face velocities
     uint layer;         // Layer units
     uint mortonCode;    // Morton code for spatial indexing
 };
@@ -44,6 +55,8 @@ float3 simulationBoundsMin;
 float3 simulationBoundsMax;
 float3 mortonNormalizationFactor;
 float mortonMaxValue;
+float gravity;
+float deltaTime;
 
 // Grid parameters for even particle distribution
 uint3 gridDimensions;
@@ -72,7 +85,12 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     
     // Initialize particle with zero values
     Particle particle;
-    particle.velocity = float3(0.0, 0.0, 0.0);
+    particle.velocities.left = 0.0;
+    particle.velocities.right = 0.0;
+    particle.velocities.bottom = 0.0;
+    particle.velocities.top = 0.0;
+    particle.velocities.front = 0.0;
+    particle.velocities.back = 0.0;
     
     // Calculate grid position using morton code major order (Z, Y, X)
     // This ensures particles are distributed evenly throughout the volume
@@ -89,9 +107,14 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // Set layer based on position: far vertical face (Z=0) gets layer 0, others get layer 11
     // bool onBoundary = (gridX == 0) || (gridY == 0) || (gridZ == 0) ||
 	// 	(gridX == (uint)gridDimensions.x - 1) || (gridY == (uint)gridDimensions.y - 1) || (gridZ == (uint)gridDimensions.z - 1);
-    bool onBoundary = (gridX == 0) || (gridY == 0) || (gridZ == 0);
+    // bool onBoundary = (gridX == 0) || (gridY == 0);
+    bool onBoundary = (gridX == 0);
 	particle.layer = onBoundary ? 0 : 11;
     // particle.layer = 9;
+
+    // if (gridX == 0) {
+    //     particle.velocities.left = 1;
+    // }
     
     // Reverse X axis to make particles initially unsorted
     gridX = (uint)gridDimensions.x - 1 - gridX;
@@ -101,24 +124,48 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     float3 gridOffset = float3(gridX, gridY, gridZ) * gridSpacing;
     particle.position = fluidInitialBoundsMin + gridOffset;
     
-    // Normalize position to morton code range using pre-calculated factors
-    float3 normalizedPos = (particle.position - simulationBoundsMin) * mortonNormalizationFactor;
-    
-    // Clamp to valid range using pre-calculated max value
-    normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
-    
     // Generate morton code from normalized position
-    particle.mortonCode = EncodeMorton3D(normalizedPos);
+    // particle.mortonCode = EncodeMorton3D(normalizedPos);
+    particle.mortonCode = 0;
 
     // particle.layer = particle.mortonCode % 10;
     
     // Write particle to buffer
     particlesBuffer[index] = particle;
     
+    // Note: nodeFlagsBuffer initialization moved to CreateNodes() in Nodes.compute
+}
+
+[numthreads(64,1,1)]
+void AdvectParticles (uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= count) return;
+
+    Particle particle = particlesBuffer[index];
+    faceVelocities velocities = particle.velocities;
+
+    // Vectors point outward from the face
+
+    velocities.bottom += gravity * deltaTime;
+    velocities.top -= gravity * deltaTime;
+
+    float3 velocity = float3(velocities.right - velocities.left, velocities.front - velocities.back, velocities.top - velocities.bottom);
+
+    float3 position = particle.position + velocity * deltaTime;
+
+    particle.position = position;
+    particle.velocities = velocities;
+
+    float3 normalizedPos = (position - simulationBoundsMin) * mortonNormalizationFactor;
+    normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
+
+    particle.mortonCode = EncodeMorton3D(normalizedPos);
+
+    particlesBuffer[index] = particle;
+    
     // Write morton code and index to separate buffers
     mortonCodesBuffer[index] = particle.mortonCode;
     particleIndicesBuffer[index] = index;
-    
-    // Note: nodeFlagsBuffer initialization moved to CreateNodes() in Nodes.compute
 }
 

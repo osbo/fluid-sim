@@ -2,11 +2,21 @@
 #pragma kernel ProcessLeaves
 #pragma kernel ProcessNodes
 
+struct faceVelocities
+{
+    float left;
+    float right;
+    float bottom;
+    float top;
+    float front;
+    float back;
+};
+
 // Particle struct (must match C# struct)
 struct Particle
 {
     float3 position;    // 12 bytes
-    float3 velocity;    // 12 bytes
+    faceVelocities velocities;    // 24 bytes
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
 };
@@ -15,7 +25,7 @@ struct Particle
 struct Node
 {
     float3 position;    // 12 bytes
-    float3 velocity;    // 12 bytes
+    faceVelocities velocities;    // 24 bytes
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
 };
@@ -54,7 +64,13 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     
     // Aggregate particle data with weighted average
     float3 weightedPosition = float3(0, 0, 0);
-    float3 weightedVelocity = float3(0, 0, 0);
+    faceVelocities weightedVelocity;
+    weightedVelocity.left = 0.0;
+    weightedVelocity.right = 0.0;
+    weightedVelocity.bottom = 0.0;
+    weightedVelocity.top = 0.0;
+    weightedVelocity.front = 0.0;
+    weightedVelocity.back = 0.0;
     float totalWeight = 0.0;
     uint minLayer = 11;
     
@@ -68,7 +84,12 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         float weight = pow(8.0, (float)particle.layer);
         
         weightedPosition += particle.position * weight;
-        weightedVelocity += particle.velocity * weight;
+        weightedVelocity.left += particle.velocities.left * weight;
+        weightedVelocity.right += particle.velocities.right * weight;
+        weightedVelocity.bottom += particle.velocities.bottom * weight;
+        weightedVelocity.top += particle.velocities.top * weight;
+        weightedVelocity.front += particle.velocities.front * weight;
+        weightedVelocity.back += particle.velocities.back * weight;
         totalWeight += weight;
         
         // Track minimum layer
@@ -76,15 +97,23 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     }
     
     // Normalize by total weight (center of mass)
-    weightedPosition /= totalWeight;
-    weightedVelocity /= totalWeight;
+    // Safety check: prevent division by zero
+    if (totalWeight > 0.0) {
+        weightedPosition /= totalWeight;
+        weightedVelocity.left /= totalWeight;
+        weightedVelocity.right /= totalWeight;
+        weightedVelocity.bottom /= totalWeight;
+        weightedVelocity.top /= totalWeight;
+        weightedVelocity.front /= totalWeight;
+        weightedVelocity.back /= totalWeight;
+    }
 
     uint mortonCode = particlesBuffer[sortedParticleIndices[sortedArrayIndex]].mortonCode;
     
     // Create the node
     Node node;
     node.position = weightedPosition;
-    node.velocity = weightedVelocity;
+    node.velocities = weightedVelocity;
     node.layer = minLayer;  // Use the minimum layer found
     node.mortonCode = mortonCode;
     
@@ -120,7 +149,13 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
     if (coarsen)
     {
         float3 weightedPosition = float3(0, 0, 0);
-        float3 weightedVelocity = float3(0, 0, 0);
+        faceVelocities weightedVelocity;
+        weightedVelocity.left = 0.0;
+        weightedVelocity.right = 0.0;
+        weightedVelocity.bottom = 0.0;
+        weightedVelocity.top = 0.0;
+        weightedVelocity.front = 0.0;
+        weightedVelocity.back = 0.0;
         float totalWeight = 0.0;
         uint minLayer = 11;
 
@@ -128,7 +163,13 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
         {
             Node node = nodesBuffer[i];
             weightedPosition += node.position * pow(8.0, (float)node.layer);
-            weightedVelocity += node.velocity * pow(8.0, (float)node.layer);
+            float weight = pow(8.0, (float)node.layer);
+            weightedVelocity.left += node.velocities.left * weight;
+            weightedVelocity.right += node.velocities.right * weight;
+            weightedVelocity.bottom += node.velocities.bottom * weight;
+            weightedVelocity.top += node.velocities.top * weight;
+            weightedVelocity.front += node.velocities.front * weight;
+            weightedVelocity.back += node.velocities.back * weight;
             totalWeight += pow(8.0, (float)node.layer);
             minLayer = min(minLayer, node.layer);
         }
@@ -136,12 +177,17 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
         // Safety check: prevent division by zero
         if (totalWeight > 0.0) {
             weightedPosition /= totalWeight;
-            weightedVelocity /= totalWeight;
+            weightedVelocity.left /= totalWeight;
+            weightedVelocity.right /= totalWeight;
+            weightedVelocity.bottom /= totalWeight;
+            weightedVelocity.top /= totalWeight;
+            weightedVelocity.front /= totalWeight;
+            weightedVelocity.back /= totalWeight;
         }
 
         Node aggregatedNode;
         aggregatedNode.position = weightedPosition;
-        aggregatedNode.velocity = weightedVelocity;
+        aggregatedNode.velocities = weightedVelocity;
         aggregatedNode.layer = minLayer;
         aggregatedNode.mortonCode = nodesBuffer[sortedArrayIndex].mortonCode;
 
@@ -187,7 +233,13 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
     if (coarsen)
     {
         float3 weightedPosition = float3(0, 0, 0);
-        float3 weightedVelocity = float3(0, 0, 0);
+        faceVelocities weightedVelocity;
+        weightedVelocity.left = 0.0;
+        weightedVelocity.right = 0.0;
+        weightedVelocity.bottom = 0.0;
+        weightedVelocity.top = 0.0;
+        weightedVelocity.front = 0.0;
+        weightedVelocity.back = 0.0;
         float totalWeight = 0.0;
         uint minLayer = 11;
 
@@ -195,7 +247,13 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         {
             Node node = nodesBuffer[activeIndices[i]];
             weightedPosition += node.position * pow(8.0, (float)node.layer);
-            weightedVelocity += node.velocity * pow(8.0, (float)node.layer);
+            float weight = pow(8.0, (float)node.layer);
+            weightedVelocity.left += node.velocities.left * weight;
+            weightedVelocity.right += node.velocities.right * weight;
+            weightedVelocity.bottom += node.velocities.bottom * weight;
+            weightedVelocity.top += node.velocities.top * weight;
+            weightedVelocity.front += node.velocities.front * weight;
+            weightedVelocity.back += node.velocities.back * weight;
             totalWeight += pow(8.0, (float)node.layer);
             minLayer = min(minLayer, node.layer);
         }
@@ -203,12 +261,17 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         // Safety check: prevent division by zero
         if (totalWeight > 0.0) {
             weightedPosition /= totalWeight;
-            weightedVelocity /= totalWeight;
+            weightedVelocity.left /= totalWeight;
+            weightedVelocity.right /= totalWeight;
+            weightedVelocity.bottom /= totalWeight;
+            weightedVelocity.top /= totalWeight;
+            weightedVelocity.front /= totalWeight;
+            weightedVelocity.back /= totalWeight;
         }
 
         Node aggregatedNode;
         aggregatedNode.position = weightedPosition;
-        aggregatedNode.velocity = weightedVelocity;
+        aggregatedNode.velocities = weightedVelocity;
         aggregatedNode.layer = minLayer;
         aggregatedNode.mortonCode = nodesBuffer[activeIndices[uniqueActiveIndex]].mortonCode;
 
@@ -223,7 +286,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         {
             Node node = nodesBuffer[activeIndices[i]];
             if (node.layer > layer) {
-                nodesBuffer[activeIndices[i]].layer = layer;
+                nodesBuffer[activeIndices[i]].layer = layer - 1;
             }
         }
     }
