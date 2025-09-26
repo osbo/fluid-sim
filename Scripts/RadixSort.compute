@@ -125,7 +125,7 @@ void copyIndices(uint3 id : SV_DispatchThreadID)
     outputIndices[tid] = inputIndices[tid];
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(512, 1, 1)]
 void clearBuffer32(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
@@ -134,7 +134,7 @@ void clearBuffer32(uint3 id : SV_DispatchThreadID)
     }
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(512, 1, 1)]
 void clearBuffer64(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
