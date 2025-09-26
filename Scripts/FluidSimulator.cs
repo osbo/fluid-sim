@@ -995,24 +995,24 @@ public class FluidSimulator : MonoBehaviour
             new Color(0f, 0.5f, 0.5f) // Teal - Layer 10
         };
         
-        for (int i = 0; i < numActiveNodes; i++)
-        {
-            Node node = nodesCPU[activeIndicesCpu[i]];
-            int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
-            Gizmos.color = layerColors[layerIndex];
-            Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        }
-
-        // Particle[] particlesCPU = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesCPU);
-
-        // for (int i = 0; i < numParticles; i++)
+        // for (int i = 0; i < numActiveNodes; i++)
         // {
-        //     Particle particle = particlesCPU[i];
-        //     int layerIndex = Mathf.Clamp((int)particle.layer, 0, layerColors.Length - 1);
+        //     Node node = nodesCPU[activeIndicesCpu[i]];
+        //     int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
         //     Gizmos.color = layerColors[layerIndex];
-        //     Gizmos.DrawCube(particle.position, Vector3.one * 0.25f);
+        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
         // }
+
+        Particle[] particlesCPU = new Particle[numParticles];
+        particlesBuffer.GetData(particlesCPU);
+
+        for (int i = 0; i < numParticles; i++)
+        {
+            Particle particle = particlesCPU[i];
+            int layerIndex = Mathf.Clamp((int)particle.layer, 0, layerColors.Length - 1);
+            Gizmos.color = layerColors[layerIndex];
+            Gizmos.DrawCube(particle.position, Vector3.one * 0.25f);
+        }
     }
 
     private Vector3 DecodeMorton3D(Node node)

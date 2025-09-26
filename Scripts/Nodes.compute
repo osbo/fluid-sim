@@ -202,7 +202,7 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
         {
             Node node = nodesBuffer[i];
             if (node.layer > layer) {
-                node.layer = layer;
+                node.layer = layer - 1;
             }
         }
     }
