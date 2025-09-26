@@ -53,11 +53,27 @@ public class FluidSimulator : MonoBehaviour
     private int numUniqueActiveNodes;
     private int layer;
     
+    // Simulation parameters (calculated in InitializeParticleSystem)
+    private Vector3 mortonNormalizationFactor;
+    private float mortonMaxValue;
+    private Vector3 simulationBoundsMin;
+    private Vector3 simulationBoundsMax;
+
+    private struct faceVelocities
+    {
+        public float left;
+        public float right;
+        public float bottom;
+        public float top;
+        public float front;
+        public float back;
+    }
+    
     // Particle struct (must match compute shader)
     private struct Particle
     {
         public Vector3 position;    // 12 bytes
-        public Vector3 velocity;    // 12 bytes
+        public faceVelocities velocities; // 6*4 = 24 bytes
         public uint layer;          // 4 bytes
         public uint mortonCode;     // 4 bytes
     }
@@ -66,7 +82,7 @@ public class FluidSimulator : MonoBehaviour
     private struct Node
     {
         public Vector3 position;    // 12 bytes
-        public Vector3 velocity;    // 12 bytes
+        public faceVelocities velocities; // 6*4 = 24 bytes
         public uint layer;          // 4 bytes
         public uint mortonCode;     // 4 bytes
     }
@@ -88,6 +104,8 @@ public class FluidSimulator : MonoBehaviour
             }
         }
         Debug.Log(str);
+
+        AdvectParticles();
 
         SortParticles();
         PrefixSumParticlesCodes();
@@ -155,7 +173,7 @@ public class FluidSimulator : MonoBehaviour
         }
         Debug.Log(str);
 
-        for (layer = 2; layer <= 9; layer++)
+        for (layer = 2; layer <= 10; layer++)
         // for (layer = 2; layer <= 7; layer++)
         {
             prefixSumActiveNodes();
@@ -235,7 +253,7 @@ public class FluidSimulator : MonoBehaviour
         initializeParticlesKernel = particlesShader.FindKernel("InitializeParticles");
         
         // Create buffers
-        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 32 bytes
+        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) + sizeof(uint)); // 12 + 24 + 4 + 4 = 44 bytes
         mortonCodesBuffer = new ComputeBuffer(numParticles, sizeof(uint));
         particleIndicesBuffer = new ComputeBuffer(numParticles, sizeof(uint));
         // nodeFlagsBuffer created later in CreateNodes() with correct size
@@ -250,8 +268,8 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetInt("count", numParticles);
         
         // Calculate bounds
-        Vector3 simulationBoundsMin = simulationBounds.bounds.min;
-        Vector3 simulationBoundsMax = simulationBounds.bounds.max;
+        simulationBoundsMin = simulationBounds.bounds.min;
+        simulationBoundsMax = simulationBounds.bounds.max;
         
         // Get fluid initial bounds from the GameObject's transform
         Vector3 fluidInitialBoundsMin = fluidInitialBounds.transform.position - fluidInitialBounds.transform.localScale * 0.5f;
@@ -262,14 +280,14 @@ public class FluidSimulator : MonoBehaviour
         
         // For 32-bit Morton codes: 10 bits per axis = 1024 possible values (0-1023)
         // Normalize each axis to 0-1023 range
-        Vector3 mortonNormalizationFactor = new Vector3(
+        mortonNormalizationFactor = new Vector3(
             1023.0f / simulationSize.x,
             1023.0f / simulationSize.y,
             1023.0f / simulationSize.z
         );
         
         // Max morton value is 1023 for each axis
-        float mortonMaxValue = 1023.0f;
+        mortonMaxValue = 1023.0f;
         
         // Calculate grid dimensions for even particle distribution
         Vector3 fluidInitialSize = fluidInitialBoundsMax - fluidInitialBoundsMin;
@@ -333,6 +351,33 @@ public class FluidSimulator : MonoBehaviour
         // Dispatch the kernel
         int threadGroups = Mathf.CeilToInt(numParticles / 64.0f);
         particlesShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
+    }
+
+    private void AdvectParticles()
+    {
+        if (particlesShader == null)
+        {
+            Debug.LogError("Particles compute shader is not assigned. Please assign `particlesShader` in the inspector.");
+            return;
+        }
+
+        int advectParticlesKernel = particlesShader.FindKernel("AdvectParticles");
+
+        float deltaTime = (1/60.0f);
+        float gravity = 9.81f;
+        
+        particlesShader.SetBuffer(advectParticlesKernel, "particlesBuffer", particlesBuffer);
+        particlesShader.SetBuffer(advectParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
+        particlesShader.SetBuffer(advectParticlesKernel, "particleIndicesBuffer", particleIndicesBuffer);
+        particlesShader.SetInt("numParticles", numParticles);
+        particlesShader.SetFloat("deltaTime", deltaTime);
+        particlesShader.SetFloat("gravity", gravity);
+        particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
+        particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
+        particlesShader.SetVector("simulationBoundsMin", simulationBoundsMin);
+        particlesShader.SetVector("simulationBoundsMax", simulationBoundsMax);
+        int threadGroups = Mathf.CeilToInt(numParticles / 64.0f);
+        particlesShader.Dispatch(advectParticlesKernel, threadGroups, 1, 1);
     }
     
     private void SortParticles()
@@ -456,7 +501,7 @@ public class FluidSimulator : MonoBehaviour
         createLeavesKernel = nodesShader.FindKernel("CreateLeaves");
 
         // Create node buffers
-        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 32 bytes
+        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) + sizeof(uint)); // 12 + 24 + 4 + 4 = 44 bytes
         nodeMortonCodes = new ComputeBuffer(numNodes, sizeof(uint));
         nodeIndices = new ComputeBuffer(numNodes, sizeof(uint));
         nodeFlagsBuffer = new ComputeBuffer(numNodes, sizeof(uint)); // 4 bytes (packed flags)
