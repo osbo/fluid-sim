@@ -349,7 +349,9 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetVector("gridSpacing", actualGridSpacing);
         
         // Dispatch the kernel
-        int threadGroups = Mathf.CeilToInt(numParticles / 64.0f);
+        particlesShader.SetFloat("dispersionPower", 4.0f); // higher = stronger skew
+        particlesShader.SetFloat("boundaryThreshold", 0.01f); // near-left threshold in normalized X
+        int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
     }
 
@@ -376,7 +378,7 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
         particlesShader.SetVector("simulationBoundsMin", simulationBoundsMin);
         particlesShader.SetVector("simulationBoundsMax", simulationBoundsMax);
-        int threadGroups = Mathf.CeilToInt(numParticles / 64.0f);
+        int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(advectParticlesKernel, threadGroups, 1, 1);
     }
     
@@ -518,7 +520,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("numParticles", numParticles);
 
         // Dispatch the kernel
-        int threadGroups = Mathf.CeilToInt(numNodes / 64.0f);
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(createLeavesKernel, threadGroups, 1, 1);
     }
 
@@ -622,7 +624,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("layer", 1);
 
         // Dispatch one thread per unique node
-        int threadGroups = Mathf.CeilToInt(numUniqueActiveNodes / 64.0f);
+        int threadGroups = Mathf.CeilToInt(numUniqueActiveNodes / 512.0f);
         nodesShader.Dispatch(processLeavesKernel, threadGroups, 1, 1);
     }
 
@@ -921,7 +923,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("layer", layer);
         
         // Dispatch one thread per unique node
-        int threadGroups = Mathf.CeilToInt(numUniqueActiveNodes / 64.0f);
+        int threadGroups = Mathf.CeilToInt(numUniqueActiveNodes / 512.0f);
         nodesShader.Dispatch(processNodesKernel, threadGroups, 1, 1);
     }
 
@@ -1000,6 +1002,17 @@ public class FluidSimulator : MonoBehaviour
             Gizmos.color = layerColors[layerIndex];
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
         }
+
+        // Particle[] particlesCPU = new Particle[numParticles];
+        // particlesBuffer.GetData(particlesCPU);
+
+        // for (int i = 0; i < numParticles; i++)
+        // {
+        //     Particle particle = particlesCPU[i];
+        //     int layerIndex = Mathf.Clamp((int)particle.layer, 0, layerColors.Length - 1);
+        //     Gizmos.color = layerColors[layerIndex];
+        //     Gizmos.DrawCube(particle.position, Vector3.one * 0.25f);
+        // }
     }
 
     private Vector3 DecodeMorton3D(Node node)
@@ -1247,7 +1260,7 @@ public class RadixSort
     {
         sortShader.SetBuffer(clearBuffer32Kernel, "output", buffer);
         sortShader.SetInt("count", (int)count);
-        int threadGroups = (int)((count + 63) / 64);
+        int threadGroups = (int)((count + 511) / 512);
         sortShader.Dispatch(clearBuffer32Kernel, threadGroups, 1, 1);
     }
 }

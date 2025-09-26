@@ -50,7 +50,7 @@ uint numNodes;                                          // number of nodes
 uint numParticles;                                      // total number of particles
 uint layer;                                             // current hierarchical layer
 
-[numthreads(64, 1, 1)]
+[numthreads(512, 1, 1)]
 void CreateLeaves(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
@@ -124,7 +124,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     nodeFlagsBuffer[threadIndex] = 1;      // Initialize to 01
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(512, 1, 1)]
 void ProcessLeaves(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
@@ -208,7 +208,7 @@ void ProcessLeaves(uint3 id : SV_DispatchThreadID)
     }
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(512, 1, 1)]
 void ProcessNodes(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
