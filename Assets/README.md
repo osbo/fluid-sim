@@ -1,41 +1,38 @@
-//======================================================================
-// Octree Construction from Particle Data - Pseudocode
-//
-// This process builds a hierarchical octree grid from a list of
-// particles in a parallel, bottom-up fashion.
-//
-// Input Buffers:
-// - particlesBuffer: Contains all particle data (position, velocity, etc.).
-// - mortonCodesBuffer: Morton code for each particle.
-// - particleIndicesBuffer: Original index for each particle (0 to N-1).
-//======================================================================
+# Fluid Simulation with Octree Construction
 
-PROCEDURE BuildOctree(particlesBuffer, mortonCodesBuffer, particleIndicesBuffer)
+This project implements a GPU-accelerated fluid simulation using hierarchical octree construction from particle data. The simulation builds a hierarchical octree grid from a list of particles in a parallel, bottom-up fashion.
 
-//------------------------------------------------------------------
-// STEP 1: SORT PARTICLES
-// Sort particles based on their Morton codes. This groups particles
-// that are close to each other in 3D space. A radix sort is used
-// for efficiency on the GPU.
-//------------------------------------------------------------------
+## Overview
 
+The octree construction process groups particles that are close to each other in 3D space using Morton codes, then builds a hierarchical structure that can be used for efficient neighbor finding and collision detection in fluid simulations.
+
+## Input Buffers
+
+- **`particlesBuffer`**: Contains all particle data (position, velocity, etc.)
+- **`mortonCodesBuffer`**: Morton code for each particle
+- **`particleIndicesBuffer`**: Original index for each particle (0 to N-1)
+
+## Algorithm
+
+### Step 1: Sort Particles
+
+Sort particles based on their Morton codes. This groups particles that are close to each other in 3D space. A radix sort is used for efficiency on the GPU.
+
+```pseudocode
 sortedMortonCodes, sortedParticleIndices = RadixSort(mortonCodesBuffer, particleIndicesBuffer)
 // Result: sortedMortonCodes and sortedParticleIndices now contain the Morton
 // codes and original particle indices, sorted identically.
+```
 
+### Step 2: Identify Unique Particles & Create Leaf Nodes
 
-//------------------------------------------------------------------
-// STEP 2: IDENTIFY UNIQUE PARTICLES & CREATE LEAF NODES
-// Find the first occurrence of each unique Morton code in the sorted list.
-// Each unique code corresponds to a leaf node in the octree.
-// This is done using a parallel scan (prefix sum) operation.
-//------------------------------------------------------------------
+Find the first occurrence of each unique Morton code in the sorted list. Each unique code corresponds to a leaf node in the octree. This is done using a parallel scan (prefix sum) operation.
 
-// 2a. Mark Unique Particles
-// Create an "indicators" buffer of the same size as the particle count.
-// For each particle in the sorted list, mark it with a '1' if its Morton
-// code is different from the previous one, otherwise mark with '0'.
-// The first particle is always marked '1'.
+#### 2a. Mark Unique Particles
+
+Create an "indicators" buffer of the same size as the particle count. For each particle in the sorted list, mark it with a '1' if its Morton code is different from the previous one, otherwise mark with '0'. The first particle is always marked '1'.
+
+```pseudocode
 FOR EACH particle i IN PARALLEL:
     IF i == 0 THEN
         indicators[i] = 1
@@ -45,32 +42,43 @@ FOR EACH particle i IN PARALLEL:
         indicators[i] = 0
     END IF
 END FOR
+```
 
-// 2b. Perform Exclusive Scan (Prefix Sum) on Indicators
-// This calculates the destination index for each unique particle.
+#### 2b. Perform Exclusive Scan (Prefix Sum) on Indicators
+
+This calculates the destination index for each unique particle.
+
+```pseudocode
 prefixSums = ExclusiveScan(indicators)
 // Result: prefixSums[i] now holds the count of unique particles before index i.
+```
 
-// 2c. Get Total Unique Count
-// The total number of unique particles (leaf nodes) is the sum of the last
-// element of the prefix sum and the last indicator.
+#### 2c. Get Total Unique Count
+
+The total number of unique particles (leaf nodes) is the sum of the last element of the prefix sum and the last indicator.
+
+```pseudocode
 numNodes = prefixSums[numParticles - 1] + indicators[numParticles - 1]
+```
 
-// 2d. Scatter Unique Indices
-// Create a new buffer `uniqueIndices` to store the indices of the unique particles.
-// Each thread checks its indicator. If it's 1, it writes its own index
-// into the `uniqueIndices` buffer at the location calculated by the prefix sum.
+#### 2d. Scatter Unique Indices
+
+Create a new buffer `uniqueIndices` to store the indices of the unique particles. Each thread checks its indicator. If it's 1, it writes its own index into the `uniqueIndices` buffer at the location calculated by the prefix sum.
+
+```pseudocode
 FOR EACH particle i IN PARALLEL:
     IF indicators[i] == 1 THEN
         destinationIndex = prefixSums[i]
         uniqueIndices[destinationIndex] = i // Store the index from the *sorted* array
     END IF
 END FOR
+```
 
-// 2e. Create Leaf Nodes
-// For each unique particle, create a leaf node. The node's properties (position,
-// velocity) are the weighted average of all particles sharing that same Morton code.
-// All leaf nodes are initially marked as "active".
+#### 2e. Create Leaf Nodes
+
+For each unique particle, create a leaf node. The node's properties (position, velocity) are the weighted average of all particles sharing that same Morton code. All leaf nodes are initially marked as "active".
+
+```pseudocode
 FOR EACH unique particle j IN PARALLEL (from 0 to numNodes-1):
     startIndex = uniqueIndices[j]
     endIndex = (j + 1 < numNodes) ? uniqueIndices[j + 1] : numParticles
@@ -85,14 +93,13 @@ FOR EACH unique particle j IN PARALLEL (from 0 to numNodes-1):
     nodesBuffer[j].layer = 0
     nodeFlagsBuffer[j] = 1 // Mark as active
 END FOR
+```
 
+### Step 3: Hierarchical Coarsening (Bottom-Up Octree Build)
 
-//------------------------------------------------------------------
-// STEP 3: HIERARCHICAL COARSENING (BOTTOM-UP OCTREE BUILD)
-// Iteratively build the octree from the leaf nodes up to the root.
-// In each iteration (layer), we group active nodes from the layer below
-// into parent nodes.
-//------------------------------------------------------------------
+Iteratively build the octree from the leaf nodes up to the root. In each iteration (layer), we group active nodes from the layer below into parent nodes.
+
+```pseudocode
 FOR layer = 1 TO 10:
 
     // 3a. Find all currently active nodes
@@ -167,5 +174,29 @@ FOR layer = 1 TO 10:
     END FOR
 
 END FOR // End of layer loop
+```
 
-END PROCEDURE
+## Files
+
+- **`FluidSimulator.cs`**: Main Unity script for the fluid simulation
+- **`Nodes.compute`**: GPU compute shader for octree node operations
+- **`NodesPrefixSums.compute`**: GPU compute shader for prefix sum operations
+- **`Particles.compute`**: GPU compute shader for particle operations
+- **`RadixSort.compute`**: GPU compute shader for radix sorting
+
+## Requirements
+
+- Unity 2022.3 or later
+- Universal Render Pipeline (URP)
+- Compute shader support
+
+## Usage
+
+1. Open the project in Unity
+2. Load the `SampleScene` scene
+3. The fluid simulation will start automatically
+4. Adjust simulation parameters in the `FluidSimulator` component
+
+## License
+
+This project is part of MIT UROP research work.
