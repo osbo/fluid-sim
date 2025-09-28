@@ -1,5 +1,4 @@
 // Each #kernel tells which function to compile; you can have many kernels
-#pragma kernel CSMain
 #pragma kernel InitializeParticles
 #pragma kernel AdvectParticles
 
@@ -60,14 +59,6 @@ RWTexture2D<float4> Result;
 
 // Total number of particles to initialize
 uint count;
-
-[numthreads(8,8,1)]
-void CSMain (uint3 id : SV_DispatchThreadID)
-{
-    // TODO: insert actual code here!
-
-    Result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 0.0);
-}
 
 [numthreads(512,1,1)]
 void InitializeParticles (uint3 id : SV_DispatchThreadID)
@@ -156,7 +147,8 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
     position.z = clamp(position.z, simulationBoundsMin.z, simulationBoundsMax.z);
 
     particle.position = position;
-    particle.velocity = velocity;
+    // particle.velocity = velocity;
+    particle.velocity = float3(0.0, -1.0, 0.0);
 
     float3 normalizedPos = (position - simulationBoundsMin) * mortonNormalizationFactor;
     normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);

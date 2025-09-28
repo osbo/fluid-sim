@@ -299,13 +299,13 @@ public class FluidSimulator : MonoBehaviour
                 if (nodesCPU[i].active == 1) {
                     if (nodesCPU[i].layer == 0) {
                         if (leafCount < displayNum) {
-                            str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+                            str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
     
                             leafCount++;
                         }
                     } else {
                         if (internalCount < displayNum) {
-                            str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+                            str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
     
                                 internalCount++;
                         }
@@ -587,7 +587,9 @@ public class FluidSimulator : MonoBehaviour
         // Find kernel
         createLeavesKernel = nodesShader.FindKernel("CreateLeaves");
 
-        // Create node buffers
+        // Create node buffers (release previous ones if they exist)
+        nodesBuffer?.Release();
+        tempNodesBuffer?.Release();
         nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 3); // 12 + 24 + 4 + 4 + 4 = 48 bytes
         tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 3); // 12 + 24 + 4 + 4 + 4 = 48 bytes
 
@@ -1156,6 +1158,7 @@ public class FluidSimulator : MonoBehaviour
         uniqueCount?.Release();
         nodeCount?.Release();
         nodesBuffer?.Release();
+        tempNodesBuffer?.Release();
     }
 }
 
