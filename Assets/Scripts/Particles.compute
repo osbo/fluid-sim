@@ -23,21 +23,11 @@ uint EncodeMorton3D(float3 pos)
     return result;
 }
 
-struct faceVelocities
-{
-    float left;
-    float right;
-    float bottom;
-    float top;
-    float front;
-    float back;
-};
-
 // Particle struct definition
 struct Particle
 {
     float3 position;    // 3-component position vector
-    faceVelocities velocities;    // float face velocities
+    float3 velocity;    // float face velocities
     uint layer;         // Layer units
     uint mortonCode;    // Morton code for spatial indexing
 };
@@ -87,12 +77,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     
     // Initialize particle with zero values
     Particle particle;
-    particle.velocities.left = 0.0;
-    particle.velocities.right = 0.0;
-    particle.velocities.bottom = 0.0;
-    particle.velocities.top = 0.0;
-    particle.velocities.front = 0.0;
-    particle.velocities.back = 0.0;
+    particle.velocity = float3(0.0, 0.0, 0.0);
     
     // Calculate grid position using morton code major order (Z, Y, X)
     // This ensures particles are distributed evenly throughout the volume
@@ -106,12 +91,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     gridY = min(gridY, (uint)gridDimensions.y - 1);
     gridZ = min(gridZ, (uint)gridDimensions.z - 1);
     
-    // Layer assignment will be done after x-dispersion using a near-left threshold
-    // particle.layer = 9;
-
-    // if (gridX == 0) {
-    //     particle.velocities.left = 1;
-    // }
+    // particle.layer = 9;]
     
     // Convert grid position to world position
     // Use grid spacing to position particles evenly within the bounds
@@ -129,8 +109,18 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
 
     particle.position = float3(xPos, basePos.y, basePos.z);
 
-    // Assign layer using threshold on the dense side (currently right-biased)
+    // Calculate center of simulation bounds
+    float3 simulationCenter = (simulationBoundsMin + simulationBoundsMax) * 0.5;
+    
+    // Check if particle is within a small radius of the center
+    float3 centerOffset = particle.position - simulationCenter;
+    float distanceFromCenter = length(centerOffset);
+    float centerRadius = 5; // Small radius around center for layer 0 particles
+    
+    // Assign layer: center particles get layer 0, boundary particles get layer 0, others get layer 11
+    bool nearCenter = (distanceFromCenter <= centerRadius);
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
+    // particle.layer = (nearCenter || onBoundary) ? 0 : 11;
     particle.layer = onBoundary ? 0 : 11;
     
     // Generate morton code from normalized position
@@ -152,19 +142,21 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
     if (index >= count) return;
 
     Particle particle = particlesBuffer[index];
-    faceVelocities velocities = particle.velocities;
+    float3 velocity = particle.velocity;
 
     // Vectors point outward from the face
 
-    velocities.bottom += gravity * deltaTime;
-    velocities.top -= gravity * deltaTime;
-
-    float3 velocity = float3(velocities.right - velocities.left, velocities.front - velocities.back, velocities.top - velocities.bottom);
+    velocity.y -= gravity * deltaTime;
 
     float3 position = particle.position + velocity * deltaTime;
+    
+    // Clamp position to simulation bounds
+    position.x = clamp(position.x, simulationBoundsMin.x, simulationBoundsMax.x);
+    position.y = clamp(position.y, simulationBoundsMin.y, simulationBoundsMax.y);
+    position.z = clamp(position.z, simulationBoundsMin.z, simulationBoundsMax.z);
 
     particle.position = position;
-    particle.velocities = velocities;
+    particle.velocity = velocity;
 
     float3 normalizedPos = (position - simulationBoundsMin) * mortonNormalizationFactor;
     normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
@@ -172,9 +164,4 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
     particle.mortonCode = EncodeMorton3D(normalizedPos);
 
     particlesBuffer[index] = particle;
-    
-    // Write morton code and index to separate buffers
-    mortonCodesBuffer[index] = particle.mortonCode;
-    particleIndicesBuffer[index] = index;
 }
-

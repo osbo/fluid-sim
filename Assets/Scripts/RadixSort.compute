@@ -2,12 +2,20 @@
 #pragma kernel prefixFixup
 #pragma kernel split_prep
 #pragma kernel split_scatter
-#pragma kernel copyBuffer
-#pragma kernel copyIndices
+#pragma kernel copyParticles
 #pragma kernel clearBuffer32
 #pragma kernel clearBuffer64
 
 #define SCAN_BLOCKSIZE 512
+
+// Particle struct definition (must match Particles.compute)
+struct Particle
+{
+    float3 position;    // 3-component position vector
+    float3 velocity;    // float face velocities
+    uint layer;         // Layer units
+    uint mortonCode;    // Morton code for spatial indexing
+};
 
 RWStructuredBuffer<uint> input;
 RWStructuredBuffer<uint> output;
@@ -15,8 +23,8 @@ RWStructuredBuffer<uint> aux;
 uint len;
 uint zeroff;
 
-RWStructuredBuffer<uint> inputIndices;
-RWStructuredBuffer<uint> outputIndices;
+RWStructuredBuffer<Particle> inputParticles;
+RWStructuredBuffer<Particle> outputParticles;
 uint count;
 uint bit;
 RWStructuredBuffer<uint> e;
@@ -82,7 +90,7 @@ void split_prep(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    e[tid] = (input[tid] & (1U << bit)) == 0;
+    e[tid] = (inputParticles[tid].mortonCode & (1U << bit)) == 0;
 }
 
 [numthreads(512, 1, 1)]
@@ -95,7 +103,7 @@ void split_scatter(uint3 id : SV_DispatchThreadID)
 
     uint totalFalses = f[count - 1] + e[count - 1];
 
-    bool isBitSet = (input[tid] & (1U << bit)) != 0;
+    bool isBitSet = (inputParticles[tid].mortonCode & (1U << bit)) != 0;
 
     uint destinationIndex;
     if (isBitSet) {
@@ -105,24 +113,15 @@ void split_scatter(uint3 id : SV_DispatchThreadID)
         destinationIndex = f[tid];
     }
 
-    output[destinationIndex] = input[tid];
-    outputIndices[destinationIndex] = inputIndices[tid];
+    outputParticles[destinationIndex] = inputParticles[tid];
 }
 
 [numthreads(512, 1, 1)]
-void copyBuffer(uint3 id : SV_DispatchThreadID)
+void copyParticles(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
     if (tid >= count) return;
-    output[tid] = input[tid];
-}
-
-[numthreads(512, 1, 1)]
-void copyIndices(uint3 id : SV_DispatchThreadID)
-{
-    uint tid = id.x;
-    if (tid >= count) return;
-    outputIndices[tid] = inputIndices[tid];
+    outputParticles[tid] = inputParticles[tid];
 }
 
 [numthreads(512, 1, 1)]
@@ -139,6 +138,11 @@ void clearBuffer64(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
     if (tid < count) {
-        output[tid] = 0;
+        Particle emptyParticle;
+        emptyParticle.position = float3(0, 0, 0);
+        emptyParticle.velocity = float3(0, 0, 0);
+        emptyParticle.layer = 0;
+        emptyParticle.mortonCode = 0;
+        outputParticles[tid] = emptyParticle;
     }
 }
