@@ -97,25 +97,6 @@ void markUniquesPrefix(uint3 id : SV_DispatchThreadID)
     indicators[i] = isUnique;
 }
 
-// // Marks unique prefixes within the active subset indexed by activeIndices
-// [numthreads(512, 1, 1)]
-// void markActiveUniquesPrefix(uint3 id : SV_DispatchThreadID)
-// {
-//     uint i = id.x;
-//     if (i >= len) return;
-
-//     uint isUnique = 0;
-//     if (i == 0) {
-//         isUnique = 1;
-//     } else {
-//         uint curr = nodeMortonCodes[activeIndices[i]] >> prefixBits;
-//         uint prev = nodeMortonCodes[activeIndices[i - 1]] >> prefixBits;
-//         isUnique = (curr != prev) ? 1u : 0u;
-//     }
-
-//     indicators[i] = isUnique;
-// }
-
 [numthreads(512, 1, 1)]
 void markActiveNodes(uint3 id : SV_DispatchThreadID)
 {
