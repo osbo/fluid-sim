@@ -41,6 +41,52 @@ uint numNodes;                                          // number of nodes
 uint numParticles;                                      // total number of particles
 uint layer;                                             // current hierarchical layer
 
+// Morton helpers: interleave/deinterleave 3D (10 bits per axis)
+uint3 deinterleave(uint m)
+{
+    uint x = 0, y = 0, z = 0;
+    for (uint i = 0; i < 10; i++)
+    {
+        x |= ((m >> (3 * i + 0)) & 1) << i;
+        y |= ((m >> (3 * i + 1)) & 1) << i;
+        z |= ((m >> (3 * i + 2)) & 1) << i;
+    }
+    return uint3(x, y, z);
+}
+
+uint interleave(uint3 p)
+{
+    uint m = 0;
+    for (uint i = 0; i < 10; i++)
+    {
+        m |= ((p.x & (1u << i)) << (2 * i + 0));
+        m |= ((p.y & (1u << i)) << (2 * i + 1));
+        m |= ((p.z & (1u << i)) << (2 * i + 2));
+    }
+    return m;
+}
+
+// Lower-bound search: first index with mortonCode >= target
+uint lowerBoundMorton(uint target)
+{
+    uint left = 0u;
+    uint right = numNodes; // exclusive
+    while (left < right)
+    {
+        uint mid = left + ((right - left) >> 1);
+        uint midCode = nodesBuffer[mid].mortonCode;
+        if (midCode < target)
+        {
+            left = mid + 1u;
+        }
+        else
+        {
+            right = mid;
+        }
+    }
+    return left;
+}
+
 [numthreads(512, 1, 1)]
 void CreateLeaves(uint3 id : SV_DispatchThreadID)
 {
@@ -140,16 +186,68 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    faceVelocities aggregatedVelocities;
-    aggregatedVelocities.left = 0.0;
-    aggregatedVelocities.right = 0.0;
-    aggregatedVelocities.bottom = 0.0;
-    aggregatedVelocities.top = 0.0;
-    aggregatedVelocities.front = 0.0;
-    aggregatedVelocities.back = 0.0;
+    // if coarsen:
+    // calculate neighbor morton code prefixes: total of 6
+    // for each neighbor code:
+    // if it's out of bounds, coarsen = false, break
+    // if it's within bounds, binary search for node with morton code at least as large as neighbor code
+    // check found node's code: if it's out of the range, coarsen = false, break
+    // if it's within the range, check its layer
+    // if the node.layer < layer - 2, coarsen = false, break
 
     if (coarsen)
     {
+        uint baseCode = nodesBuffer[uniqueStart].mortonCode;
+        uint shift = layer * 3u;
+        uint prefix = baseCode >> shift; // 3b-bit prefix
+        uint3 coord = deinterleave(prefix);
+
+        uint gridDim = 1u << (10 - layer);
+
+        int3 deltas[6] = { int3(-1,0,0), int3(1,0,0), int3(0,-1,0), int3(0,1,0), int3(0,0,-1), int3(0,0,1) };
+        [unroll]
+        for (int d = 0; d < 6 && coarsen; d++)
+        {
+            int nx = (int)coord.x + deltas[d].x;
+            int ny = (int)coord.y + deltas[d].y;
+            int nz = (int)coord.z + deltas[d].z;
+
+            // Bounds at this layer's grid (disabled for now)
+            // if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
+            // {
+            //     coarsen = false;
+            //     break;
+            // }
+
+            uint3 ncoord = uint3((uint)nx, (uint)ny, (uint)nz);
+            uint nPrefix = interleave(ncoord);
+
+            uint lower = nPrefix << shift;
+            uint upper = (nPrefix + 1u) << shift; // exclusive
+
+            uint idx = lowerBoundMorton(lower);
+            if (idx < numNodes)
+            {
+                uint code = nodesBuffer[idx].mortonCode;
+                uint nLayer = nodesBuffer[idx].layer;
+                if (code >= lower && code < upper && (int)nLayer < ((int)layer - 2))
+                {
+                    coarsen = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (coarsen)
+    {
+        faceVelocities aggregatedVelocities;
+        aggregatedVelocities.left = 0.0;
+        aggregatedVelocities.right = 0.0;
+        aggregatedVelocities.bottom = 0.0;
+        aggregatedVelocities.top = 0.0;
+        aggregatedVelocities.front = 0.0;
+        aggregatedVelocities.back = 0.0;
         float3 weightedPosition = float3(0, 0, 0);
         float totalWeight = 0.0;
         uint minLayer = 11;
