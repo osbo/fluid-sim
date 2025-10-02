@@ -72,8 +72,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     
     // Calculate grid position using morton code major order (Z, Y, X)
     // This ensures particles are distributed evenly throughout the volume
-    // uint gridZ = index / (gridDimensions.x * gridDimensions.y);
-    uint gridZ = 0; // Flatten along Z axis
+    uint gridZ = index / (gridDimensions.x * gridDimensions.y);
     uint remaining = index % (gridDimensions.x * gridDimensions.y);
     uint gridY = remaining / gridDimensions.x;
     uint gridX = remaining % gridDimensions.x;
@@ -85,12 +84,10 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     
     // Convert grid position to world position
     // Use grid spacing to position particles evenly within the bounds
-    float3 gridOffset = float3(gridX, gridY, 0) * gridSpacing; // Z offset flattened
+    float3 gridOffset = float3(gridX, gridY, gridZ) * gridSpacing; // 3D offset
 
-    // Base position using uniform spacing (for Y and Z)
+    // Base position using uniform spacing in all three axes
     float3 basePos = fluidInitialBoundsMin + gridOffset;
-    // Force Z to mid-plane of fluid bounds
-    basePos.z = (fluidInitialBoundsMin.z + fluidInitialBoundsMax.z) * 0.5;
 
     // Apply power-based dispersion along X
     // u in (0,1]: cell-centered normalized coordinate across X extent

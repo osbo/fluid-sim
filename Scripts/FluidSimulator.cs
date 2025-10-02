@@ -93,43 +93,29 @@ public class FluidSimulator : MonoBehaviour
         Particle[] particles = new Particle[numParticles];
         particlesBuffer.GetData(particles);
 
-        // // Create array of indices and shuffle
-        // int[] indices = new int[numParticles];
-        // for (int i = 0; i < numParticles; i++) {
-        //     indices[i] = i;
-        // }
+        // Create array of indices and shuffle
+        int[] indices = new int[numParticles];
+        for (int i = 0; i < numParticles; i++) {
+            indices[i] = i;
+        }
         
-        // // Fisher-Yates shuffle
-        // System.Random rng = new System.Random();
-        // for (int i = indices.Length - 1; i > 0; i--) {
-        //     int j = rng.Next(0, i + 1);
-        //     int temp = indices[i];
-        //     indices[i] = indices[j];
-        //     indices[j] = temp;
-        // }
+        // Fisher-Yates shuffle
+        System.Random rng = new System.Random();
+        for (int i = indices.Length - 1; i > 0; i--) {
+            int j = rng.Next(0, i + 1);
+            int temp = indices[i];
+            indices[i] = indices[j];
+            indices[j] = temp;
+        }
 
-        // // Set first 10 shuffled indices to layer 0
-        // for (int i = 0; i < 10 && i < numParticles; i++) {
-        //     particles[indices[i]].layer = 0;
-        // }
+        // Set first 10 shuffled indices to layer 0
+        for (int i = 0; i < 10 && i < numParticles; i++) {
+            particles[indices[i]].layer = 0;
+        }
 
-        particles[9*numParticles/16].layer = 0;
+        // particles[9*numParticles/16].layer = 0;
 
         particlesBuffer.SetData(particles);
-
-        // // Debug: print numParticles
-        // Debug.Log($"Num Particles: {numParticles}");
-
-        // // Debug: check for NaN in particles
-        // Particle[] particlesCPU = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesCPU);
-        // string str = $"NaN in particles:\n";
-        // for (int i = 0; i < numParticles; i++) {
-        //     if (float.IsNaN(particlesCPU[i].position.x) || float.IsNaN(particlesCPU[i].position.y) || float.IsNaN(particlesCPU[i].position.z)) {
-        //         str += $"Particle {i}: Position is NaN\n";
-        //     }
-        // }
-        // Debug.Log(str);
 
 		// Particle compute timing: Advect + Sort
 		{
@@ -160,19 +146,7 @@ public class FluidSimulator : MonoBehaviour
         //         }
         //     }
         // }
-        // str += $"Leaf count: {leafCount}\n";
-        // str += $"Internal count: {internalCount}\n";
         // Debug.Log(str);
-
-        // // verify the sort
-        // bool sorted = true;
-        // for (int i = 1; i < numParticles; i++) {
-        //     if (particlesCPU[i].mortonCode < particlesCPU[i - 1].mortonCode) {
-        //         sorted = false;
-        //         break;
-        //     }
-        // }
-        // Debug.Log($"Sorted: {sorted}");
 
 		// Layer 0 compute timing: unique leaves + create leaves
 		{
@@ -183,52 +157,11 @@ public class FluidSimulator : MonoBehaviour
 			Debug.Log($"Layer 0 compute time (unique+create): {layer0Sw.Elapsed.TotalMilliseconds:F2} ms");
 		}
 
-        // Debug: print numNodes
-        // Debug.Log($"Num Unique Morton Codes (Layer 0: 30 bits): {numNodes}");
-
-        // uint[] uniqueIndicesCPU = new uint[numNodes];
-        // uniqueIndices.GetData(uniqueIndicesCPU);
-        // str = $"Unique Indices:\n";
-        // uint offset = 0;
-        // for (int i = 0; i < numNodes; i++) {
-        //     if (uniqueIndicesCPU[i] != i + offset) {
-        //         str += $"Unique Index {i}: {uniqueIndicesCPU[i]} (Expected: {i + offset}). Morton Code: {particlesCPU[uniqueIndicesCPU[i]].mortonCode}, previous: {particlesCPU[uniqueIndicesCPU[i] - 1].mortonCode}\n";
-        //         offset = uniqueIndicesCPU[i] - (uint)i;
-        //     }
-        // }
-        // Debug.Log(str);
-
 		StartCoroutine(PostCreateLeavesFlow());
     }
 
 	private System.Collections.IEnumerator PostCreateLeavesFlow()
 	{
-		// Debug: print nodes buffer
-		// Node[] nodesCPU = new Node[numNodes];
-		// nodesBuffer.GetData(nodesCPU);
-		// int leafCount = 0;
-		// int internalCount = 0;
-		// int displayNum = 20;
-		// str = $"Layer 0: First {displayNum} leaves and {displayNum} internal nodes:\n";
-		// for (int i = 0; i < numNodes; i++)
-		// {
-		// 	if (nodesCPU[i].layer == 0) {
-		// 		if (leafCount < displayNum) {
-		// 			str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-		// 			leafCount++;
-		// 		}
-		// 	} else {
-		// 		if (internalCount < displayNum) {
-		// 			str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-		// 			internalCount++;
-		// 		}
-		// 	}
-		// 	if (float.IsNaN(nodesCPU[i].position.x) || float.IsNaN(nodesCPU[i].position.y) || float.IsNaN(nodesCPU[i].position.z)) {
-		// 		str += $"Node {i}: Position is NaN\n";
-		// 	}
-		// }
-		// Debug.Log(str);
-
 		for (layer = 1; layer <= 10; layer++)
 		{
 			// Wait for Space key press to proceed to next layer, then wait for release (new Input System)
@@ -238,52 +171,7 @@ public class FluidSimulator : MonoBehaviour
 			System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
 			findUniqueNodes();
 			
-			// // Debug: print numUniqueNodes
-			// Debug.Log($"Num Unique Morton Codes (Layer {layer}: {30 - layer * 3} bits): {numUniqueNodes}");
-			
-			// // Debug: print unique active indices
-			// uint[] uniqueIndicesCPU = new uint[numUniqueNodes];
-			// uniqueIndices.GetData(uniqueIndicesCPU);
-			// nodesBuffer.GetData(nodesCPU);
-			// str = $"Layer {layer}: First 20 unique active indices:\n";
-			// for (int i = 0; i < 20 && i < numUniqueNodes; i++)
-			// {
-			// 	str += $"Unique Active Index {i}: {uniqueIndicesCPU[i]} (Node morton code: {nodesCPU[uniqueIndicesCPU[i]].mortonCode})\n";
-			// }
-			// Debug.Log(str);
-			
 			ProcessNodes();
-			
-			// // Debug: print nodes buffer
-			// nodesBuffer.GetData(nodesCPU);
-			// leafCount = 0;
-			// internalCount = 0;
-			// displayNum = 20;
-			// activeCount = 0;
-			// inactiveCount = 0;
-			// str = $"Layer {layer} Pre-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
-			// for (int i = 0; i < numNodes; i++)
-			// {
-			// 	if (nodesCPU[i].active == 1) {
-			// 		if (nodesCPU[i].layer == 0) {
-			// 			if (leafCount < displayNum) {
-			// 				str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-			// 				leafCount++;
-			// 			}
-			// 		} else {
-			// 			if (internalCount < displayNum) {
-			// 				str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-			// 				internalCount++;
-			// 			}
-			// 		}
-			// 		activeCount++;
-			// 	} else {
-			// 		inactiveCount++;
-			// 	}
-			// }
-			// str += $"Active nodes: {activeCount}\n";
-			// str += $"Inactive nodes: {inactiveCount}\n";
-			// Debug.Log(str);
 			
 			compactNodes();
 			
@@ -367,49 +255,50 @@ public class FluidSimulator : MonoBehaviour
         // Calculate grid dimensions for even particle distribution
         Vector3 fluidInitialSize = fluidInitialBoundsMax - fluidInitialBoundsMin;
         
-		// Calculate optimal grid dimensions to fit numParticles as evenly as possible
-		// Start with square root (flattened Z) and adjust for aspect ratio
-		// float cubeRoot = Mathf.Pow(numParticles, 1.0f / 3.0f); // OLD: 3D distribution
-		float squareRoot = Mathf.Sqrt(numParticles); // NEW: 2D distribution across X and Y
+		// Calculate optimal grid dimensions to fit numParticles as evenly as possible (3D)
+		// Start with cube root and adjust for aspect ratio
+		float cubeRoot = Mathf.Pow(numParticles, 1.0f / 3.0f);
         
         // Calculate aspect ratio normalized dimensions
         float maxSize = Mathf.Max(fluidInitialSize.x, fluidInitialSize.y, fluidInitialSize.z);
         Vector3 normalizedSize = fluidInitialSize / maxSize;
         
 		Vector3Int gridDimensions = new Vector3Int(
-			Mathf.Max(1, Mathf.RoundToInt(squareRoot * normalizedSize.x)),
-			Mathf.Max(1, Mathf.RoundToInt(squareRoot * normalizedSize.y)),
-			1 // Flatten along Z axis
+			Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.x)),
+			Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.y)),
+			Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.z))
 		);
         
         // Ensure we have enough grid cells for all particles
         // If we have too few cells, increase dimensions
 		while (gridDimensions.x * gridDimensions.y * gridDimensions.z < numParticles)
-        {
+		{
+			// Increase the smallest dimension to approach the target count
 			if (gridDimensions.x <= gridDimensions.y && gridDimensions.x <= gridDimensions.z)
-                gridDimensions.x++;
-			else if (gridDimensions.y <= gridDimensions.z)
-                gridDimensions.y++;
+				gridDimensions.x++;
+			else if (gridDimensions.y <= gridDimensions.x && gridDimensions.y <= gridDimensions.z)
+				gridDimensions.y++;
 			else
-				gridDimensions.y++; // keep Z at 1 to stay flat
-        }
+				gridDimensions.z++;
+		}
         
         // If we have too many cells, reduce dimensions
 		while (gridDimensions.x * gridDimensions.y * gridDimensions.z > numParticles)
-        {
+		{
+			// Decrease the largest dimension (but not below 1)
 			if (gridDimensions.x >= gridDimensions.y && gridDimensions.x >= gridDimensions.z)
-                gridDimensions.x = Mathf.Max(1, gridDimensions.x - 1);
-			else if (gridDimensions.y >= gridDimensions.z)
-                gridDimensions.y = Mathf.Max(1, gridDimensions.y - 1);
+				gridDimensions.x = Mathf.Max(1, gridDimensions.x - 1);
+			else if (gridDimensions.y >= gridDimensions.x && gridDimensions.y >= gridDimensions.z)
+				gridDimensions.y = Mathf.Max(1, gridDimensions.y - 1);
 			else
-				gridDimensions.y = Mathf.Max(1, gridDimensions.y - 1); // keep Z at 1
-        }
+				gridDimensions.z = Mathf.Max(1, gridDimensions.z - 1);
+		}
         
         // Calculate grid spacing to fill the entire fluid bounds
 		Vector3 actualGridSpacing = new Vector3(
 			fluidInitialSize.x / Mathf.Max(1, gridDimensions.x),
 			fluidInitialSize.y / Mathf.Max(1, gridDimensions.y),
-			fluidInitialSize.z // Z spacing unused when flattened
+			fluidInitialSize.z / Mathf.Max(1, gridDimensions.z)
 		);
         
         // Set bounds parameters to compute shader
@@ -591,110 +480,6 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.Dispatch(createLeavesKernel, threadGroups, 1, 1);
     }
 
-    // private void PrefixSumLeavesCodes()
-    // {
-    //     // dispatch numNodes threads, find unique-prefix leaves (all are active)
-    //     if (nodesPrefixSumsShader == null)
-    //     {
-    //         Debug.LogError("NodesPrefixSums compute shader is not assigned. Please assign `nodesPrefixSumsShader` in the inspector.");
-    //         return;
-    //     }
-
-    //     ClearUniqueBuffers();
-
-    //     int prefixBits = 3;
-
-	// 	nodesPrefixSumsShader.SetBuffer(markUniquesPrefixKernel, "nodeMortonCodes", nodeMortonCodes);
-	// 	nodesPrefixSumsShader.SetBuffer(markUniquesPrefixKernel, "indicators", indicators);
-	// 	nodesPrefixSumsShader.SetInt("len", numNodes);
-	// 	nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
-	// 	int groupsLinear = (numNodes + 511) / 512;
-	// 	nodesPrefixSumsShader.Dispatch(markUniquesPrefixKernel, groupsLinear, 1, 1);
-
-    //     uint tgSize = 512u;
-    //     uint numThreadgroups = (uint)((numNodes + (tgSize * 2) - 1) / (tgSize * 2));
-    //     uint auxSize = (uint)System.Math.Max(1, (int)numThreadgroups);
-
-	// 	radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", indicators);
-	// 	radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", prefixSums);
-	// 	radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", aux);
-	// 	radixSortShader.SetInt("len", numNodes);
-	// 	radixSortShader.SetInt("zeroff", 1);
-	// 	radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
-
-    //     if (numThreadgroups > 1)
-    //     {
-    //         // Scan aux -> aux2
-    //         if (auxSmall == null) auxSmall = new ComputeBuffer(1, sizeof(uint));
-    //         uint auxThreadgroups = 1; // aux length is small
-	// 		radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", aux);
-	// 		radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", aux2);
-	// 		radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
-	// 		radixSortShader.SetInt("len", (int)auxSize);
-	// 		radixSortShader.SetInt("zeroff", 1);
-	// 		radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
-
-    //         // Fixup: add scanned aux into prefixSums
-	// 		radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", prefixSums);
-	// 		radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", aux2);
-	// 		radixSortShader.SetInt("len", numNodes);
-	// 		radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
-    //     }
-
-    //     // scatterUniques unique indices
-    //     nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "indicators", indicators);
-    //     nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "prefixSums", prefixSums);
-    //     nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "uniqueIndices", uniqueIndices);
-    //     nodesPrefixSumsShader.SetInt("len", numNodes);
-    //     nodesPrefixSumsShader.Dispatch(scatterUniquesKernel, groupsLinear, 1, 1);
-        
-    //     // Write unique count
-    //     nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "indicators", indicators);
-    //     nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "prefixSums", prefixSums);
-    //     nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "uniqueCount", uniqueCount);
-    //     nodesPrefixSumsShader.SetInt("len", numNodes);
-    //     nodesPrefixSumsShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
-
-    //     uint[] uniqueCountCpu = new uint[1];
-    //     uniqueCount.GetData(uniqueCountCpu);
-    //     numUniqueActiveNodes = (int)uniqueCountCpu[0];
-    // }
-
-    // private void ProcessLeaves()
-    // {
-    //     // dispatch numUniqueActiveNodes threads
-    //     if (nodesShader == null)
-    //     {
-    //         Debug.LogError("Nodes compute shader is not assigned. Please assign `nodesShader` in the inspector.");
-    //         return;
-    //     }
-
-    //     if (numUniqueActiveNodes == 0) return;
-
-    //     // Find kernel
-    //     processLeavesKernel = nodesShader.FindKernel("ProcessLeaves");
-
-    //     // Set buffers for the node processing kernel
-    //     nodesShader.SetBuffer(processLeavesKernel, "particlesBuffer", particlesBuffer);
-    //     nodesShader.SetBuffer(processLeavesKernel, "sortedMortonCodes", sortedMortonCodes);
-    //     nodesShader.SetBuffer(processLeavesKernel, "sortedParticleIndices", sortedParticleIndices);
-    //     nodesShader.SetBuffer(processLeavesKernel, "uniqueIndices", uniqueIndices);
-    //     nodesShader.SetBuffer(processLeavesKernel, "uniqueCount", uniqueCount);
-    //     nodesShader.SetBuffer(processLeavesKernel, "nodesBuffer", nodesBuffer);
-    //     nodesShader.SetBuffer(processLeavesKernel, "nodeMortonCodes", nodeMortonCodes);
-    //     nodesShader.SetBuffer(processLeavesKernel, "nodeIndices", nodeIndices);
-    //     nodesShader.SetBuffer(processLeavesKernel, "nodeFlagsBuffer", nodeFlagsBuffer);
-    //     nodesShader.SetInt("numUniqueNodes", numUniqueActiveNodes);
-    //     nodesShader.SetInt("numActiveNodes", numActiveNodes);
-    //     nodesShader.SetInt("numNodes", numNodes);
-    //     nodesShader.SetInt("numParticles", numParticles);
-    //     nodesShader.SetInt("layer", 1);
-
-    //     // Dispatch one thread per unique node
-    //     int threadGroups = Mathf.CeilToInt(numUniqueActiveNodes / 512.0f);
-    //     nodesShader.Dispatch(processLeavesKernel, threadGroups, 1, 1);
-    // }
-
     private void findUniqueNodes() // in for loop
     {
         // dispatch numActiveNodes threads, find unique-prefix active nodes
@@ -722,16 +507,6 @@ public class FluidSimulator : MonoBehaviour
 		nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
 		int groupsLinear = (numNodes + 511) / 512;
 		nodesPrefixSumsShader.Dispatch(markUniquesPrefixKernel, groupsLinear, 1, 1);
-
-        // // Debug: print indicators after markActiveUniquesPrefix
-        // uint[] indicatorsCPU = new uint[numActiveNodes];
-        // indicators.GetData(indicatorsCPU);
-        // string debugStr = $"Layer {layer}: First 20 indicators (after markActiveUniquesPrefix):\n";
-        // for (int i = 0; i < 20 && i < numActiveNodes; i++)
-        // {
-        //     debugStr += $"Indicator {i}: {indicatorsCPU[i]}\n";
-        // }
-        // Debug.Log(debugStr);
 
         // Reuse proven radix scan kernels for indicators scan
         uint tgSize = 512u;
@@ -841,40 +616,12 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // // Debug: Print input node flags before processing
-        // uint[] nodeFlagsCPU = new uint[numNodes];
-        // nodeFlagsBuffer.GetData(nodeFlagsCPU);
-        // string debugStr = $"Layer {layer}: First 20 node flags (input):\n";
-        // for (int i = 0; i < 20 && i < numNodes; i++)
-        // {
-        //     debugStr += $"Node {i}: Flag={nodenodesCPU[i].active} (active={nodenodesCPU[i].active & 1u})\n";
-        // }
-        // Debug.Log(debugStr);
-
         // Set buffers for the node processing kernel
         nodesPrefixSumsShader.SetBuffer(markActiveNodesKernel, "nodesBuffer", nodesBuffer);
         nodesPrefixSumsShader.SetBuffer(markActiveNodesKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetInt("len", numNodes);
         int groupsLinear = Mathf.Max(1, (numNodes + 511) / 512);
         nodesPrefixSumsShader.Dispatch(markActiveNodesKernel, groupsLinear, 1, 1);
-        
-        // // Debug: print the indicators after markActiveNodes
-        // uint[] indicatorsCPU = new uint[numNodes];
-        // indicators.GetData(indicatorsCPU);
-        // string debugStr = $"Layer {layer}: First 20 indicators (after markActiveNodes):\n";
-        // for (int i = 0; i < 20 && i < numNodes; i++)
-        // {
-        //     debugStr += $"Indicator {i}: {indicatorsCPU[i]}\n";
-        // }
-        // Debug.Log(debugStr);
-
-        // // Count active indicators manually for verification
-        // int manualActiveCount = 0;
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     if (indicatorsCPU[i] == 1) manualActiveCount++;
-        // }
-        // Debug.Log($"Layer {layer}: Manual count of active indicators: {manualActiveCount}");
 
         uint tgSize = 512u;
         uint numThreadgroups = (uint)((numNodes + (tgSize * 2) - 1) / (tgSize * 2));
@@ -890,27 +637,8 @@ public class FluidSimulator : MonoBehaviour
 		radixSortShader.SetInt("zeroff", 1);
 		radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
 
-        // // Debug: print prefix sums after first level scan
-        // uint[] prefixSumsCPU = new uint[numNodes];
-        // prefixSums.GetData(prefixSumsCPU);
-        // debugStr = $"Layer {layer}: First 20 prefix sums (after first level scan):\n";
-        // for (int i = 0; i < 20 && i < numNodes; i++)
-        // {
-        //     debugStr += $"PrefixSum {i}: {prefixSumsCPU[i]}\n";
-        // }
-        // Debug.Log(debugStr);
-
         if (numThreadgroups > 1)
         {
-            // // Debug: print aux buffer before second level scan
-            // uint[] auxCPU = new uint[auxSize];
-            // aux.GetData(auxCPU);
-            // debugStr = $"Layer {layer}: Aux buffer (before second level scan):\n";
-            // for (int i = 0; i < auxSize && i < 20; i++)
-            // {
-            //     debugStr += $"Aux {i}: {auxCPU[i]}\n";
-            // }
-            // Debug.Log(debugStr);
 
             // Scan aux -> aux2
             if (auxSmall == null) auxSmall = new ComputeBuffer(1, sizeof(uint));
@@ -922,31 +650,12 @@ public class FluidSimulator : MonoBehaviour
 			radixSortShader.SetInt("zeroff", 1);
 			radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
 
-            // // Debug: print aux2 buffer after second level scan
-            // uint[] aux2CPU = new uint[auxSize];
-            // aux2.GetData(aux2CPU);
-            // debugStr = $"Layer {layer}: Aux2 buffer (after second level scan):\n";
-            // for (int i = 0; i < auxSize && i < 20; i++)
-            // {
-            //     debugStr += $"Aux2 {i}: {aux2CPU[i]}\n";
-            // }
-            // Debug.Log(debugStr);
-
             // Fixup: add scanned aux into prefixSums
 			radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", prefixSums);
 			radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", aux2);
 			radixSortShader.SetInt("len", numNodes);
 			radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
         }
-
-        // // Debug: print final prefix sums after fixup
-        // prefixSums.GetData(prefixSumsCPU);
-        // debugStr = $"Layer {layer}: First 20 prefix sums (after fixup):\n";
-        // for (int i = 0; i < 20 && i < numNodes; i++)
-        // {
-        //     debugStr += $"PrefixSum {i}: {prefixSumsCPU[i]}\n";
-        // }
-        // Debug.Log(debugStr);
 
         // scatterActives active indices
         nodesPrefixSumsShader.SetBuffer(scatterActivesKernel, "indicators", indicators);
@@ -974,31 +683,6 @@ public class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetInt("len", numNodes);
         int copyGroups = Mathf.Max(1, (numNodes + 511) / 512);
         nodesPrefixSumsShader.Dispatch(copyNodesKernel, copyGroups, 1, 1);
-
-        // // Debug: print active indices after scatter
-        // uint[] activeIndicesCPU = new uint[numNodes];
-        // activeIndices.GetData(activeIndicesCPU);
-        // debugStr = $"Layer {layer}: First 20 active indices (after scatterActives):\n";
-        // for (int i = 0; i < 20 && i < numNodes; i++)
-        // {
-        //     debugStr += $"ActiveIndex {i}: {activeIndicesCPU[i]}\n";
-        // }
-        // Debug.Log(debugStr);
-
-        // // Debug: print active count calculation details
-        // uint lastIndicator = indicatorsCPU[numNodes - 1];
-        // uint lastPrefixSum = prefixSumsCPU[numNodes - 1];
-        // uint calculatedCount = lastPrefixSum + lastIndicator;
-        // Debug.Log($"Layer {layer}: Active count calculation - lastIndicator: {lastIndicator}, lastPrefixSum: {lastPrefixSum}, calculated: {calculatedCount}");
-
-        // // Debug: print final active count
-        // Debug.Log($"Layer {layer}: Final active count from GPU: {numActiveNodes}");
-        // Debug.Log($"Layer {layer}: Manual count verification: {manualActiveCount}");
-        
-        // if (numActiveNodes != manualActiveCount)
-        // {
-        //     Debug.LogWarning($"Layer {layer}: Mismatch between GPU count ({numActiveNodes}) and manual count ({manualActiveCount})");
-        // }
     }
 
     private void ClearUniqueBuffers()
