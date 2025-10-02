@@ -87,6 +87,82 @@ uint lowerBoundMorton(uint target)
     return left;
 }
 
+// Check if 4 subnodes of a neighbor cell (at layer-1) are all at appropriate layers
+bool checkSubnodes(uint neighborCode, int3 direction, uint currentLayer)
+{
+    // Get the 4 subnodes that share a face with current node
+    // The 4 subnodes are the ones "low" in the direction opposite to the shift
+    int3 subOffsets[4];
+    int subCount = 0;
+    
+    // Determine which 4 of the 8 subnodes to check based on direction
+    if (direction.x != 0) // X direction
+    {
+        // Check the 4 subnodes with Y and Z coordinates based on direction.x
+        int yBase = direction.x > 0 ? 0 : 1;
+        int zBase = direction.x > 0 ? 0 : 1;
+        subOffsets[0] = int3(0, yBase, zBase);
+        subOffsets[1] = int3(0, yBase, 1 - zBase);
+        subOffsets[2] = int3(0, 1 - yBase, zBase);
+        subOffsets[3] = int3(0, 1 - yBase, 1 - zBase);
+        subCount = 4;
+    }
+    else if (direction.y != 0) // Y direction
+    {
+        // Check the 4 subnodes with X and Z coordinates based on direction.y
+        int xBase = direction.y > 0 ? 0 : 1;
+        int zBase = direction.y > 0 ? 0 : 1;
+        subOffsets[0] = int3(xBase, 0, zBase);
+        subOffsets[1] = int3(xBase, 0, 1 - zBase);
+        subOffsets[2] = int3(1 - xBase, 0, zBase);
+        subOffsets[3] = int3(1 - xBase, 0, 1 - zBase);
+        subCount = 4;
+    }
+    else if (direction.z != 0) // Z direction
+    {
+        // Check the 4 subnodes with X and Y coordinates based on direction.z
+        int xBase = direction.z > 0 ? 0 : 1;
+        int yBase = direction.z > 0 ? 0 : 1;
+        subOffsets[0] = int3(xBase, yBase, 0);
+        subOffsets[1] = int3(xBase, 1 - yBase, 0);
+        subOffsets[2] = int3(1 - xBase, yBase, 0);
+        subOffsets[3] = int3(1 - xBase, 1 - yBase, 0);
+        subCount = 4;
+    }
+    
+    // Check each subnode
+    for (int s = 0; s < subCount; s++)
+    {
+        // Compute the lowest morton code in the target range
+        // Take nPrefix, shift left 3, add the right 4 combos of 0 to 1 for each of the 3 bits
+        uint3 subCoord = deinterleave(neighborCode >> (currentLayer * 3));
+        subCoord += uint3((uint)subOffsets[s].x, (uint)subOffsets[s].y, (uint)subOffsets[s].z);
+        uint subPrefix = interleave(subCoord);
+        
+        // Shift the rest of the way left (shift-3) to get lower
+        uint subLower = subPrefix << (currentLayer * 3);
+        uint subUpper = (subPrefix + 1u) << (currentLayer * 3);
+        
+        // Search for the first node after this target morton code (inclusive)
+        uint subIdx = lowerBoundMorton(subLower);
+        if (subIdx >= numNodes)
+        {
+            uint subCode = nodesBuffer[subIdx].mortonCode;
+            if (subCode < subLower || subCode >= subUpper)
+            {
+                uint subLayer = nodesBuffer[subIdx].layer;
+                if ((int)subLayer < ((int)currentLayer - 1))
+                {
+                    return false; // Subnode is too coarse
+                }
+            }
+        }
+        return true;
+    }
+    
+    return true; // All subnodes are appropriate
+}
+
 [numthreads(512, 1, 1)]
 void CreateLeaves(uint3 id : SV_DispatchThreadID)
 {
@@ -186,15 +262,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    // if coarsen:
-    // calculate neighbor morton code prefixes: total of 6
-    // for each neighbor code:
-    // if it's out of bounds, coarsen = false, break
-    // if it's within bounds, binary search for node with morton code at least as large as neighbor code
-    // check found node's code: if it's out of the range, coarsen = false, break
-    // if it's within the range, check its layer
-    // if the node.layer < layer - 2, coarsen = false, break
-
     if (coarsen)
     {
         uint baseCode = nodesBuffer[uniqueStart].mortonCode;
@@ -230,10 +297,22 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             {
                 uint code = nodesBuffer[idx].mortonCode;
                 uint nLayer = nodesBuffer[idx].layer;
-                if (code >= lower && code < upper && (int)nLayer < ((int)layer - 2))
+                if (code >= lower && code < upper)
                 {
-                    coarsen = false;
-                    break;
+                    if ((int)nLayer < ((int)layer - 1))
+                    {
+                        coarsen = false;
+                        break;
+                    }
+                    else if (nLayer == layer - 1)
+                    {
+                        // Check the 4 subnodes that share a face with current node
+                        if (!checkSubnodes(code, deltas[d], layer))
+                        {
+                            coarsen = false;
+                            break;
+                        }
+                    }
                 }
             }
         }
