@@ -535,7 +535,8 @@ MonoBehaviour:
   particlesShader: {fileID: 7200000, guid: 50811f54569ba494198b8c6b696cff81, type: 3}
   nodesPrefixSumsShader: {fileID: 7200000, guid: c32ad71b0afda4f7d827eb945c910544, type: 3}
   nodesShader: {fileID: 7200000, guid: eab82c62a627a4a2295451473985b296, type: 3}
-  numParticles: 1000000
+  numParticles: 1048576
+  initialLayer: 2
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
