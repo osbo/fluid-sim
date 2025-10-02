@@ -115,8 +115,9 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // Assign layer: center particles get layer 0, boundary particles get layer 0, others get layer 11
     bool nearCenter = (distanceFromCenter <= centerRadius);
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
-    particle.layer = (nearCenter || onBoundary) ? 0 : 11;
+    // particle.layer = (nearCenter || onBoundary) ? 0 : 11;
     // particle.layer = onBoundary ? 0 : 11;
+    // particle.layer = (nearCenter) ? 0 : 11;
     particle.layer = 11;
     
     // Generate morton code from normalized position
