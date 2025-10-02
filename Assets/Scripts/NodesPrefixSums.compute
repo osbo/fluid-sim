@@ -71,8 +71,8 @@ void markUniqueParticles(uint3 id : SV_DispatchThreadID)
     if (i == 0) {
         isUnique = 1;
     } else {
-        uint curr = sortedParticles[i].mortonCode;
-        uint prev = sortedParticles[i - 1].mortonCode;
+        uint curr = sortedParticles[i].mortonCode >> prefixBits;
+        uint prev = sortedParticles[i - 1].mortonCode >> prefixBits;
         isUnique = (curr != prev) ? 1u : 0u;
     }
 

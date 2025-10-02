@@ -45,10 +45,14 @@ public class FluidSimulator : MonoBehaviour
     private int numNodes;
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
+    public int initialLayer;
 
     private string str;
     private int activeCount;
     private int inactiveCount;
+    
+    // Stopwatch to measure total octree construction time (from advection to loop end)
+    private System.Diagnostics.Stopwatch totalOctreeSw;
     
     // Simulation parameters (calculated in InitializeParticleSystem)
     private Vector3 mortonNormalizationFactor;
@@ -87,6 +91,8 @@ public class FluidSimulator : MonoBehaviour
 
     void Start()
     {
+        layer = initialLayer;
+
         InitializeParticleSystem();
 
         // Set 10 random particles to layer 0
@@ -116,6 +122,9 @@ public class FluidSimulator : MonoBehaviour
         // particles[9*numParticles/16].layer = 0;
 
         particlesBuffer.SetData(particles);
+
+        // Start total octree construction timer (advection -> full build loop end)
+        totalOctreeSw = System.Diagnostics.Stopwatch.StartNew();
 
 		// Particle compute timing: Advect + Sort
 		{
@@ -154,7 +163,7 @@ public class FluidSimulator : MonoBehaviour
 			findUniqueParticles();
 			CreateLeaves();
 			layer0Sw.Stop();
-			Debug.Log($"Layer 0 compute time (unique+create): {layer0Sw.Elapsed.TotalMilliseconds:F2} ms");
+			Debug.Log($"Layer {layer}: {numNodes} nodes, {layer0Sw.Elapsed.TotalMilliseconds:F2} ms");
 		}
 
 		StartCoroutine(PostCreateLeavesFlow());
@@ -162,7 +171,7 @@ public class FluidSimulator : MonoBehaviour
 
 	private System.Collections.IEnumerator PostCreateLeavesFlow()
 	{
-		for (layer = 1; layer <= 10; layer++)
+		for (layer = layer + 1; layer <= 10; layer++)
 		{
 			// Wait for Space key press to proceed to next layer, then wait for release (new Input System)
 			// yield return new WaitUntil(() => Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame);
@@ -207,8 +216,15 @@ public class FluidSimulator : MonoBehaviour
 			// Debug.Log(str);
 
 			sw.Stop();
-			Debug.Log($"Layer {layer} compute time: {sw.Elapsed.TotalMilliseconds:F2} ms");
+			Debug.Log($"Layer {layer}: {numNodes} nodes, {sw.Elapsed.TotalMilliseconds:F2} ms");
 		}
+
+        // Stop and log total octree construction time
+        if (totalOctreeSw != null)
+        {
+            totalOctreeSw.Stop();
+            Debug.Log($"Total octree construction: {numParticles} particles to {numNodes} nodes ({100.0f - 100.0f*(float)numNodes/numParticles:F2}% reduction), {totalOctreeSw.Elapsed.TotalMilliseconds:F2} ms");
+        }
 
 		yield break;
 	}
@@ -389,10 +405,13 @@ public class FluidSimulator : MonoBehaviour
         uniqueIndices = new ComputeBuffer(numParticles, sizeof(uint));
         uniqueCount = new ComputeBuffer(1, sizeof(uint));
 
+        int prefixBits = layer * 3;
+
         // mark uniques
         nodesPrefixSumsShader.SetBuffer(markUniqueParticlesKernel, "sortedParticles", particlesBuffer);
         nodesPrefixSumsShader.SetBuffer(markUniqueParticlesKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetInt("len", numParticles);
+		nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
         int groupsLinear = (numParticles + 511) / 512;
         nodesPrefixSumsShader.Dispatch(markUniqueParticlesKernel, groupsLinear, 1, 1);
 
