@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.InputSystem;
 
 public class FluidSimulator : MonoBehaviour
 {
@@ -185,186 +186,128 @@ public class FluidSimulator : MonoBehaviour
 
         CreateLeaves();
 
-        // Debug: print nodes buffer
-        Node[] nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        leafCount = 0;
-        internalCount = 0;
-        displayNum = 20;
-        str = $"Layer 0: First {displayNum} leaves and {displayNum} internal nodes:\n";
-        for (int i = 0; i < numNodes; i++)
-        {
-            if (nodesCPU[i].layer == 0) {
-                if (leafCount < displayNum) {
-                    str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-                    leafCount++;
-                }
-            } else {
-                if (internalCount < displayNum) {
-                    str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-                    internalCount++;
-                }
-            }
-            if (float.IsNaN(nodesCPU[i].position.x) || float.IsNaN(nodesCPU[i].position.y) || float.IsNaN(nodesCPU[i].position.z)) {
-                str += $"Node {i}: Position is NaN\n";
-            }
-        }
-        Debug.Log(str);
-
-        // PrefixSumLeavesCodes();
-
-        // // Debug: print numUniqueActiveNodes
-        // Debug.Log($"Num Unique Morton Codes (Layer 1: 27 bits): {numUniqueActiveNodes}");
-
-        // ProcessLeaves();
-
-        // // Debug: print nodes buffer
-        // nodesBuffer.GetData(nodesCPU);
-        // nodeFlagsBuffer.GetData(flagsCPU);
-        // leafCount = 0;
-        // internalCount = 0;
-        // displayNum = 20;
-        // str = $"Layer 1: First {displayNum} leaves and {displayNum} internal nodes:\n";
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     if (nodesCPU[i].layer == 0) {
-        //         if (leafCount < displayNum) {
-        //             str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n"}
-        //             leafCount++;
-        //         }
-        //     } else {
-        //         if (internalCount < displayNum) {
-        //             str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n"}
-        //             internalCount++;
-        //         }
-        //     }
-        // }
-        // Debug.Log(str);
-
-        for (layer = 1; layer <= 10; layer++)
-        // for (layer = 2; layer <= 7; layer++)
-        {
-            // prefixSumActiveNodes();
-
-            // // Debug: print numActiveNodes
-            // Debug.Log($"Num Active Nodes (Layer {layer}): {numActiveNodes}");
-
-            // // Debug: print activeIndices
-            // uint[] activeIndicesCPU = new uint[numActiveNodes];
-            // activeIndices.GetData(activeIndicesCPU);
-            // str = $"Layer {layer}: First 20 active indices:\n";
-            // for (int i = 0; i < 20; i++)
-            // {
-            //     str += $"Active Index {i}: {activeIndicesCPU[i]}\n";
-            // }
-            // Debug.Log(str);
-
-            findUniqueNodes();
-
-            // Debug: print numUniqueNodes
-            Debug.Log($"Num Unique Morton Codes (Layer {layer}: {30 - layer * 3} bits): {numUniqueNodes}");
-
-            // Debug: print unique active indices
-            uint[] uniqueIndicesCPU = new uint[numUniqueNodes];
-            uniqueIndices.GetData(uniqueIndicesCPU);
-            nodesBuffer.GetData(nodesCPU);
-            str = $"Layer {layer}: First 20 unique active indices:\n";
-            for (int i = 0; i < 20 && i < numUniqueNodes; i++)
-            {
-                str += $"Unique Active Index {i}: {uniqueIndicesCPU[i]} (Node morton code: {nodesCPU[uniqueIndicesCPU[i]].mortonCode})\n";
-            }
-            Debug.Log(str);
-
-            ProcessNodes();
-
-            // Debug: print nodes buffer
-            nodesBuffer.GetData(nodesCPU);
-            leafCount = 0;
-            internalCount = 0;
-            displayNum = 20;
-            activeCount = 0;
-            inactiveCount = 0;
-            str = $"Layer {layer} Pre-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
-            for (int i = 0; i < numNodes; i++)
-            {
-                if (nodesCPU[i].active == 1) {
-                    if (nodesCPU[i].layer == 0) {
-                        if (leafCount < displayNum) {
-                            str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-    
-                            leafCount++;
-                        }
-                    } else {
-                        if (internalCount < displayNum) {
-                            str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-    
-                                internalCount++;
-                        }
-                    }
-                    activeCount++;
-                } else {
-                    inactiveCount++;
-                }
-            }
-            str += $"Active nodes: {activeCount}\n";
-            str += $"Inactive nodes: {inactiveCount}\n";
-            Debug.Log(str);
-
-            compactNodes();
-
-            // Debug: print nodes buffer
-            nodesBuffer.GetData(nodesCPU);
-            leafCount = 0;
-            internalCount = 0;
-            displayNum = 20;
-            activeCount = 0;
-            inactiveCount = 0;
-            str = $"Layer {layer} Post-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
-            for (int i = 0; i < numNodes; i++)
-            {
-                if (nodesCPU[i].active == 1) {
-                    if (nodesCPU[i].layer == 0) {
-                        if (leafCount < displayNum) {
-                            str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
-    
-                            leafCount++;
-                        }
-                    } else {
-                        if (internalCount < displayNum) {
-                            str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
-    
-                                internalCount++;
-                        }
-                    }
-                    activeCount++;
-                } else {
-                    inactiveCount++;
-                }
-            }
-            str += $"Active nodes: {activeCount}\n";
-            str += $"Inactive nodes: {inactiveCount}\n";
-            Debug.Log(str);
-        }
-
-        // prefixSumActiveNodes();
-        
-        // buildActiveNodesBuffer();
-
-        // scatterVelocities();
-
-        // nodesBuffer.GetData(nodesCPU);
-        // nodeFlagsBuffer.GetData(flagsCPU);
-        // str = $"Layer {layer}: First 20 nodes:\n";
-        // activeCount = 0;
-        // for (int i = 0; activeCount < 20; i++)
-        // {
-        //     if (nodesCPU[i].active == 1) {
-        //         str += $"Node {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
-        //         activeCount++;
-        //     }
-        // }
-        // Debug.Log(str);
+		StartCoroutine(PostCreateLeavesFlow());
     }
+
+	private System.Collections.IEnumerator PostCreateLeavesFlow()
+	{
+		// Debug: print nodes buffer
+		Node[] nodesCPU = new Node[numNodes];
+		nodesBuffer.GetData(nodesCPU);
+		int leafCount = 0;
+		int internalCount = 0;
+		int displayNum = 20;
+		str = $"Layer 0: First {displayNum} leaves and {displayNum} internal nodes:\n";
+		for (int i = 0; i < numNodes; i++)
+		{
+			if (nodesCPU[i].layer == 0) {
+				if (leafCount < displayNum) {
+					str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+					leafCount++;
+				}
+			} else {
+				if (internalCount < displayNum) {
+					str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+					internalCount++;
+				}
+			}
+			if (float.IsNaN(nodesCPU[i].position.x) || float.IsNaN(nodesCPU[i].position.y) || float.IsNaN(nodesCPU[i].position.z)) {
+				str += $"Node {i}: Position is NaN\n";
+			}
+		}
+		Debug.Log(str);
+
+		for (layer = 1; layer <= 10; layer++)
+		{
+			findUniqueNodes();
+			
+			// Debug: print numUniqueNodes
+			Debug.Log($"Num Unique Morton Codes (Layer {layer}: {30 - layer * 3} bits): {numUniqueNodes}");
+			
+			// Debug: print unique active indices
+			uint[] uniqueIndicesCPU = new uint[numUniqueNodes];
+			uniqueIndices.GetData(uniqueIndicesCPU);
+			nodesBuffer.GetData(nodesCPU);
+			str = $"Layer {layer}: First 20 unique active indices:\n";
+			for (int i = 0; i < 20 && i < numUniqueNodes; i++)
+			{
+				str += $"Unique Active Index {i}: {uniqueIndicesCPU[i]} (Node morton code: {nodesCPU[uniqueIndicesCPU[i]].mortonCode})\n";
+			}
+			Debug.Log(str);
+			
+			ProcessNodes();
+			
+			// Debug: print nodes buffer
+			nodesBuffer.GetData(nodesCPU);
+			leafCount = 0;
+			internalCount = 0;
+			displayNum = 20;
+			activeCount = 0;
+			inactiveCount = 0;
+			str = $"Layer {layer} Pre-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
+			for (int i = 0; i < numNodes; i++)
+			{
+				if (nodesCPU[i].active == 1) {
+					if (nodesCPU[i].layer == 0) {
+						if (leafCount < displayNum) {
+							str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+							leafCount++;
+						}
+					} else {
+						if (internalCount < displayNum) {
+							str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+							internalCount++;
+						}
+					}
+					activeCount++;
+				} else {
+					inactiveCount++;
+				}
+			}
+			str += $"Active nodes: {activeCount}\n";
+			str += $"Inactive nodes: {inactiveCount}\n";
+			Debug.Log(str);
+			
+			compactNodes();
+			
+			// Debug: print nodes buffer
+			nodesBuffer.GetData(nodesCPU);
+			leafCount = 0;
+			internalCount = 0;
+			displayNum = 20;
+			activeCount = 0;
+			inactiveCount = 0;
+			str = $"Layer {layer} Post-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
+			for (int i = 0; i < numNodes; i++)
+			{
+				if (nodesCPU[i].active == 1) {
+					if (nodesCPU[i].layer == 0) {
+						if (leafCount < displayNum) {
+							str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
+							leafCount++;
+						}
+					} else {
+						if (internalCount < displayNum) {
+							str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
+							internalCount++;
+						}
+					}
+					activeCount++;
+				} else {
+					inactiveCount++;
+				}
+			}
+			str += $"Active nodes: {activeCount}\n";
+			str += $"Inactive nodes: {inactiveCount}\n";
+			Debug.Log(str);
+
+			// Wait for Space key press to proceed to next layer, then wait for release (new Input System)
+			yield return new WaitUntil(() => Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame);
+			yield return new WaitUntil(() => Keyboard.current != null && !Keyboard.current.spaceKey.isPressed);
+		}
+
+		yield break;
+	}
     
     private void InitializeParticleSystem()
     {
@@ -1094,14 +1037,14 @@ public class FluidSimulator : MonoBehaviour
         Color[] layerColors = new Color[]
         {
             new Color(1f, 0f, 0f),     // Red - Layer 0
-            new Color(1f, 0.3f, 0f),   // Orange-red - Layer 1
-            new Color(1f, 0.6f, 0f),   // Orange - Layer 2
-            new Color(1f, 1f, 0f),     // Yellow - Layer 3
-            new Color(0.5f, 1f, 0f),   // Yellow-green - Layer 4
             new Color(0f, 1f, 0f),     // Green - Layer 5
+            new Color(1f, 0.3f, 0f),   // Orange-red - Layer 1
             new Color(0f, 1f, 0.5f),   // Blue-green - Layer 6
+            new Color(1f, 0.6f, 0f),   // Orange - Layer 2
             new Color(0f, 1f, 1f),     // Cyan - Layer 7
+            new Color(1f, 1f, 0f),     // Yellow - Layer 3
             new Color(0f, 0.5f, 1f),   // Light blue - Layer 8
+            new Color(0.5f, 1f, 0f),   // Yellow-green - Layer 4
             new Color(0f, 0f, 1f),     // Blue - Layer 9
             new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
@@ -1109,9 +1052,9 @@ public class FluidSimulator : MonoBehaviour
         for (int i = 0; i < numNodes; i++)
         {
             Node node = nodesCPU[i];
-            int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
+            int layerIndex = Mathf.Clamp((int)Mathf.Min(node.layer, layer), 0, layerColors.Length - 1);
             Gizmos.color = layerColors[layerIndex];
-            Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+            Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(node.layer, layer)), 0.01f));
         }
 
         // Particle[] particlesCPU = new Particle[numParticles];
@@ -1136,7 +1079,7 @@ public class FluidSimulator : MonoBehaviour
         // Calculate the grid resolution for this layer
         // Layer 0: finest detail (1024 cells per axis)
         // Layer 10: coarsest detail (1 cell per axis)
-        int gridResolution = (int)Mathf.Pow(2, 10 - node.layer);
+        int gridResolution = (int)Mathf.Pow(2, 10 - Mathf.Min(node.layer, layer));
         
         // Normalize the node position to morton code range (0-1023)
         Vector3 mortonNormalizationFactor = new Vector3(
