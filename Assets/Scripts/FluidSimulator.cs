@@ -93,25 +93,27 @@ public class FluidSimulator : MonoBehaviour
         Particle[] particles = new Particle[numParticles];
         particlesBuffer.GetData(particles);
 
-        // Create array of indices and shuffle
-        int[] indices = new int[numParticles];
-        for (int i = 0; i < numParticles; i++) {
-            indices[i] = i;
-        }
+        // // Create array of indices and shuffle
+        // int[] indices = new int[numParticles];
+        // for (int i = 0; i < numParticles; i++) {
+        //     indices[i] = i;
+        // }
         
-        // Fisher-Yates shuffle
-        System.Random rng = new System.Random();
-        for (int i = indices.Length - 1; i > 0; i--) {
-            int j = rng.Next(0, i + 1);
-            int temp = indices[i];
-            indices[i] = indices[j];
-            indices[j] = temp;
-        }
+        // // Fisher-Yates shuffle
+        // System.Random rng = new System.Random();
+        // for (int i = indices.Length - 1; i > 0; i--) {
+        //     int j = rng.Next(0, i + 1);
+        //     int temp = indices[i];
+        //     indices[i] = indices[j];
+        //     indices[j] = temp;
+        // }
 
-        // Set first 10 shuffled indices to layer 0
-        for (int i = 0; i < 10 && i < numParticles; i++) {
-            particles[indices[i]].layer = 0;
-        }
+        // // Set first 10 shuffled indices to layer 0
+        // for (int i = 0; i < 10 && i < numParticles; i++) {
+        //     particles[indices[i]].layer = 0;
+        // }
+
+        particles[9*numParticles/16].layer = 0;
 
         particlesBuffer.SetData(particles);
 
