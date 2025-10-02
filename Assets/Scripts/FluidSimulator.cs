@@ -89,31 +89,31 @@ public class FluidSimulator : MonoBehaviour
     {
         InitializeParticleSystem();
 
-        // // Set 10 random particles to layer 0
-        // Particle[] particles = new Particle[numParticles];
-        // particlesBuffer.GetData(particles);
+        // Set 10 random particles to layer 0
+        Particle[] particles = new Particle[numParticles];
+        particlesBuffer.GetData(particles);
 
-        // // Create array of indices and shuffle
-        // int[] indices = new int[numParticles];
-        // for (int i = 0; i < numParticles; i++) {
-        //     indices[i] = i;
-        // }
+        // Create array of indices and shuffle
+        int[] indices = new int[numParticles];
+        for (int i = 0; i < numParticles; i++) {
+            indices[i] = i;
+        }
         
-        // // Fisher-Yates shuffle
-        // System.Random rng = new System.Random();
-        // for (int i = indices.Length - 1; i > 0; i--) {
-        //     int j = rng.Next(0, i + 1);
-        //     int temp = indices[i];
-        //     indices[i] = indices[j];
-        //     indices[j] = temp;
-        // }
+        // Fisher-Yates shuffle
+        System.Random rng = new System.Random();
+        for (int i = indices.Length - 1; i > 0; i--) {
+            int j = rng.Next(0, i + 1);
+            int temp = indices[i];
+            indices[i] = indices[j];
+            indices[j] = temp;
+        }
 
-        // // Set first 10 shuffled indices to layer 0
-        // for (int i = 0; i < 10 && i < numParticles; i++) {
-        //     particles[indices[i]].layer = 0;
-        // }
+        // Set first 10 shuffled indices to layer 0
+        for (int i = 0; i < 10 && i < numParticles; i++) {
+            particles[indices[i]].layer = 0;
+        }
 
-        // particlesBuffer.SetData(particles);
+        particlesBuffer.SetData(particles);
 
         // // Debug: print numParticles
         // Debug.Log($"Num Particles: {numParticles}");
@@ -129,33 +129,38 @@ public class FluidSimulator : MonoBehaviour
         // }
         // Debug.Log(str);
 
-        AdvectParticles();
+		// Particle compute timing: Advect + Sort
+		{
+			var particleSw = System.Diagnostics.Stopwatch.StartNew();
+			AdvectParticles();
+			SortParticles();
+			particleSw.Stop();
+			Debug.Log($"Particle compute time (advect+sort): {particleSw.Elapsed.TotalMilliseconds:F2} ms");
+		}
 
-        SortParticles();
-
-        // Debug: print first 20 particles
-        Particle[] particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
-        int displayNum = 20;
-        str = $"First {displayNum} leaf and internal particles:\n";
-        int leafCount = 0;
-        int internalCount = 0;
-        for (int i = 0; i < numParticles; i++) {
-            if (particlesCPU[i].layer == 0) {
-                leafCount++;
-                if (leafCount <= displayNum) {
-                    str += $"Leaf {i}: Position: {particlesCPU[i].position}, Velocity: {particlesCPU[i].velocity}, Layer: {particlesCPU[i].layer}, Morton Code: {particlesCPU[i].mortonCode}\n";
-                }
-            } else {
-                internalCount++;
-                if (internalCount <= displayNum) {
-                    str += $"Internal {i}: Position: {particlesCPU[i].position}, Velocity: {particlesCPU[i].velocity}, Layer: {particlesCPU[i].layer}, Morton Code: {particlesCPU[i].mortonCode}\n";
-                }
-            }
-        }
-        str += $"Leaf count: {leafCount}\n";
-        str += $"Internal count: {internalCount}\n";
-        Debug.Log(str);
+        // // Debug: print first 20 particles
+        // Particle[] particlesCPU = new Particle[numParticles];
+        // particlesBuffer.GetData(particlesCPU);
+        // int displayNum = 20;
+        // str = $"First {displayNum} leaf and internal particles:\n";
+        // int leafCount = 0;
+        // int internalCount = 0;
+        // for (int i = 0; i < numParticles; i++) {
+        //     if (particlesCPU[i].layer == 0) {
+        //         leafCount++;
+        //         if (leafCount <= displayNum) {
+        //             str += $"Leaf {i}: Position: {particlesCPU[i].position}, Velocity: {particlesCPU[i].velocity}, Layer: {particlesCPU[i].layer}, Morton Code: {particlesCPU[i].mortonCode}\n";
+        //         }
+        //     } else {
+        //         internalCount++;
+        //         if (internalCount <= displayNum) {
+        //             str += $"Internal {i}: Position: {particlesCPU[i].position}, Velocity: {particlesCPU[i].velocity}, Layer: {particlesCPU[i].layer}, Morton Code: {particlesCPU[i].mortonCode}\n";
+        //         }
+        //     }
+        // }
+        // str += $"Leaf count: {leafCount}\n";
+        // str += $"Internal count: {internalCount}\n";
+        // Debug.Log(str);
 
         // // verify the sort
         // bool sorted = true;
@@ -167,10 +172,17 @@ public class FluidSimulator : MonoBehaviour
         // }
         // Debug.Log($"Sorted: {sorted}");
 
-        findUniqueParticles();
+		// Layer 0 compute timing: unique leaves + create leaves
+		{
+			var layer0Sw = System.Diagnostics.Stopwatch.StartNew();
+			findUniqueParticles();
+			CreateLeaves();
+			layer0Sw.Stop();
+			Debug.Log($"Layer 0 compute time (unique+create): {layer0Sw.Elapsed.TotalMilliseconds:F2} ms");
+		}
 
         // Debug: print numNodes
-        Debug.Log($"Num Unique Morton Codes (Layer 0: 30 bits): {numNodes}");
+        // Debug.Log($"Num Unique Morton Codes (Layer 0: 30 bits): {numNodes}");
 
         // uint[] uniqueIndicesCPU = new uint[numNodes];
         // uniqueIndices.GetData(uniqueIndicesCPU);
@@ -184,126 +196,128 @@ public class FluidSimulator : MonoBehaviour
         // }
         // Debug.Log(str);
 
-        CreateLeaves();
-
 		StartCoroutine(PostCreateLeavesFlow());
     }
 
 	private System.Collections.IEnumerator PostCreateLeavesFlow()
 	{
 		// Debug: print nodes buffer
-		Node[] nodesCPU = new Node[numNodes];
-		nodesBuffer.GetData(nodesCPU);
-		int leafCount = 0;
-		int internalCount = 0;
-		int displayNum = 20;
-		str = $"Layer 0: First {displayNum} leaves and {displayNum} internal nodes:\n";
-		for (int i = 0; i < numNodes; i++)
-		{
-			if (nodesCPU[i].layer == 0) {
-				if (leafCount < displayNum) {
-					str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-					leafCount++;
-				}
-			} else {
-				if (internalCount < displayNum) {
-					str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-					internalCount++;
-				}
-			}
-			if (float.IsNaN(nodesCPU[i].position.x) || float.IsNaN(nodesCPU[i].position.y) || float.IsNaN(nodesCPU[i].position.z)) {
-				str += $"Node {i}: Position is NaN\n";
-			}
-		}
-		Debug.Log(str);
+		// Node[] nodesCPU = new Node[numNodes];
+		// nodesBuffer.GetData(nodesCPU);
+		// int leafCount = 0;
+		// int internalCount = 0;
+		// int displayNum = 20;
+		// str = $"Layer 0: First {displayNum} leaves and {displayNum} internal nodes:\n";
+		// for (int i = 0; i < numNodes; i++)
+		// {
+		// 	if (nodesCPU[i].layer == 0) {
+		// 		if (leafCount < displayNum) {
+		// 			str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+		// 			leafCount++;
+		// 		}
+		// 	} else {
+		// 		if (internalCount < displayNum) {
+		// 			str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+		// 			internalCount++;
+		// 		}
+		// 	}
+		// 	if (float.IsNaN(nodesCPU[i].position.x) || float.IsNaN(nodesCPU[i].position.y) || float.IsNaN(nodesCPU[i].position.z)) {
+		// 		str += $"Node {i}: Position is NaN\n";
+		// 	}
+		// }
+		// Debug.Log(str);
 
 		for (layer = 1; layer <= 10; layer++)
 		{
+			// Wait for Space key press to proceed to next layer, then wait for release (new Input System)
+			// yield return new WaitUntil(() => Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame);
+			// yield return new WaitUntil(() => Keyboard.current != null && !Keyboard.current.spaceKey.isPressed);
+            
+			System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
 			findUniqueNodes();
 			
-			// Debug: print numUniqueNodes
-			Debug.Log($"Num Unique Morton Codes (Layer {layer}: {30 - layer * 3} bits): {numUniqueNodes}");
+			// // Debug: print numUniqueNodes
+			// Debug.Log($"Num Unique Morton Codes (Layer {layer}: {30 - layer * 3} bits): {numUniqueNodes}");
 			
-			// Debug: print unique active indices
-			uint[] uniqueIndicesCPU = new uint[numUniqueNodes];
-			uniqueIndices.GetData(uniqueIndicesCPU);
-			nodesBuffer.GetData(nodesCPU);
-			str = $"Layer {layer}: First 20 unique active indices:\n";
-			for (int i = 0; i < 20 && i < numUniqueNodes; i++)
-			{
-				str += $"Unique Active Index {i}: {uniqueIndicesCPU[i]} (Node morton code: {nodesCPU[uniqueIndicesCPU[i]].mortonCode})\n";
-			}
-			Debug.Log(str);
+			// // Debug: print unique active indices
+			// uint[] uniqueIndicesCPU = new uint[numUniqueNodes];
+			// uniqueIndices.GetData(uniqueIndicesCPU);
+			// nodesBuffer.GetData(nodesCPU);
+			// str = $"Layer {layer}: First 20 unique active indices:\n";
+			// for (int i = 0; i < 20 && i < numUniqueNodes; i++)
+			// {
+			// 	str += $"Unique Active Index {i}: {uniqueIndicesCPU[i]} (Node morton code: {nodesCPU[uniqueIndicesCPU[i]].mortonCode})\n";
+			// }
+			// Debug.Log(str);
 			
 			ProcessNodes();
 			
-			// Debug: print nodes buffer
-			nodesBuffer.GetData(nodesCPU);
-			leafCount = 0;
-			internalCount = 0;
-			displayNum = 20;
-			activeCount = 0;
-			inactiveCount = 0;
-			str = $"Layer {layer} Pre-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
-			for (int i = 0; i < numNodes; i++)
-			{
-				if (nodesCPU[i].active == 1) {
-					if (nodesCPU[i].layer == 0) {
-						if (leafCount < displayNum) {
-							str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-							leafCount++;
-						}
-					} else {
-						if (internalCount < displayNum) {
-							str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
-							internalCount++;
-						}
-					}
-					activeCount++;
-				} else {
-					inactiveCount++;
-				}
-			}
-			str += $"Active nodes: {activeCount}\n";
-			str += $"Inactive nodes: {inactiveCount}\n";
-			Debug.Log(str);
+			// // Debug: print nodes buffer
+			// nodesBuffer.GetData(nodesCPU);
+			// leafCount = 0;
+			// internalCount = 0;
+			// displayNum = 20;
+			// activeCount = 0;
+			// inactiveCount = 0;
+			// str = $"Layer {layer} Pre-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
+			// for (int i = 0; i < numNodes; i++)
+			// {
+			// 	if (nodesCPU[i].active == 1) {
+			// 		if (nodesCPU[i].layer == 0) {
+			// 			if (leafCount < displayNum) {
+			// 				str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+			// 				leafCount++;
+			// 			}
+			// 		} else {
+			// 			if (internalCount < displayNum) {
+			// 				str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}\n";
+			// 				internalCount++;
+			// 			}
+			// 		}
+			// 		activeCount++;
+			// 	} else {
+			// 		inactiveCount++;
+			// 	}
+			// }
+			// str += $"Active nodes: {activeCount}\n";
+			// str += $"Inactive nodes: {inactiveCount}\n";
+			// Debug.Log(str);
 			
 			compactNodes();
 			
-			// Debug: print nodes buffer
-			nodesBuffer.GetData(nodesCPU);
-			leafCount = 0;
-			internalCount = 0;
-			displayNum = 20;
-			activeCount = 0;
-			inactiveCount = 0;
-			str = $"Layer {layer} Post-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
-			for (int i = 0; i < numNodes; i++)
-			{
-				if (nodesCPU[i].active == 1) {
-					if (nodesCPU[i].layer == 0) {
-						if (leafCount < displayNum) {
-							str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
-							leafCount++;
-						}
-					} else {
-						if (internalCount < displayNum) {
-							str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
-							internalCount++;
-						}
-					}
-					activeCount++;
-				} else {
-					inactiveCount++;
-				}
-			}
-			str += $"Active nodes: {activeCount}\n";
-			str += $"Inactive nodes: {inactiveCount}\n";
-			Debug.Log(str);
+			// // Debug: print nodes buffer
+			// nodesBuffer.GetData(nodesCPU);
+			// leafCount = 0;
+			// internalCount = 0;
+			// displayNum = 20;
+			// activeCount = 0;
+			// inactiveCount = 0;
+			// str = $"Layer {layer} Post-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
+			// for (int i = 0; i < numNodes; i++)
+			// {
+			// 	if (nodesCPU[i].active == 1) {
+			// 		if (nodesCPU[i].layer == 0) {
+			// 			if (leafCount < displayNum) {
+			// 				str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
+			// 				leafCount++;
+			// 			}
+			// 		} else {
+			// 			if (internalCount < displayNum) {
+			// 				str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
+			// 				internalCount++;
+			// 			}
+			// 		}
+			// 		activeCount++;
+			// 	} else {
+			// 		inactiveCount++;
+			// 	}
+			// }
+			// str += $"Active nodes: {activeCount}\n";
+			// str += $"Inactive nodes: {inactiveCount}\n";
+			// Debug.Log(str);
 
-			// Wait for Space key press to proceed to next layer, then wait for release (new Input System)
-			yield return new WaitUntil(() => Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame);
-			yield return new WaitUntil(() => Keyboard.current != null && !Keyboard.current.spaceKey.isPressed);
+			sw.Stop();
+			Debug.Log($"Layer {layer} compute time: {sw.Elapsed.TotalMilliseconds:F2} ms");
 		}
 
 		yield break;
@@ -351,49 +365,50 @@ public class FluidSimulator : MonoBehaviour
         // Calculate grid dimensions for even particle distribution
         Vector3 fluidInitialSize = fluidInitialBoundsMax - fluidInitialBoundsMin;
         
-        // Calculate optimal grid dimensions to fit numParticles as evenly as possible
-        // Start with cubic root and adjust for aspect ratio
-        float cubeRoot = Mathf.Pow(numParticles, 1.0f / 3.0f);
+		// Calculate optimal grid dimensions to fit numParticles as evenly as possible
+		// Start with square root (flattened Z) and adjust for aspect ratio
+		// float cubeRoot = Mathf.Pow(numParticles, 1.0f / 3.0f); // OLD: 3D distribution
+		float squareRoot = Mathf.Sqrt(numParticles); // NEW: 2D distribution across X and Y
         
         // Calculate aspect ratio normalized dimensions
         float maxSize = Mathf.Max(fluidInitialSize.x, fluidInitialSize.y, fluidInitialSize.z);
         Vector3 normalizedSize = fluidInitialSize / maxSize;
         
-        Vector3Int gridDimensions = new Vector3Int(
-            Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.x)),
-            Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.y)),
-            Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.z))
-        );
+		Vector3Int gridDimensions = new Vector3Int(
+			Mathf.Max(1, Mathf.RoundToInt(squareRoot * normalizedSize.x)),
+			Mathf.Max(1, Mathf.RoundToInt(squareRoot * normalizedSize.y)),
+			1 // Flatten along Z axis
+		);
         
         // Ensure we have enough grid cells for all particles
         // If we have too few cells, increase dimensions
-        while (gridDimensions.x * gridDimensions.y * gridDimensions.z < numParticles)
+		while (gridDimensions.x * gridDimensions.y * gridDimensions.z < numParticles)
         {
-            if (gridDimensions.x <= gridDimensions.y && gridDimensions.x <= gridDimensions.z)
+			if (gridDimensions.x <= gridDimensions.y && gridDimensions.x <= gridDimensions.z)
                 gridDimensions.x++;
-            else if (gridDimensions.y <= gridDimensions.z)
+			else if (gridDimensions.y <= gridDimensions.z)
                 gridDimensions.y++;
-            else
-                gridDimensions.z++;
+			else
+				gridDimensions.y++; // keep Z at 1 to stay flat
         }
         
         // If we have too many cells, reduce dimensions
-        while (gridDimensions.x * gridDimensions.y * gridDimensions.z > numParticles)
+		while (gridDimensions.x * gridDimensions.y * gridDimensions.z > numParticles)
         {
-            if (gridDimensions.x >= gridDimensions.y && gridDimensions.x >= gridDimensions.z)
+			if (gridDimensions.x >= gridDimensions.y && gridDimensions.x >= gridDimensions.z)
                 gridDimensions.x = Mathf.Max(1, gridDimensions.x - 1);
-            else if (gridDimensions.y >= gridDimensions.z)
+			else if (gridDimensions.y >= gridDimensions.z)
                 gridDimensions.y = Mathf.Max(1, gridDimensions.y - 1);
-            else
-                gridDimensions.z = Mathf.Max(1, gridDimensions.z - 1);
+			else
+				gridDimensions.y = Mathf.Max(1, gridDimensions.y - 1); // keep Z at 1
         }
         
         // Calculate grid spacing to fill the entire fluid bounds
-        Vector3 actualGridSpacing = new Vector3(
-            fluidInitialSize.x / Mathf.Max(1, gridDimensions.x),
-            fluidInitialSize.y / Mathf.Max(1, gridDimensions.y),
-            fluidInitialSize.z / Mathf.Max(1, gridDimensions.z)
-        );
+		Vector3 actualGridSpacing = new Vector3(
+			fluidInitialSize.x / Mathf.Max(1, gridDimensions.x),
+			fluidInitialSize.y / Mathf.Max(1, gridDimensions.y),
+			fluidInitialSize.z // Z spacing unused when flattened
+		);
         
         // Set bounds parameters to compute shader
         particlesShader.SetVector("simulationBoundsMin", simulationBoundsMin);
@@ -841,30 +856,30 @@ public class FluidSimulator : MonoBehaviour
         int groupsLinear = Mathf.Max(1, (numNodes + 511) / 512);
         nodesPrefixSumsShader.Dispatch(markActiveNodesKernel, groupsLinear, 1, 1);
         
-        // Debug: print the indicators after markActiveNodes
-        uint[] indicatorsCPU = new uint[numNodes];
-        indicators.GetData(indicatorsCPU);
-        string debugStr = $"Layer {layer}: First 20 indicators (after markActiveNodes):\n";
-        for (int i = 0; i < 20 && i < numNodes; i++)
-        {
-            debugStr += $"Indicator {i}: {indicatorsCPU[i]}\n";
-        }
-        Debug.Log(debugStr);
+        // // Debug: print the indicators after markActiveNodes
+        // uint[] indicatorsCPU = new uint[numNodes];
+        // indicators.GetData(indicatorsCPU);
+        // string debugStr = $"Layer {layer}: First 20 indicators (after markActiveNodes):\n";
+        // for (int i = 0; i < 20 && i < numNodes; i++)
+        // {
+        //     debugStr += $"Indicator {i}: {indicatorsCPU[i]}\n";
+        // }
+        // Debug.Log(debugStr);
 
-        // Count active indicators manually for verification
-        int manualActiveCount = 0;
-        for (int i = 0; i < numNodes; i++)
-        {
-            if (indicatorsCPU[i] == 1) manualActiveCount++;
-        }
-        Debug.Log($"Layer {layer}: Manual count of active indicators: {manualActiveCount}");
+        // // Count active indicators manually for verification
+        // int manualActiveCount = 0;
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     if (indicatorsCPU[i] == 1) manualActiveCount++;
+        // }
+        // Debug.Log($"Layer {layer}: Manual count of active indicators: {manualActiveCount}");
 
         uint tgSize = 512u;
         uint numThreadgroups = (uint)((numNodes + (tgSize * 2) - 1) / (tgSize * 2));
         uint auxSize = (uint)System.Math.Max(1, (int)numThreadgroups);
 
-        // Debug: Print aux buffer size and thread group info
-        Debug.Log($"Layer {layer}: Prefix sum parameters - numNodes: {numNodes}, numThreadgroups: {numThreadgroups}, auxSize: {auxSize}");
+        // // Debug: Print aux buffer size and thread group info
+        // Debug.Log($"Layer {layer}: Prefix sum parameters - numNodes: {numNodes}, numThreadgroups: {numThreadgroups}, auxSize: {auxSize}");
 
 		radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", indicators);
 		radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", prefixSums);
@@ -873,27 +888,27 @@ public class FluidSimulator : MonoBehaviour
 		radixSortShader.SetInt("zeroff", 1);
 		radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
 
-        // Debug: print prefix sums after first level scan
-        uint[] prefixSumsCPU = new uint[numNodes];
-        prefixSums.GetData(prefixSumsCPU);
-        debugStr = $"Layer {layer}: First 20 prefix sums (after first level scan):\n";
-        for (int i = 0; i < 20 && i < numNodes; i++)
-        {
-            debugStr += $"PrefixSum {i}: {prefixSumsCPU[i]}\n";
-        }
-        Debug.Log(debugStr);
+        // // Debug: print prefix sums after first level scan
+        // uint[] prefixSumsCPU = new uint[numNodes];
+        // prefixSums.GetData(prefixSumsCPU);
+        // debugStr = $"Layer {layer}: First 20 prefix sums (after first level scan):\n";
+        // for (int i = 0; i < 20 && i < numNodes; i++)
+        // {
+        //     debugStr += $"PrefixSum {i}: {prefixSumsCPU[i]}\n";
+        // }
+        // Debug.Log(debugStr);
 
         if (numThreadgroups > 1)
         {
-            // Debug: print aux buffer before second level scan
-            uint[] auxCPU = new uint[auxSize];
-            aux.GetData(auxCPU);
-            debugStr = $"Layer {layer}: Aux buffer (before second level scan):\n";
-            for (int i = 0; i < auxSize && i < 20; i++)
-            {
-                debugStr += $"Aux {i}: {auxCPU[i]}\n";
-            }
-            Debug.Log(debugStr);
+            // // Debug: print aux buffer before second level scan
+            // uint[] auxCPU = new uint[auxSize];
+            // aux.GetData(auxCPU);
+            // debugStr = $"Layer {layer}: Aux buffer (before second level scan):\n";
+            // for (int i = 0; i < auxSize && i < 20; i++)
+            // {
+            //     debugStr += $"Aux {i}: {auxCPU[i]}\n";
+            // }
+            // Debug.Log(debugStr);
 
             // Scan aux -> aux2
             if (auxSmall == null) auxSmall = new ComputeBuffer(1, sizeof(uint));
@@ -905,15 +920,15 @@ public class FluidSimulator : MonoBehaviour
 			radixSortShader.SetInt("zeroff", 1);
 			radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
 
-            // Debug: print aux2 buffer after second level scan
-            uint[] aux2CPU = new uint[auxSize];
-            aux2.GetData(aux2CPU);
-            debugStr = $"Layer {layer}: Aux2 buffer (after second level scan):\n";
-            for (int i = 0; i < auxSize && i < 20; i++)
-            {
-                debugStr += $"Aux2 {i}: {aux2CPU[i]}\n";
-            }
-            Debug.Log(debugStr);
+            // // Debug: print aux2 buffer after second level scan
+            // uint[] aux2CPU = new uint[auxSize];
+            // aux2.GetData(aux2CPU);
+            // debugStr = $"Layer {layer}: Aux2 buffer (after second level scan):\n";
+            // for (int i = 0; i < auxSize && i < 20; i++)
+            // {
+            //     debugStr += $"Aux2 {i}: {aux2CPU[i]}\n";
+            // }
+            // Debug.Log(debugStr);
 
             // Fixup: add scanned aux into prefixSums
 			radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", prefixSums);
@@ -922,14 +937,14 @@ public class FluidSimulator : MonoBehaviour
 			radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
         }
 
-        // Debug: print final prefix sums after fixup
-        prefixSums.GetData(prefixSumsCPU);
-        debugStr = $"Layer {layer}: First 20 prefix sums (after fixup):\n";
-        for (int i = 0; i < 20 && i < numNodes; i++)
-        {
-            debugStr += $"PrefixSum {i}: {prefixSumsCPU[i]}\n";
-        }
-        Debug.Log(debugStr);
+        // // Debug: print final prefix sums after fixup
+        // prefixSums.GetData(prefixSumsCPU);
+        // debugStr = $"Layer {layer}: First 20 prefix sums (after fixup):\n";
+        // for (int i = 0; i < 20 && i < numNodes; i++)
+        // {
+        //     debugStr += $"PrefixSum {i}: {prefixSumsCPU[i]}\n";
+        // }
+        // Debug.Log(debugStr);
 
         // scatterActives active indices
         nodesPrefixSumsShader.SetBuffer(scatterActivesKernel, "indicators", indicators);

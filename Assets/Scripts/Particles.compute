@@ -72,7 +72,8 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     
     // Calculate grid position using morton code major order (Z, Y, X)
     // This ensures particles are distributed evenly throughout the volume
-    uint gridZ = index / (gridDimensions.x * gridDimensions.y);
+    // uint gridZ = index / (gridDimensions.x * gridDimensions.y);
+    uint gridZ = 0; // Flatten along Z axis
     uint remaining = index % (gridDimensions.x * gridDimensions.y);
     uint gridY = remaining / gridDimensions.x;
     uint gridX = remaining % gridDimensions.x;
@@ -82,14 +83,14 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     gridY = min(gridY, (uint)gridDimensions.y - 1);
     gridZ = min(gridZ, (uint)gridDimensions.z - 1);
     
-    // particle.layer = 9;]
-    
     // Convert grid position to world position
     // Use grid spacing to position particles evenly within the bounds
-    float3 gridOffset = float3(gridX, gridY, gridZ) * gridSpacing;
+    float3 gridOffset = float3(gridX, gridY, 0) * gridSpacing; // Z offset flattened
 
     // Base position using uniform spacing (for Y and Z)
     float3 basePos = fluidInitialBoundsMin + gridOffset;
+    // Force Z to mid-plane of fluid bounds
+    basePos.z = (fluidInitialBoundsMin.z + fluidInitialBoundsMax.z) * 0.5;
 
     // Apply power-based dispersion along X
     // u in (0,1]: cell-centered normalized coordinate across X extent
@@ -100,7 +101,8 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     float skew = 1.0 - pow(base, max(0.0001, dispersionPower));
     float xPos = lerp(fluidInitialBoundsMin.x, fluidInitialBoundsMax.x, saturate(skew));
 
-    particle.position = float3(xPos, basePos.y, basePos.z);
+    // particle.position = float3(xPos, basePos.y, basePos.z);
+    particle.position = float3(basePos.x, basePos.y, basePos.z);
 
     // Calculate center of simulation bounds
     float3 simulationCenter = (fluidInitialBoundsMin + fluidInitialBoundsMax) * 0.5;
@@ -115,7 +117,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
     particle.layer = (nearCenter || onBoundary) ? 0 : 11;
     // particle.layer = onBoundary ? 0 : 11;
-    // particle.layer = 11;
+    particle.layer = 11;
     
     // Generate morton code from normalized position
     // particle.mortonCode = EncodeMorton3D(normalizedPos);
