@@ -106,7 +106,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     float3 simulationCenter = (fluidInitialBoundsMin + fluidInitialBoundsMax) * 0.5;
     
     // Check if particle is within a small radius of the center
-    float3 centerOffset = particle.position - simulationCenter;
+    float2 centerOffset = float2(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y);
     float distanceFromCenter = length(centerOffset);
     float centerRadius = 1; // Small radius around center for layer 0 particles
     
