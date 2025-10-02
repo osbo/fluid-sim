@@ -95,24 +95,27 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // u in (0,1]: cell-centered normalized coordinate across X extent
     float u = ((float)gridX + 0.5) / max(1.0, (float)gridDimensions.x);
     // Reverse density: concentrate toward the right for power > 1
-    float skew = 1.0 - pow(1.0 - u, max(0.0001, dispersionPower));
+    // Ensure base is positive to avoid pow() warning
+    float base = max(0.0001, 1.0 - u);
+    float skew = 1.0 - pow(base, max(0.0001, dispersionPower));
     float xPos = lerp(fluidInitialBoundsMin.x, fluidInitialBoundsMax.x, saturate(skew));
 
     particle.position = float3(xPos, basePos.y, basePos.z);
 
     // Calculate center of simulation bounds
-    float3 simulationCenter = (simulationBoundsMin + simulationBoundsMax) * 0.5;
+    float3 simulationCenter = (fluidInitialBoundsMin + fluidInitialBoundsMax) * 0.5;
     
     // Check if particle is within a small radius of the center
     float3 centerOffset = particle.position - simulationCenter;
     float distanceFromCenter = length(centerOffset);
-    float centerRadius = 5; // Small radius around center for layer 0 particles
+    float centerRadius = 1; // Small radius around center for layer 0 particles
     
     // Assign layer: center particles get layer 0, boundary particles get layer 0, others get layer 11
     bool nearCenter = (distanceFromCenter <= centerRadius);
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
-    // particle.layer = (nearCenter || onBoundary) ? 0 : 11;
-    particle.layer = onBoundary ? 0 : 11;
+    particle.layer = (nearCenter || onBoundary) ? 0 : 11;
+    // particle.layer = onBoundary ? 0 : 11;
+    // particle.layer = 11;
     
     // Generate morton code from normalized position
     // particle.mortonCode = EncodeMorton3D(normalizedPos);

@@ -88,6 +88,32 @@ public class FluidSimulator : MonoBehaviour
     {
         InitializeParticleSystem();
 
+        // // Set 10 random particles to layer 0
+        // Particle[] particles = new Particle[numParticles];
+        // particlesBuffer.GetData(particles);
+
+        // // Create array of indices and shuffle
+        // int[] indices = new int[numParticles];
+        // for (int i = 0; i < numParticles; i++) {
+        //     indices[i] = i;
+        // }
+        
+        // // Fisher-Yates shuffle
+        // System.Random rng = new System.Random();
+        // for (int i = indices.Length - 1; i > 0; i--) {
+        //     int j = rng.Next(0, i + 1);
+        //     int temp = indices[i];
+        //     indices[i] = indices[j];
+        //     indices[j] = temp;
+        // }
+
+        // // Set first 10 shuffled indices to layer 0
+        // for (int i = 0; i < 10 && i < numParticles; i++) {
+        //     particles[indices[i]].layer = 0;
+        // }
+
+        // particlesBuffer.SetData(particles);
+
         // // Debug: print numParticles
         // Debug.Log($"Num Particles: {numParticles}");
 
@@ -1067,17 +1093,17 @@ public class FluidSimulator : MonoBehaviour
         // Define 11 colors for different layers (0-10)
         Color[] layerColors = new Color[]
         {
-            Color.red,      // Layer 0
-            Color.green,    // Layer 1
-            Color.blue,     // Layer 2
-            Color.yellow,   // Layer 3
-            Color.magenta,  // Layer 4
-            Color.cyan,     // Layer 5
-            Color.white,    // Layer 6
-            Color.gray,     // Layer 7
-            new Color(1f, 0.5f, 0f), // Orange - Layer 8
-            new Color(0.5f, 0f, 1f), // Purple - Layer 9
-            new Color(0f, 0.5f, 0.5f) // Teal - Layer 10
+            new Color(1f, 0f, 0f),     // Red - Layer 0
+            new Color(1f, 0.3f, 0f),   // Orange-red - Layer 1
+            new Color(1f, 0.6f, 0f),   // Orange - Layer 2
+            new Color(1f, 1f, 0f),     // Yellow - Layer 3
+            new Color(0.5f, 1f, 0f),   // Yellow-green - Layer 4
+            new Color(0f, 1f, 0f),     // Green - Layer 5
+            new Color(0f, 1f, 0.5f),   // Blue-green - Layer 6
+            new Color(0f, 1f, 1f),     // Cyan - Layer 7
+            new Color(0f, 0.5f, 1f),   // Light blue - Layer 8
+            new Color(0f, 0f, 1f),     // Blue - Layer 9
+            new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
         
         for (int i = 0; i < numNodes; i++)
