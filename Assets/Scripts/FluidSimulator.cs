@@ -26,6 +26,8 @@ public class FluidSimulator : MonoBehaviour
     private int writeNodeCountKernel;
     private int radixPrefixSumKernelId;
     private int radixPrefixFixupKernelId;
+    private int pullVelocitiesKernel;
+    private int copyFaceVelocitiesKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -135,28 +137,6 @@ public class FluidSimulator : MonoBehaviour
 			Debug.Log($"Particle compute time (advect+sort): {particleSw.Elapsed.TotalMilliseconds:F2} ms");
 		}
 
-        // // Debug: print first 20 particles
-        // Particle[] particlesCPU = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesCPU);
-        // int displayNum = 20;
-        // str = $"First {displayNum} leaf and internal particles:\n";
-        // int leafCount = 0;
-        // int internalCount = 0;
-        // for (int i = 0; i < numParticles; i++) {
-        //     if (particlesCPU[i].layer == 0) {
-        //         leafCount++;
-        //         if (leafCount <= displayNum) {
-        //             str += $"Leaf {i}: Position: {particlesCPU[i].position}, Velocity: {particlesCPU[i].velocity}, Layer: {particlesCPU[i].layer}, Morton Code: {particlesCPU[i].mortonCode}\n";
-        //         }
-        //     } else {
-        //         internalCount++;
-        //         if (internalCount <= displayNum) {
-        //             str += $"Internal {i}: Position: {particlesCPU[i].position}, Velocity: {particlesCPU[i].velocity}, Layer: {particlesCPU[i].layer}, Morton Code: {particlesCPU[i].mortonCode}\n";
-        //         }
-        //     }
-        // }
-        // Debug.Log(str);
-
 		// Layer 0 compute timing: unique leaves + create leaves
 		{
 			var layer0Sw = System.Diagnostics.Stopwatch.StartNew();
@@ -183,37 +163,6 @@ public class FluidSimulator : MonoBehaviour
 			ProcessNodes();
 			
 			compactNodes();
-			
-			// // Debug: print nodes buffer
-			// nodesBuffer.GetData(nodesCPU);
-			// leafCount = 0;
-			// internalCount = 0;
-			// displayNum = 20;
-			// activeCount = 0;
-			// inactiveCount = 0;
-			// str = $"Layer {layer} Post-compacting: First {displayNum} leaves and {displayNum} internal nodes:\n";
-			// for (int i = 0; i < numNodes; i++)
-			// {
-			// 	if (nodesCPU[i].active == 1) {
-			// 		if (nodesCPU[i].layer == 0) {
-			// 			if (leafCount < displayNum) {
-			// 				str += $"Leaf {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
-			// 				leafCount++;
-			// 			}
-			// 		} else {
-			// 			if (internalCount < displayNum) {
-			// 				str += $"Internal {i}: Morton Code: {nodesCPU[i].mortonCode}, Layer: {nodesCPU[i].layer}, Position: {nodesCPU[i].position}, Active: {nodesCPU[i].active}, Velocities: {nodesCPU[i].velocities.left}, {nodesCPU[i].velocities.right}, {nodesCPU[i].velocities.bottom}, {nodesCPU[i].velocities.top}, {nodesCPU[i].velocities.front}, {nodesCPU[i].velocities.back}\n";
-			// 				internalCount++;
-			// 			}
-			// 		}
-			// 		activeCount++;
-			// 	} else {
-			// 		inactiveCount++;
-			// 	}
-			// }
-			// str += $"Active nodes: {activeCount}\n";
-			// str += $"Inactive nodes: {inactiveCount}\n";
-			// Debug.Log(str);
 
 			sw.Stop();
 			Debug.Log($"Layer {layer}: {numNodes} nodes, {sw.Elapsed.TotalMilliseconds:F2} ms");
@@ -225,6 +174,34 @@ public class FluidSimulator : MonoBehaviour
             totalOctreeSw.Stop();
             Debug.Log($"Total octree construction: {numParticles} particles to {numNodes} nodes ({100.0f - 100.0f*(float)numNodes/numParticles:F2}% reduction), {totalOctreeSw.Elapsed.TotalMilliseconds:F2} ms");
         }
+
+        // Debug: print first 20 nodes
+        Node[] nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        string str = "Middle 40 nodes:\n";
+        for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
+        {   
+            // int index = UnityEngine.Random.Range(0, numNodes);
+            int index = i;
+            Node node = nodesCPU[index];
+            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
+        }
+        Debug.Log(str);
+
+        pullVelocities();
+
+        // Node[] nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        str = "Middle 40 nodes after pullVelocities:\n";
+        for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
+        {   
+            // int index = UnityEngine.Random.Range(0, numNodes);
+            int index = i;
+            Node node = nodesCPU[index];
+            // str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back}\n";
+            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Neighbor Morton Codes: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
+        }
+        Debug.Log(str);
 
 		yield break;
 	}
@@ -704,6 +681,28 @@ public class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.Dispatch(copyNodesKernel, copyGroups, 1, 1);
     }
 
+    private void pullVelocities()
+    {
+        if (nodesShader == null)
+        {
+            Debug.LogError("Nodes compute shader is not assigned. Please assign `nodesShader` in the inspector.");
+            return;
+        }
+
+        pullVelocitiesKernel = nodesShader.FindKernel("pullVelocities");
+        nodesShader.SetBuffer(pullVelocitiesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(pullVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+        nodesShader.Dispatch(pullVelocitiesKernel, threadGroups, 1, 1);
+
+        copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
+        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
+    }
+
     private void ClearUniqueBuffers()
     {
         if (nodesPrefixSumsShader == null)
@@ -757,16 +756,28 @@ public class FluidSimulator : MonoBehaviour
         Color[] layerColors = new Color[]
         {
             new Color(1f, 0f, 0f),     // Red - Layer 0
-            new Color(0f, 1f, 0f),     // Green - Layer 5
             new Color(1f, 0.3f, 0f),   // Orange-red - Layer 1
-            new Color(0f, 1f, 0.5f),   // Blue-green - Layer 6
             new Color(1f, 0.6f, 0f),   // Orange - Layer 2
-            new Color(0f, 1f, 1f),     // Cyan - Layer 7
             new Color(1f, 1f, 0f),     // Yellow - Layer 3
-            new Color(0f, 0.5f, 1f),   // Light blue - Layer 8
             new Color(0.5f, 1f, 0f),   // Yellow-green - Layer 4
+            new Color(0f, 1f, 0f),     // Green - Layer 5
+            new Color(0f, 1f, 0.5f),   // Blue-green - Layer 6
+            new Color(0f, 1f, 1f),     // Cyan - Layer 7
+            new Color(0f, 0.5f, 1f),   // Light blue - Layer 8
             new Color(0f, 0f, 1f),     // Blue - Layer 9
             new Color(0.5f, 0f, 1f)    // Violet - Layer 10
+
+            // new Color(1f, 0f, 0f),     // Red - Layer 0
+            // new Color(0f, 1f, 0f),     // Green - Layer 5
+            // new Color(1f, 0.3f, 0f),   // Orange-red - Layer 1
+            // new Color(0f, 1f, 0.5f),   // Blue-green - Layer 6
+            // new Color(1f, 0.6f, 0f),   // Orange - Layer 2
+            // new Color(0f, 1f, 1f),     // Cyan - Layer 7
+            // new Color(1f, 1f, 0f),     // Yellow - Layer 3
+            // new Color(0f, 0.5f, 1f),   // Light blue - Layer 8
+            // new Color(0.5f, 1f, 0f),   // Yellow-green - Layer 4
+            // new Color(0f, 0f, 1f),     // Blue - Layer 9
+            // new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
         
         for (int i = 0; i < numNodes; i++)

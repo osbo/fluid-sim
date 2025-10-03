@@ -1,5 +1,7 @@
 #pragma kernel CreateLeaves
 #pragma kernel ProcessNodes
+#pragma kernel pullVelocities
+#pragma kernel copyFaceVelocities
 
 struct faceVelocities
 {
@@ -35,6 +37,7 @@ RWStructuredBuffer<Particle> particlesBuffer;           // input: all particles
 RWStructuredBuffer<uint> uniqueIndices;                 // input: indices of first occurrence of each unique code
 // Output buffers
 RWStructuredBuffer<Node> nodesBuffer;                   // output: aggregated nodes
+RWStructuredBuffer<Node> tempNodesBuffer;               // output: per-node gathered face deltas
 
 uint numUniqueNodes;                              // number of unique morton codes
 uint numNodes;                                          // number of nodes
@@ -67,10 +70,11 @@ uint interleave(uint3 p)
 }
 
 // Lower-bound search: first index with mortonCode >= target
-uint lowerBoundMorton(uint target)
+// left is inclusive, right is exclusive
+uint lowerBoundMorton(uint target, uint left_bound, uint right_bound)
 {
-    uint left = 0u;
-    uint right = numNodes; // exclusive
+    uint left = left_bound;
+    uint right = right_bound; // exclusive
     while (left < right)
     {
         uint mid = left + ((right - left) >> 1);
@@ -87,41 +91,27 @@ uint lowerBoundMorton(uint target)
     return left;
 }
 
-// // Check if 8 subnodes of a neighbor cell (at layer-1) are all at appropriate layers
-// bool checkSubnodes(uint nPrefix, uint currentLayer)
-// {
-//     // 8 binary numbers with 3 bits: 000, 001, 010, 011, 100, 101, 110, 111
-//     int subOffsets[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
-//     int subCount = 8;
-//     uint shiftedPrefix = nPrefix << 3;
-    
-//     // Check each subnode
-//     for (int s = 0; s < subCount; s++)
-//     {
-//         uint subPrefix = shiftedPrefix + subOffsets[s];
-        
-//         // Shift the rest of the way left (shift-3) to get lower
-//         uint subLower = subPrefix << ((currentLayer-1) * 3);
-//         uint subUpper = (subPrefix + 1u) << ((currentLayer-1) * 3);
-        
-//         // Search for the first node after this target morton code (inclusive)
-//         uint subIdx = lowerBoundMorton(subLower);
-//         if (subIdx < numNodes)
-//         {
-//             uint subCode = nodesBuffer[subIdx].mortonCode;
-//             if (subCode >= subLower && subCode < subUpper)
-//             {
-//                 uint subLayer = nodesBuffer[subIdx].layer;
-//                 if (subLayer < (currentLayer - 1))
-//                 {
-//                     return false; // Subnode is too coarse
-//                 }
-//             }
-//         }
-//     }
-    
-//     return true; // All subnodes are appropriate
-// }
+// Upper-bound search: last index with mortonCode <= target
+// left_bound is inclusive, right_bound is exclusive
+uint upperBoundMorton(uint target, uint left_bound, uint right_bound)
+{
+    uint left = left_bound;
+    uint right = right_bound;
+    while (left < right)
+    {
+        uint mid = left + ((right - left) >> 1);
+        uint midCode = nodesBuffer[mid].mortonCode;
+        if (midCode > target)
+        {
+            right = mid;
+        }
+        else
+        {
+            left = mid + 1u;
+        }
+    }
+    return left - 1u; // return last position where code <= target
+}
 
 [numthreads(512, 1, 1)]
 void CreateLeaves(uint3 id : SV_DispatchThreadID)
@@ -139,11 +129,11 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     float3 weightedPosition = float3(0, 0, 0);
     faceVelocities leafVelocities;
     leafVelocities.left = 0.0;
-    leafVelocities.right = 0.0;
+    leafVelocities.right = 1.0;
     leafVelocities.bottom = 0.0;
-    leafVelocities.top = 0.0;
+    leafVelocities.top = 1.0;
     leafVelocities.front = 0.0;
-    leafVelocities.back = 0.0;
+    leafVelocities.back = 1.0;
     
     float totalWeight = 0.0;
     uint minLayer = 11;
@@ -158,22 +148,22 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         weightedPosition += particle.position * weight;
         totalWeight += weight;
 
-        float3 velocity = particle.velocity;
-        if (velocity.x < 0) {
-            leafVelocities.left += velocity.x * -1;
-        } else {
-            leafVelocities.right += velocity.x;
-        }
-        if (velocity.y < 0) {
-            leafVelocities.bottom += velocity.y * -1;
-        } else {
-            leafVelocities.top += velocity.y;
-        }
-        if (velocity.z < 0) {
-            leafVelocities.front += velocity.z * -1;
-        } else {
-            leafVelocities.back += velocity.z;
-        }
+        // float3 velocity = particle.velocity;
+        // if (velocity.x < 0) {
+        //     leafVelocities.left += velocity.x * -1;
+        // } else {
+        //     leafVelocities.right += velocity.x;
+        // }
+        // if (velocity.y < 0) {
+        //     leafVelocities.bottom += velocity.y * -1;
+        // } else {
+        //     leafVelocities.top += velocity.y;
+        // }
+        // if (velocity.z < 0) {
+        //     leafVelocities.front += velocity.z * -1;
+        // } else {
+        //     leafVelocities.back += velocity.z;
+        // }
         
         // Track minimum layer
         minLayer = min(minLayer, particle.layer);
@@ -253,7 +243,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             uint lower = nPrefix << shift;
             uint upper = (nPrefix + 1u) << shift; // exclusive
 
-            uint idx_low = lowerBoundMorton(lower);
+            uint idx_low = lowerBoundMorton(lower, 0, numNodes);
 
             // this isn't perfect, but it's honestly fast enough. It's bounded to at most 8 iterations, and is robust.
             for (uint j = idx_low; j < numNodes; j++)
@@ -327,4 +317,229 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             }
         }
     }
+}
+
+// Next step: handle bigger than current layer
+// Do multiplier when aggregating based on layer
+
+[numthreads(512, 1, 1)]
+void pullVelocities(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    Node node = nodesBuffer[threadIndex];
+    faceVelocities selfVel = node.velocities;
+
+    // Initialize output (delta) node with zero face velocities
+    Node outNode;
+    outNode.position = node.position;
+    outNode.layer = node.layer;
+    outNode.mortonCode = node.mortonCode;
+    outNode.active = node.active;
+    outNode.velocities = node.velocities;
+
+    // all face neighbors of this node. It's bounded to 2:1 ratio
+    int3 deltas[6] = {int3(-1,0,0), int3(1,0,0), int3(0,-1,0), int3(0,1,0), int3(0,0,-1), int3(0,0,1)};
+    for (int d = 0; d < 6; d++)
+    {
+        uint shift = node.layer * 3;
+        uint prefix = node.mortonCode >> shift;
+        uint3 coord = deinterleave(prefix);
+
+        int nx = (int)coord.x + deltas[d].x;
+        int ny = (int)coord.y + deltas[d].y;
+        int nz = (int)coord.z + deltas[d].z;
+        
+        // Skip if neighbor is outside the grid bounds for this layer
+        uint gridDim = 1u << (10 - node.layer);
+        if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
+        {
+            continue; // Skip this neighbor direction
+        }
+        
+        uint3 ncoord = uint3((uint)nx, (uint)ny, (uint)nz);
+        uint nPrefix = interleave(ncoord) >> shift;
+
+        // same-layer neighbor: leq prefix will fall under eq. Layer will be eq.
+        // parent neighbor: leq prefix fill fall under less or equal, but layer will be +1
+        // child neighbor: search geq for lower and upper bounds. Layer will be -1, operate on all 4 subnodes.
+
+        uint target = nPrefix << shift;
+        uint upper = (nPrefix + 1u) << shift; // start of next region
+
+        // Find the last node in this region by finding first node in next region, then subtract 1
+        uint idx_next = lowerBoundMorton(upper, 0, numNodes);
+        uint idx_leq = (idx_next > 0) ? idx_next - 1u : 0u;
+
+        // Skip if no valid neighbor found
+        if (idx_leq >= numNodes) continue;
+
+        Node nNode = nodesBuffer[idx_leq];
+        uint idx_leq_mc = nNode.mortonCode;
+        uint idx_leq_mc_prefix = idx_leq_mc >> shift;
+        uint idx_leq_layer = nNode.layer;
+
+        if (idx_leq_mc_prefix == nPrefix && idx_leq_layer == node.layer)
+        {
+            // // same-layer neighbor
+            // faceVelocities nVel = nNode.velocities;
+            // if (d == 0) {
+            //     outNode.velocities.left -= nVel.right;
+            // } else if (d == 1) {
+            //     outNode.velocities.right -= nVel.left;
+            // } else if (d == 2) {
+            //     outNode.velocities.bottom -= nVel.top;
+            // } else if (d == 3) {
+            //     outNode.velocities.top -= nVel.bottom;
+            // } else if (d == 4) {
+            //     outNode.velocities.front -= nVel.back;
+            // } else if (d == 5) {
+            //     outNode.velocities.back -= nVel.front;
+            // }
+            if (d == 0) {
+                outNode.velocities.left = idx_leq_mc;
+            } else if (d == 1) {
+                outNode.velocities.right = idx_leq_mc;
+            } else if (d == 2) {
+                outNode.velocities.bottom = idx_leq_mc;
+            } else if (d == 3) {
+                outNode.velocities.top = idx_leq_mc;
+            } else if (d == 4) {
+                outNode.velocities.front = idx_leq_mc;
+            } else if (d == 5) {
+                outNode.velocities.back = idx_leq_mc;
+            }
+        }
+        else if (idx_leq_mc_prefix >> 3 == nPrefix >> 3 && idx_leq_layer == node.layer + 1)
+        {
+            // // parent neighbor (divide incoming velocity by 4)
+            // faceVelocities nVel = nNode.velocities;
+            // if (d == 0) {
+            //     outNode.velocities.left -= nVel.right / 4.0;
+            // } else if (d == 1) {
+            //     outNode.velocities.right -= nVel.left / 4.0;
+            // } else if (d == 2) {
+            //     outNode.velocities.bottom -= nVel.top / 4.0;
+            // } else if (d == 3) {
+            //     outNode.velocities.top -= nVel.bottom / 4.0;
+            // } else if (d == 4) {
+            //     outNode.velocities.front -= nVel.back / 4.0;
+            // } else if (d == 5) {
+            //     outNode.velocities.back -= nVel.front / 4.0;
+            // }
+            if (d == 0) {
+                outNode.velocities.left = idx_leq_mc;
+            } else if (d == 1) {
+                outNode.velocities.right = idx_leq_mc;
+            } else if (d == 2) {
+                outNode.velocities.bottom = idx_leq_mc;
+            } else if (d == 3) {
+                outNode.velocities.top = idx_leq_mc;
+            } else if (d == 4) {
+                outNode.velocities.front = idx_leq_mc;
+            } else if (d == 5) {
+                outNode.velocities.back = idx_leq_mc;
+            }
+        }
+        else
+        {
+            uint idx_target = lowerBoundMorton(target, 0, numNodes); // low child bound
+            uint idx_upper = lowerBoundMorton(upper, 0, numNodes); // high child bound
+            if (idx_target < idx_upper)
+            {
+                // child neighbor
+                uint nPrefixShifted = nPrefix << 3;
+                int subNodesLower[4];
+                if (d == 0) { // right face
+                    subNodesLower[0] = 1;
+                    subNodesLower[1] = 3;
+                    subNodesLower[2] = 5;
+                    subNodesLower[3] = 7;
+                } else if (d == 1) { // left face
+                    subNodesLower[0] = 0;
+                    subNodesLower[1] = 2;
+                    subNodesLower[2] = 4;
+                    subNodesLower[3] = 6;
+                } else if (d == 2) { // top face
+                    subNodesLower[0] = 2;
+                    subNodesLower[1] = 3;
+                    subNodesLower[2] = 6;
+                    subNodesLower[3] = 7;
+                } else if (d == 3) { // bottom face
+                    subNodesLower[0] = 0;
+                    subNodesLower[1] = 1;
+                    subNodesLower[2] = 4;
+                    subNodesLower[3] = 5;
+                } else if (d == 4) { // back face
+                    subNodesLower[0] = 4;
+                    subNodesLower[1] = 5;
+                    subNodesLower[2] = 6;
+                    subNodesLower[3] = 7;
+                } else if (d == 5) { // front face
+                    subNodesLower[0] = 0;
+                    subNodesLower[1] = 1;
+                    subNodesLower[2] = 2;
+                    subNodesLower[3] = 3;
+                }
+
+                for (int i = 0; i < 4; i++)
+                {
+                    uint subPrefix = nPrefixShifted + subNodesLower[i];
+                    uint subLower = subPrefix << (shift - 3);
+                    uint subUpper = (subPrefix + 1u) << (shift - 3);
+                    uint idx_sub = lowerBoundMorton(subLower, idx_target, idx_upper);
+                    Node cNode = nodesBuffer[idx_sub];
+                    uint idx_sub_mc = cNode.mortonCode;
+                    uint idx_sub_mc_prefix = idx_sub_mc >> (shift - 3);
+                    uint idx_sub_layer = cNode.layer;
+                    if (idx_sub < idx_upper)
+                    {
+                        if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
+                        {
+                            // faceVelocities cVel = cNode.velocities;
+                            // if (d == 0) {
+                            //     outNode.velocities.left -= cVel.right;
+                            // } else if (d == 1) {
+                            //     outNode.velocities.right -= cVel.left;
+                            // } else if (d == 2) {
+                            //     outNode.velocities.bottom -= cVel.top;
+                            // } else if (d == 3) {
+                            //     outNode.velocities.top -= cVel.bottom;
+                            // } else if (d == 4) {
+                            //     outNode.velocities.front -= cVel.back;
+                            // } else if (d == 5) {
+                            //     outNode.velocities.back -= cVel.front;
+                            // }
+                            if (d == 0) {
+                                outNode.velocities.left = idx_sub_mc;
+                            } else if (d == 1) {
+                                outNode.velocities.right = idx_sub_mc;
+                            } else if (d == 2) {
+                                outNode.velocities.bottom = idx_sub_mc;
+                            } else if (d == 3) {
+                                outNode.velocities.top = idx_sub_mc;
+                            } else if (d == 4) {
+                                outNode.velocities.front = idx_sub_mc;
+                            } else if (d == 5) {
+                                outNode.velocities.back = idx_sub_mc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Write gathered deltas to temp buffer for this node
+    tempNodesBuffer[threadIndex] = outNode;
+}
+
+[numthreads(512, 1, 1)]
+void copyFaceVelocities(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    nodesBuffer[threadIndex] = tempNodesBuffer[threadIndex];
 }
