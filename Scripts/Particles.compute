@@ -48,6 +48,7 @@ float gravity;
 float deltaTime;
 float dispersionPower; // >1 concentrates near left, <1 concentrates near right
 float boundaryThreshold; // normalized u threshold near left edge considered boundary
+uint initialLayer;
 
 // Grid parameters for even particle distribution
 uint3 gridDimensions;
@@ -105,17 +106,22 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     float3 simulationCenter = (fluidInitialBoundsMin + fluidInitialBoundsMax) * 0.5;
     
     // Check if particle is within a small radius of the center
-    float2 centerOffset = float2(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y);
+    // float2 centerOffset = float2(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y);
+    float3 centerOffset = float3(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y, particle.position.z - simulationCenter.z);
     float distanceFromCenter = length(centerOffset);
     float centerRadius = 1; // Small radius around center for layer 0 particles
     
     // Assign layer: center particles get layer 0, boundary particles get layer 0, others get layer 11
     bool nearCenter = (distanceFromCenter <= centerRadius);
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
-    // particle.layer = (nearCenter || onBoundary) ? 0 : 11;
-    // particle.layer = onBoundary ? 0 : 11;
-    // particle.layer = (nearCenter) ? 0 : 11;
+    // particle.layer = (nearCenter || onBoundary) ? initialLayer : 11;
+    // particle.layer = onBoundary ? initialLayer : 11;
+    // particle.layer = (nearCenter) ? initialLayer : 11;
     particle.layer = 11;
+
+    // if (nearCenter) {
+    //     particle.velocity = float3(-1.0, 0, 0.0);
+    // }
     
     // Generate morton code from normalized position
     // particle.mortonCode = EncodeMorton3D(normalizedPos);
@@ -140,7 +146,7 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
 
     // Vectors point outward from the face
 
-    velocity.y -= gravity * deltaTime;
+    // velocity.y -= gravity * deltaTime;
 
     float3 position = particle.position + velocity * deltaTime;
     
