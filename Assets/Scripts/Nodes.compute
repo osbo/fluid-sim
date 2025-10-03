@@ -331,13 +331,22 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[threadIndex];
     faceVelocities selfVel = node.velocities;
 
-    // Initialize output (delta) node with zero face velocities
+    // Initialize output velocities to zero
+    faceVelocities newVelocities;
+    newVelocities.left = 0.0;
+    newVelocities.right = 0.0;
+    newVelocities.bottom = 0.0;
+    newVelocities.top = 0.0;
+    newVelocities.front = 0.0;
+    newVelocities.back = 0.0;
+
+    // Initialize output node
     Node outNode;
     outNode.position = node.position;
     outNode.layer = node.layer;
     outNode.mortonCode = node.mortonCode;
     outNode.active = node.active;
-    outNode.velocities = node.velocities;
+    outNode.velocities = newVelocities;
 
     // all face neighbors of this node. It's bounded to 2:1 ratio
     int3 deltas[6] = {int3(-1,0,0), int3(1,0,0), int3(0,-1,0), int3(0,1,0), int3(0,0,-1), int3(0,0,1)};
@@ -355,24 +364,19 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
+            // Reflective boundary conditions
             if (d == 0) { // Left boundary
-                outNode.velocities.right += selfVel.left;
-                outNode.velocities.left = 0;
+                outNode.velocities.left = -selfVel.left;
             } else if (d == 1) { // Right boundary
-                outNode.velocities.left += selfVel.right;
-                outNode.velocities.right = 0;
+                outNode.velocities.right = -selfVel.right;
             } else if (d == 2) { // Bottom boundary
-                outNode.velocities.top += selfVel.bottom;
-                outNode.velocities.bottom = 0;
+                outNode.velocities.bottom = -selfVel.bottom;
             } else if (d == 3) { // Top boundary
-                outNode.velocities.bottom += selfVel.top;
-                outNode.velocities.top = 0;
+                outNode.velocities.top = -selfVel.top;
             } else if (d == 4) { // Front boundary
-                outNode.velocities.back += selfVel.front;
-                outNode.velocities.front = 0;
+                outNode.velocities.front = -selfVel.front;
             } else if (d == 5) { // Back boundary
-                outNode.velocities.front += selfVel.back;
-                outNode.velocities.back = 0;
+                outNode.velocities.back = -selfVel.back;
             }
             continue; // Skip this neighbor direction
         }
@@ -401,20 +405,26 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
 
         if (idx_leq_mc_prefix == nPrefix && idx_leq_layer == node.layer)
         {
-            // same-layer neighbor
+            // same-layer neighbor - calculate shared velocity
             faceVelocities nVel = nNode.velocities;
             if (d == 0) {
-                outNode.velocities.left -= nVel.right;
+                float avg_vel = (selfVel.left - nVel.right) / 2.0f;
+                outNode.velocities.left = avg_vel;
             } else if (d == 1) {
-                outNode.velocities.right -= nVel.left;
+                float avg_vel = (selfVel.right - nVel.left) / 2.0f;
+                outNode.velocities.right = avg_vel;
             } else if (d == 2) {
-                outNode.velocities.bottom -= nVel.top;
+                float avg_vel = (selfVel.bottom - nVel.top) / 2.0f;
+                outNode.velocities.bottom = avg_vel;
             } else if (d == 3) {
-                outNode.velocities.top -= nVel.bottom;
+                float avg_vel = (selfVel.top - nVel.bottom) / 2.0f;
+                outNode.velocities.top = avg_vel;
             } else if (d == 4) {
-                outNode.velocities.front -= nVel.back;
+                float avg_vel = (selfVel.front - nVel.back) / 2.0f;
+                outNode.velocities.front = avg_vel;
             } else if (d == 5) {
-                outNode.velocities.back -= nVel.front;
+                float avg_vel = (selfVel.back - nVel.front) / 2.0f;
+                outNode.velocities.back = avg_vel;
             }
             // if (d == 0) {
             //     outNode.velocities.left = idx_leq_mc;
@@ -430,22 +440,28 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
             //     outNode.velocities.back = idx_leq_mc;
             // }
         }
-        else if (idx_leq_mc_prefix >> 3 == nPrefix >> 3 && idx_leq_layer == node.layer + 1)
+        else if ((idx_leq_mc >> (shift + 3)) == (nPrefix >> 3) && idx_leq_layer == node.layer + 1)
         {
-            // parent neighbor (divide incoming velocity by 4)
+            // parent neighbor - calculate shared velocity (divide incoming velocity by 4)
             faceVelocities nVel = nNode.velocities;
             if (d == 0) {
-                outNode.velocities.left -= nVel.right / 4.0;
+                float avg_vel = (selfVel.left - nVel.right / 4.0) / 2.0f;
+                outNode.velocities.left = avg_vel;
             } else if (d == 1) {
-                outNode.velocities.right -= nVel.left / 4.0;
+                float avg_vel = (selfVel.right - nVel.left / 4.0) / 2.0f;
+                outNode.velocities.right = avg_vel;
             } else if (d == 2) {
-                outNode.velocities.bottom -= nVel.top / 4.0;
+                float avg_vel = (selfVel.bottom - nVel.top / 4.0) / 2.0f;
+                outNode.velocities.bottom = avg_vel;
             } else if (d == 3) {
-                outNode.velocities.top -= nVel.bottom / 4.0;
+                float avg_vel = (selfVel.top - nVel.bottom / 4.0) / 2.0f;
+                outNode.velocities.top = avg_vel;
             } else if (d == 4) {
-                outNode.velocities.front -= nVel.back / 4.0;
+                float avg_vel = (selfVel.front - nVel.back / 4.0) / 2.0f;
+                outNode.velocities.front = avg_vel;
             } else if (d == 5) {
-                outNode.velocities.back -= nVel.front / 4.0;
+                float avg_vel = (selfVel.back - nVel.front / 4.0) / 2.0f;
+                outNode.velocities.back = avg_vel;
             }
             // if (d == 0) {
             //     outNode.velocities.left = idx_leq_mc;
@@ -502,6 +518,10 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                     subNodesLower[3] = 3;
                 }
 
+                // Accumulate velocities from all 4 sub-nodes
+                float accumulated_vel = 0.0f;
+                int valid_subnodes = 0;
+                
                 for (int i = 0; i < 4; i++)
                 {
                     uint subPrefix = nPrefixShifted + subNodesLower[i];
@@ -518,32 +538,38 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                         {
                             faceVelocities cVel = cNode.velocities;
                             if (d == 0) {
-                                outNode.velocities.left -= cVel.right;
+                                accumulated_vel += (selfVel.left - cVel.right) / 2.0f;
                             } else if (d == 1) {
-                                outNode.velocities.right -= cVel.left;
+                                accumulated_vel += (selfVel.right - cVel.left) / 2.0f;
                             } else if (d == 2) {
-                                outNode.velocities.bottom -= cVel.top;
+                                accumulated_vel += (selfVel.bottom - cVel.top) / 2.0f;
                             } else if (d == 3) {
-                                outNode.velocities.top -= cVel.bottom;
+                                accumulated_vel += (selfVel.top - cVel.bottom) / 2.0f;
                             } else if (d == 4) {
-                                outNode.velocities.front -= cVel.back;
+                                accumulated_vel += (selfVel.front - cVel.back) / 2.0f;
                             } else if (d == 5) {
-                                outNode.velocities.back -= cVel.front;
+                                accumulated_vel += (selfVel.back - cVel.front) / 2.0f;
                             }
-                            // if (d == 0) {
-                            //     outNode.velocities.left = idx_sub_mc;
-                            // } else if (d == 1) {
-                            //     outNode.velocities.right = idx_sub_mc;
-                            // } else if (d == 2) {
-                            //     outNode.velocities.bottom = idx_sub_mc;
-                            // } else if (d == 3) {
-                            //     outNode.velocities.top = idx_sub_mc;
-                            // } else if (d == 4) {
-                            //     outNode.velocities.front = idx_sub_mc;
-                            // } else if (d == 5) {
-                            //     outNode.velocities.back = idx_sub_mc;
-                            // }
+                            valid_subnodes++;
                         }
+                    }
+                }
+                
+                // Average the accumulated velocities
+                if (valid_subnodes > 0) {
+                    float avg_vel = accumulated_vel / (float)valid_subnodes;
+                    if (d == 0) {
+                        outNode.velocities.left = avg_vel;
+                    } else if (d == 1) {
+                        outNode.velocities.right = avg_vel;
+                    } else if (d == 2) {
+                        outNode.velocities.bottom = avg_vel;
+                    } else if (d == 3) {
+                        outNode.velocities.top = avg_vel;
+                    } else if (d == 4) {
+                        outNode.velocities.front = avg_vel;
+                    } else if (d == 5) {
+                        outNode.velocities.back = avg_vel;
                     }
                 }
             }
