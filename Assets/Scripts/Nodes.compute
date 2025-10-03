@@ -32,12 +32,16 @@ struct Node
     uint active;        // 4 bytes
 };
 
+// Neighbors are stored as a flat buffer of 24 uints per node:
+// [left4, right4, bottom4, top4, front4, back4]
+
 // Input buffers
 RWStructuredBuffer<Particle> particlesBuffer;           // input: all particles
 RWStructuredBuffer<uint> uniqueIndices;                 // input: indices of first occurrence of each unique code
 // Output buffers
 RWStructuredBuffer<Node> nodesBuffer;                   // output: aggregated nodes
 RWStructuredBuffer<Node> tempNodesBuffer;               // output: per-node gathered face deltas
+RWStructuredBuffer<uint> neighborsBuffer;               // output: neighbor indices per node (numNodes * 24)
 
 uint numUniqueNodes;                              // number of unique morton codes
 uint numNodes;                                          // number of nodes
@@ -135,7 +139,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     leafVelocities.front = 1.0;
     leafVelocities.back = 1.0;
     
-    float totalWeight = 0.0;
+    float totalWeight = 1.0;
     uint minLayer = 11;
     
     // Process all particles with this morton code
@@ -339,6 +343,13 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
     outNode.active = node.active;
     outNode.velocities = node.velocities;
 
+    // Initialize neighbors to invalid index (numNodes) for all 24 slots
+    uint nbBase = threadIndex * 24;
+    for (uint k = 0; k < 24; k++)
+    {
+        neighborsBuffer[nbBase + k] = numNodes;
+    }
+
     // all face neighbors of this node. It's bounded to 2:1 ratio
     int3 deltas[6] = {int3(-1,0,0), int3(1,0,0), int3(0,-1,0), int3(0,1,0), int3(0,0,-1), int3(0,0,1)};
     for (int d = 0; d < 6; d++)
@@ -405,16 +416,22 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
             faceVelocities nVel = nNode.velocities;
             if (d == 0) {
                 outNode.velocities.left -= nVel.right;
+                neighborsBuffer[threadIndex * 24 + 0] = idx_leq;
             } else if (d == 1) {
                 outNode.velocities.right -= nVel.left;
+                neighborsBuffer[threadIndex * 24 + 4] = idx_leq;
             } else if (d == 2) {
                 outNode.velocities.bottom -= nVel.top;
+                neighborsBuffer[threadIndex * 24 + 8] = idx_leq;
             } else if (d == 3) {
                 outNode.velocities.top -= nVel.bottom;
+                neighborsBuffer[threadIndex * 24 + 12] = idx_leq;
             } else if (d == 4) {
                 outNode.velocities.front -= nVel.back;
+                neighborsBuffer[threadIndex * 24 + 16] = idx_leq;
             } else if (d == 5) {
                 outNode.velocities.back -= nVel.front;
+                neighborsBuffer[threadIndex * 24 + 20] = idx_leq;
             }
             // if (d == 0) {
             //     outNode.velocities.left = idx_leq_mc;
@@ -436,16 +453,22 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
             faceVelocities nVel = nNode.velocities;
             if (d == 0) {
                 outNode.velocities.left -= nVel.right / 4.0;
+                neighborsBuffer[threadIndex * 24 + 0] = idx_leq;
             } else if (d == 1) {
                 outNode.velocities.right -= nVel.left / 4.0;
+                neighborsBuffer[threadIndex * 24 + 4] = idx_leq;
             } else if (d == 2) {
                 outNode.velocities.bottom -= nVel.top / 4.0;
+                neighborsBuffer[threadIndex * 24 + 8] = idx_leq;
             } else if (d == 3) {
                 outNode.velocities.top -= nVel.bottom / 4.0;
+                neighborsBuffer[threadIndex * 24 + 12] = idx_leq;
             } else if (d == 4) {
                 outNode.velocities.front -= nVel.back / 4.0;
+                neighborsBuffer[threadIndex * 24 + 16] = idx_leq;
             } else if (d == 5) {
                 outNode.velocities.back -= nVel.front / 4.0;
+                neighborsBuffer[threadIndex * 24 + 20] = idx_leq;
             }
             // if (d == 0) {
             //     outNode.velocities.left = idx_leq_mc;
@@ -519,16 +542,22 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                             faceVelocities cVel = cNode.velocities;
                             if (d == 0) {
                                 outNode.velocities.left -= cVel.right;
+                                neighborsBuffer[threadIndex * 24 + 0 + i] = idx_sub;
                             } else if (d == 1) {
                                 outNode.velocities.right -= cVel.left;
+                                neighborsBuffer[threadIndex * 24 + 4 + i] = idx_sub;
                             } else if (d == 2) {
                                 outNode.velocities.bottom -= cVel.top;
+                                neighborsBuffer[threadIndex * 24 + 8 + i] = idx_sub;
                             } else if (d == 3) {
                                 outNode.velocities.top -= cVel.bottom;
+                                neighborsBuffer[threadIndex * 24 + 12 + i] = idx_sub;
                             } else if (d == 4) {
                                 outNode.velocities.front -= cVel.back;
+                                neighborsBuffer[threadIndex * 24 + 16 + i] = idx_sub;
                             } else if (d == 5) {
                                 outNode.velocities.back -= cVel.front;
+                                neighborsBuffer[threadIndex * 24 + 20 + i] = idx_sub;
                             }
                             // if (d == 0) {
                             //     outNode.velocities.left = idx_sub_mc;
