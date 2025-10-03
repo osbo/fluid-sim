@@ -91,7 +91,7 @@ public class FluidSimulator : MonoBehaviour
         public uint mortonCode;     // 4 bytes
         public uint active;         // 4 bytes
     }
-    
+
     private Node[] nodesCPU;
 
     void Start()
@@ -131,23 +131,27 @@ public class FluidSimulator : MonoBehaviour
         // Start total octree construction timer (advection -> full build loop end)
         totalOctreeSw = System.Diagnostics.Stopwatch.StartNew();
 
-		// Particle compute timing: Advect + Sort
-		{
-			var particleSw = System.Diagnostics.Stopwatch.StartNew();
-			AdvectParticles();
-			SortParticles();
-			particleSw.Stop();
-			Debug.Log($"Particle compute time (advect+sort): {particleSw.Elapsed.TotalMilliseconds:F2} ms");
-		}
+		// Particle compute timing
+		var advectSw = System.Diagnostics.Stopwatch.StartNew();
+		AdvectParticles();
+		advectSw.Stop();
 
-		// Layer 0 compute timing: unique leaves + create leaves
-		{
-			var layer0Sw = System.Diagnostics.Stopwatch.StartNew();
-			findUniqueParticles();
-			CreateLeaves();
-			layer0Sw.Stop();
-			Debug.Log($"Layer {layer}: {numNodes} nodes, {layer0Sw.Elapsed.TotalMilliseconds:F2} ms");
-		}
+		var sortSw = System.Diagnostics.Stopwatch.StartNew();
+		SortParticles();
+		sortSw.Stop();
+
+		Debug.Log($"Particle compute time: Advect: {advectSw.Elapsed.TotalMilliseconds:F2} ms, Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms");
+
+		// Layer 0 compute timing
+		var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
+		findUniqueParticles();
+		findUniqueSw.Stop();
+
+		var createLeavesSw = System.Diagnostics.Stopwatch.StartNew();
+		CreateLeaves();
+		createLeavesSw.Stop();
+
+		Debug.Log($"Layer {layer}: {numNodes} nodes, Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms, Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms");
 
 		StartCoroutine(PostCreateLeavesFlow());
     }
@@ -166,15 +170,22 @@ public class FluidSimulator : MonoBehaviour
 			// yield return new WaitUntil(() => Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame);
 			// yield return new WaitUntil(() => Keyboard.current != null && !Keyboard.current.spaceKey.isPressed);
             
-			System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+			var totalLayerSw = System.Diagnostics.Stopwatch.StartNew();
+			
+			var findUniqueNodesSw = System.Diagnostics.Stopwatch.StartNew();
 			findUniqueNodes();
+			findUniqueNodesSw.Stop();
 			
+			var processNodesSw = System.Diagnostics.Stopwatch.StartNew();
 			ProcessNodes();
+			processNodesSw.Stop();
 			
+			var compactNodesSw = System.Diagnostics.Stopwatch.StartNew();
 			compactNodes();
+			compactNodesSw.Stop();
 
-			sw.Stop();
-			Debug.Log($"Layer {layer}: {numNodes} nodes, {sw.Elapsed.TotalMilliseconds:F2} ms");
+			totalLayerSw.Stop();
+			Debug.Log($"Layer {layer}: {numNodes} nodes, Total: {totalLayerSw.Elapsed.TotalMilliseconds:F2} ms (Find Unique: {findUniqueNodesSw.Elapsed.TotalMilliseconds:F2} ms, Process: {processNodesSw.Elapsed.TotalMilliseconds:F2} ms, Compact: {compactNodesSw.Elapsed.TotalMilliseconds:F2} ms)");
 		}
 
         // Stop and log total octree construction time

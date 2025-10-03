@@ -60,41 +60,78 @@ uint prefixBits;                                 // number of bits to shift righ
 
 // groupshared for scan
 groupshared uint scan_array[SCAN_BLOCKSIZE * 2];
+groupshared uint morton_codes[SCAN_BLOCKSIZE];
 
 [numthreads(512, 1, 1)]
-void markUniqueParticles(uint3 id : SV_DispatchThreadID)
+void markUniqueParticles(uint3 id : SV_DispatchThreadID, uint3 Gtid : SV_GroupThreadID)
 {
     uint i = id.x;
-    if (i >= len) return;
+    uint local_i = Gtid.x;
 
-    uint isUnique = 0;
-    if (i == 0) {
-        isUnique = 1;
-    } else {
-        uint curr = sortedParticles[i].mortonCode >> prefixBits;
-        uint prev = sortedParticles[i - 1].mortonCode >> prefixBits;
-        isUnique = (curr != prev) ? 1u : 0u;
+    if (i < len)
+    {
+        // Load morton code into shared memory
+        morton_codes[local_i] = sortedParticles[i].mortonCode >> prefixBits;
     }
+    
+    GroupMemoryBarrierWithGroupSync();
 
-    indicators[i] = isUnique;
+    if (i < len)
+    {
+        uint isUnique = 0;
+        if (i == 0) {
+            isUnique = 1;
+        } else {
+            uint prev_code;
+            if (local_i > 0) {
+                prev_code = morton_codes[local_i - 1];
+            } else {
+                // First thread in the block reads from global memory
+                prev_code = sortedParticles[i - 1].mortonCode >> prefixBits;
+            }
+            
+            uint curr_code = morton_codes[local_i];
+            isUnique = (curr_code != prev_code) ? 1u : 0u;
+        }
+
+        indicators[i] = isUnique;
+    }
 }
 
 [numthreads(512, 1, 1)]
-void markUniquesPrefix(uint3 id : SV_DispatchThreadID)
+void markUniquesPrefix(uint3 id : SV_DispatchThreadID, uint3 Gtid : SV_GroupThreadID)
 {
     uint i = id.x;
-    if (i >= len) return;
+    uint local_i = Gtid.x;
 
-    uint isUnique = 0;
-    if (i == 0) {
-        isUnique = 1;
-    } else {
-        uint curr = nodesBuffer[i].mortonCode >> prefixBits;
-        uint prev = nodesBuffer[i - 1].mortonCode >> prefixBits;
-        isUnique = (curr != prev) ? 1u : 0u;
+    if (i < len)
+    {
+        // Load morton code into shared memory
+        morton_codes[local_i] = nodesBuffer[i].mortonCode >> prefixBits;
     }
+    
+    GroupMemoryBarrierWithGroupSync();
 
-    indicators[i] = isUnique;
+    if (i < len)
+    {
+        uint isUnique = 0;
+        if (i == 0) {
+            isUnique = 1;
+        } else {
+            uint prev_code;
+            if (local_i > 0) {
+                prev_code = morton_codes[local_i - 1];
+            } else {
+                // First thread in the block reads from global memory
+                prev_code = nodesBuffer[i - 1].mortonCode >> prefixBits;
+            }
+            
+            uint curr_code = morton_codes[local_i];
+            isUnique = (curr_code != prev_code) ? 1u : 0u;
+        }
+
+        indicators[i] = isUnique;
+    }
 }
 
 [numthreads(512, 1, 1)]
