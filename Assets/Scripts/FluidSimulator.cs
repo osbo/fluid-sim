@@ -41,6 +41,7 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer auxSmall;
     private ComputeBuffer nodesBuffer;
     private ComputeBuffer tempNodesBuffer;
+    private ComputeBuffer neighborsBuffer;
     // add previous active node count, but that can be a cpu variable 
     
     // Number of nodes, active nodes, and unique active nodes
@@ -48,6 +49,109 @@ public class FluidSimulator : MonoBehaviour
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
     public int initialLayer;
+    public int selectedNode;
+
+    // Expose numNodes for editor UI (read-only)
+    public int NumNodesForUI { get { return numNodes; } }
+
+    public bool TryGetSelectedNodeDivergence(out float divergence)
+    {
+        divergence = 0f;
+        if (nodesBuffer == null) return false;
+        if (selectedNode < 0 || selectedNode >= numNodes) return false;
+
+        Node[] single = new Node[1];
+        try
+        {
+            nodesBuffer.GetData(single, 0, selectedNode, 1);
+        }
+        catch
+        {
+            return false;
+        }
+
+        var v = single[0].velocities;
+        divergence = v.right - v.left + v.top - v.bottom + v.front - v.back;
+        return true;
+    }
+
+    public bool TryGetSelectedNodeExpectedDivergence(out float expectedDivergence)
+    {
+        expectedDivergence = 0f;
+        if (neighborsBuffer == null || nodesCPU_before == null) return false;
+        if (selectedNode < 0 || selectedNode >= numNodes) return false;
+
+        // Read neighbors for selected node (24 uints)
+        uint[] flat = new uint[24];
+        try
+        {
+            neighborsBuffer.GetData(flat, 0, selectedNode * 24, 24);
+        }
+        catch
+        {
+            return false;
+        }
+
+		Node self = nodesCPU_before[selectedNode];
+		var v = self.velocities;
+
+		// Accumulate opposing contributions per original kernel rules:
+		// - Same-layer neighbor: subtract neighbor's opposite face (no scaling)
+		// - Parent neighbor (layer+1): subtract neighbor's opposite face / 4
+		// - Child neighbors (layer-1): subtract sum of 4 children's opposite faces (no extra divide)
+		float accLeftOpp = 0f;   // contributes to expectedLeft
+		float accRightOpp = 0f;  // contributes to expectedRight
+		float accBottomOpp = 0f; // contributes to expectedBottom
+		float accTopOpp = 0f;    // contributes to expectedTop
+		float accFrontOpp = 0f;  // contributes to expectedFront
+		float accBackOpp = 0f;   // contributes to expectedBack
+
+		uint selfLayer = self.layer;
+
+		void AccumulateFace(int offset, System.Func<faceVelocities, float> selectOpp, ref float acc)
+		{
+			for (int i = 0; i < 4; i++)
+			{
+				uint idx = flat[offset + i];
+				if (idx >= numNodes) continue;
+				var n = nodesCPU_before[idx];
+				float val = selectOpp(n.velocities);
+				if (n.layer == selfLayer + 1) val *= 0.25f; // parent scaling
+				// child (selfLayer-1) and same-layer are added raw
+				acc += val;
+			}
+		}
+
+		// For LEFT face we stored neighbors in slots [0..3] (offset 0), and we need neighbor's RIGHT
+		AccumulateFace(0, fv => fv.right, ref accLeftOpp);
+		// RIGHT face neighbors in [4..7], need neighbor's LEFT
+		AccumulateFace(4, fv => fv.left, ref accRightOpp);
+		// BOTTOM face neighbors in [8..11], need neighbor's TOP
+		AccumulateFace(8, fv => fv.top, ref accBottomOpp);
+		// TOP face neighbors in [12..15], need neighbor's BOTTOM
+		AccumulateFace(12, fv => fv.bottom, ref accTopOpp);
+		// FRONT face neighbors in [16..19], need neighbor's BACK
+		AccumulateFace(16, fv => fv.back, ref accFrontOpp);
+		// BACK face neighbors in [20..23], need neighbor's FRONT
+		AccumulateFace(20, fv => fv.front, ref accBackOpp);
+
+		// If a face had no neighbors at all, treat as reflective: expected face = -self face
+		bool HasAny(int offset)
+		{
+			for (int i = 0; i < 4; i++) if (flat[offset + i] < numNodes) return true;
+			return false;
+		}
+
+		float expectedLeft = HasAny(0)  ? (v.left - accLeftOpp)     : -v.left;
+		float expectedRight = HasAny(4) ? (v.right - accRightOpp)   : -v.right;
+		float expectedBottom = HasAny(8) ? (v.bottom - accBottomOpp): -v.bottom;
+		float expectedTop = HasAny(12) ? (v.top - accTopOpp)        : -v.top;
+		float expectedFront = HasAny(16)? (v.front - accFrontOpp)   : -v.front;
+		float expectedBack = HasAny(20) ? (v.back - accBackOpp)     : -v.back;
+
+		expectedDivergence = (expectedRight - expectedLeft) + (expectedTop - expectedBottom) + (expectedFront - expectedBack);
+        return true;
+    }
 
     private string str;
     private int activeCount;
@@ -91,6 +195,9 @@ public class FluidSimulator : MonoBehaviour
         public uint active;         // 4 bytes
     }
 
+    private Node[] nodesCPU_before;
+    private Node[] nodesCPU;
+
     void Start()
     {
         layer = initialLayer;
@@ -118,10 +225,10 @@ public class FluidSimulator : MonoBehaviour
 
         // Set first 10 shuffled indices to layer 0
         for (int i = 0; i < 10 && i < numParticles; i++) {
-            particles[indices[i]].layer = 0;
+            particles[indices[i]].layer = (uint)initialLayer;
         }
 
-        // particles[9*numParticles/16].layer = 0;
+        // particles[9*numParticles/16].layer = initialLayer;
 
         particlesBuffer.SetData(particles);
 
@@ -184,27 +291,35 @@ public class FluidSimulator : MonoBehaviour
         // start new timer
         var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
 
-        // // Debug: print first 20 nodes
-        // Node[] nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // string str = "Middle 40 nodes:\n";
+        nodesCPU_before = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU_before);
+        str = "Random 40 nodes before pullVelocities:\n";
         // for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
-        // {   
-        //     // int index = UnityEngine.Random.Range(0, numNodes);
-        //     int index = i;
-        //     Node node = nodesCPU[index];
-        //     str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
-        // }
-        // Debug.Log(str);
+        // int numPrinted = 40;
+        for (int i = 0; i < 40; i++)
+        {   
+            int index = UnityEngine.Random.Range(0, numNodes);
+            // if (numPrinted == 40) break;
+            // int index = i;
+            Node node = nodesCPU_before[index];
+            // if (node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back == 0) continue;
+            // numPrinted++;
+            float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
+            float volume = Mathf.Pow(8, node.layer) * 0.0001f;
+            float divergenceNormalized = divergence / volume;
+            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {divergence}, Volume: {volume}, Divergence Normalized: {divergenceNormalized}\n";
+            // str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Neighbor Morton Codes: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
+        }
+        Debug.Log(str);
 
         pullVelocities();
 
         pullVelocitiesSw.Stop();
         Debug.Log($"Pull velocities time: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms");
 
-        Node[] nodesCPU = new Node[numNodes];
+        nodesCPU = new Node[numNodes];
         nodesBuffer.GetData(nodesCPU);
-        str = "Middle 40 nodes after pullVelocities:\n";
+        str = "Random 40 nodes after pullVelocities:\n";
         // for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
         // int numPrinted = 40;
         for (int i = 0; i < 40; i++)
@@ -215,7 +330,7 @@ public class FluidSimulator : MonoBehaviour
             Node node = nodesCPU[index];
             // if (node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back == 0) continue;
             // numPrinted++;
-            float divergence = node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back;
+            float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
             float volume = Mathf.Pow(8, node.layer) * 0.0001f;
             float divergenceNormalized = divergence / volume;
             str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {divergence}, Volume: {volume}, Divergence Normalized: {divergenceNormalized}\n";
@@ -321,6 +436,7 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetVector("fluidInitialBoundsMax", fluidInitialBoundsMax);
         particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
         particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
+        particlesShader.SetInt("initialLayer", initialLayer);
         
         // Set grid parameters to compute shader
         particlesShader.SetInts("gridDimensions", new int[] { (int)gridDimensions.x, (int)gridDimensions.y, (int)gridDimensions.z });
@@ -709,9 +825,12 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
+        neighborsBuffer = new ComputeBuffer(numNodes, sizeof(uint) * 24);
+
         pullVelocitiesKernel = nodesShader.FindKernel("pullVelocities");
         nodesShader.SetBuffer(pullVelocitiesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(pullVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesShader.SetBuffer(pullVelocitiesKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(pullVelocitiesKernel, threadGroups, 1, 1);
@@ -761,8 +880,8 @@ public class FluidSimulator : MonoBehaviour
     {
         if (nodesBuffer == null) return;
 
-        Node[] nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
+        // Node[] nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
         
         // Calculate the maximum detail cell size (smallest possible cell)
         // With 10 bits per axis, we have 1024 possible values (0-1023)
@@ -805,13 +924,32 @@ public class FluidSimulator : MonoBehaviour
             Node node = nodesCPU[i];
             int layerIndex = Mathf.Clamp((int)Mathf.Min(node.layer, layer), 0, layerColors.Length - 1);
             Gizmos.color = layerColors[layerIndex];
-            float divergence = node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back;
-            float volume = Mathf.Pow(8, node.layer) * 0.01f;
-            float divergenceNormalized = divergence / volume;
-            float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-            Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+            // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
+            // float volume = Mathf.Pow(8, node.layer) * 0.01f;
+            // float divergenceNormalized = divergence / volume;
+            // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+            // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(node.layer, layer)), 0.01f));
         }
+
+        // Read neighbors as a flat uint buffer: 24 uints per node (left4,right4,bottom4,top4,front4,back4)
+        if (neighborsBuffer == null) return;
+        uint[] neighborsCPU = new uint[numNodes * 24];
+        neighborsBuffer.GetData(neighborsCPU);
+        Gizmos.color = new Color(1, 0, 0, 1);
+        if (selectedNode >= numNodes) return;
+        Gizmos.DrawCube(DecodeMorton3D(nodesCPU[selectedNode]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[selectedNode].layer, layer)), 0.01f));
+        Gizmos.DrawWireCube(DecodeMorton3D(nodesCPU[selectedNode]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[selectedNode].layer, layer)), 0.01f));
+        int nb = selectedNode * 24;
+        for (int i = 0; i < 24; i++) {
+            uint idx = neighborsCPU[nb + i];
+            if (idx >= numNodes) continue;
+            Gizmos.color = new Color(0, 1, 0, 0.25f);
+            Gizmos.DrawCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[idx].layer, layer)), 0.01f));
+            Gizmos.color = new Color(0, 1, 0, 1);
+            Gizmos.DrawWireCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[idx].layer, layer)), 0.01f));
+        }
+
 
         // Particle[] particlesCPU = new Particle[numParticles];
         // particlesBuffer.GetData(particlesCPU);

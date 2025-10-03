@@ -537,6 +537,7 @@ MonoBehaviour:
   nodesShader: {fileID: 7200000, guid: eab82c62a627a4a2295451473985b296, type: 3}
   numParticles: 1048576
   initialLayer: 2
+  selectedNode: 0
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
