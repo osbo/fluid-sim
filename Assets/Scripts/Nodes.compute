@@ -128,11 +128,11 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     // Aggregate particle data with weighted average
     float3 weightedPosition = float3(0, 0, 0);
     faceVelocities leafVelocities;
-    leafVelocities.left = 0.0;
+    leafVelocities.left = 1.0;
     leafVelocities.right = 1.0;
-    leafVelocities.bottom = 0.0;
+    leafVelocities.bottom = 1.0;
     leafVelocities.top = 1.0;
-    leafVelocities.front = 0.0;
+    leafVelocities.front = 1.0;
     leafVelocities.back = 1.0;
     
     float totalWeight = 0.0;
@@ -355,6 +355,25 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
+            if (d == 0) { // Left boundary
+                outNode.velocities.right += selfVel.left;
+                outNode.velocities.left = 0;
+            } else if (d == 1) { // Right boundary
+                outNode.velocities.left += selfVel.right;
+                outNode.velocities.right = 0;
+            } else if (d == 2) { // Bottom boundary
+                outNode.velocities.top += selfVel.bottom;
+                outNode.velocities.bottom = 0;
+            } else if (d == 3) { // Top boundary
+                outNode.velocities.bottom += selfVel.top;
+                outNode.velocities.top = 0;
+            } else if (d == 4) { // Front boundary
+                outNode.velocities.back += selfVel.front;
+                outNode.velocities.front = 0;
+            } else if (d == 5) { // Back boundary
+                outNode.velocities.front += selfVel.back;
+                outNode.velocities.back = 0;
+            }
             continue; // Skip this neighbor direction
         }
         
