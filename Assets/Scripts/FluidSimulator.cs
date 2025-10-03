@@ -151,6 +151,12 @@ public class FluidSimulator : MonoBehaviour
 
 	private System.Collections.IEnumerator PostCreateLeavesFlow()
 	{
+		// Calculate maxDetailCellSize for volume calculations
+		Vector3 simulationBoundsMin = simulationBounds.bounds.min;
+		Vector3 simulationBoundsMax = simulationBounds.bounds.max;
+		Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+		float maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
+		
 		for (layer = layer + 1; layer <= 10; layer++)
 		{
 			// Wait for Space key press to proceed to next layer, then wait for release (new Input System)
@@ -175,30 +181,44 @@ public class FluidSimulator : MonoBehaviour
             Debug.Log($"Total octree construction: {numParticles} particles to {numNodes} nodes ({100.0f - 100.0f*(float)numNodes/numParticles:F2}% reduction), {totalOctreeSw.Elapsed.TotalMilliseconds:F2} ms");
         }
 
-        // Debug: print first 20 nodes
-        Node[] nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        string str = "Middle 40 nodes:\n";
-        for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
-        {   
-            // int index = UnityEngine.Random.Range(0, numNodes);
-            int index = i;
-            Node node = nodesCPU[index];
-            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
-        }
-        Debug.Log(str);
+        // start new timer
+        var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
+
+        // // Debug: print first 20 nodes
+        // Node[] nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // string str = "Middle 40 nodes:\n";
+        // for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
+        // {   
+        //     // int index = UnityEngine.Random.Range(0, numNodes);
+        //     int index = i;
+        //     Node node = nodesCPU[index];
+        //     str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
+        // }
+        // Debug.Log(str);
 
         pullVelocities();
 
-        // Node[] nodesCPU = new Node[numNodes];
+        pullVelocitiesSw.Stop();
+        Debug.Log($"Pull velocities time: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms");
+
+        Node[] nodesCPU = new Node[numNodes];
         nodesBuffer.GetData(nodesCPU);
         str = "Middle 40 nodes after pullVelocities:\n";
-        for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
+        // for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
+        // int numPrinted = 40;
+        for (int i = 0; i < 40; i++)
         {   
-            // int index = UnityEngine.Random.Range(0, numNodes);
-            int index = i;
+            int index = UnityEngine.Random.Range(0, numNodes);
+            // if (numPrinted == 40) break;
+            // int index = i;
             Node node = nodesCPU[index];
-            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back}\n";
+            // if (node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back == 0) continue;
+            // numPrinted++;
+            float divergence = node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back;
+            float volume = Mathf.Pow(8, node.layer) * 0.0001f;
+            float divergenceNormalized = divergence / volume;
+            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {divergence}, Volume: {volume}, Divergence Normalized: {divergenceNormalized}\n";
             // str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Neighbor Morton Codes: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
         }
         Debug.Log(str);
@@ -785,6 +805,11 @@ public class FluidSimulator : MonoBehaviour
             Node node = nodesCPU[i];
             int layerIndex = Mathf.Clamp((int)Mathf.Min(node.layer, layer), 0, layerColors.Length - 1);
             Gizmos.color = layerColors[layerIndex];
+            // float divergence = node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back;
+            // float volume = Mathf.Pow(8, node.layer) * 0.01f;
+            // float divergenceNormalized = divergence / volume;
+            // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+            // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(node.layer, layer)), 0.01f));
         }
 
