@@ -156,8 +156,8 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
     position.z = clamp(position.z, simulationBoundsMin.z, simulationBoundsMax.z);
 
     particle.position = position;
-    // particle.velocity = velocity;
-    particle.velocity = float3(0.0, -1.0, 0.0);
+    particle.velocity = velocity;
+    // particle.velocity = float3(0.0, -1.0, 0.0);
 
     float3 normalizedPos = (position - simulationBoundsMin) * mortonNormalizationFactor;
     normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);

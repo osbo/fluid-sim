@@ -167,12 +167,12 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     // Aggregate particle data with weighted average
     float3 weightedPosition = float3(0, 0, 0);
     faceVelocities leafVelocities;
-    leafVelocities.left = 1.0;
-    leafVelocities.right = 1.0;
-    leafVelocities.bottom = 1.0;
-    leafVelocities.top = 1.0;
-    leafVelocities.front = 1.0;
-    leafVelocities.back = 1.0;
+    leafVelocities.left = 0.0;
+    leafVelocities.right = 0.0;
+    leafVelocities.bottom = 0.0;
+    leafVelocities.top = 0.0;
+    leafVelocities.front = 0.0;
+    leafVelocities.back = 0.0;
     
     float totalWeight = 1.0;
     uint minLayer = 11;
@@ -187,22 +187,22 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         weightedPosition += particle.position * weight;
         totalWeight += weight;
 
-        // float3 velocity = particle.velocity;
-        // if (velocity.x < 0) {
-        //     leafVelocities.left += velocity.x * -1;
-        // } else {
-        //     leafVelocities.right += velocity.x;
-        // }
-        // if (velocity.y < 0) {
-        //     leafVelocities.bottom += velocity.y * -1;
-        // } else {
-        //     leafVelocities.top += velocity.y;
-        // }
-        // if (velocity.z < 0) {
-        //     leafVelocities.front += velocity.z * -1;
-        // } else {
-        //     leafVelocities.back += velocity.z;
-        // }
+        float3 velocity = particle.velocity;
+        if (velocity.x < 0) {
+            leafVelocities.left += velocity.x * -1;
+        } else {
+            leafVelocities.right += velocity.x;
+        }
+        if (velocity.y < 0) {
+            leafVelocities.bottom += velocity.y * -1;
+        } else {
+            leafVelocities.top += velocity.y;
+        }
+        if (velocity.z < 0) {
+            leafVelocities.front += velocity.z * -1;
+        } else {
+            leafVelocities.back += velocity.z;
+        }
         
         // Track minimum layer
         minLayer = min(minLayer, particle.layer);
