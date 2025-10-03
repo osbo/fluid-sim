@@ -359,7 +359,7 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         }
         
         uint3 ncoord = uint3((uint)nx, (uint)ny, (uint)nz);
-        uint nPrefix = interleave(ncoord) >> shift;
+        uint nPrefix = interleave(ncoord);
 
         // same-layer neighbor: leq prefix will fall under eq. Layer will be eq.
         // parent neighbor: leq prefix fill fall under less or equal, but layer will be +1
@@ -382,65 +382,65 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
 
         if (idx_leq_mc_prefix == nPrefix && idx_leq_layer == node.layer)
         {
-            // // same-layer neighbor
-            // faceVelocities nVel = nNode.velocities;
-            // if (d == 0) {
-            //     outNode.velocities.left -= nVel.right;
-            // } else if (d == 1) {
-            //     outNode.velocities.right -= nVel.left;
-            // } else if (d == 2) {
-            //     outNode.velocities.bottom -= nVel.top;
-            // } else if (d == 3) {
-            //     outNode.velocities.top -= nVel.bottom;
-            // } else if (d == 4) {
-            //     outNode.velocities.front -= nVel.back;
-            // } else if (d == 5) {
-            //     outNode.velocities.back -= nVel.front;
-            // }
+            // same-layer neighbor
+            faceVelocities nVel = nNode.velocities;
             if (d == 0) {
-                outNode.velocities.left = idx_leq_mc;
+                outNode.velocities.left -= nVel.right;
             } else if (d == 1) {
-                outNode.velocities.right = idx_leq_mc;
+                outNode.velocities.right -= nVel.left;
             } else if (d == 2) {
-                outNode.velocities.bottom = idx_leq_mc;
+                outNode.velocities.bottom -= nVel.top;
             } else if (d == 3) {
-                outNode.velocities.top = idx_leq_mc;
+                outNode.velocities.top -= nVel.bottom;
             } else if (d == 4) {
-                outNode.velocities.front = idx_leq_mc;
+                outNode.velocities.front -= nVel.back;
             } else if (d == 5) {
-                outNode.velocities.back = idx_leq_mc;
+                outNode.velocities.back -= nVel.front;
             }
+            // if (d == 0) {
+            //     outNode.velocities.left = idx_leq_mc;
+            // } else if (d == 1) {
+            //     outNode.velocities.right = idx_leq_mc;
+            // } else if (d == 2) {
+            //     outNode.velocities.bottom = idx_leq_mc;
+            // } else if (d == 3) {
+            //     outNode.velocities.top = idx_leq_mc;
+            // } else if (d == 4) {
+            //     outNode.velocities.front = idx_leq_mc;
+            // } else if (d == 5) {
+            //     outNode.velocities.back = idx_leq_mc;
+            // }
         }
         else if (idx_leq_mc_prefix >> 3 == nPrefix >> 3 && idx_leq_layer == node.layer + 1)
         {
-            // // parent neighbor (divide incoming velocity by 4)
-            // faceVelocities nVel = nNode.velocities;
-            // if (d == 0) {
-            //     outNode.velocities.left -= nVel.right / 4.0;
-            // } else if (d == 1) {
-            //     outNode.velocities.right -= nVel.left / 4.0;
-            // } else if (d == 2) {
-            //     outNode.velocities.bottom -= nVel.top / 4.0;
-            // } else if (d == 3) {
-            //     outNode.velocities.top -= nVel.bottom / 4.0;
-            // } else if (d == 4) {
-            //     outNode.velocities.front -= nVel.back / 4.0;
-            // } else if (d == 5) {
-            //     outNode.velocities.back -= nVel.front / 4.0;
-            // }
+            // parent neighbor (divide incoming velocity by 4)
+            faceVelocities nVel = nNode.velocities;
             if (d == 0) {
-                outNode.velocities.left = idx_leq_mc;
+                outNode.velocities.left -= nVel.right / 4.0;
             } else if (d == 1) {
-                outNode.velocities.right = idx_leq_mc;
+                outNode.velocities.right -= nVel.left / 4.0;
             } else if (d == 2) {
-                outNode.velocities.bottom = idx_leq_mc;
+                outNode.velocities.bottom -= nVel.top / 4.0;
             } else if (d == 3) {
-                outNode.velocities.top = idx_leq_mc;
+                outNode.velocities.top -= nVel.bottom / 4.0;
             } else if (d == 4) {
-                outNode.velocities.front = idx_leq_mc;
+                outNode.velocities.front -= nVel.back / 4.0;
             } else if (d == 5) {
-                outNode.velocities.back = idx_leq_mc;
+                outNode.velocities.back -= nVel.front / 4.0;
             }
+            // if (d == 0) {
+            //     outNode.velocities.left = idx_leq_mc;
+            // } else if (d == 1) {
+            //     outNode.velocities.right = idx_leq_mc;
+            // } else if (d == 2) {
+            //     outNode.velocities.bottom = idx_leq_mc;
+            // } else if (d == 3) {
+            //     outNode.velocities.top = idx_leq_mc;
+            // } else if (d == 4) {
+            //     outNode.velocities.front = idx_leq_mc;
+            // } else if (d == 5) {
+            //     outNode.velocities.back = idx_leq_mc;
+            // }
         }
         else
         {
@@ -489,41 +489,41 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                     uint subLower = subPrefix << (shift - 3);
                     uint subUpper = (subPrefix + 1u) << (shift - 3);
                     uint idx_sub = lowerBoundMorton(subLower, idx_target, idx_upper);
-                    Node cNode = nodesBuffer[idx_sub];
-                    uint idx_sub_mc = cNode.mortonCode;
-                    uint idx_sub_mc_prefix = idx_sub_mc >> (shift - 3);
-                    uint idx_sub_layer = cNode.layer;
                     if (idx_sub < idx_upper)
                     {
+                        Node cNode = nodesBuffer[idx_sub];
+                        uint idx_sub_mc = cNode.mortonCode;
+                        uint idx_sub_mc_prefix = idx_sub_mc >> (shift - 3);
+                        uint idx_sub_layer = cNode.layer;
                         if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
                         {
-                            // faceVelocities cVel = cNode.velocities;
-                            // if (d == 0) {
-                            //     outNode.velocities.left -= cVel.right;
-                            // } else if (d == 1) {
-                            //     outNode.velocities.right -= cVel.left;
-                            // } else if (d == 2) {
-                            //     outNode.velocities.bottom -= cVel.top;
-                            // } else if (d == 3) {
-                            //     outNode.velocities.top -= cVel.bottom;
-                            // } else if (d == 4) {
-                            //     outNode.velocities.front -= cVel.back;
-                            // } else if (d == 5) {
-                            //     outNode.velocities.back -= cVel.front;
-                            // }
+                            faceVelocities cVel = cNode.velocities;
                             if (d == 0) {
-                                outNode.velocities.left = idx_sub_mc;
+                                outNode.velocities.left -= cVel.right;
                             } else if (d == 1) {
-                                outNode.velocities.right = idx_sub_mc;
+                                outNode.velocities.right -= cVel.left;
                             } else if (d == 2) {
-                                outNode.velocities.bottom = idx_sub_mc;
+                                outNode.velocities.bottom -= cVel.top;
                             } else if (d == 3) {
-                                outNode.velocities.top = idx_sub_mc;
+                                outNode.velocities.top -= cVel.bottom;
                             } else if (d == 4) {
-                                outNode.velocities.front = idx_sub_mc;
+                                outNode.velocities.front -= cVel.back;
                             } else if (d == 5) {
-                                outNode.velocities.back = idx_sub_mc;
+                                outNode.velocities.back -= cVel.front;
                             }
+                            // if (d == 0) {
+                            //     outNode.velocities.left = idx_sub_mc;
+                            // } else if (d == 1) {
+                            //     outNode.velocities.right = idx_sub_mc;
+                            // } else if (d == 2) {
+                            //     outNode.velocities.bottom = idx_sub_mc;
+                            // } else if (d == 3) {
+                            //     outNode.velocities.top = idx_sub_mc;
+                            // } else if (d == 4) {
+                            //     outNode.velocities.front = idx_sub_mc;
+                            // } else if (d == 5) {
+                            //     outNode.velocities.back = idx_sub_mc;
+                            // }
                         }
                     }
                 }

@@ -198,8 +198,8 @@ public class FluidSimulator : MonoBehaviour
             // int index = UnityEngine.Random.Range(0, numNodes);
             int index = i;
             Node node = nodesCPU[index];
-            // str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back}\n";
-            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Neighbor Morton Codes: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
+            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back}\n";
+            // str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Neighbor Morton Codes: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
         }
         Debug.Log(str);
 
