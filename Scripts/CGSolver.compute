@@ -1,0 +1,164 @@
+#pragma kernel CalculateDivergence
+#pragma kernel ApplyLaplacian
+#pragma kernel Axpy // y = a*x + y
+#pragma kernel DotProduct
+
+// Include common HLSL functions
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+// Struct definitions (must match C# structs)
+struct faceVelocities
+{
+    float left;
+    float right;
+    float bottom;
+    float top;
+    float front;
+    float back;
+};
+
+struct Node
+{
+    float3 position;    // 12 bytes
+    faceVelocities velocities;    // 24 bytes
+    uint layer;         // 4 bytes
+    uint mortonCode;    // 4 bytes
+    uint active;        // 4 bytes
+};
+
+// Buffers for CG solver
+RWStructuredBuffer<Node> nodesBuffer;
+RWStructuredBuffer<float> divergenceBuffer;
+RWStructuredBuffer<uint> neighborsBuffer;
+RWStructuredBuffer<float> pBuffer; // The input vector 'p'
+RWStructuredBuffer<float> ApBuffer; // The output vector 'Ap'
+RWStructuredBuffer<float> xBuffer;
+RWStructuredBuffer<float> yBuffer;
+uint numNodes;
+float maxDetailCellSize; // Smallest cell size in the simulation
+float a; // scalar 'a'
+
+// Shared memory for dot product reduction
+groupshared float s_data[512];
+
+[numthreads(512, 1, 1)]
+void CalculateDivergence(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    Node node = nodesBuffer[i];
+    faceVelocities v = node.velocities;
+
+    // Sum of net flux (Right-Left + Top-Bottom + Back-Front)
+    float divergence = v.right - v.left + v.top - v.bottom + v.back - v.front;
+
+    // Scale by inverse of cell size to get divergence
+    // dx for a cell is proportional to 2^layer
+    float dx = maxDetailCellSize * exp2((float)node.layer);
+
+    // We solve for -Divergence
+    divergenceBuffer[i] = -divergence / dx;
+}
+
+[numthreads(512, 1, 1)]
+void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    Node node = nodesBuffer[i];
+    float p_i = pBuffer[i];
+    float laplacian_p = 0.0;
+    uint neighborCount = 0;
+
+    uint neighborBaseIndex = i * 24;
+
+    // Loop through all 6 faces
+    for (int d = 0; d < 6; d++)
+    {
+        uint faceNeighborBase = neighborBaseIndex + d * 4;
+        uint neighbor_idx = neighborsBuffer[faceNeighborBase];
+
+        if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
+        {
+            // Case 1: Same-layer or Parent (coarser) neighbor
+            // There is only one neighbor for this face.
+            laplacian_p += pBuffer[neighbor_idx] - p_i;
+            neighborCount++;
+        }
+        else
+        {
+            // Case 2: Child (finer) neighbors
+            // The face is adjacent to 4 smaller cells. Average their pressures.
+            float avg_p_children = 0.0;
+            uint childCount = 0;
+            for (int k = 0; k < 4; k++)
+            {
+                uint child_idx = neighborsBuffer[faceNeighborBase + k];
+                if (child_idx < numNodes)
+                {
+                    avg_p_children += pBuffer[child_idx];
+                    childCount++;
+                }
+            }
+
+            if (childCount > 0)
+            {
+                avg_p_children /= (float)childCount;
+                laplacian_p += avg_p_children - p_i;
+                neighborCount++;
+            }
+        }
+        // NOTE: Neumann boundary conditions (solid walls) are implicitly handled.
+        // If a neighbor is invalid (>= numNodes), no pressure contribution is added,
+        // which means the pressure gradient is treated as zero.
+    }
+
+    // For now, try without scaling to see if that's the issue
+    // TODO: Add proper scaling back once we verify the discretization is correct
+    
+    // For positive definite matrix, we need: Ap = (num_neighbors * p_i) - sum(p_j)
+    // The code above calculates sum(p_j - p_i), so we need to negate it
+    // This gives us: Ap = (num_neighbors * p_i) - sum(p_j) = -sum(p_j - p_i)
+    
+    // Handle boundary nodes (no neighbors) - they should have zero Laplacian
+    if (neighborCount == 0)
+    {
+        ApBuffer[i] = 0.0f; // Boundary nodes have zero Laplacian
+    }
+    else
+    {
+        ApBuffer[i] = -laplacian_p; // Negate to get correct Laplacian (no scaling for now)
+    }
+}
+
+[numthreads(512, 1, 1)]
+void Axpy(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i >= numNodes) return;
+    yBuffer[i] = a * xBuffer[i] + yBuffer[i];
+}
+
+// For Dot Product (a simple, multi-pass reduction)
+[numthreads(512, 1, 1)]
+void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    uint li = Gtid.x;
+
+    s_data[li] = (i < numNodes) ? xBuffer[i] * yBuffer[i] : 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    // In-group reduction
+    for (uint s = 256; s > 0; s >>= 1) {
+        if (li < s) {
+            s_data[li] += s_data[li + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // First thread of each group writes its partial sum
+    if (li == 0) {
+        divergenceBuffer[Gid.x] = s_data[0]; // Re-using divergence buffer as temporary output
+    }
+}
