@@ -135,19 +135,19 @@ public class FluidSimulator : MonoBehaviour
 		// BACK face neighbors in [20..23], need neighbor's FRONT
 		AccumulateFace(20, fv => fv.front, ref accBackOpp);
 
-		// If a face had no neighbors at all, treat as reflective: expected face = -self face
-		bool HasAny(int offset)
+        // If a face had no neighbors at all (boundary), zero that face and transfer its value to the opposite face
+        bool HasAny(int offset)
 		{
 			for (int i = 0; i < 4; i++) if (flat[offset + i] < numNodes) return true;
 			return false;
 		}
 
-		float expectedLeft = HasAny(0)  ? (v.left - accLeftOpp)     : -v.left;
-		float expectedRight = HasAny(4) ? (v.right - accRightOpp)   : -v.right;
-		float expectedBottom = HasAny(8) ? (v.bottom - accBottomOpp): -v.bottom;
-		float expectedTop = HasAny(12) ? (v.top - accTopOpp)        : -v.top;
-		float expectedFront = HasAny(16)? (v.front - accFrontOpp)   : -v.front;
-		float expectedBack = HasAny(20) ? (v.back - accBackOpp)     : -v.back;
+        float expectedLeft   = HasAny(0)  ? (v.left   - accLeftOpp)    : 0f;
+        float expectedRight  = HasAny(4)  ? (v.right  - accRightOpp)   : (v.right + 0f);
+        float expectedBottom = HasAny(8)  ? (v.bottom - accBottomOpp)  : 0f;
+        float expectedTop    = HasAny(12) ? (v.top    - accTopOpp)     : (v.top + 0f);
+        float expectedFront  = HasAny(16) ? (v.front  - accFrontOpp)   : 0f;
+        float expectedBack   = HasAny(20) ? (v.back   - accBackOpp)    : (v.back + 0f);
 
 		expectedDivergence = (expectedRight - expectedLeft) + (expectedTop - expectedBottom) + (expectedFront - expectedBack);
         return true;
@@ -932,23 +932,23 @@ public class FluidSimulator : MonoBehaviour
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(node.layer, layer)), 0.01f));
         }
 
-        // Read neighbors as a flat uint buffer: 24 uints per node (left4,right4,bottom4,top4,front4,back4)
-        if (neighborsBuffer == null) return;
-        uint[] neighborsCPU = new uint[numNodes * 24];
-        neighborsBuffer.GetData(neighborsCPU);
-        Gizmos.color = new Color(1, 0, 0, 1);
-        if (selectedNode >= numNodes) return;
-        Gizmos.DrawCube(DecodeMorton3D(nodesCPU[selectedNode]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[selectedNode].layer, layer)), 0.01f));
-        Gizmos.DrawWireCube(DecodeMorton3D(nodesCPU[selectedNode]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[selectedNode].layer, layer)), 0.01f));
-        int nb = selectedNode * 24;
-        for (int i = 0; i < 24; i++) {
-            uint idx = neighborsCPU[nb + i];
-            if (idx >= numNodes) continue;
-            Gizmos.color = new Color(0, 1, 0, 0.25f);
-            Gizmos.DrawCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[idx].layer, layer)), 0.01f));
-            Gizmos.color = new Color(0, 1, 0, 1);
-            Gizmos.DrawWireCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[idx].layer, layer)), 0.01f));
-        }
+        // // Read neighbors as a flat uint buffer: 24 uints per node (left4,right4,bottom4,top4,front4,back4)
+        // if (neighborsBuffer == null) return;
+        // uint[] neighborsCPU = new uint[numNodes * 24];
+        // neighborsBuffer.GetData(neighborsCPU);
+        // Gizmos.color = new Color(1, 0, 0, 1);
+        // if (selectedNode >= numNodes) return;
+        // Gizmos.DrawCube(DecodeMorton3D(nodesCPU[selectedNode]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[selectedNode].layer, layer)), 0.01f));
+        // Gizmos.DrawWireCube(DecodeMorton3D(nodesCPU[selectedNode]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[selectedNode].layer, layer)), 0.01f));
+        // int nb = selectedNode * 24;
+        // for (int i = 0; i < 24; i++) {
+        //     uint idx = neighborsCPU[nb + i];
+        //     if (idx >= numNodes) continue;
+        //     Gizmos.color = new Color(0, 1, 0, 0.25f);
+        //     Gizmos.DrawCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[idx].layer, layer)), 0.01f));
+        //     Gizmos.color = new Color(0, 1, 0, 1);
+        //     Gizmos.DrawWireCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[idx].layer, layer)), 0.01f));
+        // }
 
 
         // Particle[] particlesCPU = new Particle[numParticles];

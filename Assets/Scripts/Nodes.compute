@@ -73,6 +73,41 @@ uint interleave(uint3 p)
     return m;
 }
 
+// Helper: given direction d, return neighbor's opposing face value
+float selectOpposingFace(faceVelocities v, int d)
+{
+    // d: 0=left,1=right,2=bottom,3=top,4=front,5=back
+    if (d == 0) return v.right;
+    if (d == 1) return v.left;
+    if (d == 2) return v.top;
+    if (d == 3) return v.bottom;
+    if (d == 4) return v.back;
+    return v.front; // d == 5
+}
+
+// Helper: subtract value from the correct face on outNode for direction d
+void subtractToFace(inout Node outNode, int d, float value)
+{
+    if (d == 0) outNode.velocities.left -= value;
+    else if (d == 1) outNode.velocities.right -= value;
+    else if (d == 2) outNode.velocities.bottom -= value;
+    else if (d == 3) outNode.velocities.top -= value;
+    else if (d == 4) outNode.velocities.front -= value;
+    else outNode.velocities.back -= value; // d == 5
+}
+
+// Helper: face offset inside 24-wide neighbors block
+uint faceOffset(int d)
+{
+    // left=0..3, right=4..7, bottom=8..11, top=12..15, front=16..19, back=20..23
+    if (d == 0) return 0u;
+    if (d == 1) return 4u;
+    if (d == 2) return 8u;
+    if (d == 3) return 12u;
+    if (d == 4) return 16u;
+    return 20u; // d == 5
+}
+
 // Lower-bound search: first index with mortonCode >= target
 // left is inclusive, right is exclusive
 uint lowerBoundMorton(uint target, uint left_bound, uint right_bound)
@@ -366,22 +401,23 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
-            if (d == 0) { // Left boundary
+            // Zero the boundary face and transfer its value to the opposite face
+            if (d == 0) { // Left boundary: move left to right
                 outNode.velocities.right += selfVel.left;
                 outNode.velocities.left = 0;
-            } else if (d == 1) { // Right boundary
+            } else if (d == 1) { // Right boundary: move right to left
                 outNode.velocities.left += selfVel.right;
                 outNode.velocities.right = 0;
-            } else if (d == 2) { // Bottom boundary
+            } else if (d == 2) { // Bottom boundary: move bottom to top
                 outNode.velocities.top += selfVel.bottom;
                 outNode.velocities.bottom = 0;
-            } else if (d == 3) { // Top boundary
+            } else if (d == 3) { // Top boundary: move top to bottom
                 outNode.velocities.bottom += selfVel.top;
                 outNode.velocities.top = 0;
-            } else if (d == 4) { // Front boundary
+            } else if (d == 4) { // Front boundary: move front to back
                 outNode.velocities.back += selfVel.front;
                 outNode.velocities.front = 0;
-            } else if (d == 5) { // Back boundary
+            } else if (d == 5) { // Back boundary: move back to front
                 outNode.velocities.front += selfVel.back;
                 outNode.velocities.back = 0;
             }
@@ -413,76 +449,16 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         if (idx_leq_mc_prefix == nPrefix && idx_leq_layer == node.layer)
         {
             // same-layer neighbor
-            faceVelocities nVel = nNode.velocities;
-            if (d == 0) {
-                outNode.velocities.left -= nVel.right;
-                neighborsBuffer[threadIndex * 24 + 0] = idx_leq;
-            } else if (d == 1) {
-                outNode.velocities.right -= nVel.left;
-                neighborsBuffer[threadIndex * 24 + 4] = idx_leq;
-            } else if (d == 2) {
-                outNode.velocities.bottom -= nVel.top;
-                neighborsBuffer[threadIndex * 24 + 8] = idx_leq;
-            } else if (d == 3) {
-                outNode.velocities.top -= nVel.bottom;
-                neighborsBuffer[threadIndex * 24 + 12] = idx_leq;
-            } else if (d == 4) {
-                outNode.velocities.front -= nVel.back;
-                neighborsBuffer[threadIndex * 24 + 16] = idx_leq;
-            } else if (d == 5) {
-                outNode.velocities.back -= nVel.front;
-                neighborsBuffer[threadIndex * 24 + 20] = idx_leq;
-            }
-            // if (d == 0) {
-            //     outNode.velocities.left = idx_leq_mc;
-            // } else if (d == 1) {
-            //     outNode.velocities.right = idx_leq_mc;
-            // } else if (d == 2) {
-            //     outNode.velocities.bottom = idx_leq_mc;
-            // } else if (d == 3) {
-            //     outNode.velocities.top = idx_leq_mc;
-            // } else if (d == 4) {
-            //     outNode.velocities.front = idx_leq_mc;
-            // } else if (d == 5) {
-            //     outNode.velocities.back = idx_leq_mc;
-            // }
+            float opp = selectOpposingFace(nNode.velocities, d);
+            subtractToFace(outNode, d, opp);
+            neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
         }
         else if ((idx_leq_mc >> (shift + 3)) == (nPrefix >> 3) && idx_leq_layer == node.layer + 1)
         {
             // parent neighbor (divide incoming velocity by 4)
-            faceVelocities nVel = nNode.velocities;
-            if (d == 0) {
-                outNode.velocities.left -= nVel.right / 4.0;
-                neighborsBuffer[threadIndex * 24 + 0] = idx_leq;
-            } else if (d == 1) {
-                outNode.velocities.right -= nVel.left / 4.0;
-                neighborsBuffer[threadIndex * 24 + 4] = idx_leq;
-            } else if (d == 2) {
-                outNode.velocities.bottom -= nVel.top / 4.0;
-                neighborsBuffer[threadIndex * 24 + 8] = idx_leq;
-            } else if (d == 3) {
-                outNode.velocities.top -= nVel.bottom / 4.0;
-                neighborsBuffer[threadIndex * 24 + 12] = idx_leq;
-            } else if (d == 4) {
-                outNode.velocities.front -= nVel.back / 4.0;
-                neighborsBuffer[threadIndex * 24 + 16] = idx_leq;
-            } else if (d == 5) {
-                outNode.velocities.back -= nVel.front / 4.0;
-                neighborsBuffer[threadIndex * 24 + 20] = idx_leq;
-            }
-            // if (d == 0) {
-            //     outNode.velocities.left = idx_leq_mc;
-            // } else if (d == 1) {
-            //     outNode.velocities.right = idx_leq_mc;
-            // } else if (d == 2) {
-            //     outNode.velocities.bottom = idx_leq_mc;
-            // } else if (d == 3) {
-            //     outNode.velocities.top = idx_leq_mc;
-            // } else if (d == 4) {
-            //     outNode.velocities.front = idx_leq_mc;
-            // } else if (d == 5) {
-            //     outNode.velocities.back = idx_leq_mc;
-            // }
+            float oppP = selectOpposingFace(nNode.velocities, d) * 0.25;
+            subtractToFace(outNode, d, oppP);
+            neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
         }
         else
         {
@@ -539,39 +515,9 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                         uint idx_sub_layer = cNode.layer;
                         if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
                         {
-                            faceVelocities cVel = cNode.velocities;
-                            if (d == 0) {
-                                outNode.velocities.left -= cVel.right;
-                                neighborsBuffer[threadIndex * 24 + 0 + i] = idx_sub;
-                            } else if (d == 1) {
-                                outNode.velocities.right -= cVel.left;
-                                neighborsBuffer[threadIndex * 24 + 4 + i] = idx_sub;
-                            } else if (d == 2) {
-                                outNode.velocities.bottom -= cVel.top;
-                                neighborsBuffer[threadIndex * 24 + 8 + i] = idx_sub;
-                            } else if (d == 3) {
-                                outNode.velocities.top -= cVel.bottom;
-                                neighborsBuffer[threadIndex * 24 + 12 + i] = idx_sub;
-                            } else if (d == 4) {
-                                outNode.velocities.front -= cVel.back;
-                                neighborsBuffer[threadIndex * 24 + 16 + i] = idx_sub;
-                            } else if (d == 5) {
-                                outNode.velocities.back -= cVel.front;
-                                neighborsBuffer[threadIndex * 24 + 20 + i] = idx_sub;
-                            }
-                            // if (d == 0) {
-                            //     outNode.velocities.left = idx_sub_mc;
-                            // } else if (d == 1) {
-                            //     outNode.velocities.right = idx_sub_mc;
-                            // } else if (d == 2) {
-                            //     outNode.velocities.bottom = idx_sub_mc;
-                            // } else if (d == 3) {
-                            //     outNode.velocities.top = idx_sub_mc;
-                            // } else if (d == 4) {
-                            //     outNode.velocities.front = idx_sub_mc;
-                            // } else if (d == 5) {
-                            //     outNode.velocities.back = idx_sub_mc;
-                            // }
+                            float oppC = selectOpposingFace(cNode.velocities, d);
+                            subtractToFace(outNode, d, oppC);
+                            neighborsBuffer[threadIndex * 24 + faceOffset(d) + i] = idx_sub;
                         }
                     }
                 }
