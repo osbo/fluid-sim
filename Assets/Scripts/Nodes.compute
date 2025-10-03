@@ -252,7 +252,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
     }
 
     if (coarsen)
-    // if (0)
     {
         uint baseCode = nodesBuffer[uniqueStart].mortonCode;
         uint shift = layer * 3u;
