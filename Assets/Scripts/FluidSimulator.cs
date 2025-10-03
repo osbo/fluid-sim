@@ -49,109 +49,6 @@ public class FluidSimulator : MonoBehaviour
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
     public int initialLayer;
-    public int selectedNode;
-
-    // Expose numNodes for editor UI (read-only)
-    public int NumNodesForUI { get { return numNodes; } }
-
-    public bool TryGetSelectedNodeDivergence(out float divergence)
-    {
-        divergence = 0f;
-        if (nodesBuffer == null) return false;
-        if (selectedNode < 0 || selectedNode >= numNodes) return false;
-
-        Node[] single = new Node[1];
-        try
-        {
-            nodesBuffer.GetData(single, 0, selectedNode, 1);
-        }
-        catch
-        {
-            return false;
-        }
-
-        var v = single[0].velocities;
-        divergence = v.right - v.left + v.top - v.bottom + v.front - v.back;
-        return true;
-    }
-
-    public bool TryGetSelectedNodeExpectedDivergence(out float expectedDivergence)
-    {
-        expectedDivergence = 0f;
-        if (neighborsBuffer == null || nodesCPU_before == null) return false;
-        if (selectedNode < 0 || selectedNode >= numNodes) return false;
-
-        // Read neighbors for selected node (24 uints)
-        uint[] flat = new uint[24];
-        try
-        {
-            neighborsBuffer.GetData(flat, 0, selectedNode * 24, 24);
-        }
-        catch
-        {
-            return false;
-        }
-
-		Node self = nodesCPU_before[selectedNode];
-		var v = self.velocities;
-
-		// Accumulate opposing contributions per original kernel rules:
-		// - Same-layer neighbor: subtract neighbor's opposite face (no scaling)
-		// - Parent neighbor (layer+1): subtract neighbor's opposite face / 4
-		// - Child neighbors (layer-1): subtract sum of 4 children's opposite faces (no extra divide)
-		float accLeftOpp = 0f;   // contributes to expectedLeft
-		float accRightOpp = 0f;  // contributes to expectedRight
-		float accBottomOpp = 0f; // contributes to expectedBottom
-		float accTopOpp = 0f;    // contributes to expectedTop
-		float accFrontOpp = 0f;  // contributes to expectedFront
-		float accBackOpp = 0f;   // contributes to expectedBack
-
-		uint selfLayer = self.layer;
-
-		void AccumulateFace(int offset, System.Func<faceVelocities, float> selectOpp, ref float acc)
-		{
-			for (int i = 0; i < 4; i++)
-			{
-				uint idx = flat[offset + i];
-				if (idx >= numNodes) continue;
-				var n = nodesCPU_before[idx];
-				float val = selectOpp(n.velocities);
-				if (n.layer == selfLayer + 1) val *= 0.25f; // parent scaling
-				// child (selfLayer-1) and same-layer are added raw
-				acc += val;
-			}
-		}
-
-		// For LEFT face we stored neighbors in slots [0..3] (offset 0), and we need neighbor's RIGHT
-		AccumulateFace(0, fv => fv.right, ref accLeftOpp);
-		// RIGHT face neighbors in [4..7], need neighbor's LEFT
-		AccumulateFace(4, fv => fv.left, ref accRightOpp);
-		// BOTTOM face neighbors in [8..11], need neighbor's TOP
-		AccumulateFace(8, fv => fv.top, ref accBottomOpp);
-		// TOP face neighbors in [12..15], need neighbor's BOTTOM
-		AccumulateFace(12, fv => fv.bottom, ref accTopOpp);
-		// FRONT face neighbors in [16..19], need neighbor's BACK
-		AccumulateFace(16, fv => fv.back, ref accFrontOpp);
-		// BACK face neighbors in [20..23], need neighbor's FRONT
-		AccumulateFace(20, fv => fv.front, ref accBackOpp);
-
-        // If a face had no neighbors at all (boundary), zero that face and transfer its value to the opposite face
-        bool HasAny(int offset)
-		{
-			for (int i = 0; i < 4; i++) if (flat[offset + i] < numNodes) return true;
-			return false;
-		}
-
-        float expectedLeft   = HasAny(0)  ? (v.left   - accLeftOpp)    : 0f;
-        float expectedRight  = HasAny(4)  ? (v.right  - accRightOpp)   : (v.right + 0f);
-        float expectedBottom = HasAny(8)  ? (v.bottom - accBottomOpp)  : 0f;
-        float expectedTop    = HasAny(12) ? (v.top    - accTopOpp)     : (v.top + 0f);
-        float expectedFront  = HasAny(16) ? (v.front  - accFrontOpp)   : 0f;
-        float expectedBack   = HasAny(20) ? (v.back   - accBackOpp)    : (v.back + 0f);
-
-		expectedDivergence = (expectedRight - expectedLeft) + (expectedTop - expectedBottom) + (expectedFront - expectedBack);
-        return true;
-    }
 
     private string str;
     private int activeCount;
@@ -194,8 +91,7 @@ public class FluidSimulator : MonoBehaviour
         public uint mortonCode;     // 4 bytes
         public uint active;         // 4 bytes
     }
-
-    private Node[] nodesCPU_before;
+    
     private Node[] nodesCPU;
 
     void Start()
@@ -291,52 +187,10 @@ public class FluidSimulator : MonoBehaviour
         // start new timer
         var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
 
-        nodesCPU_before = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU_before);
-        str = "Random 40 nodes before pullVelocities:\n";
-        // for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
-        // int numPrinted = 40;
-        for (int i = 0; i < 40; i++)
-        {   
-            int index = UnityEngine.Random.Range(0, numNodes);
-            // if (numPrinted == 40) break;
-            // int index = i;
-            Node node = nodesCPU_before[index];
-            // if (node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back == 0) continue;
-            // numPrinted++;
-            float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-            float volume = Mathf.Pow(8, node.layer) * 0.0001f;
-            float divergenceNormalized = divergence / volume;
-            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {divergence}, Volume: {volume}, Divergence Normalized: {divergenceNormalized}\n";
-            // str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Neighbor Morton Codes: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
-        }
-        Debug.Log(str);
-
         pullVelocities();
 
         pullVelocitiesSw.Stop();
         Debug.Log($"Pull velocities time: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms");
-
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        str = "Random 40 nodes after pullVelocities:\n";
-        // for (int i = (int)(numNodes*0.875); i < (int)(numNodes*0.875 + 40); i++)
-        // int numPrinted = 40;
-        for (int i = 0; i < 40; i++)
-        {   
-            int index = UnityEngine.Random.Range(0, numNodes);
-            // if (numPrinted == 40) break;
-            // int index = i;
-            Node node = nodesCPU[index];
-            // if (node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back == 0) continue;
-            // numPrinted++;
-            float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-            float volume = Mathf.Pow(8, node.layer) * 0.0001f;
-            float divergenceNormalized = divergence / volume;
-            str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Velocities: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back}), Divergence: {divergence}, Volume: {volume}, Divergence Normalized: {divergenceNormalized}\n";
-            // str += $"Layer: {node.layer}, Morton Code: {node.mortonCode}, Position: {node.position}, Neighbor Morton Codes: (left: {node.velocities.left}, right: {node.velocities.right}, bottom: {node.velocities.bottom}, top: {node.velocities.top}, front: {node.velocities.front}, back: {node.velocities.back})\n";
-        }
-        Debug.Log(str);
 
 		yield break;
 	}
@@ -918,6 +772,9 @@ public class FluidSimulator : MonoBehaviour
             // new Color(0f, 0f, 1f),     // Blue - Layer 9
             // new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
+
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
         
         for (int i = 0; i < numNodes; i++)
         {
