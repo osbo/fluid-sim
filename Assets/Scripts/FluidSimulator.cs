@@ -41,6 +41,7 @@ public class FluidSimulator : MonoBehaviour
     private int applyLaplacianKernel;
     private int axpyKernel;
     private int dotProductKernel;
+    private int applyPressureGradientKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -67,6 +68,7 @@ public class FluidSimulator : MonoBehaviour
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
     public int initialLayer;
+    public float divergenceMultiplier;
 
     private string str;
     private int activeCount;
@@ -118,34 +120,33 @@ public class FluidSimulator : MonoBehaviour
 
         InitializeParticleSystem();
 
-        // Set 10 random particles to layer 0
-        Particle[] particles = new Particle[numParticles];
-        particlesBuffer.GetData(particles);
+        // // Set 10 random particles to layer 0
+        // Particle[] particles = new Particle[numParticles];
+        // particlesBuffer.GetData(particles);
 
-        // Create array of indices and shuffle
-        int[] indices = new int[numParticles];
-        for (int i = 0; i < numParticles; i++) {
-            indices[i] = i;
-        }
+        // // Create array of indices and shuffle
+        // int[] indices = new int[numParticles];
+        // for (int i = 0; i < numParticles; i++) {
+        //     indices[i] = i;
+        // }
         
-        // Fisher-Yates shuffle
-        System.Random rng = new System.Random();
-        for (int i = indices.Length - 1; i > 0; i--) {
-            int j = rng.Next(0, i + 1);
-            int temp = indices[i];
-            indices[i] = indices[j];
-            indices[j] = temp;
-        }
+        // // Fisher-Yates shuffle
+        // System.Random rng = new System.Random();
+        // for (int i = indices.Length - 1; i > 0; i--) {
+        //     int j = rng.Next(0, i + 1);
+        //     int temp = indices[i];
+        //     indices[i] = indices[j];
+        //     indices[j] = temp;
+        // }
 
-        // Set first 10 shuffled indices to layer 0
-        for (int i = 0; i < 10 && i < numParticles; i++) {
-            particles[indices[i]].layer = (uint)initialLayer;
-            particles[indices[i]].velocity = new Vector3(0.0f, -1.0f, 0.0f);
-        }
+        // for (int i = 0; i < numParticles/1024 && i < numParticles; i++) {
+        //     particles[indices[i]].layer = (uint)initialLayer;
+        //     particles[indices[i]].velocity = new Vector3(0.0f, -1.0f, 0.0f);
+        // }
 
         // particles[9*numParticles/16].layer = initialLayer;
 
-        particlesBuffer.SetData(particles);
+        // particlesBuffer.SetData(particles);
 
         // Start total octree construction timer (advection -> full build loop end)
         totalOctreeSw = System.Diagnostics.Stopwatch.StartNew();
@@ -173,6 +174,16 @@ public class FluidSimulator : MonoBehaviour
 		Debug.Log($"Layer {layer}: {numNodes} nodes, Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms, Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms");
 
 		StartCoroutine(PostCreateLeavesFlow());
+
+        // Debug: print total divergence
+        float totalDivergence = 0.0f;
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        for (int i = 0; i < numNodes; i++)
+        {
+            totalDivergence += nodesCPU[i].velocities.right - nodesCPU[i].velocities.left + nodesCPU[i].velocities.top - nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.front - nodesCPU[i].velocities.back;
+        }
+        Debug.Log($"Total divergence: {totalDivergence}");
     }
 
 	private System.Collections.IEnumerator PostCreateLeavesFlow()
@@ -229,6 +240,8 @@ public class FluidSimulator : MonoBehaviour
 
     private void SolvePressure()
     {
+        var totalSolveSw = System.Diagnostics.Stopwatch.StartNew();
+        
         if (cgSolverShader == null)
         {
             Debug.LogError("CGSolver compute shader is not assigned. Please assign `cgSolverShader` in the inspector.");
@@ -236,10 +249,12 @@ public class FluidSimulator : MonoBehaviour
         }
 
         // Find kernel indices
+        var kernelFindSw = System.Diagnostics.Stopwatch.StartNew();
         int calculateDivergenceKernel = cgSolverShader.FindKernel("CalculateDivergence");
         int applyLaplacianKernel = cgSolverShader.FindKernel("ApplyLaplacian");
         int axpyKernel = cgSolverShader.FindKernel("Axpy");
         int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
+        kernelFindSw.Stop();
         
         if (calculateDivergenceKernel < 0 || applyLaplacianKernel < 0 || axpyKernel < 0 || dotProductKernel < 0)
         {
@@ -248,25 +263,41 @@ public class FluidSimulator : MonoBehaviour
         }
 
         // Initialize buffers
+        var bufferInitSw = System.Diagnostics.Stopwatch.StartNew();
         divergenceBuffer = new ComputeBuffer(numNodes, sizeof(float));
         residualBuffer = new ComputeBuffer(numNodes, sizeof(float));
         pBuffer = new ComputeBuffer(numNodes, sizeof(float));
         ApBuffer = new ComputeBuffer(numNodes, sizeof(float));
         pressureBuffer = new ComputeBuffer(numNodes, sizeof(float));
+        bufferInitSw.Stop();
 
         // --- Step 1: Calculate Divergence and Initialize ---
+        var divergenceSw = System.Diagnostics.Stopwatch.StartNew();
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
         cgSolverShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         Dispatch(calculateDivergenceKernel, numNodes);
+        divergenceSw.Stop();
+
+        // Debug: print total divergence
+        float totalDivergence = 0.0f;
+        float[] divergenceCPU = new float[numNodes];
+        divergenceBuffer.GetData(divergenceCPU);
+        for (int i = 0; i < numNodes; i++)
+        {
+            totalDivergence += divergenceCPU[i];
+        }
+        Debug.Log($"Total divergence: {totalDivergence}");
 
         // Initialize: r = b, p = r (since initial pressure x = 0)
+        var initSw = System.Diagnostics.Stopwatch.StartNew();
         CopyBuffer(divergenceBuffer, residualBuffer);
         CopyBuffer(divergenceBuffer, pBuffer);
 
         float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
         if (r_dot_r < convergenceThreshold) return; // Already converged
+        initSw.Stop();
 
         // Initialize residual tracking
         float initialResidual = r_dot_r;
@@ -274,6 +305,7 @@ public class FluidSimulator : MonoBehaviour
         int totalIterations = 0;
 
         // --- Step 2: Main CG Loop ---
+        var cgLoopSw = System.Diagnostics.Stopwatch.StartNew();
         for (int i = 0; i < maxCgIterations; i++)
         {
             // Calculate Ap = A * p
@@ -347,6 +379,7 @@ public class FluidSimulator : MonoBehaviour
             previousResidual = r_dot_r_new;
             totalIterations = i + 1;
         }
+        cgLoopSw.Stop();
         
         // Create clean summary report
         float finalResidual = r_dot_r;
@@ -369,7 +402,52 @@ public class FluidSimulator : MonoBehaviour
             
         Debug.Log(summary);
 
-        // --- Step 3: Apply pressure to velocities (not shown, but would be the final step) ---
+        // --- Step 3: Apply pressure to velocities ---
+        var pressureGradientSw = System.Diagnostics.Stopwatch.StartNew();
+        ApplyPressureGradient();
+        pressureGradientSw.Stop();
+        
+        // Final timing summary
+        totalSolveSw.Stop();
+        Debug.Log($"SolvePressure Timing Summary:\n" +
+                 $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• CG Loop: {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
+    }
+
+    private void ApplyPressureGradient()
+    {
+        if (nodesShader == null)
+        {
+            Debug.LogError("Nodes compute shader is not assigned.");
+            return;
+        }
+
+        applyPressureGradientKernel = nodesShader.FindKernel("ApplyPressureGradient");
+        
+        // Set the necessary buffers and parameters
+        nodesShader.SetBuffer(applyPressureGradientKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(applyPressureGradientKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesShader.SetBuffer(applyPressureGradientKernel, "neighborsBuffer", neighborsBuffer);
+        nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer); // The result from the CG solve!
+        
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.SetFloat("deltaTime", (1 / 60.0f)); // Use the same deltaTime as in advection
+        nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
+
+        // Dispatch the kernel to update velocities
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+        nodesShader.Dispatch(applyPressureGradientKernel, threadGroups, 1, 1);
+
+        copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
+        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
     }
 
     // Helper for dispatching kernels
@@ -1043,11 +1121,11 @@ public class FluidSimulator : MonoBehaviour
             Node node = nodesCPU[i];
             int layerIndex = Mathf.Clamp((int)Mathf.Min(node.layer, layer), 0, layerColors.Length - 1);
             Gizmos.color = layerColors[layerIndex];
-            // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-            // float volume = Mathf.Pow(8, node.layer) * 0.01f;
-            // float divergenceNormalized = divergence / volume;
-            // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-            // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+            float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
+            float volume = Mathf.Pow(8, node.layer);
+            float divergenceNormalized = divergence * divergenceMultiplier / volume;
+            float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+            Gizmos.color = Color.HSVToRGB(hue, 1, 1);
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(node.layer, layer)), 0.01f));
         }
 

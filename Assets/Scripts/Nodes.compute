@@ -2,6 +2,7 @@
 #pragma kernel ProcessNodes
 #pragma kernel pullVelocities
 #pragma kernel copyFaceVelocities
+#pragma kernel ApplyPressureGradient
 
 struct faceVelocities
 {
@@ -38,6 +39,7 @@ struct Node
 // Input buffers
 RWStructuredBuffer<Particle> particlesBuffer;           // input: all particles
 RWStructuredBuffer<uint> uniqueIndices;                 // input: indices of first occurrence of each unique code
+RWStructuredBuffer<float> pressureBuffer;               // input: pressure values from CG solver
 // Output buffers
 RWStructuredBuffer<Node> nodesBuffer;                   // output: aggregated nodes
 RWStructuredBuffer<Node> tempNodesBuffer;               // output: per-node gathered face deltas
@@ -47,6 +49,8 @@ uint numUniqueNodes;                              // number of unique morton cod
 uint numNodes;                                          // number of nodes
 uint numParticles;                                      // total number of particles
 uint layer;                                             // current hierarchical layer
+float deltaTime;                                        // time step for pressure gradient application
+float maxDetailCellSize;                               // smallest cell size for scaling
 
 // Morton helpers: interleave/deinterleave 3D (10 bits per axis)
 uint3 deinterleave(uint m)
@@ -571,4 +575,75 @@ void copyFaceVelocities(uint3 id : SV_DispatchThreadID)
     if (threadIndex >= numNodes) return;
 
     nodesBuffer[threadIndex] = tempNodesBuffer[threadIndex];
+}
+
+[numthreads(512, 1, 1)]
+void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    Node node = nodesBuffer[threadIndex];
+    Node outNode = node; // Start with a copy
+    float p_i = pressureBuffer[threadIndex];
+    float dx_i = maxDetailCellSize * exp2((float)node.layer);
+
+    uint neighborBaseIndex = threadIndex * 24;
+
+    // Loop through all 6 faces, same as pullVelocities and ApplyLaplacian
+    for (int d = 0; d < 6; d++)
+    {
+        uint faceNeighborBase = neighborBaseIndex + d * 4;
+        uint neighbor_idx = neighborsBuffer[faceNeighborBase];
+        float pressure_gradient = 0.0;
+
+        if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
+        {
+            // Case 1: Same-layer or Parent (coarser) neighbor
+            Node nNode = nodesBuffer[neighbor_idx];
+            float p_j = pressureBuffer[neighbor_idx];
+            float dx_j = maxDetailCellSize * exp2((float)nNode.layer);
+            
+            // Distance between cell centers
+            float distance = 0.5 * (dx_i + dx_j);
+            pressure_gradient = (p_j - p_i) / distance;
+        }
+        else
+        {
+            // Case 2: Child (finer) neighbors
+            float avg_p_children = 0.0;
+            uint childCount = 0;
+            for (int k = 0; k < 4; k++)
+            {
+                uint child_idx = neighborsBuffer[faceNeighborBase + k];
+                if (child_idx < numNodes)
+                {
+                    avg_p_children += pressureBuffer[child_idx];
+                    childCount++;
+                }
+            }
+
+            if (childCount > 0)
+            {
+                avg_p_children /= (float)childCount;
+                // Use the child's cell size for distance calculation
+                float dx_child = dx_i * 0.5;
+                float distance = 0.5 * (dx_i + dx_child);
+                pressure_gradient = (avg_p_children - p_i) / distance;
+            }
+        }
+        
+        // Subtract the scaled gradient from the appropriate face velocity
+        // Note: This applies the change directly to the velocity value on that face.
+        float velocity_correction = deltaTime * pressure_gradient;
+
+        if (d == 0) outNode.velocities.left -= velocity_correction;
+        else if (d == 1) outNode.velocities.right -= velocity_correction;
+        else if (d == 2) outNode.velocities.bottom -= velocity_correction;
+        else if (d == 3) outNode.velocities.top -= velocity_correction;
+        else if (d == 4) outNode.velocities.front -= velocity_correction;
+        else outNode.velocities.back -= velocity_correction;
+    }
+
+    tempNodesBuffer[threadIndex] = outNode;
 }

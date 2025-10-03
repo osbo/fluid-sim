@@ -109,19 +109,19 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // float2 centerOffset = float2(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y);
     float3 centerOffset = float3(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y, particle.position.z - simulationCenter.z);
     float distanceFromCenter = length(centerOffset);
-    float centerRadius = 1; // Small radius around center for layer 0 particles
+    float centerRadius = 3; // Small radius around center for layer 0 particles
     
     // Assign layer: center particles get layer 0, boundary particles get layer 0, others get layer 11
     bool nearCenter = (distanceFromCenter <= centerRadius);
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
     // particle.layer = (nearCenter || onBoundary) ? initialLayer : 11;
     // particle.layer = onBoundary ? initialLayer : 11;
-    // particle.layer = (nearCenter) ? initialLayer : 11;
-    particle.layer = 11;
+    particle.layer = (nearCenter) ? initialLayer : 11;
+    // particle.layer = 11;
 
-    // if (nearCenter) {
-    //     particle.velocity = float3(-1.0, 0, 0.0);
-    // }
+    if (nearCenter) {
+        particle.velocity = float3(-1.0, 0, 0.0);
+    }
     
     // Generate morton code from normalized position
     // particle.mortonCode = EncodeMorton3D(normalizedPos);
