@@ -805,11 +805,11 @@ public class FluidSimulator : MonoBehaviour
             Node node = nodesCPU[i];
             int layerIndex = Mathf.Clamp((int)Mathf.Min(node.layer, layer), 0, layerColors.Length - 1);
             Gizmos.color = layerColors[layerIndex];
-            // float divergence = node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back;
-            // float volume = Mathf.Pow(8, node.layer) * 0.01f;
-            // float divergenceNormalized = divergence / volume;
-            // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-            // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+            float divergence = node.velocities.left + node.velocities.right + node.velocities.bottom + node.velocities.top + node.velocities.front + node.velocities.back;
+            float volume = Mathf.Pow(8, node.layer) * 0.01f;
+            float divergenceNormalized = divergence / volume;
+            float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+            Gizmos.color = Color.HSVToRGB(hue, 1, 1);
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(node.layer, layer)), 0.01f));
         }
 
