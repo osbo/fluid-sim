@@ -282,20 +282,56 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             uint lower = nPrefix << shift;
             uint upper = (nPrefix + 1u) << shift; // exclusive
 
-            uint idx_low = lowerBoundMorton(lower, 0, numNodes);
+            int subNodesLower[4];
+            if (d == 0) { // right face
+                subNodesLower[0] = 1;
+                subNodesLower[1] = 3;
+                subNodesLower[2] = 5;
+                subNodesLower[3] = 7;
+            } else if (d == 1) { // left face
+                subNodesLower[0] = 0;
+                subNodesLower[1] = 2;
+                subNodesLower[2] = 4;
+                subNodesLower[3] = 6;
+            } else if (d == 2) { // top face
+                subNodesLower[0] = 2;
+                subNodesLower[1] = 3;
+                subNodesLower[2] = 6;
+                subNodesLower[3] = 7;
+            } else if (d == 3) { // bottom face
+                subNodesLower[0] = 0;
+                subNodesLower[1] = 1;
+                subNodesLower[2] = 4;
+                subNodesLower[3] = 5;
+            } else if (d == 4) { // back face
+                subNodesLower[0] = 4;
+                subNodesLower[1] = 5;
+                subNodesLower[2] = 6;
+                subNodesLower[3] = 7;
+            } else if (d == 5) { // front face
+                subNodesLower[0] = 0;
+                subNodesLower[1] = 1;
+                subNodesLower[2] = 2;
+                subNodesLower[3] = 3;
+            }
 
-            // this isn't perfect, but it's honestly fast enough. It's bounded to at most 8 iterations, and is robust.
-            for (uint j = idx_low; j < numNodes; j++)
+            uint nPrefixShifted = nPrefix << 3;
+            for (int i = 0; i < 4 && coarsen; i++)
             {
-                Node node = nodesBuffer[j];
-                if (node.mortonCode >= upper)
+                uint subPrefix = nPrefixShifted + subNodesLower[i];
+                uint subLower = subPrefix << (shift - 3);
+                uint subUpper = (subPrefix + 1u) << (shift - 3);
+                uint idx_sub = lowerBoundMorton(subLower, 0, numNodes);
+                if (idx_sub < numNodes)
                 {
-                    break;
-                }
-                if (node.layer < layer - 1)
-                {
-                    coarsen = false;
-                    break;
+                    Node cNode = nodesBuffer[idx_sub];
+                    if (cNode.mortonCode < subUpper)
+                    {
+                        if (cNode.layer < layer - 1)
+                        {
+                            coarsen = false;
+                        }
+                    }
                 }
             }
         }
