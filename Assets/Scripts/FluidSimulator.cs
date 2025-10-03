@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
+using System;
 
 public class FluidSimulator : MonoBehaviour
 {
@@ -10,7 +11,15 @@ public class FluidSimulator : MonoBehaviour
     public ComputeShader particlesShader;
     public ComputeShader nodesPrefixSumsShader;
     public ComputeShader nodesShader;
+    public ComputeShader cgSolverShader;
     public int numParticles;
+    
+    // CG Solver parameters
+    public int maxCgIterations = 50;
+    public float convergenceThreshold = 1e-6f;
+    
+    // Simulation parameters
+    private float maxDetailCellSize;
     
     private RadixSort radixSort;
     private int initializeParticlesKernel;
@@ -28,6 +37,10 @@ public class FluidSimulator : MonoBehaviour
     private int radixPrefixFixupKernelId;
     private int pullVelocitiesKernel;
     private int copyFaceVelocitiesKernel;
+    private int calculateDivergenceKernel;
+    private int applyLaplacianKernel;
+    private int axpyKernel;
+    private int dotProductKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -42,6 +55,11 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer nodesBuffer;
     private ComputeBuffer tempNodesBuffer;
     private ComputeBuffer neighborsBuffer;
+    private ComputeBuffer divergenceBuffer;
+    private ComputeBuffer pBuffer;
+    private ComputeBuffer ApBuffer;
+    private ComputeBuffer residualBuffer;
+    private ComputeBuffer pressureBuffer;
     // add previous active node count, but that can be a cpu variable 
     
     // Number of nodes, active nodes, and unique active nodes
@@ -122,6 +140,7 @@ public class FluidSimulator : MonoBehaviour
         // Set first 10 shuffled indices to layer 0
         for (int i = 0; i < 10 && i < numParticles; i++) {
             particles[indices[i]].layer = (uint)initialLayer;
+            particles[indices[i]].velocity = new Vector3(0.0f, -1.0f, 0.0f);
         }
 
         // particles[9*numParticles/16].layer = initialLayer;
@@ -162,7 +181,7 @@ public class FluidSimulator : MonoBehaviour
 		Vector3 simulationBoundsMin = simulationBounds.bounds.min;
 		Vector3 simulationBoundsMax = simulationBounds.bounds.max;
 		Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
-		float maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
+		maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
 		
 		for (layer = layer + 1; layer <= 10; layer++)
 		{
@@ -202,9 +221,241 @@ public class FluidSimulator : MonoBehaviour
 
         pullVelocitiesSw.Stop();
         Debug.Log($"Pull velocities time: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms");
+        
+        SolvePressure();
 
 		yield break;
 	}
+
+    private void SolvePressure()
+    {
+        if (cgSolverShader == null)
+        {
+            Debug.LogError("CGSolver compute shader is not assigned. Please assign `cgSolverShader` in the inspector.");
+            return;
+        }
+
+        // Find kernel indices
+        int calculateDivergenceKernel = cgSolverShader.FindKernel("CalculateDivergence");
+        int applyLaplacianKernel = cgSolverShader.FindKernel("ApplyLaplacian");
+        int axpyKernel = cgSolverShader.FindKernel("Axpy");
+        int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
+        
+        if (calculateDivergenceKernel < 0 || applyLaplacianKernel < 0 || axpyKernel < 0 || dotProductKernel < 0)
+        {
+            Debug.LogError("One or more CG solver kernels not found. Check CGSolver.compute shader compilation.");
+            return;
+        }
+
+        // Initialize buffers
+        divergenceBuffer = new ComputeBuffer(numNodes, sizeof(float));
+        residualBuffer = new ComputeBuffer(numNodes, sizeof(float));
+        pBuffer = new ComputeBuffer(numNodes, sizeof(float));
+        ApBuffer = new ComputeBuffer(numNodes, sizeof(float));
+        pressureBuffer = new ComputeBuffer(numNodes, sizeof(float));
+
+        // --- Step 1: Calculate Divergence and Initialize ---
+        cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
+        cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
+        cgSolverShader.SetInt("numNodes", numNodes);
+        cgSolverShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
+        Dispatch(calculateDivergenceKernel, numNodes);
+
+        // Initialize: r = b, p = r (since initial pressure x = 0)
+        CopyBuffer(divergenceBuffer, residualBuffer);
+        CopyBuffer(divergenceBuffer, pBuffer);
+
+        float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
+        if (r_dot_r < convergenceThreshold) return; // Already converged
+
+        // Initialize residual tracking
+        float initialResidual = r_dot_r;
+        float previousResidual = r_dot_r;
+        int totalIterations = 0;
+
+        // --- Step 2: Main CG Loop ---
+        for (int i = 0; i < maxCgIterations; i++)
+        {
+            // Calculate Ap = A * p
+            cgSolverShader.SetBuffer(applyLaplacianKernel, "nodesBuffer", nodesBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianKernel, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianKernel, "pBuffer", pBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianKernel, "ApBuffer", ApBuffer);
+            cgSolverShader.SetInt("numNodes", numNodes);
+            Dispatch(applyLaplacianKernel, numNodes);
+
+            // Calculate alpha with safety checks
+            float p_dot_Ap = GpuDotProduct(pBuffer, ApBuffer);
+            
+            
+            // Safety check for ill-conditioned matrix
+            if (Math.Abs(p_dot_Ap) < 1e-12f)
+            {
+                Debug.LogError($"CG Solver: Matrix is singular or ill-conditioned! p_dot_Ap = {p_dot_Ap:E6}");
+                break;
+            }
+            
+            if (p_dot_Ap <= 0.0f)
+            {
+                Debug.LogError($"CG Solver: Matrix is not positive definite! p_dot_Ap = {p_dot_Ap:E6}");
+                break;
+            }
+            
+            float alpha = r_dot_r / p_dot_Ap;
+            
+            // Safety check for alpha with more reasonable bounds
+            if (Math.Abs(alpha) > 1e3f)
+            {
+                Debug.LogError($"CG Solver: Alpha is too large! alpha = {alpha:E6}, r_dot_r = {r_dot_r:E6}, p_dot_Ap = {p_dot_Ap:E6}");
+                Debug.LogError($"This suggests the matrix is still ill-conditioned. Consider preconditioning or different discretization.");
+                break;
+            }
+            
+            // Additional safety: limit alpha to prevent overshooting
+            // Use a more conservative cap based on the residual magnitude
+            float maxAlpha = Math.Min(1.0f, 1e6f / Math.Max(r_dot_r, 1e-6f));
+            alpha = Math.Min(alpha, maxAlpha);
+
+            // Update pressure: x = x + alpha * p
+            UpdateVector(pressureBuffer, pBuffer, alpha);
+
+            // Update residual: r = r - alpha * Ap
+            UpdateVector(residualBuffer, ApBuffer, -alpha);
+
+            // Check for convergence
+            float r_dot_r_new = GpuDotProduct(residualBuffer, residualBuffer);
+            
+            // Early stopping for diverging solver
+            if (r_dot_r_new > 10.0f * initialResidual)
+            {
+                totalIterations = i + 1;
+                Debug.LogError($"CG Solver diverged after {i + 1} iterations. Residual grew to {r_dot_r_new / initialResidual:F1}x initial value.");
+                break;
+            }
+            
+            if (r_dot_r_new < convergenceThreshold) 
+            {
+                totalIterations = i + 1;
+                break;
+            }
+
+            // Update search direction: p = r + (r_new_dot_r_new / r_dot_r) * p
+            float beta = r_dot_r_new / r_dot_r;
+            UpdateVector(pBuffer, residualBuffer, 1.0f, beta); // Special AXPY: p = r + beta * p
+
+            r_dot_r = r_dot_r_new;
+            previousResidual = r_dot_r_new;
+            totalIterations = i + 1;
+        }
+        
+        // Create clean summary report
+        float finalResidual = r_dot_r;
+        float totalImprovement = ((initialResidual - finalResidual) / initialResidual) * 100.0f;
+        float residualRatio = finalResidual / initialResidual;
+        
+        string summary = $"CG Solver Summary:\n";
+        summary += $"• Iterations: {totalIterations}/{maxCgIterations}\n";
+        summary += $"• Initial residual: {initialResidual:E6}\n";
+        summary += $"• Final residual: {finalResidual:E6}\n";
+        summary += $"• Total improvement: {totalImprovement:F2}%\n";
+        summary += $"• Residual ratio: {residualRatio:E3}x initial\n";
+        
+        if (totalImprovement > 0)
+            summary += $"• Status: Converged successfully\n";
+        else if (totalImprovement > -10)
+            summary += $"• Status: Converged (slight increase)\n";
+        else
+            summary += $"• Status: Diverged ({Math.Abs(totalImprovement):F1}% increase)\n";
+            
+        Debug.Log(summary);
+
+        // --- Step 3: Apply pressure to velocities (not shown, but would be the final step) ---
+    }
+
+    // Helper for dispatching kernels
+    private void Dispatch(int kernel, int count) 
+    {
+        int threadGroups = Mathf.CeilToInt(count / 512.0f);
+        cgSolverShader.Dispatch(kernel, threadGroups, 1, 1);
+    }
+
+    // Helper for copying buffer data
+    private void CopyBuffer(ComputeBuffer source, ComputeBuffer destination)
+    {
+        if (source.count != destination.count) return;
+        
+        float[] data = new float[source.count];
+        source.GetData(data);
+        destination.SetData(data);
+    }
+
+    // Helper for GPU-side dot product
+    private float GpuDotProduct(ComputeBuffer bufferA, ComputeBuffer bufferB)
+    {
+        if (cgSolverShader == null) return 0.0f;
+
+        int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
+        
+        // Set up buffers for dot product
+        cgSolverShader.SetBuffer(dotProductKernel, "xBuffer", bufferA);
+        cgSolverShader.SetBuffer(dotProductKernel, "yBuffer", bufferB);
+        cgSolverShader.SetBuffer(dotProductKernel, "divergenceBuffer", divergenceBuffer); // Required for output
+        cgSolverShader.SetInt("numNodes", numNodes);
+        
+        // Dispatch dot product kernel
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+        cgSolverShader.Dispatch(dotProductKernel, threadGroups, 1, 1);
+        
+        // Read back the result from divergenceBuffer (reused as temporary output)
+        float[] result = new float[threadGroups];
+        divergenceBuffer.GetData(result);
+        
+        // Sum up all partial results
+        float total = 0.0f;
+        for (int i = 0; i < threadGroups; i++)
+        {
+            total += result[i];
+        }
+        
+        return total;
+    }
+
+    // Helper for AXPY operations: y = a*x + y
+    private void UpdateVector(ComputeBuffer yBuffer, ComputeBuffer xBuffer, float a)
+    {
+        if (cgSolverShader == null) return;
+
+        int axpyKernel = cgSolverShader.FindKernel("Axpy");
+        
+        cgSolverShader.SetBuffer(axpyKernel, "xBuffer", xBuffer);
+        cgSolverShader.SetBuffer(axpyKernel, "yBuffer", yBuffer);
+        cgSolverShader.SetFloat("a", a);
+        cgSolverShader.SetInt("numNodes", numNodes);
+        
+        Dispatch(axpyKernel, numNodes);
+    }
+
+    // Special AXPY for p = r + beta * p
+    private void UpdateVector(ComputeBuffer pBuffer, ComputeBuffer rBuffer, float rCoeff, float pCoeff)
+    {
+        if (cgSolverShader == null) return;
+
+        int axpyKernel = cgSolverShader.FindKernel("Axpy");
+        
+        // First: p = beta * p
+        cgSolverShader.SetBuffer(axpyKernel, "xBuffer", pBuffer);
+        cgSolverShader.SetBuffer(axpyKernel, "yBuffer", pBuffer);
+        cgSolverShader.SetFloat("a", pCoeff);
+        cgSolverShader.SetInt("numNodes", numNodes);
+        Dispatch(axpyKernel, numNodes);
+        
+        // Then: p = r + p (where p is now beta * p)
+        cgSolverShader.SetBuffer(axpyKernel, "xBuffer", rBuffer);
+        cgSolverShader.SetBuffer(axpyKernel, "yBuffer", pBuffer);
+        cgSolverShader.SetFloat("a", rCoeff);
+        cgSolverShader.SetInt("numNodes", numNodes);
+        Dispatch(axpyKernel, numNodes);
+    }
     
     private void InitializeParticleSystem()
     {
@@ -890,6 +1141,12 @@ public class FluidSimulator : MonoBehaviour
         nodeCount?.Release();
         nodesBuffer?.Release();
         tempNodesBuffer?.Release();
+        neighborsBuffer?.Release();
+        divergenceBuffer?.Release();
+        residualBuffer?.Release();
+        pBuffer?.Release();
+        ApBuffer?.Release();
+        pressureBuffer?.Release();
     }
 }
 
