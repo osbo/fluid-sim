@@ -538,7 +538,7 @@ MonoBehaviour:
   cgSolverShader: {fileID: 7200000, guid: d5297ef94acc94983b6222dcf43123f9, type: 3}
   numParticles: 1048576
   initialLayer: 3
-  velocitySensitivity: 1
+  velocitySensitivity: 32
   divergenceMultiplier: 50
 --- !u!1 &832575517
 GameObject:
