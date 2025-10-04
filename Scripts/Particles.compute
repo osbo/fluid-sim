@@ -117,7 +117,8 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // particle.layer = (nearCenter || onBoundary) ? initialLayer : 11;
     // particle.layer = onBoundary ? initialLayer : 11;
     // particle.layer = (nearCenter) ? initialLayer : 11;
-    particle.layer = 11;
+    // particle.layer = 11;
+    particle.layer = 4;
 
     // if (nearCenter) {
     //     particle.velocity = float3(-1.0, 0, 0.0);
@@ -149,17 +150,18 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
     velocity.y -= gravity * deltaTime;
 
     float3 position = particle.position + velocity * deltaTime;
+    // float3 position = particle.position;
     
     // Clamp position to simulation bounds and reflect velocity
-    if (position.x <= simulationBoundsMin.x || position.x >= simulationBoundsMax.x) {
-        velocity.x *= -0.5;
-    }
-    if (position.y <= simulationBoundsMin.y || position.y >= simulationBoundsMax.y) {
-        velocity.y *= -0.5;
-    }
-    if (position.z <= simulationBoundsMin.z || position.z >= simulationBoundsMax.z) {
-        velocity.z *= -0.5;
-    }
+    // if (position.x <= simulationBoundsMin.x || position.x >= simulationBoundsMax.x) {
+    //     velocity.x *= -0.5;
+    // }
+    // if (position.y <= simulationBoundsMin.y || position.y >= simulationBoundsMax.y) {
+    //     velocity.y *= -0.5;
+    // }
+    // if (position.z <= simulationBoundsMin.z || position.z >= simulationBoundsMax.z) {
+    //     velocity.z *= -0.5;
+    // }
 
     position = clamp(position, simulationBoundsMin, simulationBoundsMax);
 
