@@ -295,6 +295,8 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
 
         uint gridDim = 1u << (10 - layer);
 
+        uint numNeighbors = 0;
+
         int3 deltas[6] = { int3(-1,0,0), int3(1,0,0), int3(0,-1,0), int3(0,1,0), int3(0,0,-1), int3(0,0,1) };
         // [unroll]
         for (int d = 0; d < 6 && coarsen; d++)
@@ -365,10 +367,16 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
                         {
                             coarsen = false;
                         }
+                        numNeighbors++;
                     }
                 }
             }
         }
+
+        // if (numNeighbors < 6)
+        // {
+        //     coarsen = false;
+        // }
     }
 
     if (coarsen)
@@ -475,23 +483,23 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         {
             // Zero the boundary face velocity for solid walls
             if (d == 0) { // Left boundary
-                outNode.velocities.right += selfVel.right;
-                outNode.velocities.left = 0;
-            } else if (d == 1) { // Right boundary
                 outNode.velocities.right += selfVel.left;
                 outNode.velocities.left = 0;
+            } else if (d == 1) { // Right boundary
+                outNode.velocities.left += selfVel.right;
+                outNode.velocities.right = 0;
             } else if (d == 2) { // Bottom boundary
-                outNode.velocities.bottom += selfVel.bottom;
-                outNode.velocities.top = 0;
-            } else if (d == 3) { // Top boundary
-                outNode.velocities.top += selfVel.top;
+                outNode.velocities.top += selfVel.bottom;
                 outNode.velocities.bottom = 0;
+            } else if (d == 3) { // Top boundary
+                outNode.velocities.bottom += selfVel.top;
+                outNode.velocities.top = 0;
             } else if (d == 4) { // Front boundary
-                outNode.velocities.front += selfVel.front;
-                outNode.velocities.back = 0;
-            } else if (d == 5) { // Back boundary
-                outNode.velocities.back += selfVel.back;
+                outNode.velocities.back += selfVel.front;
                 outNode.velocities.front = 0;
+            } else if (d == 5) { // Back boundary
+                outNode.velocities.front += selfVel.back;
+                outNode.velocities.back = 0;
             }
             continue; // Skip this neighbor direction
         }

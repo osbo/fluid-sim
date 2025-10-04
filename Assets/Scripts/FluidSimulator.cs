@@ -15,8 +15,8 @@ public class FluidSimulator : MonoBehaviour
     public int numParticles;
     
     // CG Solver parameters
-    private int maxCgIterations = 50;
-    private float convergenceThreshold = 1e-6f;
+    public int maxCgIterations;
+    public float convergenceThreshold;
     
     // Simulation parameters
     private float maxDetailCellSize;
@@ -69,6 +69,7 @@ public class FluidSimulator : MonoBehaviour
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
     public float gravity;
+    public float frameRate;
     public int initialLayer;
     public float velocitySensitivity;
     private float divergenceMultiplier = 50.0f;
@@ -121,9 +122,8 @@ public class FluidSimulator : MonoBehaviour
 
     void Start()
     {
-        layer = initialLayer;
         InitializeParticleSystem();
-        InitializeInitialParticles();
+        // InitializeInitialParticles();
     }
 
     private void InitializeInitialParticles()
@@ -149,7 +149,7 @@ public class FluidSimulator : MonoBehaviour
         // for (int i = 0; i < numParticles/1024 && i < numParticles; i++) {
         for (int i = 0; (uint)i < 20 && i < numParticles; i++) {
             particlesCPU[indices[i]].layer = (uint)initialLayer;
-            particlesCPU[indices[i]].velocity = new Vector3(0.0f, -100.0f, 0.0f);
+            particlesCPU[indices[i]].velocity = new Vector3(0.0f, 10.0f, 0.0f);
         }
 
         particlesBuffer.SetData(particlesCPU);
@@ -157,7 +157,7 @@ public class FluidSimulator : MonoBehaviour
 
     void Update()
     {
-        // // Check for space key press to advance frame
+        // Check for space key press to advance frame
         // if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
         // {
         //     if (!hasShownWaitMessage)
@@ -236,14 +236,14 @@ public class FluidSimulator : MonoBehaviour
         SolvePressure();
         solvePressureSw.Stop();
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        string str = "Node velocities:\n";
-        for (int i = 0; i < 40 && i < numNodes; i++)
-        {
-            str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        }
-        Debug.Log(str);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // string str = "Node velocities:\n";
+        // for (int i = 0; i < 40 && i < numNodes; i++)
+        // {
+        //     str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        // }
+        // Debug.Log(str);
 
         // Step 7: Grid to particles
         var gridToParticlesSw = System.Diagnostics.Stopwatch.StartNew();
@@ -286,14 +286,14 @@ public class FluidSimulator : MonoBehaviour
             }
         }
 
-        // Build output string
-        str = "Particle layer distribution:\n";
-        for (int layer = 0; layer <= maxLayer; layer++) {
-            if (layerCounts[layer] > 0) {
-                str += $"Layer {layer}: {layerCounts[layer]} particles\n";
-            }
-        }
-        Debug.Log(str);
+        // // Build output string
+        // str = "Particle layer distribution:\n";
+        // for (int layer = 0; layer <= maxLayer; layer++) {
+        //     if (layerCounts[layer] > 0) {
+        //         str += $"Layer {layer}: {layerCounts[layer]} particles\n";
+        //     }
+        // }
+        // Debug.Log(str);
     }
 
 
@@ -331,7 +331,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.Dispatch(createParticlesKernel, threadGroups, 1, 1);
 
         gridToParticlesSw.Stop();
-        Debug.Log($"Grid to particles time: {gridToParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
+        // Debug.Log($"Grid to particles time: {gridToParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     private void SolvePressure()
@@ -463,7 +463,7 @@ public class FluidSimulator : MonoBehaviour
             if (r_dot_r_new > 10.0f * initialResidual)
             {
                 totalIterations = i + 1;
-                Debug.LogError($"CG Solver diverged after {i + 1} iterations. Residual grew to {r_dot_r_new / initialResidual:F1}x initial value.");
+                // Debug.LogError($"CG Solver diverged after {i + 1} iterations. Residual grew to {r_dot_r_new / initialResidual:F1}x initial value.");
                 break;
             }
             
@@ -488,7 +488,7 @@ public class FluidSimulator : MonoBehaviour
         float totalImprovement = ((initialResidual - finalResidual) / initialResidual) * 100.0f;
         float residualRatio = finalResidual / initialResidual;
         
-        string summary = $"CG Solver Summary:\n";
+        string summary = $"CG Solver Summary: Iterations {totalIterations}/{maxCgIterations}, Total {((totalImprovement > 0) ? "Convergence" : "Divergence")} {totalImprovement:F2}%, Residual Ratio {residualRatio:E3}x initial\n";
         summary += $"• Iterations: {totalIterations}/{maxCgIterations}\n";
         summary += $"• Initial residual: {initialResidual:E6}\n";
         summary += $"• Final residual: {finalResidual:E6}\n";
@@ -511,14 +511,14 @@ public class FluidSimulator : MonoBehaviour
         
         // Final timing summary
         totalSolveSw.Stop();
-        Debug.Log($"SolvePressure Timing Summary:\n" +
-                 $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• CG Loop: {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
+        // Debug.Log($"SolvePressure Timing Summary:\n" +
+        //          $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• CG Loop: {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     private void ApplyPressureGradient()
@@ -538,7 +538,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer); // The result from the CG solve!
         
         nodesShader.SetInt("numNodes", numNodes);
-        nodesShader.SetFloat("deltaTime", (1 / 60.0f)); // Use the same deltaTime as in advection
+        nodesShader.SetFloat("deltaTime", (1 / frameRate)); // Use the same deltaTime as in advection
         nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         nodesShader.SetFloat("velocitySensitivity", velocitySensitivity);
         nodesShader.SetInt("initialLayer", initialLayer);
