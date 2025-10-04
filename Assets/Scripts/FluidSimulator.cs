@@ -120,33 +120,34 @@ public class FluidSimulator : MonoBehaviour
 
         InitializeParticleSystem();
 
-        // // Set 10 random particles to layer 0
-        // Particle[] particles = new Particle[numParticles];
-        // particlesBuffer.GetData(particles);
+        // Set 10 random particles to layer 0
+        Particle[] particles = new Particle[numParticles];
+        particlesBuffer.GetData(particles);
 
-        // // Create array of indices and shuffle
-        // int[] indices = new int[numParticles];
-        // for (int i = 0; i < numParticles; i++) {
-        //     indices[i] = i;
-        // }
+        // Create array of indices and shuffle
+        int[] indices = new int[numParticles];
+        for (int i = 0; i < numParticles; i++) {
+            indices[i] = i;
+        }
         
-        // // Fisher-Yates shuffle
-        // System.Random rng = new System.Random();
-        // for (int i = indices.Length - 1; i > 0; i--) {
-        //     int j = rng.Next(0, i + 1);
-        //     int temp = indices[i];
-        //     indices[i] = indices[j];
-        //     indices[j] = temp;
-        // }
+        // Fisher-Yates shuffle
+        System.Random rng = new System.Random();
+        for (int i = indices.Length - 1; i > 0; i--) {
+            int j = rng.Next(0, i + 1);
+            int temp = indices[i];
+            indices[i] = indices[j];
+            indices[j] = temp;
+        }
 
         // for (int i = 0; i < numParticles/1024 && i < numParticles; i++) {
-        //     particles[indices[i]].layer = (uint)initialLayer;
-        //     particles[indices[i]].velocity = new Vector3(0.0f, -1.0f, 0.0f);
-        // }
+        for (int i = 0; (uint)i < 20 && i < numParticles; i++) {
+            particles[indices[i]].layer = (uint)initialLayer;
+            particles[indices[i]].velocity = new Vector3(0.0f, -1.0f, 0.0f);
+        }
 
         // particles[9*numParticles/16].layer = initialLayer;
 
-        // particlesBuffer.SetData(particles);
+        particlesBuffer.SetData(particles);
 
         // Start total octree construction timer (advection -> full build loop end)
         totalOctreeSw = System.Diagnostics.Stopwatch.StartNew();
@@ -235,8 +236,26 @@ public class FluidSimulator : MonoBehaviour
         
         SolvePressure();
 
+        GridToParticles();
+
 		yield break;
 	}
+
+    private void GridToParticles()
+    {
+        var gridToParticlesSw = System.Diagnostics.Stopwatch.StartNew();
+
+        // Overwrite particlesBuffer with numNodes * 8 new particles
+        
+        // Dispatch per node, create 8 new particles
+        // Update numParticles
+        // Position them side length / 4 offset from node position in combinations of directions
+        // Trilinear interpolate linear velocity from node face velocities
+        // Determine layer based on velocity
+
+        gridToParticlesSw.Stop();
+        Debug.Log($"Grid to particles time: {gridToParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
+    }
 
     private void SolvePressure()
     {
@@ -1121,11 +1140,11 @@ public class FluidSimulator : MonoBehaviour
             Node node = nodesCPU[i];
             int layerIndex = Mathf.Clamp((int)Mathf.Min(node.layer, layer), 0, layerColors.Length - 1);
             Gizmos.color = layerColors[layerIndex];
-            float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-            float volume = Mathf.Pow(8, node.layer);
-            float divergenceNormalized = divergence * divergenceMultiplier / volume;
-            float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-            Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+            // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
+            // float volume = Mathf.Pow(8, node.layer);
+            // float divergenceNormalized = divergence * divergenceMultiplier / volume;
+            // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+            // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(node.layer, layer)), 0.01f));
         }
 

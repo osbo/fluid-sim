@@ -116,8 +116,8 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
     // particle.layer = (nearCenter || onBoundary) ? initialLayer : 11;
     // particle.layer = onBoundary ? initialLayer : 11;
-    particle.layer = (nearCenter) ? initialLayer : 11;
-    // particle.layer = 11;
+    // particle.layer = (nearCenter) ? initialLayer : 11;
+    particle.layer = 11;
 
     if (nearCenter) {
         particle.velocity = float3(-1.0, 0, 0.0);
