@@ -116,13 +116,13 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
     // particle.layer = (nearCenter || onBoundary) ? initialLayer : 11;
     // particle.layer = onBoundary ? initialLayer : 11;
-    // particle.layer = (nearCenter) ? initialLayer : 11;
+    particle.layer = (nearCenter) ? initialLayer : 11;
     // particle.layer = 11;
-    particle.layer = 4;
+    // particle.layer = 4;
 
-    // if (nearCenter) {
-    //     particle.velocity = float3(-1.0, 0, 0.0);
-    // }
+    if (nearCenter) {
+        particle.velocity = float3(0.0, 500.0, 0.0);
+    }
     
     // Generate morton code from normalized position
     // particle.mortonCode = EncodeMorton3D(normalizedPos);
@@ -153,15 +153,15 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
     // float3 position = particle.position;
     
     // Clamp position to simulation bounds and reflect velocity
-    // if (position.x <= simulationBoundsMin.x || position.x >= simulationBoundsMax.x) {
-    //     velocity.x *= -0.5;
-    // }
-    // if (position.y <= simulationBoundsMin.y || position.y >= simulationBoundsMax.y) {
-    //     velocity.y *= -0.5;
-    // }
-    // if (position.z <= simulationBoundsMin.z || position.z >= simulationBoundsMax.z) {
-    //     velocity.z *= -0.5;
-    // }
+    if (position.x <= simulationBoundsMin.x || position.x >= simulationBoundsMax.x) {
+        velocity.x *= -0.5;
+    }
+    if (position.y <= simulationBoundsMin.y || position.y >= simulationBoundsMax.y) {
+        velocity.y *= -0.5;
+    }
+    if (position.z <= simulationBoundsMin.z || position.z >= simulationBoundsMax.z) {
+        velocity.z *= -0.5;
+    }
 
     position = clamp(position, simulationBoundsMin, simulationBoundsMax);
 
