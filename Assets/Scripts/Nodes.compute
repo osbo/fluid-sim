@@ -3,6 +3,7 @@
 #pragma kernel pullVelocities
 #pragma kernel copyFaceVelocities
 #pragma kernel ApplyPressureGradient
+#pragma kernel CreateParticles
 
 struct faceVelocities
 {
@@ -51,10 +52,12 @@ uint numParticles;                                      // total number of parti
 uint layer;                                             // current hierarchical layer
 float deltaTime;                                        // time step for pressure gradient application
 float maxDetailCellSize;                               // smallest cell size for scaling
+float velocitySensitivity;                              // sensitivity of velocity to layer
+uint initialLayer;                                      // initial layer
+float3 simulationBoundsMin;                             // minimum simulation bounds
+float3 simulationBoundsMax;                             // maximum simulation bounds
 
 // Additional variables for particle creation
-float3 simulationBoundsMin;
-float3 simulationBoundsMax;
 float3 mortonNormalizationFactor;
 float mortonMaxValue;
 
@@ -687,13 +690,18 @@ void CreateParticles(uint3 id : SV_DispatchThreadID)
 
     Node node = nodesBuffer[threadIndex];
 
-    int sideLength = (int)exp2((float)node.layer);
+    int sideLength = maxDetailCellSize * exp2((float)node.layer);
     int offset = sideLength / 4;
 
     for (int i = 0; i < 8; i++)
     {
         Particle particle;
         particle.position = node.position + offset * float3(i % 2 * 2 - 1, (i / 2) % 2 * 2 - 1, (i / 4) % 2 * 2 - 1);
+        
+        // Clamp particle position to simulation bounds
+        particle.position.x = clamp(particle.position.x, simulationBoundsMin.x, simulationBoundsMax.x);
+        particle.position.y = clamp(particle.position.y, simulationBoundsMin.y, simulationBoundsMax.y);
+        particle.position.z = clamp(particle.position.z, simulationBoundsMin.z, simulationBoundsMax.z);
         float3 particleOffset = particle.position - node.position;
 
         // Calculate normalized position within the node bounds for interpolation
@@ -708,22 +716,22 @@ void CreateParticles(uint3 id : SV_DispatchThreadID)
         
         // Trilinear interpolation of face velocities to get particle velocity
         // X component: interpolate between left and right face velocities
-        float xVelocity = lerp(node.velocities.left, node.velocities.right, 
+        float xVelocity = lerp(-node.velocities.left, node.velocities.right, 
                               (normalizedOffset.x + 1.0) * 0.5);
         
         // Y component: interpolate between bottom and top face velocities  
-        float yVelocity = lerp(node.velocities.bottom, node.velocities.top,
+        float yVelocity = lerp(-node.velocities.bottom, node.velocities.top,
                               (normalizedOffset.y + 1.0) * 0.5);
         
         // Z component: interpolate between front and back face velocities
-        float zVelocity = lerp(node.velocities.front, node.velocities.back,
+        float zVelocity = lerp(-node.velocities.front, node.velocities.back,
                               (normalizedOffset.z + 1.0) * 0.5);
         
-        particle.velocity = float3(xVelocity, yVelocity, zVelocity);
+        particle.velocity = float3(xVelocity, yVelocity, zVelocity) / 8;
         
         // Set particle layer to be one level finer than the parent node
         // particle.layer = node.layer + 1;
-        particle.layer = 11 - log2(length(particle.velocity));
+        particle.layer = clamp(11 - log2(velocitySensitivity * length(particle.velocity)), initialLayer, 11);
         
         particle.mortonCode = 0;
         
