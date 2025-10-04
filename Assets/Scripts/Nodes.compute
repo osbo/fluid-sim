@@ -52,6 +52,12 @@ uint layer;                                             // current hierarchical 
 float deltaTime;                                        // time step for pressure gradient application
 float maxDetailCellSize;                               // smallest cell size for scaling
 
+// Additional variables for particle creation
+float3 simulationBoundsMin;
+float3 simulationBoundsMax;
+float3 mortonNormalizationFactor;
+float mortonMaxValue;
+
 // Morton helpers: interleave/deinterleave 3D (10 bits per axis)
 uint3 deinterleave(uint m)
 {
@@ -75,6 +81,26 @@ uint interleave(uint3 p)
         m |= ((p.z & (1u << i)) << (2 * i + 2));
     }
     return m;
+}
+
+// 32-bit Morton code encoding function (adapted from 64-bit Swift/Metal version)
+uint EncodeMorton3D(float3 pos)
+{
+    // Convert to uint32 and mask to 10 bits per axis (0x3FF = 1023 = 2^10-1)
+    uint x = (uint)pos.x & 0x3FF;
+    uint y = (uint)pos.y & 0x3FF;
+    uint z = (uint)pos.z & 0x3FF;
+    
+    uint result = 0;
+    
+    // Interleave bits for 32-bit Morton code (10 bits per axis = 30 bits total)
+    for (int i = 0; i < 10; i++) {
+        result |= ((x & (1U << i)) << (2 * i));
+        result |= ((y & (1U << i)) << (2 * i + 1));
+        result |= ((z & (1U << i)) << (2 * i + 2));
+    }
+    
+    return result;
 }
 
 // Helper: given direction d, return neighbor's opposing face value
@@ -646,4 +672,63 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
     }
 
     tempNodesBuffer[threadIndex] = outNode;
+}
+
+[numthreads(512, 1, 1)]
+void CreateParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+        
+    // Dispatch per node, create 8 new particles
+    // Position them side length / 4 offset from node position in combinations of directions
+    // Trilinear interpolate linear velocity from node face velocities
+    // Determine layer based on velocity
+
+    Node node = nodesBuffer[threadIndex];
+
+    int sideLength = (int)exp2((float)node.layer);
+    int offset = sideLength / 4;
+
+    for (int i = 0; i < 8; i++)
+    {
+        Particle particle;
+        particle.position = node.position + offset * float3(i % 2 * 2 - 1, (i / 2) % 2 * 2 - 1, (i / 4) % 2 * 2 - 1);
+        float3 particleOffset = particle.position - node.position;
+
+        // Calculate normalized position within the node bounds for interpolation
+        // Node bounds are from -sideLength/2 to +sideLength/2 around node.position
+        float halfSideLength = sideLength * 0.5;
+        float3 normalizedOffset = particleOffset / halfSideLength;
+        
+        // Clamp to [-1, 1] range to handle particles outside parent node
+        normalizedOffset.x = clamp(normalizedOffset.x, -1.0, 1.0);
+        normalizedOffset.y = clamp(normalizedOffset.y, -1.0, 1.0);
+        normalizedOffset.z = clamp(normalizedOffset.z, -1.0, 1.0);
+        
+        // Trilinear interpolation of face velocities to get particle velocity
+        // X component: interpolate between left and right face velocities
+        float xVelocity = lerp(node.velocities.left, node.velocities.right, 
+                              (normalizedOffset.x + 1.0) * 0.5);
+        
+        // Y component: interpolate between bottom and top face velocities  
+        float yVelocity = lerp(node.velocities.bottom, node.velocities.top,
+                              (normalizedOffset.y + 1.0) * 0.5);
+        
+        // Z component: interpolate between front and back face velocities
+        float zVelocity = lerp(node.velocities.front, node.velocities.back,
+                              (normalizedOffset.z + 1.0) * 0.5);
+        
+        particle.velocity = float3(xVelocity, yVelocity, zVelocity);
+        
+        // Set particle layer to be one level finer than the parent node
+        // particle.layer = node.layer + 1;
+        particle.layer = 11 - log2(length(particle.velocity));
+        
+        particle.mortonCode = 0;
+        
+        // Write particle to buffer (8 particles per node)
+        uint particleIndex = threadIndex * 8 + i;
+        particlesBuffer[particleIndex] = particle;
+    }
 }

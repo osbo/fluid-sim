@@ -539,7 +539,8 @@ MonoBehaviour:
   numParticles: 1048576
   maxCgIterations: 50
   convergenceThreshold: 0.000001
-  initialLayer: 2
+  initialLayer: 3
+  divergenceMultiplier: 50
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
