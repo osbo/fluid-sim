@@ -83,8 +83,16 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
         if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
             // Case 1: Same-layer or Parent (coarser) neighbor
-            // There is only one neighbor for this face.
-            laplacian_p += pBuffer[neighbor_idx] - p_i;
+            if (nodesBuffer[neighbor_idx].layer > node.layer)
+            {
+                // Child-Parent interaction: scale to maintain symmetry.
+                laplacian_p += (pBuffer[neighbor_idx] - p_i) / 4.0;
+            }
+            else
+            {
+                // Same-layer interaction.
+                laplacian_p += pBuffer[neighbor_idx] - p_i;
+            }
             neighborCount++;
         }
         else

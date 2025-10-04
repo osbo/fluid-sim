@@ -233,6 +233,15 @@ public class FluidSimulator : MonoBehaviour
         SolvePressure();
         solvePressureSw.Stop();
 
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        string str = "Node velocities:\n";
+        for (int i = 0; i < 40; i++)
+        {
+            str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        }
+        Debug.Log(str);
+
         // Step 7: Grid to particles
         var gridToParticlesSw = System.Diagnostics.Stopwatch.StartNew();
         GridToParticles();
@@ -423,7 +432,7 @@ public class FluidSimulator : MonoBehaviour
                 break;
             }
             
-            float alpha = r_dot_r / p_dot_Ap;
+            float alpha = r_dot_r / (p_dot_Ap + 1e-12f);
             
             // Safety check for alpha with more reasonable bounds
             if (Math.Abs(alpha) > 1e3f)
