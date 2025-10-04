@@ -469,24 +469,18 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
-            // Zero the boundary face and transfer its value to the opposite face
-            if (d == 0) { // Left boundary: move left to right
-                outNode.velocities.right += selfVel.left;
+            // Zero the boundary face velocity for solid walls
+            if (d == 0) { // Left boundary
                 outNode.velocities.left = 0;
-            } else if (d == 1) { // Right boundary: move right to left
-                outNode.velocities.left += selfVel.right;
+            } else if (d == 1) { // Right boundary
                 outNode.velocities.right = 0;
-            } else if (d == 2) { // Bottom boundary: move bottom to top
-                outNode.velocities.top += selfVel.bottom;
+            } else if (d == 2) { // Bottom boundary
                 outNode.velocities.bottom = 0;
-            } else if (d == 3) { // Top boundary: move top to bottom
-                outNode.velocities.bottom += selfVel.top;
+            } else if (d == 3) { // Top boundary
                 outNode.velocities.top = 0;
-            } else if (d == 4) { // Front boundary: move front to back
-                outNode.velocities.back += selfVel.front;
+            } else if (d == 4) { // Front boundary
                 outNode.velocities.front = 0;
-            } else if (d == 5) { // Back boundary: move back to front
-                outNode.velocities.front += selfVel.back;
+            } else if (d == 5) { // Back boundary
                 outNode.velocities.back = 0;
             }
             continue; // Skip this neighbor direction
@@ -690,8 +684,8 @@ void CreateParticles(uint3 id : SV_DispatchThreadID)
 
     Node node = nodesBuffer[threadIndex];
 
-    int sideLength = maxDetailCellSize * exp2((float)node.layer);
-    int offset = sideLength / 4;
+    float sideLength = maxDetailCellSize * exp2((float)node.layer);
+    float offset = sideLength / 4.0;
 
     for (int i = 0; i < 8; i++)
     {
@@ -714,24 +708,30 @@ void CreateParticles(uint3 id : SV_DispatchThreadID)
         normalizedOffset.y = clamp(normalizedOffset.y, -1.0, 1.0);
         normalizedOffset.z = clamp(normalizedOffset.z, -1.0, 1.0);
         
-        // Trilinear interpolation of face velocities to get particle velocity
-        // X component: interpolate between left and right face velocities
-        float xVelocity = lerp(-node.velocities.left, node.velocities.right, 
-                              (normalizedOffset.x + 1.0) * 0.5);
+        // // Trilinear interpolation of face velocities to get particle velocity
+        // // X component: interpolate between left and right face velocities
+        // float xVelocity = lerp(-node.velocities.left, node.velocities.right, 
+        //                       (normalizedOffset.x + 1.0) * 0.5);
         
-        // Y component: interpolate between bottom and top face velocities  
-        float yVelocity = lerp(-node.velocities.bottom, node.velocities.top,
-                              (normalizedOffset.y + 1.0) * 0.5);
+        // // Y component: interpolate between bottom and top face velocities  
+        // float yVelocity = lerp(-node.velocities.bottom, node.velocities.top,
+        //                       (normalizedOffset.y + 1.0) * 0.5);
         
-        // Z component: interpolate between front and back face velocities
-        float zVelocity = lerp(-node.velocities.front, node.velocities.back,
-                              (normalizedOffset.z + 1.0) * 0.5);
+        // // Z component: interpolate between front and back face velocities
+        // float zVelocity = lerp(-node.velocities.front, node.velocities.back,
+        //                       (normalizedOffset.z + 1.0) * 0.5);
+
+        float xVelocity = node.velocities.right - node.velocities.left;
+        float yVelocity = node.velocities.top - node.velocities.bottom;
+        float zVelocity = node.velocities.back - node.velocities.front;
         
         particle.velocity = float3(xVelocity, yVelocity, zVelocity) / 8;
+
+        float velocityNormalized = length(particle.velocity) / (sideLength*sideLength*sideLength);
         
         // Set particle layer to be one level finer than the parent node
         // particle.layer = node.layer + 1;
-        particle.layer = clamp(11 - log2(velocitySensitivity * length(particle.velocity)), initialLayer, 11);
+        particle.layer = clamp(10 - velocityNormalized * velocitySensitivity, initialLayer, 10);
         
         particle.mortonCode = 0;
         

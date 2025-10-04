@@ -146,14 +146,22 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
 
     // Vectors point outward from the face
 
-    // velocity.y -= gravity * deltaTime;
+    velocity.y -= gravity * deltaTime;
 
     float3 position = particle.position + velocity * deltaTime;
     
-    // Clamp position to simulation bounds
-    position.x = clamp(position.x, simulationBoundsMin.x, simulationBoundsMax.x);
-    position.y = clamp(position.y, simulationBoundsMin.y, simulationBoundsMax.y);
-    position.z = clamp(position.z, simulationBoundsMin.z, simulationBoundsMax.z);
+    // Clamp position to simulation bounds and reflect velocity
+    if (position.x <= simulationBoundsMin.x || position.x >= simulationBoundsMax.x) {
+        velocity.x *= -0.5;
+    }
+    if (position.y <= simulationBoundsMin.y || position.y >= simulationBoundsMax.y) {
+        velocity.y *= -0.5;
+    }
+    if (position.z <= simulationBoundsMin.z || position.z >= simulationBoundsMax.z) {
+        velocity.z *= -0.5;
+    }
+
+    position = clamp(position, simulationBoundsMin, simulationBoundsMax);
 
     particle.position = position;
     particle.velocity = velocity;
