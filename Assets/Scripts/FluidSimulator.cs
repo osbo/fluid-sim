@@ -75,6 +75,7 @@ public class FluidSimulator : MonoBehaviour
     private string str;
     private int activeCount;
     private int inactiveCount;
+    private bool hasShownWaitMessage = false;
     
     // Stopwatch to measure total octree construction time (from advection to loop end)
     private System.Diagnostics.Stopwatch totalOctreeSw;
@@ -120,9 +121,12 @@ public class FluidSimulator : MonoBehaviour
     void Start()
     {
         layer = initialLayer;
-
         InitializeParticleSystem();
+        InitializeInitialParticles();
+    }
 
+    private void InitializeInitialParticles()
+    {
         // Set 10 random particles to layer 0
         particlesBuffer.GetData(particlesCPU);
 
@@ -147,111 +151,126 @@ public class FluidSimulator : MonoBehaviour
             particlesCPU[indices[i]].velocity = new Vector3(0.0f, -100.0f, 0.0f);
         }
 
-        // particles[9*numParticles/16].layer = initialLayer;
-
         particlesBuffer.SetData(particlesCPU);
-
-        // Start total octree construction timer (advection -> full build loop end)
-        totalOctreeSw = System.Diagnostics.Stopwatch.StartNew();
-
-		// Particle compute timing
-		var advectSw = System.Diagnostics.Stopwatch.StartNew();
-		AdvectParticles();
-		advectSw.Stop();
-
-		var sortSw = System.Diagnostics.Stopwatch.StartNew();
-		SortParticles();
-		sortSw.Stop();
-
-		Debug.Log($"Particle compute time: Advect: {advectSw.Elapsed.TotalMilliseconds:F2} ms, Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms");
-
-		// Layer 0 compute timing
-		var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
-		findUniqueParticles();
-		findUniqueSw.Stop();
-
-		var createLeavesSw = System.Diagnostics.Stopwatch.StartNew();
-		CreateLeaves();
-		createLeavesSw.Stop();
-
-		Debug.Log($"Layer {layer}: {numNodes} nodes, Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms, Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms");
-
-		StartCoroutine(PostCreateLeavesFlow());
     }
 
-	private System.Collections.IEnumerator PostCreateLeavesFlow()
-	{
-		// Calculate maxDetailCellSize for volume calculations
-		Vector3 simulationBoundsMin = simulationBounds.bounds.min;
-		Vector3 simulationBoundsMax = simulationBounds.bounds.max;
-		Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
-		maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
-		
-		for (layer = layer + 1; layer <= 10; layer++)
-		{
-			// Wait for Space key press to proceed to next layer, then wait for release (new Input System)
-			// yield return new WaitUntil(() => Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame);
-			// yield return new WaitUntil(() => Keyboard.current != null && !Keyboard.current.spaceKey.isPressed);
-            
-			var totalLayerSw = System.Diagnostics.Stopwatch.StartNew();
-			
-			var findUniqueNodesSw = System.Diagnostics.Stopwatch.StartNew();
-			findUniqueNodes();
-			findUniqueNodesSw.Stop();
-			
-			var processNodesSw = System.Diagnostics.Stopwatch.StartNew();
-			ProcessNodes();
-			processNodesSw.Stop();
-			
-			var compactNodesSw = System.Diagnostics.Stopwatch.StartNew();
-			compactNodes();
-			compactNodesSw.Stop();
-
-			totalLayerSw.Stop();
-			Debug.Log($"Layer {layer}: {numNodes} nodes, Total: {totalLayerSw.Elapsed.TotalMilliseconds:F2} ms (Find Unique: {findUniqueNodesSw.Elapsed.TotalMilliseconds:F2} ms, Process: {processNodesSw.Elapsed.TotalMilliseconds:F2} ms, Compact: {compactNodesSw.Elapsed.TotalMilliseconds:F2} ms)");
-		}
-
-        // Stop and log total octree construction time
-        if (totalOctreeSw != null)
+    void Update()
+    {
+        // Check for space key press to advance frame
+        if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
         {
-            totalOctreeSw.Stop();
-            Debug.Log($"Total octree construction: {numParticles} particles to {numNodes} nodes ({100.0f - 100.0f*(float)numNodes/numParticles:F2}% reduction), {totalOctreeSw.Elapsed.TotalMilliseconds:F2} ms");
+            if (!hasShownWaitMessage)
+            {
+                Debug.Log("Press SPACE to advance simulation frame");
+                hasShownWaitMessage = true;
+            }
+            return; // Wait for space key press
         }
-
-        // start new timer
-        var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
-
-        pullVelocities();
-
-        pullVelocitiesSw.Stop();
-        Debug.Log($"Pull velocities time: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms");
         
+        // Reset wait message flag when frame advances
+        hasShownWaitMessage = false;
+        
+        // Start frame timing
+        var frameSw = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Calculate maxDetailCellSize for volume calculations
+        Vector3 simulationBoundsMin = simulationBounds.bounds.min;
+        Vector3 simulationBoundsMax = simulationBounds.bounds.max;
+        Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
+
+        // Frame loop: AdvectParticles -> SortParticles -> findUniqueParticles -> CreateLeaves -> layer loop -> pullVelocities -> SolvePressure -> GridToParticles
+        
+        // Step 1: Advect particles
+        var advectSw = System.Diagnostics.Stopwatch.StartNew();
+        AdvectParticles();
+        advectSw.Stop();
+
+        // Step 2: Sort particles
+        var sortSw = System.Diagnostics.Stopwatch.StartNew();
+        SortParticles();
+        sortSw.Stop();
+
+        // Step 3: Find unique particles and create leaves
+        var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
+        findUniqueParticles();
+        findUniqueSw.Stop();
+
+        var createLeavesSw = System.Diagnostics.Stopwatch.StartNew();
+        CreateLeaves();
+        createLeavesSw.Stop();
+
+        // Step 4: Layer loop (layers 1-10)
+        var layerLoopSw = System.Diagnostics.Stopwatch.StartNew();
+        for (layer = layer + 1; layer <= 10; layer++)
+        {
+            var totalLayerSw = System.Diagnostics.Stopwatch.StartNew();
+            
+            var findUniqueNodesSw = System.Diagnostics.Stopwatch.StartNew();
+            findUniqueNodes();
+            findUniqueNodesSw.Stop();
+            
+            var processNodesSw = System.Diagnostics.Stopwatch.StartNew();
+            ProcessNodes();
+            processNodesSw.Stop();
+            
+            var compactNodesSw = System.Diagnostics.Stopwatch.StartNew();
+            compactNodes();
+            compactNodesSw.Stop();
+
+            totalLayerSw.Stop();
+            // Debug.Log($"Layer {layer}: {numNodes} nodes, Total: {totalLayerSw.Elapsed.TotalMilliseconds:F2} ms (Find Unique: {findUniqueNodesSw.Elapsed.TotalMilliseconds:F2} ms, Process: {processNodesSw.Elapsed.TotalMilliseconds:F2} ms, Compact: {compactNodesSw.Elapsed.TotalMilliseconds:F2} ms)");
+        }
+        layerLoopSw.Stop();
+
+        // Step 5: Pull velocities
+        var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
+        pullVelocities();
+        pullVelocitiesSw.Stop();
+
+        // Step 6: Solve pressure
+        var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
         SolvePressure();
+        solvePressureSw.Stop();
+
+        // Step 7: Grid to particles
+        var gridToParticlesSw = System.Diagnostics.Stopwatch.StartNew();
+        GridToParticles();
+        gridToParticlesSw.Stop();
+
+        // Frame timing summary
+        frameSw.Stop();
+        Debug.Log($"Frame Summary:\n" +
+                 $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Advect: {advectSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Pull Velocities: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Grid to Particles: {gridToParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
 
         // Debug: print total divergence
-        float totalDivergence = 0.0f;
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        for (int i = 0; i < numNodes; i++)
-        {
-            totalDivergence += nodesCPU[i].velocities.right - nodesCPU[i].velocities.left + nodesCPU[i].velocities.top - nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.front - nodesCPU[i].velocities.back;
-        }
-        Debug.Log($"Total divergence: {totalDivergence}");
+        // float totalDivergence = 0.0f;
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     totalDivergence += nodesCPU[i].velocities.right - nodesCPU[i].velocities.left + nodesCPU[i].velocities.top - nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.front - nodesCPU[i].velocities.back;
+        // }
+        // Debug.Log($"Total divergence: {totalDivergence}");
 
-        GridToParticles();
-
+        // Debug: Count particles in each layer
         particlesCPU = new Particle[numParticles];
         particlesBuffer.GetData(particlesCPU);
         
-        // Count particles in each layer
         int maxLayer = 11; // Maximum possible layer
         int[] layerCounts = new int[maxLayer + 1]; // Array size 12 (indices 0-11)
         for (int i = 0; i < numParticles; i++) {
             uint particleLayer = particlesCPU[i].layer;
             if (particleLayer < layerCounts.Length) {
                 layerCounts[particleLayer]++;
-            } else {
-                Debug.LogWarning($"Particle {i} has layer {particleLayer} which is outside expected range (0-{maxLayer-1})");
             }
         }
 
@@ -263,9 +282,8 @@ public class FluidSimulator : MonoBehaviour
             }
         }
         Debug.Log(str);
+    }
 
-		yield break;
-	}
 
     private void GridToParticles()
     {
@@ -273,7 +291,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Overwrite particlesBuffer with numNodes * 8 new particles
         numParticles = numNodes * 8;
-        particlesBuffer.Release();
+        particlesBuffer?.Release();
         particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 12 + 12 + 4 + 4 = 32 bytes
         
         // Dispatch per node, create 8 new particles
@@ -328,8 +346,14 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // Initialize buffers
+        // Initialize buffers - release and recreate each frame since numNodes changes
         var bufferInitSw = System.Diagnostics.Stopwatch.StartNew();
+        divergenceBuffer?.Release();
+        residualBuffer?.Release();
+        pBuffer?.Release();
+        ApBuffer?.Release();
+        pressureBuffer?.Release();
+        
         divergenceBuffer = new ComputeBuffer(numNodes, sizeof(float));
         residualBuffer = new ComputeBuffer(numNodes, sizeof(float));
         pBuffer = new ComputeBuffer(numNodes, sizeof(float));
@@ -346,15 +370,15 @@ public class FluidSimulator : MonoBehaviour
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
 
-        // Debug: print total divergence
-        float totalDivergence = 0.0f;
-        float[] divergenceCPU = new float[numNodes];
-        divergenceBuffer.GetData(divergenceCPU);
-        for (int i = 0; i < numNodes; i++)
-        {
-            totalDivergence += divergenceCPU[i];
-        }
-        Debug.Log($"Total divergence: {totalDivergence}");
+        // // Debug: print total divergence
+        // float totalDivergence = 0.0f;
+        // float[] divergenceCPU = new float[numNodes];
+        // divergenceBuffer.GetData(divergenceCPU);
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     totalDivergence += divergenceCPU[i];
+        // }
+        // Debug.Log($"Total divergence: {totalDivergence}");
 
         // Initialize: r = b, p = r (since initial pressure x = 0)
         var initSw = System.Diagnostics.Stopwatch.StartNew();
@@ -739,7 +763,8 @@ public class FluidSimulator : MonoBehaviour
     
     private void SortParticles()
     {
-        // Initialize radix sort
+        // Release and recreate radix sort each frame since numParticles changes
+        radixSort?.ReleaseBuffers();
         radixSort = new RadixSort(radixSortShader, (uint)numParticles);
         
         // Sort the particles directly by their morton codes
@@ -767,6 +792,14 @@ public class FluidSimulator : MonoBehaviour
             Debug.LogError("One or more kernels not found in Leaves.compute. Verify #pragma kernel names and shader assignment.");
             return;
         }
+
+        // Release and recreate buffers each frame since numParticles changes
+        indicators?.Release();
+        prefixSums?.Release();
+        aux?.Release();
+        aux2?.Release();
+        uniqueIndices?.Release();
+        uniqueCount?.Release();
 
         // Allocate leaves buffers
         indicators = new ComputeBuffer(numParticles, sizeof(uint));
@@ -857,7 +890,7 @@ public class FluidSimulator : MonoBehaviour
         // Find kernel
         createLeavesKernel = nodesShader.FindKernel("CreateLeaves");
 
-        // Create node buffers (release previous ones if they exist)
+        // Release and recreate node buffers each frame since numNodes changes
         nodesBuffer?.Release();
         tempNodesBuffer?.Release();
         nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 3); // 12 + 24 + 4 + 4 + 4 = 48 bytes
@@ -1088,6 +1121,8 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
+        // Release and recreate neighbors buffer each frame since numNodes changes
+        neighborsBuffer?.Release();
         neighborsBuffer = new ComputeBuffer(numNodes, sizeof(uint) * 24);
 
         pullVelocitiesKernel = nodesShader.FindKernel("pullVelocities");
