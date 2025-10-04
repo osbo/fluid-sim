@@ -248,6 +248,8 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     }
 
     uint mortonCode = particlesBuffer[rangeStart].mortonCode;
+
+    // weightedPosition = clamp(weightedPosition, simulationBoundsMin, simulationBoundsMax);
     
     // Create the node
     Node node;
@@ -402,6 +404,8 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             weightedPosition /= totalWeight;
         }
 
+        // weightedPosition = clamp(weightedPosition, simulationBoundsMin, simulationBoundsMax);
+
         Node aggregatedNode;
         aggregatedNode.position = weightedPosition;
         aggregatedNode.velocities = aggregatedVelocities;
@@ -411,16 +415,16 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
 
         nodesBuffer[uniqueStart] = aggregatedNode;
 
-        for (uint i = 1; i < numNodesInGroup; i++)
+        for (uint j = 1; j < numNodesInGroup; j++)
         {
-            nodesBuffer[uniqueStart + i].active = 0;
+            nodesBuffer[uniqueStart + j].active = 0;
         }
     } else {
-        for (uint i = uniqueStart; i < uniqueEnd; i++)
+        for (uint j = uniqueStart; j < uniqueEnd; j++)
         {
-            Node node = nodesBuffer[i];
+            Node node = nodesBuffer[j];
             if (node.layer > layer) {
-                nodesBuffer[i].layer = layer - 1;
+                nodesBuffer[j].layer = layer - 1;
             }
         }
     }
@@ -471,17 +475,23 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         {
             // Zero the boundary face velocity for solid walls
             if (d == 0) { // Left boundary
+                outNode.velocities.right += selfVel.right;
                 outNode.velocities.left = 0;
             } else if (d == 1) { // Right boundary
-                outNode.velocities.right = 0;
+                outNode.velocities.right += selfVel.left;
+                outNode.velocities.left = 0;
             } else if (d == 2) { // Bottom boundary
-                outNode.velocities.bottom = 0;
-            } else if (d == 3) { // Top boundary
+                outNode.velocities.bottom += selfVel.bottom;
                 outNode.velocities.top = 0;
+            } else if (d == 3) { // Top boundary
+                outNode.velocities.top += selfVel.top;
+                outNode.velocities.bottom = 0;
             } else if (d == 4) { // Front boundary
-                outNode.velocities.front = 0;
-            } else if (d == 5) { // Back boundary
+                outNode.velocities.front += selfVel.front;
                 outNode.velocities.back = 0;
+            } else if (d == 5) { // Back boundary
+                outNode.velocities.back += selfVel.back;
+                outNode.velocities.front = 0;
             }
             continue; // Skip this neighbor direction
         }
@@ -677,63 +687,57 @@ void CreateParticles(uint3 id : SV_DispatchThreadID)
     uint threadIndex = id.x;
     if (threadIndex >= numNodes) return;
         
-    // Dispatch per node, create 8 new particles
-    // Position them side length / 4 offset from node position in combinations of directions
-    // Trilinear interpolate linear velocity from node face velocities
-    // Determine layer based on velocity
-
     Node node = nodesBuffer[threadIndex];
 
     float sideLength = maxDetailCellSize * exp2((float)node.layer);
     float offset = sideLength / 4.0;
 
-    for (int i = 0; i < 8; i++)
+    // 1. Calculate node cell boundaries
+    // The node's morton code is just one from a particle, we need the cell's base morton code.
+    // The lower (3 * node.layer) bits should be zero for the cell's morton code.
+    uint cellMortonCode = node.mortonCode & ~((1u << (3 * node.layer)) - 1);
+    
+    // Deinterleave to get integer grid coordinates of the cell's minimum corner.
+    uint3 cellGridMin = deinterleave(cellMortonCode);
+    
+    // Cell size in grid units is 2^layer.
+    float cellGridSize = exp2((float)node.layer);
+    uint3 cellGridMax = cellGridMin + uint3(cellGridSize, cellGridSize, cellGridSize);
+
+    // Convert grid coordinates to world coordinates to get the bounding box.
+    float3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+    float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) / 1023.0) * simulationSize;
+    float3 nodeMax = simulationBoundsMin + (float3(cellGridMax) / 1023.0) * simulationSize;
+
+    for (uint i = 0; i < 8; i++)
     {
         Particle particle;
-        particle.position = node.position + offset * float3(i % 2 * 2 - 1, (i / 2) % 2 * 2 - 1, (i / 4) % 2 * 2 - 1);
         
-        // Clamp particle position to simulation bounds
-        particle.position.x = clamp(particle.position.x, simulationBoundsMin.x, simulationBoundsMax.x);
-        particle.position.y = clamp(particle.position.y, simulationBoundsMin.y, simulationBoundsMax.y);
-        particle.position.z = clamp(particle.position.z, simulationBoundsMin.z, simulationBoundsMax.z);
-        float3 particleOffset = particle.position - node.position;
+        // 2. Position particles evenly spaced around the node's center of mass
+        float3 position = node.position + offset * float3(
+            (i & 1) == 0 ? -1.0 : 1.0,
+            (i & 2) == 0 ? -1.0 : 1.0,
+            (i & 4) == 0 ? -1.0 : 1.0
+        );
+        
+        // 3. Clamp the particle position to the node's boundaries
+        particle.position = clamp(position, nodeMin, nodeMax);
 
-        // Calculate normalized position within the node bounds for interpolation
-        // Node bounds are from -sideLength/2 to +sideLength/2 around node.position
-        float halfSideLength = sideLength * 0.5;
-        float3 normalizedOffset = particleOffset / halfSideLength;
-        
-        // Clamp to [-1, 1] range to handle particles outside parent node
-        normalizedOffset.x = clamp(normalizedOffset.x, -1.0, 1.0);
-        normalizedOffset.y = clamp(normalizedOffset.y, -1.0, 1.0);
-        normalizedOffset.z = clamp(normalizedOffset.z, -1.0, 1.0);
-        
-        // // Trilinear interpolation of face velocities to get particle velocity
-        // // X component: interpolate between left and right face velocities
-        // float xVelocity = lerp(-node.velocities.left, node.velocities.right, 
-        //                       (normalizedOffset.x + 1.0) * 0.5);
-        
-        // // Y component: interpolate between bottom and top face velocities  
-        // float yVelocity = lerp(-node.velocities.bottom, node.velocities.top,
-        //                       (normalizedOffset.y + 1.0) * 0.5);
-        
-        // // Z component: interpolate between front and back face velocities
-        // float zVelocity = lerp(-node.velocities.front, node.velocities.back,
-        //                       (normalizedOffset.z + 1.0) * 0.5);
-
+        // Trilinear interpolate linear velocity from node face velocities
         float xVelocity = node.velocities.right - node.velocities.left;
         float yVelocity = node.velocities.top - node.velocities.bottom;
         float zVelocity = node.velocities.back - node.velocities.front;
         
-        particle.velocity = float3(xVelocity, yVelocity, zVelocity) / 8;
+        particle.velocity = float3(xVelocity, yVelocity, zVelocity) / 16.0; // split between 8 particles, divide by 2 because each component is from 2 faces
 
+        // Determine layer based on velocity
         float velocityNormalized = length(particle.velocity) / (sideLength*sideLength*sideLength);
         
         // Set particle layer to be one level finer than the parent node
-        // particle.layer = node.layer + 1;
+        // particle.layer = node.layer;
         particle.layer = clamp(10 - velocityNormalized * velocitySensitivity, initialLayer, 10);
         
-        particle.mortonCode = 0;
+        particle.mortonCode = 0; // Will be recalculated in AdvectParticles
         
         // Write particle to buffer (8 particles per node)
         uint particleIndex = threadIndex * 8 + i;

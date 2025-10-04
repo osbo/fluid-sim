@@ -68,9 +68,10 @@ public class FluidSimulator : MonoBehaviour
     private int numNodes;
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
+    public float gravity;
     public int initialLayer;
     public float velocitySensitivity;
-    public float divergenceMultiplier;
+    private float divergenceMultiplier = 50.0f;
 
     private string str;
     private int activeCount;
@@ -156,19 +157,21 @@ public class FluidSimulator : MonoBehaviour
 
     void Update()
     {
-        // Check for space key press to advance frame
-        if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
-        {
-            if (!hasShownWaitMessage)
-            {
-                Debug.Log("Press SPACE to advance simulation frame");
-                hasShownWaitMessage = true;
-            }
-            return; // Wait for space key press
-        }
+        // // Check for space key press to advance frame
+        // if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
+        // {
+        //     if (!hasShownWaitMessage)
+        //     {
+        //         Debug.Log("Press SPACE to advance simulation frame");
+        //         hasShownWaitMessage = true;
+        //     }
+        //     return; // Wait for space key press
+        // }
         
-        // Reset wait message flag when frame advances
-        hasShownWaitMessage = false;
+        // // Reset wait message flag when frame advances
+        // hasShownWaitMessage = false;
+
+        layer = initialLayer;
         
         // Start frame timing
         var frameSw = System.Diagnostics.Stopwatch.StartNew();
@@ -236,7 +239,7 @@ public class FluidSimulator : MonoBehaviour
         nodesCPU = new Node[numNodes];
         nodesBuffer.GetData(nodesCPU);
         string str = "Node velocities:\n";
-        for (int i = 0; i < 40; i++)
+        for (int i = 0; i < 40 && i < numNodes; i++)
         {
             str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
         }
@@ -274,7 +277,7 @@ public class FluidSimulator : MonoBehaviour
         particlesCPU = new Particle[numParticles];
         particlesBuffer.GetData(particlesCPU);
         
-        int maxLayer = 11; // Maximum possible layer
+        int maxLayer = 10; // Maximum possible layer
         int[] layerCounts = new int[maxLayer + 1]; // Array size 12 (indices 0-11)
         for (int i = 0; i < numParticles; i++) {
             uint particleLayer = particlesCPU[i].layer;
@@ -756,7 +759,6 @@ public class FluidSimulator : MonoBehaviour
         int advectParticlesKernel = particlesShader.FindKernel("AdvectParticles");
 
         float deltaTime = (1/60.0f);
-        float gravity = 9.81f;
         
         particlesShader.SetBuffer(advectParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetInt("numParticles", numParticles);
@@ -1262,15 +1264,15 @@ public class FluidSimulator : MonoBehaviour
 
 
         // Particle[] particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
+        // particlesBuffer.GetData(particlesCPU);
 
-        for (int i = 0; i < numParticles; i++)
-        {
-            Particle particle = particlesCPU[i];
-            int layerIndex = Mathf.Clamp((int)particle.layer, 0, layerColors.Length - 1);
-            Gizmos.color = layerColors[layerIndex];
-            Gizmos.DrawCube(particle.position, Vector3.one * 0.25f);
-        }
+        // for (int i = 0; i < numParticles; i++)
+        // {
+        //     Particle particle = particlesCPU[i];
+        //     int layerIndex = Mathf.Clamp((int)particle.layer, 0, layerColors.Length - 1);
+        //     Gizmos.color = layerColors[layerIndex];
+        //     Gizmos.DrawCube(particle.position, Vector3.one * 0.25f);
+        // }
     }
 
     private Vector3 DecodeMorton3D(Node node)
@@ -1283,7 +1285,7 @@ public class FluidSimulator : MonoBehaviour
         // Calculate the grid resolution for this layer
         // Layer 0: finest detail (1024 cells per axis)
         // Layer 10: coarsest detail (1 cell per axis)
-        int gridResolution = (int)Mathf.Pow(2, 10 - Mathf.Min(node.layer, layer));
+        int gridResolution = (int)Mathf.Pow(2, 10 - node.layer);
         
         // Normalize the node position to morton code range (0-1023)
         Vector3 mortonNormalizationFactor = new Vector3(
