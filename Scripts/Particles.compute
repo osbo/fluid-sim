@@ -119,9 +119,9 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // particle.layer = (nearCenter) ? initialLayer : 11;
     particle.layer = 11;
 
-    if (nearCenter) {
-        particle.velocity = float3(-1.0, 0, 0.0);
-    }
+    // if (nearCenter) {
+    //     particle.velocity = float3(-1.0, 0, 0.0);
+    // }
     
     // Generate morton code from normalized position
     // particle.mortonCode = EncodeMorton3D(normalizedPos);
