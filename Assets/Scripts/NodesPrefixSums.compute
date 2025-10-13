@@ -20,6 +20,7 @@ struct Particle
     float3 velocity;    // float face velocities
     uint layer;         // Layer units
     uint mortonCode;    // Morton code for spatial indexing
+    uint previousLayer; // Previous layer tracking
 };
 
 struct faceVelocities
@@ -39,6 +40,7 @@ struct Node
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes
+    uint previousLayer; // 4 bytes
 };
 
 // Buffers
@@ -140,7 +142,7 @@ void markActiveNodes(uint3 id : SV_DispatchThreadID)
     uint i = id.x;
     if (i >= len) return;
 
-    indicators[i] = nodesBuffer[i].active;
+    indicators[i] = nodesBuffer[i].active & 1u; // Check last bit
 }
 
 [numthreads(SCAN_BLOCKSIZE, 1, 1)]
