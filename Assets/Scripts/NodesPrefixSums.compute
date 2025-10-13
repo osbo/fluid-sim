@@ -20,7 +20,6 @@ struct Particle
     float3 velocity;    // float face velocities
     uint layer;         // Layer units
     uint mortonCode;    // Morton code for spatial indexing
-    uint previousLayer; // Previous layer tracking
 };
 
 struct faceVelocities
@@ -40,7 +39,6 @@ struct Node
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes
-    uint previousLayer; // 4 bytes
 };
 
 // Buffers
