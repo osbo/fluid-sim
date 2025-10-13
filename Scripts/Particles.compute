@@ -1,6 +1,38 @@
 // Each #kernel tells which function to compile; you can have many kernels
 #pragma kernel InitializeParticles
 #pragma kernel AdvectParticles
+#pragma kernel UpdateParticles
+
+
+// Particle struct definition
+struct Particle
+{
+    float3 position;    // 3-component position vector
+    float3 velocity;    // float face velocities
+    uint layer;         // Layer units
+    uint mortonCode;    // Morton code for spatial indexing
+};
+
+struct faceVelocities
+{
+    float left;
+    float right;
+    float bottom;
+    float top;
+    float front;
+    float back;
+};
+
+// Node struct (must match C# struct)
+struct Node
+{
+    float3 position;    // 12 bytes
+    faceVelocities velocities;    // 24 bytes
+    uint layer;         // 4 bytes
+    uint mortonCode;    // 4 bytes
+    uint active;        // 4 bytes
+};
+
 
 // 32-bit Morton code encoding function (adapted from 64-bit Swift/Metal version)
 uint EncodeMorton3D(float3 pos)
@@ -22,18 +54,71 @@ uint EncodeMorton3D(float3 pos)
     return result;
 }
 
-// Particle struct definition
-struct Particle
+
+
+// Morton helpers: interleave/deinterleave 3D (10 bits per axis)
+uint3 deinterleave(uint m)
 {
-    float3 position;    // 3-component position vector
-    float3 velocity;    // float face velocities
-    uint layer;         // Layer units
-    uint mortonCode;    // Morton code for spatial indexing
-    uint previousLayer; // Previous layer tracking
-};
+    uint x = 0, y = 0, z = 0;
+    for (uint i = 0; i < 10; i++)
+    {
+        x |= ((m >> (3 * i + 0)) & 1) << i;
+        y |= ((m >> (3 * i + 1)) & 1) << i;
+        z |= ((m >> (3 * i + 2)) & 1) << i;
+    }
+    return uint3(x, y, z);
+}
+
+uint interleave(uint3 p)
+{
+    uint m = 0;
+    for (uint i = 0; i < 10; i++)
+    {
+        m |= ((p.x & (1u << i)) << (2 * i + 0));
+        m |= ((p.y & (1u << i)) << (2 * i + 1));
+        m |= ((p.z & (1u << i)) << (2 * i + 2));
+    }
+    return m;
+}
+
+// Helper: given direction d, return neighbor's opposing face value
+float selectOpposingFace(faceVelocities v, int d)
+{
+    // d: 0=left,1=right,2=bottom,3=top,4=front,5=back
+    if (d == 0) return v.right;
+    if (d == 1) return v.left;
+    if (d == 2) return v.top;
+    if (d == 3) return v.bottom;
+    if (d == 4) return v.back;
+    return v.front; // d == 5
+}
+
+// Helper: subtract value from the correct face on outNode for direction d
+void subtractToFace(inout Node outNode, int d, float value)
+{
+    if (d == 0) outNode.velocities.left -= value;
+    else if (d == 1) outNode.velocities.right -= value;
+    else if (d == 2) outNode.velocities.bottom -= value;
+    else if (d == 3) outNode.velocities.top -= value;
+    else if (d == 4) outNode.velocities.front -= value;
+    else outNode.velocities.back -= value; // d == 5
+}
+
+// Helper: face offset inside 24-wide neighbors block
+uint faceOffset(int d)
+{
+    // left=0..3, right=4..7, bottom=8..11, top=12..15, front=16..19, back=20..23
+    if (d == 0) return 0u;
+    if (d == 1) return 4u;
+    if (d == 2) return 8u;
+    if (d == 3) return 12u;
+    if (d == 4) return 16u;
+    return 20u; // d == 5
+}
 
 // Buffer definitions
 RWStructuredBuffer<Particle> particlesBuffer;
+RWStructuredBuffer<Node> nodesBuffer;
 RWStructuredBuffer<uint> mortonCodesBuffer;  // Separate morton codes buffer
 RWStructuredBuffer<uint> particleIndicesBuffer;  // Separate indices buffer
 // nodeFlagsBuffer moved to Nodes.compute
@@ -50,6 +135,8 @@ float deltaTime;
 float dispersionPower; // >1 concentrates near left, <1 concentrates near right
 float boundaryThreshold; // normalized u threshold near left edge considered boundary
 uint initialLayer;
+uint numNodes;
+uint numParticles;
 
 // Grid parameters for even particle distribution
 uint3 gridDimensions;
@@ -122,13 +209,12 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // particle.layer = 4;
 
     if (nearCenter) {
-        particle.velocity = float3(0.0, 500.0, 0.0);
+        particle.velocity = float3(0.0, 100.0, 0.0);
     }
     
     // Generate morton code from normalized position
     // particle.mortonCode = EncodeMorton3D(normalizedPos);
     particle.mortonCode = 0;
-    particle.previousLayer = particle.layer; // Initialize previousLayer to current layer
 
     // particle.layer = particle.mortonCode % 10;
     
@@ -175,6 +261,69 @@ void AdvectParticles (uint3 id : SV_DispatchThreadID)
     normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
 
     particle.mortonCode = EncodeMorton3D(normalizedPos);
+
+    particlesBuffer[index] = particle;
+}
+
+[numthreads(512,1,1)]
+void UpdateParticles (uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= numParticles) return;
+
+    Particle particle = particlesBuffer[index];
+    // binary search nodes buffer for particle.mortonCode (find greatest mortonCode < particle.mortonCode)
+    uint target = particle.mortonCode;
+    uint left = 0;
+    uint right = (numNodes > 0) ? numNodes : 0; // right is exclusive
+    while (left < right)
+    {
+        uint mid = left + ((right - left) >> 1);
+        uint midCode = nodesBuffer[mid].mortonCode;
+        if (midCode < target)
+        {
+            left = mid + 1; // keep searching to the right
+        }
+        else
+        {
+            right = mid; // mid is >= target; move left
+        }
+    }
+
+    // left is the first index with code >= target; we want strictly less than target
+    if (left == 0)
+    {
+        // No node has mortonCode < target; nothing to update for this particle
+        return;
+    }
+    uint nodeIndex = left - 1;
+
+    Node node = nodesBuffer[nodeIndex];
+
+    // PIC for now, proof of concept
+
+    // 2. TRILINEAR INTERPOLATION
+    // Get the node's world-space boundaries (reusing your logic from CreateParticles) [cite: 244-250]
+    float3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+    uint cellMortonCode = node.mortonCode & ~((1u << (3 * node.layer)) - 1);
+    uint3 cellGridMin = deinterleave(cellMortonCode);
+    float cellGridSize = exp2((float)node.layer);
+    float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) / 1023.0) * simulationSize;
+    float3 nodeMax = nodeMin + (cellGridSize / 1023.0) * simulationSize;
+
+    // Calculate the particle's fractional position (0-1) inside the node's bounds
+    float3 t = saturate((particle.position - nodeMin) / (nodeMax - nodeMin));
+
+    // Interpolate the NEW (post-solve) velocity
+    float3 newGridVelocity;
+    newGridVelocity.x = lerp(-node.velocities.left, node.velocities.right, t.x);
+    newGridVelocity.y = lerp(-node.velocities.bottom, node.velocities.top, t.y);
+    newGridVelocity.z = lerp(-node.velocities.front, node.velocities.back, t.z);
+
+    // 3. APPLY VELOCITY UPDATE
+    
+    // Option A: Pure PIC Update (simple, but high energy loss)
+    particle.velocity = newGridVelocity * 0.001;
 
     particlesBuffer[index] = particle;
 }
