@@ -15,7 +15,6 @@ struct Particle
     float3 velocity;    // float face velocities
     uint layer;         // Layer units
     uint mortonCode;    // Morton code for spatial indexing
-    uint previousLayer; // Previous layer tracking
 };
 
 RWStructuredBuffer<uint> input;

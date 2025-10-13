@@ -3,7 +3,6 @@
 #pragma kernel pullVelocities
 #pragma kernel copyFaceVelocities
 #pragma kernel ApplyPressureGradient
-#pragma kernel CreateParticles
 
 struct faceVelocities
 {
@@ -22,7 +21,6 @@ struct Particle
     float3 velocity;    // 12 bytes
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
-    uint previousLayer; // 4 bytes
 };
 
 // Node struct (must match C# struct)
@@ -33,7 +31,6 @@ struct Node
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes
-    uint previousLayer; // 4 bytes
 };
 
 // Neighbors are stored as a flat buffer of 24 uints per node:
@@ -211,7 +208,6 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     
     float totalWeight = 1.0;
     uint minLayer = 11;
-    uint maxPreviousLayer = 0;
     
     // Process all particles with this morton code
     for (uint i = rangeStart; i < rangeEnd; i++)
@@ -242,7 +238,6 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         
         // Track minimum layer
         minLayer = min(minLayer, particle.layer);
-        maxPreviousLayer = max(maxPreviousLayer, particle.previousLayer);
     }
     
     // Normalize by total weight (center of mass)
@@ -262,7 +257,6 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     node.layer = minLayer;  // Use the minimum layer found
     node.mortonCode = mortonCode;
     node.active = 1u; // Set last bit to 1
-    node.previousLayer = maxPreviousLayer; // Initialize from particle
     
     // Write outputs
     nodesBuffer[threadIndex] = node;
@@ -282,20 +276,15 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
     if (numNodesInGroup <= 1 || uniqueStart >= uniqueEnd || uniqueEnd > numNodes) return;
 
     bool coarsen = true;
-    uint maxPreviousLayer = 0;
     for (uint i = uniqueStart; i < uniqueEnd; i++)
     {
         Node node = nodesBuffer[i];
-        maxPreviousLayer = max(maxPreviousLayer, node.previousLayer);
-        // if (node.layer < layer || node.active && 2u != 0) {
         if (node.layer < layer) {
             coarsen = false;
             break;
         }
     }
 
-    bool isSurface = false;
-    // if (coarsen || layer == maxPreviousLayer)
     if (true)
     // if (coarsen)
     {
@@ -374,7 +363,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
                     Node cNode = nodesBuffer[idx_sub];
                     if (cNode.mortonCode < subUpper)
                     {
-                        // if (cNode.layer < layer - 1 || cNode.active && 2u != 0u)
                         if (cNode.layer < layer - 1)
                         {
                             coarsen = false;
@@ -383,13 +371,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
                     }
                 }
             }
-        }
-        // if (numNeighbors > 2 && numNeighbors < 8)
-        // if (numNeighbors < 8)
-        if (maxPreviousLayer < layer && numNeighbors < 8)
-        {
-            // coarsen = false;
-            isSurface = true;
         }
     }
 
@@ -405,7 +386,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         float3 weightedPosition = float3(0, 0, 0);
         float totalWeight = 0.0;
         uint minLayer = 11;
-        uint maxPreviousLayer = 0;
 
         for (uint i = uniqueStart; i < uniqueEnd; i++)
         {
@@ -420,7 +400,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             aggregatedVelocities.front += node.velocities.front;
             aggregatedVelocities.back += node.velocities.back;
             minLayer = min(minLayer, node.layer);
-            maxPreviousLayer = max(maxPreviousLayer, node.previousLayer);
         }
 
         // Safety check: prevent division by zero
@@ -436,12 +415,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         aggregatedNode.layer = minLayer;
         aggregatedNode.mortonCode = nodesBuffer[uniqueStart].mortonCode;
         aggregatedNode.active = 1u; // Set last bit to 1
-        aggregatedNode.previousLayer = maxPreviousLayer; // Use maximum of child previousLayer values
-
-        if (isSurface)
-        {
-            aggregatedNode.active |= 2u; // Set second to least significant bit to 1
-        }
 
         nodesBuffer[uniqueStart] = aggregatedNode;
 
@@ -455,10 +428,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             Node node = nodesBuffer[j];
             if (node.layer > layer) {
                 nodesBuffer[j].layer = layer - 1;
-            }
-            if (isSurface)
-            {
-                nodesBuffer[j].active |= 2u; // Set second to least significant bit to 1
             }
         }
     }
@@ -482,7 +451,6 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
     outNode.layer = node.layer;
     outNode.mortonCode = node.mortonCode;
     outNode.active = node.active;
-    outNode.previousLayer = node.previousLayer;
     outNode.velocities = node.velocities;
 
     // Initialize neighbors to invalid index (numNodes) for all 24 slots
@@ -714,69 +682,4 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
     }
 
     tempNodesBuffer[threadIndex] = outNode;
-}
-
-[numthreads(512, 1, 1)]
-void CreateParticles(uint3 id : SV_DispatchThreadID)
-{
-    uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
-        
-    Node node = nodesBuffer[threadIndex];
-
-    float sideLength = maxDetailCellSize * exp2((float)node.layer);
-    float offset = sideLength / 4.0;
-
-    // 1. Calculate node cell boundaries
-    // The node's morton code is just one from a particle, we need the cell's base morton code.
-    // The lower (3 * node.layer) bits should be zero for the cell's morton code.
-    uint cellMortonCode = node.mortonCode & ~((1u << (3 * node.layer)) - 1);
-    
-    // Deinterleave to get integer grid coordinates of the cell's minimum corner.
-    uint3 cellGridMin = deinterleave(cellMortonCode);
-    
-    // Cell size in grid units is 2^layer.
-    float cellGridSize = exp2((float)node.layer);
-    uint3 cellGridMax = cellGridMin + uint3(cellGridSize, cellGridSize, cellGridSize);
-
-    // Convert grid coordinates to world coordinates to get the bounding box.
-    float3 simulationSize = simulationBoundsMax - simulationBoundsMin;
-    float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) / 1023.0) * simulationSize;
-    float3 nodeMax = simulationBoundsMin + (float3(cellGridMax) / 1023.0) * simulationSize;
-
-    for (uint i = 0; i < 8; i++)
-    {
-        Particle particle;
-        
-        // 2. Position particles evenly spaced around the node's center of mass
-        float3 position = node.position + offset * float3(
-            (i & 1) == 0 ? -1.0 : 1.0,
-            (i & 2) == 0 ? -1.0 : 1.0,
-            (i & 4) == 0 ? -1.0 : 1.0
-        );
-        
-        // 3. Clamp the particle position to the node's boundaries
-        particle.position = clamp(position, nodeMin, nodeMax);
-
-        // Trilinear interpolate linear velocity from node face velocities
-        float xVelocity = node.velocities.right - node.velocities.left;
-        float yVelocity = node.velocities.top - node.velocities.bottom;
-        float zVelocity = node.velocities.back - node.velocities.front;
-        
-        particle.velocity = float3(xVelocity, yVelocity, zVelocity) / 16.0; // split between 8 particles, divide by 2 because each component is from 2 faces
-
-        // Determine layer based on velocity
-        float velocityNormalized = length(particle.velocity) / (sideLength*sideLength*sideLength);
-        
-        // Set particle layer to be one level finer than the parent node
-        // particle.layer = node.layer;
-        particle.layer = clamp(10 - velocityNormalized * velocitySensitivity, initialLayer, 10);
-        
-        particle.mortonCode = 0; // Will be recalculated in AdvectParticles
-        particle.previousLayer = node.layer; // Pass through previousLayer from node
-        
-        // Write particle to buffer (8 particles per node)
-        uint particleIndex = threadIndex * 8 + i;
-        particlesBuffer[particleIndex] = particle;
-    }
 }
