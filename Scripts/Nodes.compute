@@ -22,6 +22,7 @@ struct Particle
     float3 velocity;    // 12 bytes
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
+    uint previousLayer; // 4 bytes
 };
 
 // Node struct (must match C# struct)
@@ -32,6 +33,7 @@ struct Node
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes
+    uint previousLayer; // 4 bytes
 };
 
 // Neighbors are stored as a flat buffer of 24 uints per node:
@@ -209,6 +211,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     
     float totalWeight = 1.0;
     uint minLayer = 11;
+    uint maxPreviousLayer = 0;
     
     // Process all particles with this morton code
     for (uint i = rangeStart; i < rangeEnd; i++)
@@ -239,6 +242,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         
         // Track minimum layer
         minLayer = min(minLayer, particle.layer);
+        maxPreviousLayer = max(maxPreviousLayer, particle.previousLayer);
     }
     
     // Normalize by total weight (center of mass)
@@ -257,7 +261,8 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     node.velocities = leafVelocities;
     node.layer = minLayer;  // Use the minimum layer found
     node.mortonCode = mortonCode;
-    node.active = 1;
+    node.active = 1u; // Set last bit to 1
+    node.previousLayer = maxPreviousLayer; // Initialize from particle
     
     // Write outputs
     nodesBuffer[threadIndex] = node;
@@ -277,16 +282,22 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
     if (numNodesInGroup <= 1 || uniqueStart >= uniqueEnd || uniqueEnd > numNodes) return;
 
     bool coarsen = true;
+    uint maxPreviousLayer = 0;
     for (uint i = uniqueStart; i < uniqueEnd; i++)
     {
         Node node = nodesBuffer[i];
+        maxPreviousLayer = max(maxPreviousLayer, node.previousLayer);
+        // if (node.layer < layer || node.active && 2u != 0) {
         if (node.layer < layer) {
             coarsen = false;
             break;
         }
     }
 
-    if (coarsen)
+    bool isSurface = false;
+    // if (coarsen || layer == maxPreviousLayer)
+    if (true)
+    // if (coarsen)
     {
         uint baseCode = nodesBuffer[uniqueStart].mortonCode;
         uint shift = layer * 3u;
@@ -363,6 +374,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
                     Node cNode = nodesBuffer[idx_sub];
                     if (cNode.mortonCode < subUpper)
                     {
+                        // if (cNode.layer < layer - 1 || cNode.active && 2u != 0u)
                         if (cNode.layer < layer - 1)
                         {
                             coarsen = false;
@@ -372,11 +384,13 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
                 }
             }
         }
-
-        // if (numNeighbors < 6)
-        // {
-        //     coarsen = false;
-        // }
+        // if (numNeighbors > 2 && numNeighbors < 8)
+        // if (numNeighbors < 8)
+        if (maxPreviousLayer < layer && numNeighbors < 8)
+        {
+            // coarsen = false;
+            isSurface = true;
+        }
     }
 
     if (coarsen)
@@ -391,6 +405,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         float3 weightedPosition = float3(0, 0, 0);
         float totalWeight = 0.0;
         uint minLayer = 11;
+        uint maxPreviousLayer = 0;
 
         for (uint i = uniqueStart; i < uniqueEnd; i++)
         {
@@ -405,6 +420,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             aggregatedVelocities.front += node.velocities.front;
             aggregatedVelocities.back += node.velocities.back;
             minLayer = min(minLayer, node.layer);
+            maxPreviousLayer = max(maxPreviousLayer, node.previousLayer);
         }
 
         // Safety check: prevent division by zero
@@ -419,13 +435,19 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         aggregatedNode.velocities = aggregatedVelocities;
         aggregatedNode.layer = minLayer;
         aggregatedNode.mortonCode = nodesBuffer[uniqueStart].mortonCode;
-        aggregatedNode.active = 1;
+        aggregatedNode.active = 1u; // Set last bit to 1
+        aggregatedNode.previousLayer = maxPreviousLayer; // Use maximum of child previousLayer values
+
+        if (isSurface)
+        {
+            aggregatedNode.active |= 2u; // Set second to least significant bit to 1
+        }
 
         nodesBuffer[uniqueStart] = aggregatedNode;
 
         for (uint j = 1; j < numNodesInGroup; j++)
         {
-            nodesBuffer[uniqueStart + j].active = 0;
+            nodesBuffer[uniqueStart + j].active = 0u; // Set last bit to 0
         }
     } else {
         for (uint j = uniqueStart; j < uniqueEnd; j++)
@@ -433,6 +455,10 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             Node node = nodesBuffer[j];
             if (node.layer > layer) {
                 nodesBuffer[j].layer = layer - 1;
+            }
+            if (isSurface)
+            {
+                nodesBuffer[j].active |= 2u; // Set second to least significant bit to 1
             }
         }
     }
@@ -456,6 +482,7 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
     outNode.layer = node.layer;
     outNode.mortonCode = node.mortonCode;
     outNode.active = node.active;
+    outNode.previousLayer = node.previousLayer;
     outNode.velocities = node.velocities;
 
     // Initialize neighbors to invalid index (numNodes) for all 24 slots
@@ -746,6 +773,7 @@ void CreateParticles(uint3 id : SV_DispatchThreadID)
         particle.layer = clamp(10 - velocityNormalized * velocitySensitivity, initialLayer, 10);
         
         particle.mortonCode = 0; // Will be recalculated in AdvectParticles
+        particle.previousLayer = node.layer; // Pass through previousLayer from node
         
         // Write particle to buffer (8 particles per node)
         uint particleIndex = threadIndex * 8 + i;
