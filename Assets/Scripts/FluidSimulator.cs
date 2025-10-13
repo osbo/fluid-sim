@@ -105,6 +105,7 @@ public class FluidSimulator : MonoBehaviour
         public Vector3 velocity;    // 12 bytes
         public uint layer;          // 4 bytes
         public uint mortonCode;     // 4 bytes
+        public uint previousLayer; // 4 bytes
     }
 
     // Node struct (must match compute shader)
@@ -115,6 +116,7 @@ public class FluidSimulator : MonoBehaviour
         public uint layer;          // 4 bytes
         public uint mortonCode;     // 4 bytes
         public uint active;         // 4 bytes
+        public uint previousLayer; // 4 bytes
     }
 
     private Node[] nodesCPU;
@@ -158,18 +160,18 @@ public class FluidSimulator : MonoBehaviour
     void Update()
     {
         // Check for space key press to advance frame
-        // if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
-        // {
-        //     if (!hasShownWaitMessage)
-        //     {
-        //         Debug.Log("Press SPACE to advance simulation frame");
-        //         hasShownWaitMessage = true;
-        //     }
-        //     return; // Wait for space key press
-        // }
+        if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
+        {
+            if (!hasShownWaitMessage)
+            {
+                Debug.Log("Press SPACE to advance simulation frame");
+                hasShownWaitMessage = true;
+            }
+            return; // Wait for space key press
+        }
         
-        // // Reset wait message flag when frame advances
-        // hasShownWaitMessage = false;
+        // Reset wait message flag when frame advances
+        hasShownWaitMessage = false;
 
         layer = initialLayer;
         
@@ -304,7 +306,7 @@ public class FluidSimulator : MonoBehaviour
         // Overwrite particlesBuffer with numNodes * 8 new particles
         numParticles = numNodes * 8;
         particlesBuffer?.Release();
-        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 12 + 12 + 4 + 4 = 32 bytes
+        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint) + sizeof(uint)); // 12 + 12 + 4 + 4 + 4 = 36 bytes
         
         // Dispatch per node, create 8 new particles
         // Update numParticles
@@ -650,7 +652,7 @@ public class FluidSimulator : MonoBehaviour
         initializeParticlesKernel = particlesShader.FindKernel("InitializeParticles");
         
         // Create buffers
-        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 12 + 12 + 4 + 4 = 32 bytes
+        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint) + sizeof(uint)); // 12 + 12 + 4 + 4 + 4 = 36 bytes
         particlesCPU = new Particle[numParticles];
 
         // Set buffer data to compute shader
@@ -904,8 +906,8 @@ public class FluidSimulator : MonoBehaviour
         // Release and recreate node buffers each frame since numNodes changes
         nodesBuffer?.Release();
         tempNodesBuffer?.Release();
-        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 3); // 12 + 24 + 4 + 4 + 4 = 48 bytes
-        tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 3); // 12 + 24 + 4 + 4 + 4 = 48 bytes
+        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 4); // 12 + 24 + 4 + 4 + 4 + 4 = 52 bytes
+        tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 4); // 12 + 24 + 4 + 4 + 4 + 4 = 52 bytes
 
         // Set buffer data to compute shader
         nodesShader.SetBuffer(createLeavesKernel, "particlesBuffer", particlesBuffer);
@@ -1241,6 +1243,9 @@ public class FluidSimulator : MonoBehaviour
             // float divergenceNormalized = divergence * divergenceMultiplier / volume;
             // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
             // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+            if ((node.active & 2u) != 0u) {
+                Gizmos.color = new Color(1f, 0f, 0f);
+            }
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
         }
 
@@ -1376,7 +1381,7 @@ public class RadixSort
         clearBuffer32Kernel = sortShader.FindKernel("clearBuffer32");
 
         // Calculate particle struct size (3*4 + 3*4 + 4 + 4 = 32 bytes)
-        int particleSize = 3 * 4 + 3 * 4 + 4 + 4; // position(12) + velocity(12) + layer(4) + mortonCode(4)
+        int particleSize = 3 * 4 + 3 * 4 + 4 + 4 + 4; // position(12) + velocity(12) + layer(4) + mortonCode(4) + previousLayer(4)
         tempParticles = new ComputeBuffer((int)maxLength, particleSize, ComputeBufferType.Default);
         tempParticlesB = new ComputeBuffer((int)maxLength, particleSize, ComputeBufferType.Default);
         eBuffer = new ComputeBuffer((int)maxLength, sizeof(uint), ComputeBufferType.Default);

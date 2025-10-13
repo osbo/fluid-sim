@@ -29,6 +29,7 @@ struct Particle
     float3 velocity;    // float face velocities
     uint layer;         // Layer units
     uint mortonCode;    // Morton code for spatial indexing
+    uint previousLayer; // Previous layer tracking
 };
 
 // Buffer definitions
@@ -127,6 +128,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // Generate morton code from normalized position
     // particle.mortonCode = EncodeMorton3D(normalizedPos);
     particle.mortonCode = 0;
+    particle.previousLayer = particle.layer; // Initialize previousLayer to current layer
 
     // particle.layer = particle.mortonCode % 10;
     

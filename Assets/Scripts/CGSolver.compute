@@ -24,6 +24,7 @@ struct Node
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes
+    uint previousLayer; // 4 bytes
 };
 
 // Buffers for CG solver
