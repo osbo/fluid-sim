@@ -36,6 +36,7 @@ struct Node
 {
     float3 position;    // 12 bytes
     faceVelocities velocities; // 24 bytes (6 floats)
+    float mass;          // 4 bytes
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes

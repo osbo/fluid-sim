@@ -28,6 +28,7 @@ struct Node
 {
     float3 position;    // 12 bytes
     faceVelocities velocities;    // 24 bytes
+    float mass;          // 4 bytes
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes
@@ -134,9 +135,10 @@ float gravity;
 float deltaTime;
 float dispersionPower; // >1 concentrates near left, <1 concentrates near right
 float boundaryThreshold; // normalized u threshold near left edge considered boundary
-uint initialLayer;
+uint minLayer;
 uint numNodes;
 uint numParticles;
+uint maxLayer;
 
 // Grid parameters for even particle distribution
 uint3 gridDimensions;
@@ -195,21 +197,21 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     
     // Check if particle is within a small radius of the center
     // float2 centerOffset = float2(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y);
-    float3 centerOffset = float3(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y, particle.position.z - simulationCenter.z);
+    float3 centerOffset = float3(particle.position.x - simulationCenter.x, particle.position.y - (simulationCenter.y + 10), particle.position.z - simulationCenter.z);
     float distanceFromCenter = length(centerOffset);
     float centerRadius = 3; // Small radius around center for layer 0 particles
     
     // Assign layer: center particles get layer 0, boundary particles get layer 0, others get layer 11
     bool nearCenter = (distanceFromCenter <= centerRadius);
     bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
-    // particle.layer = (nearCenter || onBoundary) ? initialLayer : 11;
-    // particle.layer = onBoundary ? initialLayer : 11;
-    particle.layer = (nearCenter) ? initialLayer : 11;
+    // particle.layer = (nearCenter || onBoundary) ? minLayer : 11;
+    // particle.layer = onBoundary ? minLayer : 11;
+    particle.layer = (nearCenter) ? minLayer : maxLayer;
     // particle.layer = 11;
     // particle.layer = 4;
 
     if (nearCenter) {
-        particle.velocity = float3(0.0, 100.0, 0.0);
+        particle.velocity = float3(0.0, 500.0, 0.0);
     }
     
     // Generate morton code from normalized position
@@ -311,8 +313,14 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) / 1023.0) * simulationSize;
     float3 nodeMax = nodeMin + (cellGridSize / 1023.0) * simulationSize;
 
+    // Guard against zero extents to avoid NaNs
+    float3 extent = nodeMax - nodeMin;
+    extent.x = max(extent.x, 1e-6);
+    extent.y = max(extent.y, 1e-6);
+    extent.z = max(extent.z, 1e-6);
+
     // Calculate the particle's fractional position (0-1) inside the node's bounds
-    float3 t = saturate((particle.position - nodeMin) / (nodeMax - nodeMin));
+    float3 t = saturate((particle.position - nodeMin) / extent);
 
     // Interpolate the NEW (post-solve) velocity
     float3 newGridVelocity;
@@ -320,10 +328,14 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     newGridVelocity.y = lerp(-node.velocities.bottom, node.velocities.top, t.y);
     newGridVelocity.z = lerp(-node.velocities.front, node.velocities.back, t.z);
 
+    // newGridVelocity.x = node.velocities.right - node.velocities.left;
+    // newGridVelocity.y = node.velocities.top - node.velocities.bottom;
+    // newGridVelocity.z = node.velocities.back - node.velocities.front;
+
     // 3. APPLY VELOCITY UPDATE
     
     // Option A: Pure PIC Update (simple, but high energy loss)
-    particle.velocity = newGridVelocity * 0.001;
+    particle.velocity = newGridVelocity;
 
     particlesBuffer[index] = particle;
 }
