@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
 using System;
+using UnityEngine.Rendering;
 
 public class FluidSimulator : MonoBehaviour
 {
@@ -62,6 +63,7 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer ApBuffer;
     private ComputeBuffer residualBuffer;
     private ComputeBuffer pressureBuffer;
+    
     // add previous active node count, but that can be a cpu variable 
     
     // Number of nodes, active nodes, and unique active nodes
@@ -70,7 +72,8 @@ public class FluidSimulator : MonoBehaviour
     private int layer;
     public float gravity;
     public float frameRate;
-    public int initialLayer;
+    public int minLayer;
+    public int maxLayer;
     public float velocitySensitivity;
     private float divergenceMultiplier = 50.0f;
 
@@ -112,6 +115,7 @@ public class FluidSimulator : MonoBehaviour
     {
         public Vector3 position;    // 12 bytes
         public faceVelocities velocities; // 6*4 = 24 bytes
+        public float mass;             // 4 bytes
         public uint layer;          // 4 bytes
         public uint mortonCode;     // 4 bytes
         public uint active;         // 4 bytes
@@ -119,6 +123,24 @@ public class FluidSimulator : MonoBehaviour
 
     private Node[] nodesCPU;
     private Particle[] particlesCPU;
+
+    // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
+    public Material particlesMaterial;
+
+    void OnEnable()
+    {
+        RenderPipelineManager.endCameraRendering += OnEndCameraRendering;
+    }
+
+    void OnDisable()
+    {
+        RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
+    }
+
+    private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
+    {
+        DrawParticles(cam);
+    }
 
     void Start()
     {
@@ -147,9 +169,9 @@ public class FluidSimulator : MonoBehaviour
         }
 
         // for (int i = 0; i < numParticles/1024 && i < numParticles; i++) {
-        for (int i = 0; (uint)i < 20 && i < numParticles; i++) {
-            particlesCPU[indices[i]].layer = (uint)initialLayer;
-            particlesCPU[indices[i]].velocity = new Vector3(0.0f, 10.0f, 0.0f);
+        for (int i = 0; (uint)i < 1000 && i < numParticles; i++) {
+            particlesCPU[indices[i]].layer = (uint)minLayer;
+            particlesCPU[indices[i]].velocity = new Vector3(100.0f, 0.0f, 0.0f);
         }
 
         particlesBuffer.SetData(particlesCPU);
@@ -171,7 +193,7 @@ public class FluidSimulator : MonoBehaviour
         // // Reset wait message flag when frame advances
         // hasShownWaitMessage = false;
 
-        layer = initialLayer;
+        layer = minLayer;
         
         // Start frame timing
         var frameSw = System.Diagnostics.Stopwatch.StartNew();
@@ -205,7 +227,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 4: Layer loop (layers 1-10)
         var layerLoopSw = System.Diagnostics.Stopwatch.StartNew();
-        for (layer = layer + 1; layer <= 10; layer++)
+        for (layer = layer + 1; layer <= maxLayer; layer++)
         {
             var totalLayerSw = System.Diagnostics.Stopwatch.StartNew();
             
@@ -236,19 +258,33 @@ public class FluidSimulator : MonoBehaviour
         SolvePressure();
         solvePressureSw.Stop();
 
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // string str = "Node velocities:\n";
-        // for (int i = 0; i < 40 && i < numNodes; i++)
-        // {
-        //     str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        // }
-        // Debug.Log(str);
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        string str = "Node velocities:\n";
+        for (int i = 0; i < 40 && i < numNodes; i++)
+        {
+            str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        }
+        Debug.Log(str);
 
         // Step 7: Update particles
         var updateParticlesSw = System.Diagnostics.Stopwatch.StartNew();
         UpdateParticles();
         updateParticlesSw.Stop();
+
+        particlesCPU = new Particle[numParticles];
+        particlesBuffer.GetData(particlesCPU);
+        for (int i = 0; i < numParticles; i++)
+        {
+            if (float.IsNaN(particlesCPU[i].velocity.x) || float.IsNaN(particlesCPU[i].velocity.y) || float.IsNaN(particlesCPU[i].velocity.z))
+            {
+                Debug.Log($"Particle {i} has NaN velocity\n");
+                break;
+            }
+        }
+
+        // Draw particles as points using the particles buffer
+        // Moved to OnRenderObject for reliable rendering timing
 
         // Frame timing summary
         frameSw.Stop();
@@ -492,7 +528,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetFloat("deltaTime", (1 / frameRate)); // Use the same deltaTime as in advection
         nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         nodesShader.SetFloat("velocitySensitivity", velocitySensitivity);
-        nodesShader.SetInt("initialLayer", initialLayer);
+        nodesShader.SetInt("minLayer", minLayer);
 
         // Dispatch the kernel to update velocities
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
@@ -607,7 +643,8 @@ public class FluidSimulator : MonoBehaviour
         // Set buffer data to compute shader
         particlesShader.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetInt("count", numParticles);
-        
+        particlesShader.SetInt("minLayer", minLayer);
+        particlesShader.SetInt("maxLayer", maxLayer);
         // Calculate bounds
         simulationBoundsMin = simulationBounds.bounds.min;
         simulationBoundsMax = simulationBounds.bounds.max;
@@ -686,7 +723,7 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetVector("fluidInitialBoundsMax", fluidInitialBoundsMax);
         particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
         particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
-        particlesShader.SetInt("initialLayer", initialLayer);
+        particlesShader.SetInt("minLayer", minLayer);
         
         // Set grid parameters to compute shader
         particlesShader.SetInts("gridDimensions", new int[] { (int)gridDimensions.x, (int)gridDimensions.y, (int)gridDimensions.z });
@@ -855,8 +892,8 @@ public class FluidSimulator : MonoBehaviour
         // Release and recreate node buffers each frame since numNodes changes
         nodesBuffer?.Release();
         tempNodesBuffer?.Release();
-        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 3); // 12 + 24 + 4 + 4 + 4 + 4 = 52 bytes
-        tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(uint) * 3); // 12 + 24 + 4 + 4 + 4 + 4 = 52 bytes
+        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
 
         // Set buffer data to compute shader
         nodesShader.SetBuffer(createLeavesKernel, "particlesBuffer", particlesBuffer);
@@ -864,6 +901,8 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(createLeavesKernel, "uniqueIndices", uniqueIndices);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetInt("numParticles", numParticles);
+        nodesShader.SetInt("minLayer", minLayer);
+        nodesShader.SetInt("maxLayer", maxLayer);
 
         // Dispatch the kernel
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
@@ -961,6 +1000,8 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("numUniqueNodes", numUniqueNodes);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetInt("layer", layer);
+        nodesShader.SetInt("minLayer", minLayer);
+        nodesShader.SetInt("maxLayer", maxLayer);
         
         // Dispatch one thread per unique node
         int threadGroups = Mathf.CeilToInt(numUniqueNodes / 512.0f);
@@ -1214,17 +1255,32 @@ public class FluidSimulator : MonoBehaviour
         // }
 
 
-        Particle[] particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
+        // Particle[] particlesCPU = new Particle[numParticles];
+        // particlesBuffer.GetData(particlesCPU);
 
-        for (int i = 0; i < numParticles; i++)
-        {
-            Particle particle = particlesCPU[i];
-            int layerIndex = Mathf.Clamp((int)particle.layer, 0, layerColors.Length - 1);
-            Gizmos.color = layerColors[layerIndex];
-            Gizmos.DrawCube(particle.position, Vector3.one * 0.25f);
-        }
+        // for (int i = 0; i < numParticles; i++)
+        // {
+        //     Particle particle = particlesCPU[i];
+        //     int layerIndex = Mathf.Clamp((int)particle.layer, 0, layerColors.Length - 1);
+        //     Gizmos.color = layerColors[layerIndex];
+        //     Gizmos.DrawCube(particle.position, Vector3.one * 0.25f);
+        // }
     }
+
+    private void DrawParticles(Camera cam)
+    {
+        if (particlesMaterial == null || particlesBuffer == null || numParticles <= 0) return;
+        if (cam == null) return;
+
+        particlesMaterial.SetBuffer("_Particles", particlesBuffer);
+        particlesMaterial.SetFloat("_PointSize", 2.0f);
+
+        particlesMaterial.SetPass(0);
+        Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
+    }
+
+    // remove legacy OnRenderObject path
+    // void OnRenderObject() { DrawParticles(Camera.current != null ? Camera.current : Camera.main); }
 
     private Vector3 DecodeMorton3D(Node node)
     {
