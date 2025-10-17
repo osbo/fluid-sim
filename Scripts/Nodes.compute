@@ -28,6 +28,7 @@ struct Node
 {
     float3 position;    // 12 bytes
     faceVelocities velocities;    // 24 bytes
+    float mass;          // 4 bytes
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes
@@ -52,7 +53,8 @@ uint layer;                                             // current hierarchical 
 float deltaTime;                                        // time step for pressure gradient application
 float maxDetailCellSize;                               // smallest cell size for scaling
 float velocitySensitivity;                              // sensitivity of velocity to layer
-uint initialLayer;                                      // initial layer
+uint minLayer;                                      // initial layer
+uint maxLayer;                                          // maximum layer
 float3 simulationBoundsMin;                             // minimum simulation bounds
 float3 simulationBoundsMax;                             // maximum simulation bounds
 
@@ -206,44 +208,49 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     leafVelocities.front = 0.0;
     leafVelocities.back = 0.0;
     
-    float totalWeight = 1.0;
-    uint minLayer = 11;
+    float count = 0.0;
+    uint minSubLayer = maxLayer;
     
     // Process all particles with this morton code
     for (uint i = rangeStart; i < rangeEnd; i++)
     {
         Particle particle = particlesBuffer[i];
         
-        // Weight = 8^(particle.layer), but since layer is always 0, weight = 8^0 = 1
-        float weight = pow(8.0, (float)particle.layer);
-        weightedPosition += particle.position * weight;
-        totalWeight += weight;
+        count += 1.0;
+        weightedPosition += particle.position;
 
         float3 velocity = particle.velocity;
         if (velocity.x < 0) {
-            leafVelocities.left += velocity.x * -1;
+            leafVelocities.left += (-velocity.x);
         } else {
             leafVelocities.right += velocity.x;
         }
         if (velocity.y < 0) {
-            leafVelocities.bottom += velocity.y * -1;
+            leafVelocities.bottom += (-velocity.y);
         } else {
             leafVelocities.top += velocity.y;
         }
         if (velocity.z < 0) {
-            leafVelocities.front += velocity.z * -1;
+            leafVelocities.front += (-velocity.z);
         } else {
             leafVelocities.back += velocity.z;
         }
         
         // Track minimum layer
-        minLayer = min(minLayer, particle.layer);
+        minSubLayer = min(minSubLayer, particle.layer);
     }
     
     // Normalize by total weight (center of mass)
     // Safety check: prevent division by zero
-    if (totalWeight > 0.0) {
-        weightedPosition /= totalWeight;
+    if (count > 0.0) {
+        weightedPosition /= count;
+        // Average face velocities by weight as well
+        leafVelocities.left /= count;
+        leafVelocities.right /= count;
+        leafVelocities.bottom /= count;
+        leafVelocities.top /= count;
+        leafVelocities.front /= count;
+        leafVelocities.back /= count;
     }
 
     uint mortonCode = particlesBuffer[rangeStart].mortonCode;
@@ -254,7 +261,8 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     Node node;
     node.position = weightedPosition;
     node.velocities = leafVelocities;
-    node.layer = minLayer;  // Use the minimum layer found
+    node.layer = minSubLayer;  // Use the minimum layer found
+    node.mass = count;
     node.mortonCode = mortonCode;
     node.active = 1u; // Set last bit to 1
     
@@ -285,8 +293,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    if (true)
-    // if (coarsen)
+    if (coarsen)
     {
         uint baseCode = nodesBuffer[uniqueStart].mortonCode;
         uint shift = layer * 3u;
@@ -384,27 +391,33 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         aggregatedVelocities.front = 0.0;
         aggregatedVelocities.back = 0.0;
         float3 weightedPosition = float3(0, 0, 0);
-        float totalWeight = 0.0;
-        uint minLayer = 11;
+        float totalMass = 0.0;
+        uint minSubLayer = maxLayer;
 
         for (uint i = uniqueStart; i < uniqueEnd; i++)
         {
             Node node = nodesBuffer[i];
-            float weight = pow(8.0, (float)node.layer);
-            weightedPosition += node.position * weight;
-            totalWeight += weight;
-            aggregatedVelocities.left += node.velocities.left;
-            aggregatedVelocities.right += node.velocities.right;
-            aggregatedVelocities.bottom += node.velocities.bottom;
-            aggregatedVelocities.top += node.velocities.top;
-            aggregatedVelocities.front += node.velocities.front;
-            aggregatedVelocities.back += node.velocities.back;
-            minLayer = min(minLayer, node.layer);
+            float mass = node.mass;
+            weightedPosition += node.position * mass;
+            totalMass += mass;
+            aggregatedVelocities.left += node.velocities.left * mass;
+            aggregatedVelocities.right += node.velocities.right * mass;
+            aggregatedVelocities.bottom += node.velocities.bottom * mass;
+            aggregatedVelocities.top += node.velocities.top * mass;
+            aggregatedVelocities.front += node.velocities.front * mass;
+            aggregatedVelocities.back += node.velocities.back * mass;
+            minSubLayer = min(minSubLayer, node.layer);
         }
 
         // Safety check: prevent division by zero
-        if (totalWeight > 0.0) {
-            weightedPosition /= totalWeight;
+        if (totalMass > 0.0) {
+            weightedPosition /= totalMass;
+            aggregatedVelocities.left /= totalMass;
+            aggregatedVelocities.right /= totalMass;
+            aggregatedVelocities.bottom /= totalMass;
+            aggregatedVelocities.top /= totalMass;
+            aggregatedVelocities.front /= totalMass;
+            aggregatedVelocities.back /= totalMass;
         }
 
         // weightedPosition = clamp(weightedPosition, simulationBoundsMin, simulationBoundsMax);
@@ -412,7 +425,8 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         Node aggregatedNode;
         aggregatedNode.position = weightedPosition;
         aggregatedNode.velocities = aggregatedVelocities;
-        aggregatedNode.layer = minLayer;
+        aggregatedNode.layer = minSubLayer;
+        aggregatedNode.mass = totalMass;
         aggregatedNode.mortonCode = nodesBuffer[uniqueStart].mortonCode;
         aggregatedNode.active = 1u; // Set last bit to 1
 
@@ -448,10 +462,11 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
     // Initialize output (delta) node with zero face velocities
     Node outNode;
     outNode.position = node.position;
+    outNode.mass = node.mass;
     outNode.layer = node.layer;
     outNode.mortonCode = node.mortonCode;
     outNode.active = node.active;
-    outNode.velocities = node.velocities;
+    outNode.velocities = selfVel;
 
     // Initialize neighbors to invalid index (numNodes) for all 24 slots
     uint nbBase = threadIndex * 24;
@@ -537,62 +552,65 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         }
         else
         {
-            uint idx_target = lowerBoundMorton(target, 0, numNodes); // low child bound
-            uint idx_upper = lowerBoundMorton(upper, 0, numNodes); // high child bound
-            if (idx_target < idx_upper)
+            // child neighbor path only valid if shift >= 3 (layer >= 1)
+            if (shift >= 3)
             {
-                // child neighbor
-                uint nPrefixShifted = nPrefix << 3;
-                int subNodesLower[4];
-                if (d == 0) { // right face
-                    subNodesLower[0] = 1;
-                    subNodesLower[1] = 3;
-                    subNodesLower[2] = 5;
-                    subNodesLower[3] = 7;
-                } else if (d == 1) { // left face
-                    subNodesLower[0] = 0;
-                    subNodesLower[1] = 2;
-                    subNodesLower[2] = 4;
-                    subNodesLower[3] = 6;
-                } else if (d == 2) { // top face
-                    subNodesLower[0] = 2;
-                    subNodesLower[1] = 3;
-                    subNodesLower[2] = 6;
-                    subNodesLower[3] = 7;
-                } else if (d == 3) { // bottom face
-                    subNodesLower[0] = 0;
-                    subNodesLower[1] = 1;
-                    subNodesLower[2] = 4;
-                    subNodesLower[3] = 5;
-                } else if (d == 4) { // back face
-                    subNodesLower[0] = 4;
-                    subNodesLower[1] = 5;
-                    subNodesLower[2] = 6;
-                    subNodesLower[3] = 7;
-                } else if (d == 5) { // front face
-                    subNodesLower[0] = 0;
-                    subNodesLower[1] = 1;
-                    subNodesLower[2] = 2;
-                    subNodesLower[3] = 3;
-                }
-
-                for (int i = 0; i < 4; i++)
+                uint idx_target = lowerBoundMorton(target, 0, numNodes); // low child bound
+                uint idx_upper = lowerBoundMorton(upper, 0, numNodes); // high child bound
+                if (idx_target < idx_upper)
                 {
-                    uint subPrefix = nPrefixShifted + subNodesLower[i];
-                    uint subLower = subPrefix << (shift - 3);
-                    uint subUpper = (subPrefix + 1u) << (shift - 3);
-                    uint idx_sub = lowerBoundMorton(subLower, idx_target, idx_upper);
-                    if (idx_sub < idx_upper)
+                    uint nPrefixShifted = nPrefix << 3;
+                    int subNodesLower[4];
+                    if (d == 0) { // right face
+                        subNodesLower[0] = 1;
+                        subNodesLower[1] = 3;
+                        subNodesLower[2] = 5;
+                        subNodesLower[3] = 7;
+                    } else if (d == 1) { // left face
+                        subNodesLower[0] = 0;
+                        subNodesLower[1] = 2;
+                        subNodesLower[2] = 4;
+                        subNodesLower[3] = 6;
+                    } else if (d == 2) { // top face
+                        subNodesLower[0] = 2;
+                        subNodesLower[1] = 3;
+                        subNodesLower[2] = 6;
+                        subNodesLower[3] = 7;
+                    } else if (d == 3) { // bottom face
+                        subNodesLower[0] = 0;
+                        subNodesLower[1] = 1;
+                        subNodesLower[2] = 4;
+                        subNodesLower[3] = 5;
+                    } else if (d == 4) { // back face
+                        subNodesLower[0] = 4;
+                        subNodesLower[1] = 5;
+                        subNodesLower[2] = 6;
+                        subNodesLower[3] = 7;
+                    } else if (d == 5) { // front face
+                        subNodesLower[0] = 0;
+                        subNodesLower[1] = 1;
+                        subNodesLower[2] = 2;
+                        subNodesLower[3] = 3;
+                    }
+
+                    for (int i = 0; i < 4; i++)
                     {
-                        Node cNode = nodesBuffer[idx_sub];
-                        uint idx_sub_mc = cNode.mortonCode;
-                        uint idx_sub_mc_prefix = idx_sub_mc >> (shift - 3);
-                        uint idx_sub_layer = cNode.layer;
-                        if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
+                        uint subPrefix = nPrefixShifted + subNodesLower[i];
+                        uint subLower = subPrefix << (shift - 3);
+                        uint subUpper = (subPrefix + 1u) << (shift - 3);
+                        uint idx_sub = lowerBoundMorton(subLower, idx_target, idx_upper);
+                        if (idx_sub < idx_upper)
                         {
-                            float oppC = selectOpposingFace(cNode.velocities, d);
-                            subtractToFace(outNode, d, oppC);
-                            neighborsBuffer[threadIndex * 24 + faceOffset(d) + i] = idx_sub;
+                            Node cNode = nodesBuffer[idx_sub];
+                            uint idx_sub_mc = cNode.mortonCode;
+                            uint idx_sub_mc_prefix = idx_sub_mc >> (shift - 3);
+                            uint idx_sub_layer = cNode.layer;
+                            if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
+                            {
+                                float oppC = selectOpposingFace(cNode.velocities, d);
+                                subtractToFace(outNode, d, oppC);
+                                neighborsBuffer[threadIndex * 24 + faceOffset(d) + i] = idx_sub;
+                            }
                         }
                     }
                 }
@@ -622,7 +640,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[threadIndex];
     Node outNode = node; // Start with a copy
     float p_i = pressureBuffer[threadIndex];
-    float dx_i = maxDetailCellSize * exp2((float)node.layer);
+    float dx_i = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
 
     uint neighborBaseIndex = threadIndex * 24;
 
@@ -638,13 +656,11 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
             // Case 1: Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
             float p_j = pressureBuffer[neighbor_idx];
-            float dx_j = maxDetailCellSize * exp2((float)nNode.layer);
-            
-            // Distance between cell centers
-            float distance = 0.5 * (dx_i + dx_j);
+            float dx_j = max(maxDetailCellSize * exp2((float)nNode.layer), 1e-6);
+            float distance = max(0.5 * (dx_i + dx_j), 1e-6);
             pressure_gradient = (p_j - p_i) / distance;
         }
-        else
+        else if (dx_i > 0.0)
         {
             // Case 2: Child (finer) neighbors
             float avg_p_children = 0.0;
@@ -662,15 +678,12 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
             if (childCount > 0)
             {
                 avg_p_children /= (float)childCount;
-                // Use the child's cell size for distance calculation
                 float dx_child = dx_i * 0.5;
-                float distance = 0.5 * (dx_i + dx_child);
+                float distance = max(0.5 * (dx_i + dx_child), 1e-6);
                 pressure_gradient = (avg_p_children - p_i) / distance;
             }
         }
         
-        // Subtract the scaled gradient from the appropriate face velocity
-        // Note: This applies the change directly to the velocity value on that face.
         float velocity_correction = deltaTime * pressure_gradient;
 
         if (d == 0) outNode.velocities.left -= velocity_correction;

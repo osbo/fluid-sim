@@ -538,11 +538,12 @@ MonoBehaviour:
   cgSolverShader: {fileID: 7200000, guid: d5297ef94acc94983b6222dcf43123f9, type: 3}
   numParticles: 1048576
   maxCgIterations: 50
-  convergenceThreshold: 0
-  gravity: 0
+  convergenceThreshold: 10000
+  gravity: 9.8
   frameRate: 60
-  initialLayer: 4
+  minLayer: 4
   velocitySensitivity: 320
+  particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0

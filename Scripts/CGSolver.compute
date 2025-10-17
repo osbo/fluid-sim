@@ -21,6 +21,7 @@ struct Node
 {
     float3 position;    // 12 bytes
     faceVelocities velocities;    // 24 bytes
+    float mass;          // 4 bytes
     uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
     uint active;        // 4 bytes
@@ -50,15 +51,11 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[i];
     faceVelocities v = node.velocities;
 
-    // Sum of net flux (Right-Left + Top-Bottom + Back-Front)
     float divergence = v.right - v.left + v.top - v.bottom + v.back - v.front;
-
-    // Scale by inverse of cell size to get divergence
-    // dx for a cell is proportional to 2^layer
-    float dx = maxDetailCellSize * exp2((float)node.layer);
-
-    // We solve for -Divergence
-    divergenceBuffer[i] = -divergence / dx;
+    float dx = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
+    float outVal = -divergence / dx;
+    if (!isfinite(outVal)) outVal = 0.0;
+    divergenceBuffer[i] = outVal;
 }
 
 [numthreads(512, 1, 1)]
@@ -70,75 +67,50 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[i];
     float p_i = pBuffer[i];
     float laplacian_p = 0.0;
-    uint neighborCount = 0;
 
+    float dx_i = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
     uint neighborBaseIndex = i * 24;
 
-    // Loop through all 6 faces
+    // Loop over all 6 faces of the node
     for (int d = 0; d < 6; d++)
     {
         uint faceNeighborBase = neighborBaseIndex + d * 4;
-        uint neighbor_idx = neighborsBuffer[faceNeighborBase];
+        uint neighbor_idx = neighborsBuffer[faceNeighborBase]; // first slot: same/parent layer
 
         if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
-            // Case 1: Same-layer or Parent (coarser) neighbor
-            if (nodesBuffer[neighbor_idx].layer > node.layer)
-            {
-                // Child-Parent interaction: scale to maintain symmetry.
-                laplacian_p += (pBuffer[neighbor_idx] - p_i) / 4.0;
-            }
-            else
-            {
-                // Same-layer interaction.
-                laplacian_p += pBuffer[neighbor_idx] - p_i;
-            }
-            neighborCount++;
+            // Same-layer or Parent (coarser) neighbor
+            Node nNode = nodesBuffer[neighbor_idx];
+            float p_j = pBuffer[neighbor_idx];
+            float dx_j = max(maxDetailCellSize * exp2((float)nNode.layer), 1e-6);
+            float distance = max(0.5 * (dx_i + dx_j), 1e-6);
+            float a_shared = min(dx_i, dx_j) * min(dx_i, dx_j);
+            float w = a_shared / distance;
+            laplacian_p += w * (p_j - p_i);
         }
         else
         {
-            // Case 2: Child (finer) neighbors
-            // The face is adjacent to 4 smaller cells. Average their pressures.
-            float avg_p_children = 0.0;
-            uint childCount = 0;
+            // Child (finer) neighbors (up to 4 per face)
             for (int k = 0; k < 4; k++)
             {
                 uint child_idx = neighborsBuffer[faceNeighborBase + k];
                 if (child_idx < numNodes)
                 {
-                    avg_p_children += pBuffer[child_idx];
-                    childCount++;
+                    Node cNode = nodesBuffer[child_idx];
+                    float p_c = pBuffer[child_idx];
+                    float dx_c = max(maxDetailCellSize * exp2((float)cNode.layer), 1e-6);
+                    float distance = max(0.5 * (dx_i + dx_c), 1e-6);
+                    float a_shared = dx_c * dx_c; // child face area
+                    float w = a_shared / distance;
+                    laplacian_p += w * (p_c - p_i);
                 }
             }
-
-            if (childCount > 0)
-            {
-                avg_p_children /= (float)childCount;
-                laplacian_p += avg_p_children - p_i;
-                neighborCount++;
-            }
         }
-        // NOTE: Neumann boundary conditions (solid walls) are implicitly handled.
-        // If a neighbor is invalid (>= numNodes), no pressure contribution is added,
-        // which means the pressure gradient is treated as zero.
     }
 
-    // For now, try without scaling to see if that's the issue
-    // TODO: Add proper scaling back once we verify the discretization is correct
-    
-    // For positive definite matrix, we need: Ap = (num_neighbors * p_i) - sum(p_j)
-    // The code above calculates sum(p_j - p_i), so we need to negate it
-    // This gives us: Ap = (num_neighbors * p_i) - sum(p_j) = -sum(p_j - p_i)
-    
-    // Handle boundary nodes (no neighbors) - they should have zero Laplacian
-    if (neighborCount == 0)
-    {
-        ApBuffer[i] = 0.0f; // Boundary nodes have zero Laplacian
-    }
-    else
-    {
-        ApBuffer[i] = -laplacian_p; // Negate to get correct Laplacian (no scaling for now)
-    }
+    float outVal = -laplacian_p;
+    if (!isfinite(outVal)) outVal = 0.0;
+    ApBuffer[i] = outVal;
 }
 
 [numthreads(512, 1, 1)]
@@ -157,7 +129,6 @@ void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id 
     s_data[li] = (i < numNodes) ? xBuffer[i] * yBuffer[i] : 0;
     GroupMemoryBarrierWithGroupSync();
 
-    // In-group reduction
     for (uint s = 256; s > 0; s >>= 1) {
         if (li < s) {
             s_data[li] += s_data[li + s];
@@ -165,8 +136,7 @@ void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id 
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // First thread of each group writes its partial sum
     if (li == 0) {
-        divergenceBuffer[Gid.x] = s_data[0]; // Re-using divergence buffer as temporary output
+        divergenceBuffer[Gid.x] = s_data[0];
     }
 }
