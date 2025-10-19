@@ -196,7 +196,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     
     // Check if particle is within a small radius of the center
     // float2 centerOffset = float2(particle.position.x - simulationCenter.x, particle.position.y - simulationCenter.y);
-    float3 centerOffset = float3(particle.position.x - simulationCenter.x, particle.position.y - (simulationCenter.y + 10), particle.position.z - simulationCenter.z);
+    float3 centerOffset = float3(particle.position.x - simulationCenter.x, particle.position.y - (simulationCenter.y + 20), particle.position.z - simulationCenter.z);
     float distanceFromCenter = length(centerOffset);
     float centerRadius = 3; // Small radius around center for layer 0 particles
     
@@ -292,6 +292,8 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
         // Advect the particle using its new velocity
         float3 newPosition = particle.position + newVelocity * deltaTime;
+
+        // newVelocity.y -= gravity * deltaTime;
 
         // Boundary conditions: clamp position and dampen velocity for bounce
         if (newPosition.x <= simulationBoundsMin.x) { newPosition.x = simulationBoundsMin.x; newVelocity.x *= -0.5; }

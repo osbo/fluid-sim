@@ -249,12 +249,12 @@ public class FluidSimulator : MonoBehaviour
         pullVelocities();
         pullVelocitiesSw.Stop();
 
-        // Step 4.5: Apply gravity on the grid
+        // Step 5: Apply gravity on the grid
         var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
         ApplyGravity();
         applyGravitySw.Stop();
 
-        // Step 5: Solve pressure
+        // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
         SolvePressure();
         solvePressureSw.Stop();
@@ -268,7 +268,7 @@ public class FluidSimulator : MonoBehaviour
         }
         Debug.Log(str);
 
-        // Step 6: Update particles
+        // Step 7: Update particles
         var updateParticlesSw = System.Diagnostics.Stopwatch.StartNew();
         UpdateParticles();
         updateParticlesSw.Stop();
@@ -299,26 +299,6 @@ public class FluidSimulator : MonoBehaviour
                  $"• Apply Gravity: {applyGravitySw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
-    }
-
-    private void ApplyGravity()
-    {
-        if (nodesShader == null) return;
-
-        applyGravityKernel = nodesShader.FindKernel("ApplyGravity");
-        if (applyGravityKernel < 0)
-        {
-            Debug.LogError("ApplyGravity kernel not found in Nodes.compute shader.");
-            return;
-        }
-
-        nodesShader.SetBuffer(applyGravityKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetInt("numNodes", numNodes);
-        nodesShader.SetFloat("gravity", gravity);
-        nodesShader.SetFloat("deltaTime", (1 / frameRate));
-
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        nodesShader.Dispatch(applyGravityKernel, threadGroups, 1, 1);
     }
 
     private void UpdateParticles()
@@ -390,6 +370,7 @@ public class FluidSimulator : MonoBehaviour
         var divergenceSw = System.Diagnostics.Stopwatch.StartNew();
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
+        cgSolverShader.SetBuffer(calculateDivergenceKernel, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
         cgSolverShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         Dispatch(calculateDivergenceKernel, numNodes);
@@ -428,6 +409,7 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(applyLaplacianKernel, "neighborsBuffer", neighborsBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "pBuffer", pBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "ApBuffer", ApBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianKernel, "neighborsBuffer", neighborsBuffer);
             cgSolverShader.SetInt("numNodes", numNodes);
             cgSolverShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
             cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
@@ -1146,6 +1128,25 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
+    }
+
+    private void ApplyGravity()
+    {
+        if (nodesShader == null) return;
+
+        applyGravityKernel = nodesShader.FindKernel("ApplyGravity");
+        if (applyGravityKernel < 0)
+        {
+            Debug.LogError("ApplyGravity kernel not found in Nodes.compute shader.");
+            return;
+        }
+
+        nodesShader.SetBuffer(applyGravityKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.SetFloat("gravity", gravity);
+        nodesShader.SetFloat("deltaTime", (1 / frameRate));
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+        nodesShader.Dispatch(applyGravityKernel, threadGroups, 1, 1);
     }
 
     private void ClearUniqueBuffers()
