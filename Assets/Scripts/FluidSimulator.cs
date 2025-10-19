@@ -44,6 +44,7 @@ public class FluidSimulator : MonoBehaviour
     private int dotProductKernel;
     private int applyPressureGradientKernel;
     private int updateParticlesKernel;
+    private int applyGravityKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -74,6 +75,7 @@ public class FluidSimulator : MonoBehaviour
     public float frameRate;
     public int minLayer;
     public int maxLayer;
+    public int surfaceLayer;
     public float velocitySensitivity;
     private float divergenceMultiplier = 50.0f;
 
@@ -82,7 +84,6 @@ public class FluidSimulator : MonoBehaviour
     private int inactiveCount;
     private bool hasShownWaitMessage = false;
     
-    // Stopwatch to measure total octree construction time (from advection to loop end)
     private System.Diagnostics.Stopwatch totalOctreeSw;
     
     // Simulation parameters (calculated in InitializeParticleSystem)
@@ -204,19 +205,14 @@ public class FluidSimulator : MonoBehaviour
         Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
         maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
 
-        // Frame loop: AdvectParticles -> SortParticles -> findUniqueParticles -> CreateLeaves -> layer loop -> pullVelocities -> SolvePressure -> GridToParticles
-        
-        // Step 1: Advect particles
-        var advectSw = System.Diagnostics.Stopwatch.StartNew();
-        AdvectParticles();
-        advectSw.Stop();
+        // Frame loop: SortParticles -> findUniqueParticles -> CreateLeaves -> layer loop -> pullVelocities -> SolvePressure -> UpdateParticles
 
-        // Step 2: Sort particles
+        // Step 1: Sort particles
         var sortSw = System.Diagnostics.Stopwatch.StartNew();
         SortParticles();
         sortSw.Stop();
 
-        // Step 3: Find unique particles and create leaves
+        // Step 2: Find unique particles and create leaves
         var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
         findUniqueParticles();
         findUniqueSw.Stop();
@@ -225,7 +221,7 @@ public class FluidSimulator : MonoBehaviour
         CreateLeaves();
         createLeavesSw.Stop();
 
-        // Step 4: Layer loop (layers 1-10)
+        // Step 3: Layer loop (layers 1-10)
         var layerLoopSw = System.Diagnostics.Stopwatch.StartNew();
         for (layer = layer + 1; layer <= maxLayer; layer++)
         {
@@ -248,12 +244,17 @@ public class FluidSimulator : MonoBehaviour
         }
         layerLoopSw.Stop();
 
-        // Step 5: Pull velocities
+        // Step 4: Pull velocities
         var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
         pullVelocities();
         pullVelocitiesSw.Stop();
 
-        // Step 6: Solve pressure
+        // Step 4.5: Apply gravity on the grid
+        var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
+        ApplyGravity();
+        applyGravitySw.Stop();
+
+        // Step 5: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
         SolvePressure();
         solvePressureSw.Stop();
@@ -267,7 +268,7 @@ public class FluidSimulator : MonoBehaviour
         }
         Debug.Log(str);
 
-        // Step 7: Update particles
+        // Step 6: Update particles
         var updateParticlesSw = System.Diagnostics.Stopwatch.StartNew();
         UpdateParticles();
         updateParticlesSw.Stop();
@@ -290,14 +291,34 @@ public class FluidSimulator : MonoBehaviour
         frameSw.Stop();
         Debug.Log($"Frame Summary:\n" +
                  $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Advect: {advectSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Pull Velocities: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Apply Gravity: {applyGravitySw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
+    }
+
+    private void ApplyGravity()
+    {
+        if (nodesShader == null) return;
+
+        applyGravityKernel = nodesShader.FindKernel("ApplyGravity");
+        if (applyGravityKernel < 0)
+        {
+            Debug.LogError("ApplyGravity kernel not found in Nodes.compute shader.");
+            return;
+        }
+
+        nodesShader.SetBuffer(applyGravityKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.SetFloat("gravity", gravity);
+        nodesShader.SetFloat("deltaTime", (1 / frameRate));
+
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+        nodesShader.Dispatch(applyGravityKernel, threadGroups, 1, 1);
     }
 
     private void UpdateParticles()
@@ -315,6 +336,11 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetBuffer(updateParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetInt("numNodes", numNodes);
         particlesShader.SetInt("numParticles", numParticles);
+        particlesShader.SetFloat("deltaTime", (1 / frameRate));
+        particlesShader.SetFloat("gravity", gravity);
+        particlesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
+        particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
+        particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
         particlesShader.SetVector("simulationBoundsMin", simulationBoundsMin);
         particlesShader.SetVector("simulationBoundsMax", simulationBoundsMax);
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
@@ -369,15 +395,15 @@ public class FluidSimulator : MonoBehaviour
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
 
-        // // Debug: print total divergence
-        // float totalDivergence = 0.0f;
-        // float[] divergenceCPU = new float[numNodes];
-        // divergenceBuffer.GetData(divergenceCPU);
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     totalDivergence += divergenceCPU[i];
-        // }
-        // Debug.Log($"Total divergence: {totalDivergence}");
+        // Debug: print total divergence
+        float totalDivergence = 0.0f;
+        float[] divergenceCPU = new float[numNodes];
+        divergenceBuffer.GetData(divergenceCPU);
+        for (int i = 0; i < numNodes; i++)
+        {
+            totalDivergence += divergenceCPU[i];
+        }
+        Debug.Log($"Total divergence: {totalDivergence}");
 
         // Initialize: r = b, p = r (since initial pressure x = 0)
         var initSw = System.Diagnostics.Stopwatch.StartNew();
@@ -403,6 +429,8 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(applyLaplacianKernel, "pBuffer", pBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "ApBuffer", ApBuffer);
             cgSolverShader.SetInt("numNodes", numNodes);
+            cgSolverShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
+            cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
             Dispatch(applyLaplacianKernel, numNodes);
 
             // Calculate alpha with safety checks
@@ -735,30 +763,6 @@ public class FluidSimulator : MonoBehaviour
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
     }
-
-    private void AdvectParticles()
-    {
-        if (particlesShader == null)
-        {
-            Debug.LogError("Particles compute shader is not assigned. Please assign `particlesShader` in the inspector.");
-            return;
-        }
-
-        int advectParticlesKernel = particlesShader.FindKernel("AdvectParticles");
-
-        float deltaTime = (1/60.0f);
-        
-        particlesShader.SetBuffer(advectParticlesKernel, "particlesBuffer", particlesBuffer);
-        particlesShader.SetInt("numParticles", numParticles);
-        particlesShader.SetFloat("deltaTime", deltaTime);
-        particlesShader.SetFloat("gravity", gravity);
-        particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
-        particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
-        particlesShader.SetVector("simulationBoundsMin", simulationBoundsMin);
-        particlesShader.SetVector("simulationBoundsMax", simulationBoundsMax);
-        int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
-        particlesShader.Dispatch(advectParticlesKernel, threadGroups, 1, 1);
-    }
     
     private void SortParticles()
     {
@@ -1002,6 +1006,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("layer", layer);
         nodesShader.SetInt("minLayer", minLayer);
         nodesShader.SetInt("maxLayer", maxLayer);
+        nodesShader.SetInt("surfaceLayer", surfaceLayer);
         
         // Dispatch one thread per unique node
         int threadGroups = Mathf.CeilToInt(numUniqueNodes / 512.0f);
@@ -1233,7 +1238,7 @@ public class FluidSimulator : MonoBehaviour
             // float divergenceNormalized = divergence * divergenceMultiplier / volume;
             // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
             // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
-            Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+            // Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
         }
 
         // // Read neighbors as a flat uint buffer: 24 uints per node (left4,right4,bottom4,top4,front4,back4)
