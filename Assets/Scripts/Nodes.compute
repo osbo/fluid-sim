@@ -3,6 +3,7 @@
 #pragma kernel pullVelocities
 #pragma kernel copyFaceVelocities
 #pragma kernel ApplyPressureGradient
+#pragma kernel ApplyGravity
 
 struct faceVelocities
 {
@@ -51,6 +52,7 @@ uint numNodes;                                          // number of nodes
 uint numParticles;                                      // total number of particles
 uint layer;                                             // current hierarchical layer
 float deltaTime;                                        // time step for pressure gradient application
+uint surfaceLayer;                                      // layer of the surface
 float maxDetailCellSize;                               // smallest cell size for scaling
 float velocitySensitivity;                              // sensitivity of velocity to layer
 uint minLayer;                                      // initial layer
@@ -61,6 +63,7 @@ float3 simulationBoundsMax;                             // maximum simulation bo
 // Additional variables for particle creation
 float3 mortonNormalizationFactor;
 float mortonMaxValue;
+float gravity;
 
 // Morton helpers: interleave/deinterleave 3D (10 bits per axis)
 uint3 deinterleave(uint m)
@@ -73,6 +76,23 @@ uint3 deinterleave(uint m)
         z |= ((m >> (3 * i + 2)) & 1) << i;
     }
     return uint3(x, y, z);
+}
+
+[numthreads(512, 1, 1)]
+void ApplyGravity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    Node node = nodesBuffer[i];
+    
+    // Apply gravity to vertical face velocities
+    // Gravity acts downwards (-Y)
+    // It should decrease upward velocity (top) and increase downward velocity (bottom)
+    node.velocities.top = max(0.0, node.velocities.top - gravity * deltaTime);
+    node.velocities.bottom = node.velocities.bottom + gravity * deltaTime;
+    
+    nodesBuffer[i] = node;
 }
 
 uint interleave(uint3 p)
@@ -379,6 +399,9 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
                 }
             }
         }
+        if (numNeighbors < 8 && layer > surfaceLayer) {
+            coarsen = false;
+        }
     }
 
     if (coarsen)
@@ -493,22 +516,22 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         {
             // Zero the boundary face velocity for solid walls
             if (d == 0) { // Left boundary
-                outNode.velocities.right += selfVel.left;
+                // outNode.velocities.right += selfVel.left;
                 outNode.velocities.left = 0;
             } else if (d == 1) { // Right boundary
-                outNode.velocities.left += selfVel.right;
+                // outNode.velocities.left += selfVel.right;
                 outNode.velocities.right = 0;
             } else if (d == 2) { // Bottom boundary
-                outNode.velocities.top += selfVel.bottom;
+                // outNode.velocities.top += selfVel.bottom;
                 outNode.velocities.bottom = 0;
             } else if (d == 3) { // Top boundary
-                outNode.velocities.bottom += selfVel.top;
+                // outNode.velocities.bottom += selfVel.top;
                 outNode.velocities.top = 0;
             } else if (d == 4) { // Front boundary
-                outNode.velocities.back += selfVel.front;
+                // outNode.velocities.back += selfVel.front;
                 outNode.velocities.front = 0;
             } else if (d == 5) { // Back boundary
-                outNode.velocities.front += selfVel.back;
+                // outNode.velocities.front += selfVel.back;
                 outNode.velocities.back = 0;
             }
             continue; // Skip this neighbor direction
@@ -650,8 +673,9 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
         uint faceNeighborBase = neighborBaseIndex + d * 4;
         uint neighbor_idx = neighborsBuffer[faceNeighborBase];
         float pressure_gradient = 0.0;
+        bool isBoundary = (neighbor_idx >= numNodes);
 
-        if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
+        if (!isBoundary && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
             // Case 1: Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
@@ -660,7 +684,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
             pressure_gradient = (p_j - p_i) / distance;
         }
-        else if (dx_i > 0.0)
+        else if (!isBoundary && dx_i > 0.0)
         {
             // Case 2: Child (finer) neighbors
             float avg_p_children = 0.0;
