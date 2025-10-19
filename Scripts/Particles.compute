@@ -1,6 +1,5 @@
 // Each #kernel tells which function to compile; you can have many kernels
 #pragma kernel InitializeParticles
-#pragma kernel AdvectParticles
 #pragma kernel UpdateParticles
 
 
@@ -211,12 +210,14 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // particle.layer = 4;
 
     if (nearCenter) {
-        particle.velocity = float3(0.0, 500.0, 0.0);
+        particle.velocity = float3(0.0, 100.0, 0.0);
     }
     
+
+    float3 normalizedPos = (particle.position - simulationBoundsMin) * mortonNormalizationFactor;
+    normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
     // Generate morton code from normalized position
-    // particle.mortonCode = EncodeMorton3D(normalizedPos);
-    particle.mortonCode = 0;
+    particle.mortonCode = EncodeMorton3D(normalizedPos);
 
     // particle.layer = particle.mortonCode % 10;
     
@@ -227,115 +228,88 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(512,1,1)]
-void AdvectParticles (uint3 id : SV_DispatchThreadID)
-{
-    uint index = id.x;
-    if (index >= count) return;
-
-    Particle particle = particlesBuffer[index];
-    float3 velocity = particle.velocity;
-
-    // Vectors point outward from the face
-
-    velocity.y -= gravity * deltaTime;
-
-    float3 position = particle.position + velocity * deltaTime;
-    // float3 position = particle.position;
-    
-    // Clamp position to simulation bounds and reflect velocity
-    if (position.x <= simulationBoundsMin.x || position.x >= simulationBoundsMax.x) {
-        velocity.x *= -0.5;
-    }
-    if (position.y <= simulationBoundsMin.y || position.y >= simulationBoundsMax.y) {
-        velocity.y *= -0.5;
-    }
-    if (position.z <= simulationBoundsMin.z || position.z >= simulationBoundsMax.z) {
-        velocity.z *= -0.5;
-    }
-
-    position = clamp(position, simulationBoundsMin, simulationBoundsMax);
-
-    particle.position = position;
-    particle.velocity = velocity;
-    // particle.velocity = float3(0.0, -1.0, 0.0);
-
-    float3 normalizedPos = (position - simulationBoundsMin) * mortonNormalizationFactor;
-    normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
-
-    particle.mortonCode = EncodeMorton3D(normalizedPos);
-
-    particlesBuffer[index] = particle;
-}
-
-[numthreads(512,1,1)]
 void UpdateParticles (uint3 id : SV_DispatchThreadID)
 {
     uint index = id.x;
     if (index >= numParticles) return;
 
     Particle particle = particlesBuffer[index];
-    // binary search nodes buffer for particle.mortonCode (find greatest mortonCode < particle.mortonCode)
+
+    // --- 1. Find Containing Grid Cell (Binary Search) ---
+    // (This part of your code is correct and remains unchanged)
     uint target = particle.mortonCode;
     uint left = 0;
-    uint right = (numNodes > 0) ? numNodes : 0; // right is exclusive
+    uint right = (numNodes > 0) ? numNodes : 0;
     while (left < right)
     {
         uint mid = left + ((right - left) >> 1);
         uint midCode = nodesBuffer[mid].mortonCode;
-        if (midCode < target)
-        {
-            left = mid + 1; // keep searching to the right
+        if (midCode < target) {
+            left = mid + 1;
         }
-        else
-        {
-            right = mid; // mid is >= target; move left
+        else {
+            right = mid;
         }
     }
-
-    // left is the first index with code >= target; we want strictly less than target
-    if (left == 0)
-    {
-        // No node has mortonCode < target; nothing to update for this particle
-        return;
-    }
-    uint nodeIndex = left - 1;
-
-    Node node = nodesBuffer[nodeIndex];
-
-    // PIC for now, proof of concept
-
-    // 2. TRILINEAR INTERPOLATION
-    // Get the node's world-space boundaries (reusing your logic from CreateParticles) [cite: 244-250]
-    float3 simulationSize = simulationBoundsMax - simulationBoundsMin;
-    uint cellMortonCode = node.mortonCode & ~((1u << (3 * node.layer)) - 1);
-    uint3 cellGridMin = deinterleave(cellMortonCode);
-    float cellGridSize = exp2((float)node.layer);
-    float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) / 1023.0) * simulationSize;
-    float3 nodeMax = nodeMin + (cellGridSize / 1023.0) * simulationSize;
-
-    // Guard against zero extents to avoid NaNs
-    float3 extent = nodeMax - nodeMin;
-    extent.x = max(extent.x, 1e-6);
-    extent.y = max(extent.y, 1e-6);
-    extent.z = max(extent.z, 1e-6);
-
-    // Calculate the particle's fractional position (0-1) inside the node's bounds
-    float3 t = saturate((particle.position - nodeMin) / extent);
-
-    // Interpolate the NEW (post-solve) velocity
-    float3 newGridVelocity;
-    newGridVelocity.x = lerp(-node.velocities.left, node.velocities.right, t.x);
-    newGridVelocity.y = lerp(-node.velocities.bottom, node.velocities.top, t.y);
-    newGridVelocity.z = lerp(-node.velocities.front, node.velocities.back, t.z);
-
-    // newGridVelocity.x = node.velocities.right - node.velocities.left;
-    // newGridVelocity.y = node.velocities.top - node.velocities.bottom;
-    // newGridVelocity.z = node.velocities.back - node.velocities.front;
-
-    // 3. APPLY VELOCITY UPDATE
     
-    // Option A: Pure PIC Update (simple, but high energy loss)
-    particle.velocity = newGridVelocity;
+    // If the particle is outside the node grid, we can't interpolate.
+    // In this case, we just apply gravity and boundary collision as a fallback.
+    if (left == 0 && numNodes > 0) {
+        // Fallback for particles outside the main fluid body
+        particle.velocity.y -= gravity * deltaTime;
+        particle.position += particle.velocity * deltaTime;
+        
+        if (particle.position.x <= simulationBoundsMin.x || particle.position.x >= simulationBoundsMax.x) { particle.velocity.x *= -0.5; }
+        if (particle.position.y <= simulationBoundsMin.y || particle.position.y >= simulationBoundsMax.y) { particle.velocity.y *= -0.5; }
+        if (particle.position.z <= simulationBoundsMin.z || particle.position.z >= simulationBoundsMax.z) { particle.velocity.z *= -0.5; }
+        particle.position = clamp(particle.position, simulationBoundsMin, simulationBoundsMax);
+    } else {
+        uint nodeIndex = (left > 0) ? left - 1 : 0;
+        Node node = nodesBuffer[nodeIndex];
+
+        // --- 2. Interpolate Velocity from Grid (Trilinear) ---
+        // (This part of your code is correct and remains unchanged)
+        float3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        uint cellMortonCode = node.mortonCode & ~((1u << (3 * node.layer)) - 1);
+        uint3 cellGridMin = deinterleave(cellMortonCode);
+        float cellGridSize = exp2((float)node.layer);
+        float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) / 1023.0) * simulationSize;
+        float3 nodeMax = nodeMin + (cellGridSize / 1023.0) * simulationSize;
+        float3 extent = max(nodeMax - nodeMin, 1e-6);
+        float3 t = saturate((particle.position - nodeMin) / extent);
+        float3 newGridVelocity;
+        newGridVelocity.x = lerp(-node.velocities.left, node.velocities.right, t.x);
+        newGridVelocity.y = lerp(-node.velocities.bottom, node.velocities.top, t.y);
+        newGridVelocity.z = lerp(-node.velocities.front, node.velocities.back, t.z);
+
+        // --- 3. UPDATE PARTICLE VELOCITY & POSITION (THE FIX) ---
+        
+        // Use a PIC/FLIP blend to calculate the new velocity.
+        // This preserves the particle's high-frequency detail (FLIP) while
+        // using the grid's incompressible velocity for stability (PIC).
+        float flip_ratio = 0.95f; // 95% PIC, 5% FLIP
+        float3 newVelocity = lerp(particle.velocity, newGridVelocity, flip_ratio);
+
+        // Advect the particle using its new velocity
+        float3 newPosition = particle.position + newVelocity * deltaTime;
+
+        // Boundary conditions: clamp position and dampen velocity for bounce
+        if (newPosition.x <= simulationBoundsMin.x) { newPosition.x = simulationBoundsMin.x; newVelocity.x *= -0.5; }
+        if (newPosition.x >= simulationBoundsMax.x) { newPosition.x = simulationBoundsMax.x; newVelocity.x *= -0.5; }
+        if (newPosition.y <= simulationBoundsMin.y) { newPosition.y = simulationBoundsMin.y; newVelocity.y *= -0.5; }
+        if (newPosition.y >= simulationBoundsMax.y) { newPosition.y = simulationBoundsMax.y; newVelocity.y *= -0.5; }
+        if (newPosition.z <= simulationBoundsMin.z) { newPosition.z = simulationBoundsMin.z; newVelocity.z *= -0.5; }
+        if (newPosition.z >= simulationBoundsMax.z) { newPosition.z = simulationBoundsMax.z; newVelocity.z *= -0.5; }
+        
+        // Update the particle's state
+        particle.position = newPosition;
+        particle.velocity = newVelocity;
+    }
+
+    // --- 4. Update Morton Code for Next Frame ---
+    float3 normalizedPos = (particle.position - simulationBoundsMin) * mortonNormalizationFactor;
+    normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
+    particle.mortonCode = EncodeMorton3D(normalizedPos);
 
     particlesBuffer[index] = particle;
 }

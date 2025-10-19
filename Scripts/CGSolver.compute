@@ -38,6 +38,7 @@ RWStructuredBuffer<float> yBuffer;
 uint numNodes;
 float maxDetailCellSize; // Smallest cell size in the simulation
 float a; // scalar 'a'
+float deltaTime; // Time step for physics scaling
 
 // Shared memory for dot product reduction
 groupshared float s_data[512];
@@ -76,8 +77,9 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
     {
         uint faceNeighborBase = neighborBaseIndex + d * 4;
         uint neighbor_idx = neighborsBuffer[faceNeighborBase]; // first slot: same/parent layer
+        bool isBoundary = (neighbor_idx >= numNodes);
 
-        if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
+        if (!isBoundary && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
             // Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
@@ -88,7 +90,7 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
             float w = a_shared / distance;
             laplacian_p += w * (p_j - p_i);
         }
-        else
+        else if (!isBoundary)
         {
             // Child (finer) neighbors (up to 4 per face)
             for (int k = 0; k < 4; k++)
@@ -106,9 +108,27 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
                 }
             }
         }
+        // If isBoundary, contribute nothing (Neumann BC)
     }
 
-    float outVal = -laplacian_p;
+    // --- START OF FIX ---
+    // The previous `laplacian_p` is Σ w*(p_j - p_i).
+    // We need to compute Ap = -Δt * (1/V) * Σ w*(p_i - p_j)
+    // This is equivalent to Ap = Δt * (1/V) * Σ w*(p_j - p_i)
+
+    float volume_i = dx_i * dx_i * dx_i;
+    float outVal = laplacian_p / max(volume_i, 1e-9); // This is (∇²p)_i
+    outVal *= deltaTime; // This is (Δt * ∇²p)_i
+    
+    // We are solving -Δt∇²p, so we need one final sign flip.
+    // However, your C# loop computes alpha = r_dot_r / p_dot_Ap, and your original
+    // Ap was -laplacian_p, so your code implicitly expects A to be positive definite.
+    // My math says Ap = Δt * ∇²p. To make it PD, we need Ap = -Δt * ∇²p.
+    // This is -deltaTime * (laplacian_p / volume).
+    
+    outVal = -outVal;
+    // --- END OF FIX ---
+
     if (!isfinite(outVal)) outVal = 0.0;
     ApBuffer[i] = outVal;
 }
