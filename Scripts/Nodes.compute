@@ -78,23 +78,6 @@ uint3 deinterleave(uint m)
     return uint3(x, y, z);
 }
 
-[numthreads(512, 1, 1)]
-void ApplyGravity(uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    if (i >= numNodes) return;
-
-    Node node = nodesBuffer[i];
-    
-    // Apply gravity to vertical face velocities
-    // Gravity acts downwards (-Y)
-    // It should decrease upward velocity (top) and increase downward velocity (bottom)
-    node.velocities.top = max(0.0, node.velocities.top - gravity * deltaTime);
-    node.velocities.bottom = node.velocities.bottom + gravity * deltaTime;
-    
-    nodesBuffer[i] = node;
-}
-
 uint interleave(uint3 p)
 {
     uint m = 0;
@@ -575,6 +558,12 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         }
         else
         {
+            // Initialize all 4 positions with invalid neighbor index
+            for (int i = 0; i < 4; i++)
+            {
+                neighborsBuffer[threadIndex * 24 + faceOffset(d) + i] = numNodes + 1;
+            }
+            
             // child neighbor path only valid if shift >= 3 (layer >= 1)
             if (shift >= 3)
             {
@@ -615,7 +604,7 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                         subNodesLower[2] = 2;
                         subNodesLower[3] = 3;
                     }
-
+                    
                     for (int i = 0; i < 4; i++)
                     {
                         uint subPrefix = nPrefixShifted + subNodesLower[i];
@@ -719,4 +708,16 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
     }
 
     tempNodesBuffer[threadIndex] = outNode;
+}
+
+[numthreads(512, 1, 1)]
+void ApplyGravity(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    Node node = nodesBuffer[threadIndex];
+    node.velocities.top -= gravity * deltaTime;
+    node.velocities.bottom += gravity * deltaTime;
+    nodesBuffer[threadIndex] = node;
 }

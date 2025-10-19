@@ -221,7 +221,7 @@ Transform:
   m_GameObject: {fileID: 72561708}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalPosition: {x: 0, y: 50, z: 0}
   m_LocalScale: {x: 100, y: 100, z: 100}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -314,7 +314,7 @@ Transform:
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
   m_LocalRotation: {x: 0.13241215, y: 0.26848885, z: -0.03728845, w: 0.9534099}
-  m_LocalPosition: {x: -84.38203, y: 30.758503, z: -131.29388}
+  m_LocalPosition: {x: -77.8, y: 74.8, z: -120.7}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -539,10 +539,10 @@ MonoBehaviour:
   numParticles: 1048576
   maxCgIterations: 50
   convergenceThreshold: 10000
-  gravity: 9.8
+  gravity: 100
   frameRate: 60
   minLayer: 4
-  maxLayer: 10
+  maxLayer: 4
   surfaceLayer: 4
   velocitySensitivity: 320
   particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
@@ -697,7 +697,7 @@ Transform:
   m_GameObject: {fileID: 1326165318}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: -25, z: 0}
+  m_LocalPosition: {x: 0, y: 30, z: 0}
   m_LocalScale: {x: 100, y: 50, z: 100}
   m_ConstrainProportionsScale: 0
   m_Children: []
