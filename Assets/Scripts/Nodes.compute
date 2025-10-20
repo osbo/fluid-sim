@@ -4,6 +4,7 @@
 #pragma kernel copyFaceVelocities
 #pragma kernel ApplyPressureGradient
 #pragma kernel ApplyGravity
+#pragma kernel EnforceBoundaryConditions
 
 struct faceVelocities
 {
@@ -497,26 +498,26 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
-            // Zero the boundary face velocity for solid walls
-            if (d == 0) { // Left boundary
-                // outNode.velocities.right += selfVel.left;
-                outNode.velocities.left = 0;
-            } else if (d == 1) { // Right boundary
-                // outNode.velocities.left += selfVel.right;
-                outNode.velocities.right = 0;
-            } else if (d == 2) { // Bottom boundary
-                // outNode.velocities.top += selfVel.bottom;
-                outNode.velocities.bottom = 0;
-            } else if (d == 3) { // Top boundary
-                // outNode.velocities.bottom += selfVel.top;
-                outNode.velocities.top = 0;
-            } else if (d == 4) { // Front boundary
-                // outNode.velocities.back += selfVel.front;
-                outNode.velocities.front = 0;
-            } else if (d == 5) { // Back boundary
-                // outNode.velocities.front += selfVel.back;
-                outNode.velocities.back = 0;
-            }
+            // // Zero the boundary face velocity for solid walls
+            // if (d == 0) { // Left boundary
+            //     outNode.velocities.right += selfVel.left;
+            //     outNode.velocities.left = 0;
+            // } else if (d == 1) { // Right boundary
+            //     outNode.velocities.left += selfVel.right;
+            //     outNode.velocities.right = 0;
+            // } else if (d == 2) { // Bottom boundary
+            //     outNode.velocities.top += selfVel.bottom;
+            //     outNode.velocities.bottom = 0;
+            // } else if (d == 3) { // Top boundary
+            //     outNode.velocities.bottom += selfVel.top;
+            //     outNode.velocities.top = 0;
+            // } else if (d == 4) { // Front boundary
+            //     outNode.velocities.back += selfVel.front;
+            //     outNode.velocities.front = 0;
+            // } else if (d == 5) { // Back boundary
+            //     outNode.velocities.front += selfVel.back;
+            //     outNode.velocities.back = 0;
+            // }
             continue; // Skip this neighbor direction
         }
         
@@ -719,5 +720,33 @@ void ApplyGravity(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[threadIndex];
     node.velocities.top -= gravity * deltaTime;
     node.velocities.bottom += gravity * deltaTime;
+    nodesBuffer[threadIndex] = node;
+}
+
+[numthreads(512, 1, 1)]
+void EnforceBoundaryConditions(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    Node node = nodesBuffer[threadIndex];
+    
+    uint shift = node.layer * 3;
+    uint prefix = node.mortonCode >> shift;
+    uint3 coord = deinterleave(prefix);
+    uint gridDim = 1u << (10 - node.layer);
+
+    // Check X boundaries
+    if (coord.x == 0) node.velocities.left = 0;
+    if (coord.x == gridDim - 1) node.velocities.right = 0;
+    
+    // Check Y boundaries
+    if (coord.y == 0) node.velocities.bottom = 0;
+    if (coord.y == gridDim - 1) node.velocities.top = 0;
+
+    // Check Z boundaries
+    if (coord.z == 0) node.velocities.front = 0;
+    if (coord.z == gridDim - 1) node.velocities.back = 0;
+    
     nodesBuffer[threadIndex] = node;
 }

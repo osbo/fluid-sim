@@ -1,6 +1,6 @@
-#pragma kernel CalculateDivergence
 #pragma kernel ApplyLaplacian
 #pragma kernel Axpy // y = a*x + y
+#pragma kernel CalculateDivergence
 #pragma kernel DotProduct
 
 // Include common HLSL functions
@@ -52,29 +52,29 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[i];
     faceVelocities v = node.velocities;
     
-    // Get neighbor indices for each face
+    // Get neighbor indices for each face (corrected mapping to match faceOffset function)
     uint neighborBaseIndex = i * 24;
-    uint rightNeighbor = neighborsBuffer[neighborBaseIndex + 0]; // right face
-    uint leftNeighbor = neighborsBuffer[neighborBaseIndex + 4];  // left face  
-    uint topNeighbor = neighborsBuffer[neighborBaseIndex + 8];  // top face
-    uint bottomNeighbor = neighborsBuffer[neighborBaseIndex + 12]; // bottom face
-    uint backNeighbor = neighborsBuffer[neighborBaseIndex + 16]; // back face
-    uint frontNeighbor = neighborsBuffer[neighborBaseIndex + 20]; // front face
+    uint rightNeighbor = neighborsBuffer[neighborBaseIndex + 4]; // right face (d=1, offset=4)
+    uint leftNeighbor = neighborsBuffer[neighborBaseIndex + 0];  // left face (d=0, offset=0)
+    uint topNeighbor = neighborsBuffer[neighborBaseIndex + 12];  // top face (d=3, offset=12)
+    uint bottomNeighbor = neighborsBuffer[neighborBaseIndex + 8]; // bottom face (d=2, offset=8)
+    uint backNeighbor = neighborsBuffer[neighborBaseIndex + 20]; // back face (d=5, offset=20)
+    uint frontNeighbor = neighborsBuffer[neighborBaseIndex + 16]; // front face (d=4, offset=16)
     
-    // Calculate face velocities, taking min with 0 if no neighbor (numNodes + 1)
-    float rightVel = (rightNeighbor == numNodes + 1) ? min(v.right, 0.0) : v.right;
-    float leftVel = (leftNeighbor == numNodes + 1) ? min(v.left, 0.0) : v.left;
-    float topVel = (topNeighbor == numNodes + 1) ? min(v.top, 0.0) : v.top;
-    float bottomVel = (bottomNeighbor == numNodes + 1) ? min(v.bottom, 0.0) : v.bottom;
-    float backVel = (backNeighbor == numNodes + 1) ? min(v.back, 0.0) : v.back;
-    float frontVel = (frontNeighbor == numNodes + 1) ? min(v.front, 0.0) : v.front;
+    // CORRECTED: Check for any boundary index >= numNodes (consistent with ApplyLaplacian)
+    // float rightVel = (rightNeighbor >= numNodes) ? 0.0 : v.right;
+    // float leftVel = (leftNeighbor >= numNodes) ? 0.0 : v.left;
+    // float topVel = (topNeighbor >= numNodes) ? 0.0 : v.top;
+    // float bottomVel = (bottomNeighbor >= numNodes) ? 0.0 : v.bottom;
+    // float backVel = (backNeighbor >= numNodes) ? 0.0 : v.back;
+    // float frontVel = (frontNeighbor >= numNodes) ? 0.0 : v.front;
 
-    // float rightVel = v.right;
-    // float leftVel = v.left;
-    // float topVel = v.top;
-    // float bottomVel = v.bottom;
-    // float backVel = v.back;
-    // float frontVel = v.front;
+    float rightVel = v.right;
+    float leftVel = v.left;
+    float topVel = v.top;
+    float bottomVel = v.bottom;
+    float backVel = v.back;
+    float frontVel = v.front;
 
     float divergence = rightVel + leftVel + topVel + bottomVel + backVel + frontVel;
     float dx = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
@@ -102,9 +102,9 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
         uint faceNeighborBase = neighborBaseIndex + d * 4;
         uint neighbor_idx = neighborsBuffer[faceNeighborBase]; // first slot: same/parent layer
         bool isBoundary = (neighbor_idx >= numNodes);
-        bool isFreeBoundary = (neighbor_idx == numNodes + 1);
+        // bool isFreeBoundary = (neighbor_idx == numNodes + 1);
 
-        if (!isBoundary && !isFreeBoundary && nodesBuffer[neighbor_idx].layer >= node.layer)
+        if (!isBoundary && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
             // Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
