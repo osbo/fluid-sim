@@ -1,5 +1,6 @@
 #pragma kernel ApplyLaplacian
 #pragma kernel Axpy // y = a*x + y
+#pragma kernel Scale // y = a*y
 #pragma kernel CalculateDivergence
 #pragma kernel DotProduct
 
@@ -62,19 +63,19 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     uint frontNeighbor = neighborsBuffer[neighborBaseIndex + 16]; // front face (d=4, offset=16)
     
     // CORRECTED: Check for any boundary index >= numNodes (consistent with ApplyLaplacian)
-    // float rightVel = (rightNeighbor >= numNodes) ? 0.0 : v.right;
-    // float leftVel = (leftNeighbor >= numNodes) ? 0.0 : v.left;
-    // float topVel = (topNeighbor >= numNodes) ? 0.0 : v.top;
-    // float bottomVel = (bottomNeighbor >= numNodes) ? 0.0 : v.bottom;
-    // float backVel = (backNeighbor >= numNodes) ? 0.0 : v.back;
-    // float frontVel = (frontNeighbor >= numNodes) ? 0.0 : v.front;
+    float rightVel = (rightNeighbor >= numNodes) ? 0.0 : v.right;
+    float leftVel = (leftNeighbor >= numNodes) ? 0.0 : v.left;
+    float topVel = (topNeighbor >= numNodes) ? 0.0 : v.top;
+    float bottomVel = (bottomNeighbor >= numNodes) ? 0.0 : v.bottom;
+    float backVel = (backNeighbor >= numNodes) ? 0.0 : v.back;
+    float frontVel = (frontNeighbor >= numNodes) ? 0.0 : v.front;
 
-    float rightVel = v.right;
-    float leftVel = v.left;
-    float topVel = v.top;
-    float bottomVel = v.bottom;
-    float backVel = v.back;
-    float frontVel = v.front;
+    // float rightVel = v.right;
+    // float leftVel = v.left;
+    // float topVel = v.top;
+    // float bottomVel = v.bottom;
+    // float backVel = v.back;
+    // float frontVel = v.front;
 
     float divergence = rightVel + leftVel + topVel + bottomVel + backVel + frontVel;
     float dx = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
@@ -136,36 +137,48 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
         }
         else if (!isBoundary)
         {
-            // Child (finer) neighbors (up to 4 per face)
+            // Child (finer) neighbors. First, average their pressures.
+            float avg_p_children = 0.0;
+            uint childCount = 0;
+            float dx_c_avg = 0.0;
+
             for (int k = 0; k < 4; k++)
             {
                 uint child_idx = neighborsBuffer[faceNeighborBase + k];
-                if (child_idx < numNodes && child_idx != numNodes + 1)
+                if (child_idx < numNodes)
                 {
-                    Node cNode = nodesBuffer[child_idx];
-                    float p_c = pBuffer[child_idx];
-                    
-                    // Guard against NaN values
-                    if (!isfinite(p_c)) p_c = 0.0;
-                    
-                    float dx_c = max(maxDetailCellSize * exp2((float)cNode.layer), 1e-6);
-                    if (!isfinite(dx_c)) dx_c = 1e-6;
-                    
-                    float distance = max(0.5 * (dx_i + dx_c), 1e-6);
-                    if (!isfinite(distance)) distance = 1e-6;
-                    
-                    float a_shared = dx_c * dx_c; // child face area
-                    if (!isfinite(a_shared)) a_shared = 1e-12;
-                    
-                    float w = a_shared / distance;
-                    if (!isfinite(w)) w = 0.0;
-                    
-                    float contribution = w * (p_c - p_i);
-                    if (!isfinite(contribution)) contribution = 0.0;
-                    
-                    laplacian_p += contribution;
+                    avg_p_children += pBuffer[child_idx];
+                    dx_c_avg += max(maxDetailCellSize * exp2((float)nodesBuffer[child_idx].layer), 1e-6);
+                    childCount++;
                 }
             }
+
+            if (childCount > 0)
+            {
+                avg_p_children /= (float)childCount;
+                dx_c_avg /= (float)childCount;
+
+                // Now, calculate a SINGLE flux using the averaged pressure.
+                float p_j = avg_p_children;
+                if (!isfinite(p_j)) p_j = 0.0;
+
+                // Distance is between the center of the coarse cell and the center of the child face plane.
+                float distance = max(0.5 * (dx_i + dx_c_avg), 1e-6);
+                if (!isfinite(distance)) distance = 1e-6;
+
+                // The shared area is the area of the coarse face.
+                float a_shared = dx_i * dx_i;
+                if (!isfinite(a_shared)) a_shared = 1e-12;
+
+                float w = a_shared / distance;
+                if (!isfinite(w)) w = 0.0;
+
+                float contribution = w * (p_j - p_i);
+                if (!isfinite(contribution)) contribution = 0.0;
+                
+                laplacian_p += contribution;
+            }
+            // If childCount is 0, it's a boundary, and we contribute nothing (Neumann BC).
         }
         // If isBoundary or isFreeBoundary, contribute nothing (Neumann BC)
     }
@@ -206,6 +219,21 @@ void Axpy(uint3 id : SV_DispatchThreadID) {
     if (!isfinite(a)) a = 0.0;
     
     float result = a * x_val + y_val;
+    if (!isfinite(result)) result = 0.0;
+    
+    yBuffer[i] = result;
+}
+
+[numthreads(512, 1, 1)]
+void Scale(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i >= numNodes) return;
+    
+    float y_val = yBuffer[i];
+    if (!isfinite(y_val)) y_val = 0.0;
+    if (!isfinite(a)) a = 0.0;
+    
+    float result = a * y_val;
     if (!isfinite(result)) result = 0.0;
     
     yBuffer[i] = result;

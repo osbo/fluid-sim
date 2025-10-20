@@ -211,9 +211,9 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // particle.layer = 11;
     // particle.layer = 4;
 
-    if (nearCenter) {
-        particle.velocity = float3(0.0, 100.0, 0.0);
-    }
+    // if (nearCenter) {
+    //     particle.velocity = float3(0.0, 100.0, 0.0);
+    // }
     
 
     float3 normalizedPos = (particle.position - simulationBoundsMin) * mortonNormalizationFactor;
@@ -309,7 +309,7 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
         // FLIP method: Calculate velocity delta and blend
         float3 grid_velocity_delta = newGridVelocity - oldGridVelocity;
         float3 flip_velocity = particle.velocity + grid_velocity_delta;
-        float flip_ratio = 0.5f;
+        float flip_ratio = 0.95f;
         float3 newVelocity = lerp(newGridVelocity, flip_velocity, flip_ratio);
 
         // Advect the particle and apply boundary conditions

@@ -553,7 +553,7 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         else if ((idx_leq_mc >> (shift + 3)) == (nPrefix >> 3) && idx_leq_layer == node.layer + 1)
         {
             // parent neighbor (divide incoming velocity by 4)
-            float oppP = selectOpposingFace(nNode.velocities, d) * 0.25;
+            float oppP = selectOpposingFace(nNode.velocities, d);
             subtractToFace(outNode, d, oppP);
             neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
         }
@@ -606,6 +606,8 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                         subNodesLower[3] = 3;
                     }
                     
+                    uint numChildNeighbors = 0;
+                    float totalChildVelocity = 0.0;
                     for (int i = 0; i < 4; i++)
                     {
                         uint subPrefix = nPrefixShifted + subNodesLower[i];
@@ -621,10 +623,16 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                             if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
                             {
                                 float oppC = selectOpposingFace(cNode.velocities, d);
-                                subtractToFace(outNode, d, oppC);
+                                // subtractToFace(outNode, d, oppC);
+                                totalChildVelocity += oppC;
                                 neighborsBuffer[threadIndex * 24 + faceOffset(d) + i] = idx_sub;
+                                numChildNeighbors++;
                             }
                         }
+                    }
+                    if (numChildNeighbors != 0)
+                    {
+                        subtractToFace(outNode, d, totalChildVelocity / numChildNeighbors);
                     }
                 }
             }

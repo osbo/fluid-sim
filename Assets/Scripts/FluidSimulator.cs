@@ -655,19 +655,22 @@ public class FluidSimulator : MonoBehaviour
     {
         if (cgSolverShader == null) return;
 
+        // Find the new Scale kernel (and the existing Axpy kernel)
+        int scaleKernel = cgSolverShader.FindKernel("Scale");
         int axpyKernel = cgSolverShader.FindKernel("Axpy");
         
-        // First: p = beta * p
-        cgSolverShader.SetBuffer(axpyKernel, "xBuffer", pBuffer);
-        cgSolverShader.SetBuffer(axpyKernel, "yBuffer", pBuffer);
-        cgSolverShader.SetFloat("a", pCoeff);
+        // --- CORRECTED LOGIC ---
+
+        // First, scale p by beta: p_new = beta * p_old
+        cgSolverShader.SetBuffer(scaleKernel, "yBuffer", pBuffer);
+        cgSolverShader.SetFloat("a", pCoeff); // pCoeff is beta
         cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(axpyKernel, numNodes);
+        Dispatch(scaleKernel, numNodes);
         
-        // Then: p = r + p (where p is now beta * p)
+        // Then, add r: p_new = r_new + p_new (which is now beta * p_old)
         cgSolverShader.SetBuffer(axpyKernel, "xBuffer", rBuffer);
         cgSolverShader.SetBuffer(axpyKernel, "yBuffer", pBuffer);
-        cgSolverShader.SetFloat("a", rCoeff);
+        cgSolverShader.SetFloat("a", rCoeff); // rCoeff is 1.0
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(axpyKernel, numNodes);
     }
