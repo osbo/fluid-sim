@@ -93,7 +93,11 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
     float p_i = pBuffer[i];
     float laplacian_p = 0.0;
 
+    // Guard against NaN values in input
+    if (!isfinite(p_i)) p_i = 0.0;
+
     float dx_i = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
+    if (!isfinite(dx_i)) dx_i = 1e-6;
     uint neighborBaseIndex = i * 24;
 
     // Loop over all 6 faces of the node
@@ -109,11 +113,26 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
             // Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
             float p_j = pBuffer[neighbor_idx];
+            
+            // Guard against NaN values
+            if (!isfinite(p_j)) p_j = 0.0;
+            
             float dx_j = max(maxDetailCellSize * exp2((float)nNode.layer), 1e-6);
+            if (!isfinite(dx_j)) dx_j = 1e-6;
+            
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
+            if (!isfinite(distance)) distance = 1e-6;
+            
             float a_shared = min(dx_i, dx_j) * min(dx_i, dx_j);
+            if (!isfinite(a_shared)) a_shared = 1e-12;
+            
             float w = a_shared / distance;
-            laplacian_p += w * (p_j - p_i);
+            if (!isfinite(w)) w = 0.0;
+            
+            float contribution = w * (p_j - p_i);
+            if (!isfinite(contribution)) contribution = 0.0;
+            
+            laplacian_p += contribution;
         }
         else if (!isBoundary)
         {
@@ -125,11 +144,26 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
                 {
                     Node cNode = nodesBuffer[child_idx];
                     float p_c = pBuffer[child_idx];
+                    
+                    // Guard against NaN values
+                    if (!isfinite(p_c)) p_c = 0.0;
+                    
                     float dx_c = max(maxDetailCellSize * exp2((float)cNode.layer), 1e-6);
+                    if (!isfinite(dx_c)) dx_c = 1e-6;
+                    
                     float distance = max(0.5 * (dx_i + dx_c), 1e-6);
+                    if (!isfinite(distance)) distance = 1e-6;
+                    
                     float a_shared = dx_c * dx_c; // child face area
+                    if (!isfinite(a_shared)) a_shared = 1e-12;
+                    
                     float w = a_shared / distance;
-                    laplacian_p += w * (p_c - p_i);
+                    if (!isfinite(w)) w = 0.0;
+                    
+                    float contribution = w * (p_c - p_i);
+                    if (!isfinite(contribution)) contribution = 0.0;
+                    
+                    laplacian_p += contribution;
                 }
             }
         }
@@ -162,7 +196,19 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
 void Axpy(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
     if (i >= numNodes) return;
-    yBuffer[i] = a * xBuffer[i] + yBuffer[i];
+    
+    float x_val = xBuffer[i];
+    float y_val = yBuffer[i];
+    
+    // Guard against NaN values
+    if (!isfinite(x_val)) x_val = 0.0;
+    if (!isfinite(y_val)) y_val = 0.0;
+    if (!isfinite(a)) a = 0.0;
+    
+    float result = a * x_val + y_val;
+    if (!isfinite(result)) result = 0.0;
+    
+    yBuffer[i] = result;
 }
 
 // For Dot Product (a simple, multi-pass reduction)
@@ -171,17 +217,31 @@ void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id 
     uint i = id.x;
     uint li = Gtid.x;
 
-    s_data[li] = (i < numNodes) ? xBuffer[i] * yBuffer[i] : 0;
+    float x_val = (i < numNodes) ? xBuffer[i] : 0.0;
+    float y_val = (i < numNodes) ? yBuffer[i] : 0.0;
+    
+    // Guard against NaN values
+    if (!isfinite(x_val)) x_val = 0.0;
+    if (!isfinite(y_val)) y_val = 0.0;
+    
+    float product = x_val * y_val;
+    if (!isfinite(product)) product = 0.0;
+    
+    s_data[li] = product;
     GroupMemoryBarrierWithGroupSync();
 
     for (uint s = 256; s > 0; s >>= 1) {
         if (li < s) {
-            s_data[li] += s_data[li + s];
+            float sum = s_data[li] + s_data[li + s];
+            if (!isfinite(sum)) sum = 0.0;
+            s_data[li] = sum;
         }
         GroupMemoryBarrierWithGroupSync();
     }
 
     if (li == 0) {
-        divergenceBuffer[Gid.x] = s_data[0];
+        float result = s_data[0];
+        if (!isfinite(result)) result = 0.0;
+        divergenceBuffer[Gid.x] = result;
     }
 }
