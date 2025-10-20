@@ -57,6 +57,7 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer nodeCount;
     private ComputeBuffer auxSmall;
     private ComputeBuffer nodesBuffer;
+    private ComputeBuffer nodesBufferOld;
     private ComputeBuffer tempNodesBuffer;
     private ComputeBuffer neighborsBuffer;
     private ComputeBuffer divergenceBuffer;
@@ -249,6 +250,11 @@ public class FluidSimulator : MonoBehaviour
         pullVelocities();
         pullVelocitiesSw.Stop();
 
+        // Step 4.5: Store old velocities for FLIP method
+        var storeOldVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
+        StoreOldVelocities();
+        storeOldVelocitiesSw.Stop();
+
         // Step 5: Apply gravity on the grid
         var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
         ApplyGravity();
@@ -296,9 +302,28 @@ public class FluidSimulator : MonoBehaviour
                  $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Pull Velocities: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Apply Gravity: {applyGravitySw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
+    }
+
+    private void StoreOldVelocities()
+    {
+        // Release and recreate nodesBufferOld each frame since numNodes changes
+        nodesBufferOld?.Release();
+        nodesBufferOld = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        
+        // Copy current nodesBuffer to nodesBufferOld
+        if (nodesBuffer != null && nodesBufferOld != null)
+        {
+            // Get data from nodesBuffer
+            Node[] nodesData = new Node[numNodes];
+            nodesBuffer.GetData(nodesData);
+            
+            // Set data to nodesBufferOld
+            nodesBufferOld.SetData(nodesData);
+        }
     }
 
     private void UpdateParticles()
@@ -311,8 +336,9 @@ public class FluidSimulator : MonoBehaviour
 
         updateParticlesKernel = particlesShader.FindKernel("UpdateParticles");
 
-        // need: nodes buffer, particles buffer, numNodes, numParticles
+        // need: nodes buffer, nodes buffer old, particles buffer, numNodes, numParticles
         particlesShader.SetBuffer(updateParticlesKernel, "nodesBuffer", nodesBuffer);
+        particlesShader.SetBuffer(updateParticlesKernel, "nodesBufferOld", nodesBufferOld);
         particlesShader.SetBuffer(updateParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetInt("numNodes", numNodes);
         particlesShader.SetInt("numParticles", numParticles);
@@ -1346,6 +1372,7 @@ public class FluidSimulator : MonoBehaviour
         uniqueCount?.Release();
         nodeCount?.Release();
         nodesBuffer?.Release();
+        nodesBufferOld?.Release();
         tempNodesBuffer?.Release();
         neighborsBuffer?.Release();
         divergenceBuffer?.Release();

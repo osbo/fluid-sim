@@ -119,6 +119,7 @@ uint faceOffset(int d)
 // Buffer definitions
 RWStructuredBuffer<Particle> particlesBuffer;
 RWStructuredBuffer<Node> nodesBuffer;
+RWStructuredBuffer<Node> nodesBufferOld;  // Old velocities for FLIP method
 RWStructuredBuffer<uint> mortonCodesBuffer;  // Separate morton codes buffer
 RWStructuredBuffer<uint> particleIndicesBuffer;  // Separate indices buffer
 // nodeFlagsBuffer moved to Nodes.compute
@@ -277,18 +278,32 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
         float3 nodeMax = nodeMin + (cellGridSize / 1023.0) * simulationSize;
         float3 extent = max(nodeMax - nodeMin, 1e-6);
         float3 t = saturate((particle.position - nodeMin) / extent);
+        
+        // Interpolate new velocity (current grid state)
         float3 newGridVelocity;
         newGridVelocity.x = lerp(-node.velocities.left, node.velocities.right, t.x);
         newGridVelocity.y = lerp(-node.velocities.bottom, node.velocities.top, t.y);
         newGridVelocity.z = lerp(-node.velocities.front, node.velocities.back, t.z);
 
-        // --- 3. UPDATE PARTICLE VELOCITY & POSITION (THE FIX) ---
+        // --- 3. FLIP METHOD: Calculate velocity delta ---
+        // Get old node state for FLIP calculation
+        Node nodeOld = nodesBufferOld[nodeIndex];
         
-        // Use a PIC/FLIP blend to calculate the new velocity.
-        // This preserves the particle's high-frequency detail (FLIP) while
-        // using the grid's incompressible velocity for stability (PIC).
-        float flip_ratio = 0.95f; // 95% PIC, 5% FLIP
-        float3 newVelocity = lerp(particle.velocity, newGridVelocity, flip_ratio);
+        // Interpolate old velocity (from the stored buffer)
+        float3 oldGridVelocity;
+        oldGridVelocity.x = lerp(-nodeOld.velocities.left, nodeOld.velocities.right, t.x);
+        oldGridVelocity.y = lerp(-nodeOld.velocities.bottom, nodeOld.velocities.top, t.y);
+        oldGridVelocity.z = lerp(-nodeOld.velocities.front, nodeOld.velocities.back, t.z);
+
+        // Calculate the change in grid velocity
+        float3 grid_velocity_delta = newGridVelocity - oldGridVelocity;
+
+        // Calculate the FLIP velocity
+        float3 flip_velocity = particle.velocity + grid_velocity_delta;
+
+        // Blend between PIC (newGridVelocity) and FLIP (flip_velocity)
+        float flip_ratio = 0.95f; // 95% FLIP, 5% PIC
+        float3 newVelocity = lerp(newGridVelocity, flip_velocity, flip_ratio);
 
         // Advect the particle using its new velocity
         float3 newPosition = particle.position + newVelocity * deltaTime;
