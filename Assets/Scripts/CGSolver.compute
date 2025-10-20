@@ -76,7 +76,7 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     // float backVel = v.back;
     // float frontVel = v.front;
 
-    float divergence = rightVel - leftVel + topVel - bottomVel + backVel - frontVel;
+    float divergence = rightVel + leftVel + topVel + bottomVel + backVel + frontVel;
     float dx = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
     float outVal = -divergence / dx;
     if (!isfinite(outVal)) outVal = 0.0;
