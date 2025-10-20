@@ -538,9 +538,9 @@ MonoBehaviour:
   cgSolverShader: {fileID: 7200000, guid: d5297ef94acc94983b6222dcf43123f9, type: 3}
   numParticles: 1048576
   maxCgIterations: 50
-  convergenceThreshold: 10000
-  gravity: 100
-  frameRate: 60
+  convergenceThreshold: 10
+  gravity: 10
+  frameRate: 20
   minLayer: 4
   maxLayer: 4
   surfaceLayer: 4
@@ -697,8 +697,8 @@ Transform:
   m_GameObject: {fileID: 1326165318}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 30, z: 0}
-  m_LocalScale: {x: 100, y: 50, z: 100}
+  m_LocalPosition: {x: 0, y: 40, z: 0}
+  m_LocalScale: {x: 50, y: 50, z: 50}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}

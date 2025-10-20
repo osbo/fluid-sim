@@ -45,6 +45,7 @@ public class FluidSimulator : MonoBehaviour
     private int applyPressureGradientKernel;
     private int updateParticlesKernel;
     private int applyGravityKernel;
+    private int enforceBoundaryConditionsKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -260,6 +261,11 @@ public class FluidSimulator : MonoBehaviour
         ApplyGravity();
         applyGravitySw.Stop();
 
+        // Step 5.5: Enforce boundary conditions
+        var enforceBoundarySw = System.Diagnostics.Stopwatch.StartNew();
+        EnforceBoundaryConditions();
+        enforceBoundarySw.Stop();
+
         // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
         SolvePressure();
@@ -304,6 +310,7 @@ public class FluidSimulator : MonoBehaviour
                  $"• Pull Velocities: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Apply Gravity: {applyGravitySw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Enforce Boundaries: {enforceBoundarySw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
     }
@@ -1173,6 +1180,24 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetFloat("deltaTime", (1 / frameRate));
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(applyGravityKernel, threadGroups, 1, 1);
+    }
+
+    private void EnforceBoundaryConditions()
+    {
+        if (nodesShader == null) return;
+        
+        enforceBoundaryConditionsKernel = nodesShader.FindKernel("EnforceBoundaryConditions");
+        if (enforceBoundaryConditionsKernel < 0)
+        {
+            Debug.LogError("EnforceBoundaryConditions kernel not found in Nodes.compute shader.");
+            return;
+        }
+        
+        nodesShader.SetBuffer(enforceBoundaryConditionsKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+        nodesShader.Dispatch(enforceBoundaryConditionsKernel, threadGroups, 1, 1);
     }
 
     private void ClearUniqueBuffers()
