@@ -47,9 +47,9 @@ uint EncodeMorton3D(float3 pos)
     
     // Interleave bits for 32-bit Morton code (10 bits per axis = 30 bits total)
     for (int i = 0;i < 10;i++) {
-        result |= ((x & (1U << i)) << (2 * i));
-        result |= ((y & (1U << i)) << (2 * i + 1));
-        result |= ((z & (1U << i)) << (2 * i + 2));
+        result |= ((x & (1U << i)) << (3 * i));
+        result |= ((y & (1U << i)) << (3 * i + 1));
+        result |= ((z & (1U << i)) << (3 * i + 2));
     }
     
     return result;
@@ -75,9 +75,9 @@ uint interleave(uint3 p)
     uint m = 0;
     for (uint i = 0;i < 10;i++)
     {
-        m |= ((p.x & (1u << i)) << (2 * i + 0));
-        m |= ((p.y & (1u << i)) << (2 * i + 1));
-        m |= ((p.z & (1u << i)) << (2 * i + 2));
+        m |= ((p.x & (1u << i)) << (3 * i + 0));
+        m |= ((p.y & (1u << i)) << (3 * i + 1));
+        m |= ((p.z & (1u << i)) << (3 * i + 2));
     }
     return m;
 }
@@ -342,8 +342,8 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
         newVelocity.y -= gravity * deltaTime;
 
-        float bounceDamping = 0.5f;
-        float epsilon = 0.001f;
+        float bounceDamping = 0.1f;  // Much more damping to reduce bouncing
+        float epsilon = 0.1f;  // Larger epsilon to prevent boundary sticking
 
         if (newPosition.x <= simulationBoundsMin.x) { newPosition.x = simulationBoundsMin.x + epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
         if (newPosition.x >= simulationBoundsMax.x) { newPosition.x = simulationBoundsMax.x - epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
