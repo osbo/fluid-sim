@@ -258,7 +258,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 5: Apply gravity on the grid
         var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
-        ApplyGravity();
+        // ApplyGravity();
         applyGravitySw.Stop();
 
         // Step 5.5: Enforce boundary conditions
@@ -268,17 +268,26 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
-        SolvePressure();
+        // SolvePressure();
         solvePressureSw.Stop();
 
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // string str = "Node velocities:\n";
-        // for (int i = 0; i < 40 && i < numNodes; i++)
-        // {
-        //     str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        // }
-        // Debug.Log(str);
+        particlesCPU = new Particle[numParticles];
+        particlesBuffer.GetData(particlesCPU);
+        string str = "Particle velocities:\n";
+        for (int i = 0; i < 40 && i < numParticles; i++)
+        {
+            str += $"Particle {i}: Velocity {particlesCPU[i].velocity}\n";
+        }
+        Debug.Log(str);
+
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        str = "Node velocities:\n";
+        for (int i = 0; i < 40 && i < numNodes; i++)
+        {
+            str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        }
+        Debug.Log(str);
 
         // Step 7: Update particles
         var updateParticlesSw = System.Diagnostics.Stopwatch.StartNew();
