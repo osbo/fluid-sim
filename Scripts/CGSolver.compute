@@ -21,6 +21,7 @@ struct faceVelocities
 struct Node
 {
     float3 position;    // 12 bytes
+    float3 velocity;    // 12 bytes
     faceVelocities velocities;    // 24 bytes
     float mass;          // 4 bytes
     uint layer;         // 4 bytes
@@ -52,32 +53,8 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
 
     Node node = nodesBuffer[i];
     faceVelocities v = node.velocities;
-    
-    // Get neighbor indices for each face (corrected mapping to match faceOffset function)
-    uint neighborBaseIndex = i * 24;
-    uint rightNeighbor = neighborsBuffer[neighborBaseIndex + 4]; // right face (d=1, offset=4)
-    uint leftNeighbor = neighborsBuffer[neighborBaseIndex + 0];  // left face (d=0, offset=0)
-    uint topNeighbor = neighborsBuffer[neighborBaseIndex + 12];  // top face (d=3, offset=12)
-    uint bottomNeighbor = neighborsBuffer[neighborBaseIndex + 8]; // bottom face (d=2, offset=8)
-    uint backNeighbor = neighborsBuffer[neighborBaseIndex + 20]; // back face (d=5, offset=20)
-    uint frontNeighbor = neighborsBuffer[neighborBaseIndex + 16]; // front face (d=4, offset=16)
-    
-    // CORRECTED: Check for any boundary index >= numNodes (consistent with ApplyLaplacian)
-    float rightVel = (rightNeighbor >= numNodes) ? 0.0 : v.right;
-    float leftVel = (leftNeighbor >= numNodes) ? 0.0 : v.left;
-    float topVel = (topNeighbor >= numNodes) ? 0.0 : v.top;
-    float bottomVel = (bottomNeighbor >= numNodes) ? 0.0 : v.bottom;
-    float backVel = (backNeighbor >= numNodes) ? 0.0 : v.back;
-    float frontVel = (frontNeighbor >= numNodes) ? 0.0 : v.front;
 
-    // float rightVel = v.right;
-    // float leftVel = v.left;
-    // float topVel = v.top;
-    // float bottomVel = v.bottom;
-    // float backVel = v.back;
-    // float frontVel = v.front;
-
-    float divergence = rightVel + leftVel + topVel + bottomVel + backVel + frontVel;
+    float divergence = v.right - v.left + v.top - v.bottom + v.back - v.front;
     float dx = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
     float outVal = -divergence / dx;
     if (!isfinite(outVal)) outVal = 0.0;

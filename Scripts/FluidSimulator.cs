@@ -79,7 +79,6 @@ public class FluidSimulator : MonoBehaviour
     public int maxLayer;
     public int surfaceLayer;
     public float velocitySensitivity;
-    private float divergenceMultiplier = 50.0f;
 
     private string str;
     private int activeCount;
@@ -117,6 +116,7 @@ public class FluidSimulator : MonoBehaviour
     private struct Node
     {
         public Vector3 position;    // 12 bytes
+        public Vector3 velocity;    // 12 bytes
         public faceVelocities velocities; // 6*4 = 24 bytes
         public float mass;             // 4 bytes
         public uint layer;          // 4 bytes
@@ -319,7 +319,7 @@ public class FluidSimulator : MonoBehaviour
     {
         // Release and recreate nodesBufferOld each frame since numNodes changes
         nodesBufferOld?.Release();
-        nodesBufferOld = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        nodesBufferOld = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
         
         // Copy current nodesBuffer to nodesBufferOld
         if (nodesBuffer != null && nodesBufferOld != null)
@@ -917,8 +917,8 @@ public class FluidSimulator : MonoBehaviour
         // Release and recreate node buffers each frame since numNodes changes
         nodesBuffer?.Release();
         tempNodesBuffer?.Release();
-        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
-        tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
 
         // Set buffer data to compute shader
         nodesShader.SetBuffer(createLeavesKernel, "particlesBuffer", particlesBuffer);
@@ -1293,7 +1293,7 @@ public class FluidSimulator : MonoBehaviour
             Gizmos.color = layerColors[layerIndex];
             // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
             // float volume = Mathf.Pow(8, node.layer);
-            // float divergenceNormalized = divergence * divergenceMultiplier / volume;
+            // float divergenceNormalized = divergence * 50.0f / volume;
             // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
             // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
             // Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
