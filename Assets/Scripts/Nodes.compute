@@ -29,6 +29,7 @@ struct Particle
 struct Node
 {
     float3 position;    // 12 bytes
+    float3 velocity;    // 12 bytes
     faceVelocities velocities;    // 24 bytes
     float mass;          // 4 bytes
     uint layer;         // 4 bytes
@@ -111,27 +112,85 @@ uint EncodeMorton3D(float3 pos)
     return result;
 }
 
-// Helper: given direction d, return neighbor's opposing face value
-float selectOpposingFace(faceVelocities v, int d)
+void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, float nodeSideLength)
 {
-    // d: 0=left,1=right,2=bottom,3=top,4=front,5=back
-    if (d == 0) return v.right;
-    if (d == 1) return v.left;
-    if (d == 2) return v.top;
-    if (d == 3) return v.bottom;
-    if (d == 4) return v.back;
-    return v.front; // d == 5
+    if (d == 0)
+    {
+        // get face position in x axis
+        float facePosition = cornerPosition.x;
+        float selfPosition = outNode.position.x;
+        float nPosition = nNode.position.x;
+        float lerpFactor = (facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
+        lerpFactor = saturate(lerpFactor); // Clamp to [0,1] range
+        lerpFactor = 0.5;
+        float faceVelocity = lerp(outNode.velocity.x, nNode.velocity.x, lerpFactor);
+        outNode.velocities.left += faceVelocity;
+    }
+    else if (d == 1)
+    {
+        float facePosition = cornerPosition.x + nodeSideLength;
+        float selfPosition = outNode.position.x;
+        float nPosition = nNode.position.x;
+        float lerpFactor = (facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
+        lerpFactor = saturate(lerpFactor); // Clamp to [0,1] range
+        lerpFactor = 0.5;
+        float faceVelocity = lerp(outNode.velocity.x, nNode.velocity.x, lerpFactor);
+        outNode.velocities.right += faceVelocity;
+    }
+    else if (d == 2)
+    {
+        float facePosition = cornerPosition.y;
+        float selfPosition = outNode.position.y;
+        float nPosition = nNode.position.y;
+        float lerpFactor = (facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
+        lerpFactor = saturate(lerpFactor); // Clamp to [0,1] range
+        lerpFactor = 0.5;
+        float faceVelocity = lerp(outNode.velocity.y, nNode.velocity.y, lerpFactor);
+        outNode.velocities.bottom += faceVelocity;
+    }
+    else if (d == 3)
+    {
+        float facePosition = cornerPosition.y + nodeSideLength;
+        float selfPosition = outNode.position.y;
+        float nPosition = nNode.position.y;
+        float lerpFactor = (facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
+        lerpFactor = saturate(lerpFactor); // Clamp to [0,1] range
+        lerpFactor = 0.5;
+        float faceVelocity = lerp(outNode.velocity.y, nNode.velocity.y, lerpFactor);
+        outNode.velocities.top += faceVelocity;
+    }
+    else if (d == 4)
+    {
+        float facePosition = cornerPosition.z;
+        float selfPosition = outNode.position.z;
+        float nPosition = nNode.position.z;
+        float lerpFactor = (facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
+        lerpFactor = saturate(lerpFactor); // Clamp to [0,1] range
+        lerpFactor = 0.5;
+        float faceVelocity = lerp(outNode.velocity.z, nNode.velocity.z, lerpFactor);
+        outNode.velocities.front += faceVelocity;
+    }
+    else // d == 5
+    {
+        float facePosition = cornerPosition.z + nodeSideLength;
+        float selfPosition = outNode.position.z;
+        float nPosition = nNode.position.z;
+        float lerpFactor = (facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
+        lerpFactor = saturate(lerpFactor); // Clamp to [0,1] range
+        lerpFactor = 0.5;
+        float faceVelocity = lerp(outNode.velocity.z, nNode.velocity.z, lerpFactor);
+        outNode.velocities.back += faceVelocity;
+    }
 }
 
-// Helper: subtract value from the correct face on outNode for direction d
-void subtractToFace(inout Node outNode, int d, float value)
+void divideFace(inout Node outNode, int d, float value)
 {
-    if (d == 0) outNode.velocities.left -= value;
-    else if (d == 1) outNode.velocities.right -= value;
-    else if (d == 2) outNode.velocities.bottom -= value;
-    else if (d == 3) outNode.velocities.top -= value;
-    else if (d == 4) outNode.velocities.front -= value;
-    else outNode.velocities.back -= value; // d == 5
+    if (d == 0) outNode.velocities.left /= value;
+    else if (d == 1) outNode.velocities.right /= value;
+    else if (d == 2) outNode.velocities.bottom /= value;
+    else if (d == 3) outNode.velocities.top /= value;
+    else if (d == 4) outNode.velocities.front /= value;
+    else outNode.velocities.back /= value; // d == 5
 }
 
 // Helper: face offset inside 24-wide neighbors block
@@ -204,6 +263,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     
     // Aggregate particle data with weighted average
     float3 weightedPosition = float3(0, 0, 0);
+    float3 weightedVelocity = float3(0, 0, 0);
     faceVelocities leafVelocities;
     leafVelocities.left = 0.0;
     leafVelocities.right = 0.0;
@@ -222,23 +282,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         
         count += 1.0;
         weightedPosition += particle.position;
-
-        float3 velocity = particle.velocity;
-        if (velocity.x < 0) {
-            leafVelocities.left += (-velocity.x);
-        } else {
-            leafVelocities.right += velocity.x;
-        }
-        if (velocity.y < 0) {
-            leafVelocities.bottom += (-velocity.y);
-        } else {
-            leafVelocities.top += velocity.y;
-        }
-        if (velocity.z < 0) {
-            leafVelocities.front += (-velocity.z);
-        } else {
-            leafVelocities.back += velocity.z;
-        }
+        weightedVelocity += particle.velocity;
         
         // Track minimum layer
         minSubLayer = min(minSubLayer, particle.layer);
@@ -248,13 +292,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     // Safety check: prevent division by zero
     if (count > 0.0) {
         weightedPosition /= count;
-        // Average face velocities by weight as well
-        leafVelocities.left /= count;
-        leafVelocities.right /= count;
-        leafVelocities.bottom /= count;
-        leafVelocities.top /= count;
-        leafVelocities.front /= count;
-        leafVelocities.back /= count;
+        weightedVelocity /= count;
     }
 
     uint mortonCode = particlesBuffer[rangeStart].mortonCode;
@@ -264,6 +302,7 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     // Create the node
     Node node;
     node.position = weightedPosition;
+    node.velocity = weightedVelocity;
     node.velocities = leafVelocities;
     node.layer = minSubLayer;  // Use the minimum layer found
     node.mass = count;
@@ -390,13 +429,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
 
     if (coarsen)
     {
-        faceVelocities aggregatedVelocities;
-        aggregatedVelocities.left = 0.0;
-        aggregatedVelocities.right = 0.0;
-        aggregatedVelocities.bottom = 0.0;
-        aggregatedVelocities.top = 0.0;
-        aggregatedVelocities.front = 0.0;
-        aggregatedVelocities.back = 0.0;
+        float3 weightedVelocity = float3(0, 0, 0);
         float3 weightedPosition = float3(0, 0, 0);
         float totalMass = 0.0;
         uint minSubLayer = maxLayer;
@@ -406,32 +439,23 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             Node node = nodesBuffer[i];
             float mass = node.mass;
             weightedPosition += node.position * mass;
+            weightedVelocity += node.velocity * mass;
             totalMass += mass;
-            aggregatedVelocities.left += node.velocities.left * mass;
-            aggregatedVelocities.right += node.velocities.right * mass;
-            aggregatedVelocities.bottom += node.velocities.bottom * mass;
-            aggregatedVelocities.top += node.velocities.top * mass;
-            aggregatedVelocities.front += node.velocities.front * mass;
-            aggregatedVelocities.back += node.velocities.back * mass;
             minSubLayer = min(minSubLayer, node.layer);
         }
 
         // Safety check: prevent division by zero
         if (totalMass > 0.0) {
             weightedPosition /= totalMass;
-            aggregatedVelocities.left /= totalMass;
-            aggregatedVelocities.right /= totalMass;
-            aggregatedVelocities.bottom /= totalMass;
-            aggregatedVelocities.top /= totalMass;
-            aggregatedVelocities.front /= totalMass;
-            aggregatedVelocities.back /= totalMass;
+            weightedVelocity /= totalMass;
         }
 
         // weightedPosition = clamp(weightedPosition, simulationBoundsMin, simulationBoundsMax);
 
         Node aggregatedNode;
         aggregatedNode.position = weightedPosition;
-        aggregatedNode.velocities = aggregatedVelocities;
+        aggregatedNode.velocity = weightedVelocity;
+        aggregatedNode.velocities = nodesBuffer[uniqueStart].velocities;
         aggregatedNode.layer = minSubLayer;
         aggregatedNode.mass = totalMass;
         aggregatedNode.mortonCode = nodesBuffer[uniqueStart].mortonCode;
@@ -464,16 +488,18 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
     if (threadIndex >= numNodes) return;
 
     Node node = nodesBuffer[threadIndex];
-    faceVelocities selfVel = node.velocities;
+    faceVelocities selfVelocities = node.velocities;
+    float3 selfPosition = node.position;
+    float3 selfVelocity = node.velocity;
 
-    // Initialize output (delta) node with zero face velocities
     Node outNode;
-    outNode.position = node.position;
+    outNode.position = selfPosition;
+    outNode.velocity = selfVelocity;
+    outNode.velocities = selfVelocities;
     outNode.mass = node.mass;
     outNode.layer = node.layer;
     outNode.mortonCode = node.mortonCode;
     outNode.active = node.active;
-    outNode.velocities = selfVel;
 
     // Initialize neighbors to invalid index (numNodes) for all 24 slots
     uint nbBase = threadIndex * 24;
@@ -484,11 +510,17 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
 
     // all face neighbors of this node. It's bounded to 2:1 ratio
     int3 deltas[6] = {int3(-1,0,0), int3(1,0,0), int3(0,-1,0), int3(0,1,0), int3(0,0,-1), int3(0,0,1)};
+
+    uint shift = node.layer * 3;
+    uint prefix = node.mortonCode >> shift;
+    uint3 coord = deinterleave(prefix);
+
+    uint3 shiftedCoord = coord << shift;
+    float3 cornerPosition = float3((float)shiftedCoord.x, (float)shiftedCoord.y, (float)shiftedCoord.z);
+    float nodeSideLength = maxDetailCellSize * exp2((float)node.layer);
+
     for (int d = 0; d < 6; d++)
     {
-        uint shift = node.layer * 3;
-        uint prefix = node.mortonCode >> shift;
-        uint3 coord = deinterleave(prefix);
 
         int nx = (int)coord.x + deltas[d].x;
         int ny = (int)coord.y + deltas[d].y;
@@ -498,26 +530,20 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
-            // // Zero the boundary face velocity for solid walls
-            // if (d == 0) { // Left boundary
-            //     outNode.velocities.right += selfVel.left;
-            //     outNode.velocities.left = 0;
-            // } else if (d == 1) { // Right boundary
-            //     outNode.velocities.left += selfVel.right;
-            //     outNode.velocities.right = 0;
-            // } else if (d == 2) { // Bottom boundary
-            //     outNode.velocities.top += selfVel.bottom;
-            //     outNode.velocities.bottom = 0;
-            // } else if (d == 3) { // Top boundary
-            //     outNode.velocities.bottom += selfVel.top;
-            //     outNode.velocities.top = 0;
-            // } else if (d == 4) { // Front boundary
-            //     outNode.velocities.back += selfVel.front;
-            //     outNode.velocities.front = 0;
-            // } else if (d == 5) { // Back boundary
-            //     outNode.velocities.front += selfVel.back;
-            //     outNode.velocities.back = 0;
-            // }
+            // Zero the boundary face velocity for solid walls
+            if (d == 0) { // Left boundary
+                outNode.velocities.left = 0;
+            } else if (d == 1) { // Right boundary
+                outNode.velocities.right = 0;
+            } else if (d == 2) { // Bottom boundary
+                outNode.velocities.bottom = 0;
+            } else if (d == 3) { // Top boundary
+                outNode.velocities.top = 0;
+            } else if (d == 4) { // Front boundary
+                outNode.velocities.front = 0;
+            } else if (d == 5) { // Back boundary
+                outNode.velocities.back = 0;
+            }
             continue; // Skip this neighbor direction
         }
         
@@ -546,15 +572,13 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         if (idx_leq_mc_prefix == nPrefix && idx_leq_layer == node.layer)
         {
             // same-layer neighbor
-            float opp = selectOpposingFace(nNode.velocities, d);
-            subtractToFace(outNode, d, opp);
+            addToFace(outNode, d, nNode, cornerPosition, nodeSideLength);
             neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
         }
         else if ((idx_leq_mc >> (shift + 3)) == (nPrefix >> 3) && idx_leq_layer == node.layer + 1)
         {
-            // parent neighbor (divide incoming velocity by 4)
-            float oppP = selectOpposingFace(nNode.velocities, d);
-            subtractToFace(outNode, d, oppP);
+            // parent neighbor
+            addToFace(outNode, d, nNode, cornerPosition, nodeSideLength);
             neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
         }
         else
@@ -606,8 +630,7 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                         subNodesLower[3] = 3;
                     }
                     
-                    uint numChildNeighbors = 0;
-                    float totalChildVelocity = 0.0;
+                    float numChildNeighbors = 0.0;
                     for (int i = 0; i < 4; i++)
                     {
                         uint subPrefix = nPrefixShifted + subNodesLower[i];
@@ -622,17 +645,15 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                             uint idx_sub_layer = cNode.layer;
                             if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
                             {
-                                float oppC = selectOpposingFace(cNode.velocities, d);
-                                // subtractToFace(outNode, d, oppC);
-                                totalChildVelocity += oppC;
+                                addToFace(outNode, d, cNode, cornerPosition, nodeSideLength);
                                 neighborsBuffer[threadIndex * 24 + faceOffset(d) + i] = idx_sub;
-                                numChildNeighbors++;
+                                numChildNeighbors += 1.0;
                             }
                         }
                     }
-                    if (numChildNeighbors != 0)
+                    if (numChildNeighbors != 0.0)
                     {
-                        subtractToFace(outNode, d, totalChildVelocity / numChildNeighbors);
+                        divideFace(outNode, d, numChildNeighbors);
                     }
                 }
             }
@@ -726,8 +747,8 @@ void ApplyGravity(uint3 id : SV_DispatchThreadID)
     if (threadIndex >= numNodes) return;
 
     Node node = nodesBuffer[threadIndex];
-    node.velocities.top -= gravity * deltaTime;
-    node.velocities.bottom += gravity * deltaTime;
+    // node.velocities.top -= gravity * deltaTime;
+    // node.velocities.bottom -= gravity * deltaTime;
     nodesBuffer[threadIndex] = node;
 }
 
