@@ -35,6 +35,7 @@ struct faceVelocities
 struct Node
 {
     float3 position;    // 12 bytes
+    float3 velocity;    // 12 bytes
     faceVelocities velocities; // 24 bytes (6 floats)
     float mass;          // 4 bytes
     uint layer;         // 4 bytes

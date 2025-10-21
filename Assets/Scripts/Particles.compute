@@ -26,6 +26,7 @@ struct faceVelocities
 struct Node
 {
     float3 position;   // 12 bytes
+    float3 velocity;   // 12 bytes
     faceVelocities velocities;   // 24 bytes
     float mass;         // 4 bytes
     uint layer;        // 4 bytes
@@ -136,6 +137,7 @@ float deltaTime;
 float velocitySensitivity;
 float dispersionPower;// >1 concentrates near left, <1 concentrates near right
 float boundaryThreshold;// normalized u threshold near left edge considered boundary
+float maxDetailCellSize;// Grid cell size for consistent geometry
 uint minLayer;
 uint numNodes;
 uint numParticles;
@@ -262,9 +264,22 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
         if (left == numNodes || (left == 0 && particle.mortonCode < nodesBuffer[0].mortonCode)) {
             useFallback = true;
         } else {
-            // The original index calculation is correct once the fallback condition is fixed.
-            // It finds the node whose Morton code is <= the particle's code.
-            nodeIndex = (left > 0) ? left - 1 : 0;
+            // --- START OF FIX ---
+            // 'left' is the index of the first node with code >= target.
+            // If 'left' is not 0 AND the node's code is NOT an exact match,
+            // then the particle belongs to the *previous* node (left - 1).
+            if (left > 0 && nodesBuffer[left].mortonCode != target)
+            {
+                nodeIndex = left - 1;
+            }
+            else
+            {
+                // This correctly handles two cases:
+                // 1) left == 0 (particle is in the first node, [source 0])
+                // 2) nodesBuffer[left].mortonCode == target (particle is in node 'left')
+                nodeIndex = left;
+            }
+            // --- END OF FIX ---
         }
     }
 
@@ -285,26 +300,36 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
         Node node = nodesBuffer[nodeIndex];
         Node nodeOld = nodesBufferOld[nodeIndex];
 
-        // Interpolate velocity from grid (Trilinear)
-        float3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        // --- START OF FIX ---
+        // Replace the nodeMin/nodeMax/extent calculation [cite: 352-354]
+        
+        // 1. Get the cell's side length in world units, consistent with physics
+        float cellSideLength = maxDetailCellSize * exp2((float)node.layer);
+        
+        // 2. Get the cell's minimum corner coordinates in grid units (0-1023)
         uint cellMortonCode = node.mortonCode & ~((1u << (3 * node.layer)) - 1);
-        uint3 cellGridMin = deinterleave(cellMortonCode);
-        float cellGridSize = exp2((float)node.layer);
-        float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) / 1023.0) * simulationSize;
-        float3 nodeMax = nodeMin + (cellGridSize / 1023.0) * simulationSize;
-        float3 extent = max(nodeMax - nodeMin, 1e-6);
+        uint3 cellGridMin = deinterleave(cellMortonCode); // Coords are 0-1023
+        
+        // 3. Calculate nodeMin and nodeMax in world units
+        //    (cellGridMin * maxDetailCellSize) maps the grid coord to world space
+        float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) * maxDetailCellSize);
+        float3 nodeMax = nodeMin + float3(cellSideLength, cellSideLength, cellSideLength);
+
+        // --- END OF FIX ---
+
+        float3 extent = max(nodeMax - nodeMin, 1e-6); // This is now consistent
         float3 t = saturate((particle.position - nodeMin) / extent);
 
         // Interpolate new and old velocities for FLIP
         float3 newGridVelocity;
-        newGridVelocity.x = lerp(-node.velocities.left, node.velocities.right, t.x);
-        newGridVelocity.y = lerp(-node.velocities.bottom, node.velocities.top, t.y);
-        newGridVelocity.z = lerp(-node.velocities.front, node.velocities.back, t.z);
+        newGridVelocity.x = lerp(node.velocities.left, node.velocities.right, t.x);
+        newGridVelocity.y = lerp(node.velocities.bottom, node.velocities.top, t.y);
+        newGridVelocity.z = lerp(node.velocities.front, node.velocities.back, t.z);
         
         float3 oldGridVelocity;
-        oldGridVelocity.x = lerp(-nodeOld.velocities.left, nodeOld.velocities.right, t.x);
-        oldGridVelocity.y = lerp(-nodeOld.velocities.bottom, nodeOld.velocities.top, t.y);
-        oldGridVelocity.z = lerp(-nodeOld.velocities.front, nodeOld.velocities.back, t.z);
+        oldGridVelocity.x = lerp(nodeOld.velocities.left, nodeOld.velocities.right, t.x);
+        oldGridVelocity.y = lerp(nodeOld.velocities.bottom, nodeOld.velocities.top, t.y);
+        oldGridVelocity.z = lerp(nodeOld.velocities.front, nodeOld.velocities.back, t.z);
 
         // FLIP method: Calculate velocity delta and blend
         float3 grid_velocity_delta = newGridVelocity - oldGridVelocity;
@@ -315,7 +340,9 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
         // Advect the particle and apply boundary conditions
         float3 newPosition = particle.position + newVelocity * deltaTime;
 
-        float bounceDamping = 0.9f;
+        newVelocity.y -= gravity * deltaTime;
+
+        float bounceDamping = 0.5f;
         float epsilon = 0.001f;
 
         if (newPosition.x <= simulationBoundsMin.x) { newPosition.x = simulationBoundsMin.x + epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
