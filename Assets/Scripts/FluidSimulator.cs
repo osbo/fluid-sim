@@ -1,12 +1,14 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
 using System;
+using System.Linq;
+using System.Runtime.InteropServices;
 using UnityEngine.Rendering;
 
 public class FluidSimulator : MonoBehaviour
 {
     [SerializeField] private BoxCollider simulationBounds;
-    [SerializeField] private GameObject fluidInitialBounds;
+    [SerializeField] private BoxCollider fluidInitialBounds;
     
     public ComputeShader radixSortShader;
     public ComputeShader particlesShader;
@@ -92,6 +94,8 @@ public class FluidSimulator : MonoBehaviour
     private float mortonMaxValue;
     private Vector3 simulationBoundsMin;
     private Vector3 simulationBoundsMax;
+    private Vector3 fluidInitialBoundsMin;
+    private Vector3 fluidInitialBoundsMax;
 
     private struct faceVelocities
     {
@@ -202,17 +206,34 @@ public class FluidSimulator : MonoBehaviour
         var frameSw = System.Diagnostics.Stopwatch.StartNew();
         
         // Calculate maxDetailCellSize for volume calculations
-        Vector3 simulationBoundsMin = simulationBounds.bounds.min;
-        Vector3 simulationBoundsMax = simulationBounds.bounds.max;
-        Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        // Use the normalized simulation bounds (simulationBoundsMin is now Vector3.zero)
+        Vector3 simulationSize = simulationBoundsMax;
         maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
 
         // Frame loop: SortParticles -> findUniqueParticles -> CreateLeaves -> layer loop -> pullVelocities -> SolvePressure -> UpdateParticles
+
+        particlesCPU = new Particle[numParticles];
+        particlesBuffer.GetData(particlesCPU);
+        string str = $"Start of frame: Particles {numParticles}:\n";
+        for (int i = 0; i < 40; i++)
+        {
+            str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z})\n";
+        }
+        Debug.Log(str);
 
         // Step 1: Sort particles
         var sortSw = System.Diagnostics.Stopwatch.StartNew();
         SortParticles();
         sortSw.Stop();
+
+        particlesCPU = new Particle[numParticles];
+        particlesBuffer.GetData(particlesCPU);
+        str = $"After sort particles: Particles {numParticles}:\n";
+        for (int i = 0; i < 40; i++)
+        {
+            str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
+        }
+        Debug.Log(str);
 
         // Step 2: Find unique particles and create leaves
         var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
@@ -222,6 +243,16 @@ public class FluidSimulator : MonoBehaviour
         var createLeavesSw = System.Diagnostics.Stopwatch.StartNew();
         CreateLeaves();
         createLeavesSw.Stop();
+        
+
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        str = $"After create leaves: Nodes:\n";
+        for (int i = 1; i < numNodes; i++)
+        {
+            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        }
+        Debug.Log(str);
 
         // Step 3: Layer loop (layers 1-10)
         var layerLoopSw = System.Diagnostics.Stopwatch.StartNew();
@@ -246,10 +277,28 @@ public class FluidSimulator : MonoBehaviour
         }
         layerLoopSw.Stop();
 
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        str = $"End of layer loop: Nodes:\n";
+        for (int i = 1; i < numNodes; i++)
+        {
+            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        }
+        Debug.Log(str);
+
         // Step 4: Pull velocities
         var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
         pullVelocities();
         pullVelocitiesSw.Stop();
+
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        str = $"After pull velocities: Nodes:\n";
+        for (int i = 1; i < numNodes; i++)
+        {
+            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        }
+        Debug.Log(str);
 
         // Step 4.5: Store old velocities for FLIP method
         var storeOldVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
@@ -258,7 +307,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 5: Apply gravity on the grid
         var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
-        // ApplyGravity();
+        ApplyGravity();
         applyGravitySw.Stop();
 
         // Step 5.5: Enforce boundary conditions
@@ -266,44 +315,54 @@ public class FluidSimulator : MonoBehaviour
         EnforceBoundaryConditions();
         enforceBoundarySw.Stop();
 
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        str = $"Before pressure solve: Nodes:\n";
+        for (int i = 1; i < numNodes; i++)
+        {
+            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        }
+        Debug.Log(str);
+
         // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
         // SolvePressure();
         solvePressureSw.Stop();
 
-        particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
-        string str = "Particle velocities:\n";
-        for (int i = 0; i < 40 && i < numParticles; i++)
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        str = $"After pressure solve: Nodes:\n";
+        for (int i = 1; i < numNodes; i++)
         {
-            str += $"Particle {i}: Velocity {particlesCPU[i].velocity}\n";
+            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
         }
         Debug.Log(str);
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        str = "Node velocities:\n";
-        for (int i = 0; i < 40 && i < numNodes; i++)
+        
+        particlesCPU = new Particle[numParticles];
+        particlesBuffer.GetData(particlesCPU);
+        str = $"Before update particles: Particles:\n";
+        for (int i = 0; i < 40; i++)
         {
-            str += $"Node {i}: Layer {nodesCPU[i].layer}, Position {nodesCPU[i].position}, Morton Code {nodesCPU[i].mortonCode}, Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+            str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
         }
         Debug.Log(str);
+
 
         // Step 7: Update particles
         var updateParticlesSw = System.Diagnostics.Stopwatch.StartNew();
         UpdateParticles();
         updateParticlesSw.Stop();
 
+        
         particlesCPU = new Particle[numParticles];
         particlesBuffer.GetData(particlesCPU);
-        for (int i = 0; i < numParticles; i++)
+        str = $"End of frame: Particles:\n";
+        for (int i = 0; i < 40; i++)
         {
-            if (float.IsNaN(particlesCPU[i].velocity.x) || float.IsNaN(particlesCPU[i].velocity.y) || float.IsNaN(particlesCPU[i].velocity.z))
-            {
-                Debug.Log($"Particle {i} has NaN velocity\n");
-                break;
-            }
+            str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
         }
+        Debug.Log(str);
 
         // Draw particles as points using the particles buffer
         // Moved to OnRenderObject for reliable rendering timing
@@ -708,11 +767,18 @@ public class FluidSimulator : MonoBehaviour
         simulationBoundsMax = simulationBounds.bounds.max;
         
         // Get fluid initial bounds from the GameObject's transform
-        Vector3 fluidInitialBoundsMin = fluidInitialBounds.transform.position - fluidInitialBounds.transform.localScale * 0.5f;
-        Vector3 fluidInitialBoundsMax = fluidInitialBounds.transform.position + fluidInitialBounds.transform.localScale * 0.5f;
+        fluidInitialBoundsMin = fluidInitialBounds.bounds.min;
+        fluidInitialBoundsMax = fluidInitialBounds.bounds.max;
+        
+        // Normalize bounds to ensure all particle positions are positive
+        // Shift all bounds to be positive by subtracting the simulation bounds minimum
+        fluidInitialBoundsMin -= simulationBoundsMin;
+        fluidInitialBoundsMax -= simulationBoundsMin;
+        simulationBoundsMin = Vector3.zero; // Now simulation bounds start at origin
+        simulationBoundsMax -= simulationBounds.bounds.min; // Shift simulation bounds max accordingly
         
         // Calculate morton code normalization factors on CPU
-        Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        Vector3 simulationSize = simulationBoundsMax;
         
         // For 32-bit Morton codes: 10 bits per axis = 1024 possible values (0-1023)
         // Normalize each axis to 0-1023 range
@@ -779,6 +845,7 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetVector("simulationBoundsMax", simulationBoundsMax);
         particlesShader.SetVector("fluidInitialBoundsMin", fluidInitialBoundsMin);
         particlesShader.SetVector("fluidInitialBoundsMax", fluidInitialBoundsMax);
+        particlesShader.SetVector("simulationSize", simulationSize);
         particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
         particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
         particlesShader.SetInt("minLayer", minLayer);
@@ -1259,9 +1326,8 @@ public class FluidSimulator : MonoBehaviour
         // Calculate the maximum detail cell size (smallest possible cell)
         // With 10 bits per axis, we have 1024 possible values (0-1023)
         // The maximum detail cell size is simulation bounds divided by 1024
-        Vector3 simulationBoundsMin = simulationBounds.bounds.min;
-        Vector3 simulationBoundsMax = simulationBounds.bounds.max;
-        Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        // Use the normalized simulation bounds (simulationBoundsMin is now Vector3.zero)
+        Vector3 simulationSize = simulationBoundsMax;
         float maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
         
         // Define 11 colors for different layers (0-10)
@@ -1348,6 +1414,10 @@ public class FluidSimulator : MonoBehaviour
         particlesMaterial.SetFloat("_PointSize", 2.0f);
         particlesMaterial.SetInt("_MinLayer", minLayer);
         particlesMaterial.SetInt("_MaxLayer", maxLayer);
+        
+        // Add simulation bounds for denormalizing particle positions
+        particlesMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
+        particlesMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
 
         particlesMaterial.SetPass(0);
         Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
@@ -1359,9 +1429,8 @@ public class FluidSimulator : MonoBehaviour
     private Vector3 DecodeMorton3D(Node node)
     {
         // Step 1: Quantize the node position to the appropriate level of detail for this layer
-        Vector3 simulationBoundsMin = simulationBounds.bounds.min;
-        Vector3 simulationBoundsMax = simulationBounds.bounds.max;
-        Vector3 simulationSize = simulationBoundsMax - simulationBoundsMin;
+        // Use the normalized simulation bounds (simulationBoundsMin is now Vector3.zero)
+        Vector3 simulationSize = simulationBoundsMax;
         
         // Calculate the grid resolution for this layer
         // Layer 0: finest detail (1024 cells per axis)
@@ -1376,9 +1445,9 @@ public class FluidSimulator : MonoBehaviour
         );
         
         Vector3 normalizedPos = new Vector3(
-            (node.position.x - simulationBoundsMin.x) * mortonNormalizationFactor.x,
-            (node.position.y - simulationBoundsMin.y) * mortonNormalizationFactor.y,
-            (node.position.z - simulationBoundsMin.z) * mortonNormalizationFactor.z
+            node.position.x * mortonNormalizationFactor.x,
+            node.position.y * mortonNormalizationFactor.y,
+            node.position.z * mortonNormalizationFactor.z
         );
         
         // Quantize to the grid resolution for this layer
@@ -1391,7 +1460,7 @@ public class FluidSimulator : MonoBehaviour
         );
         
         // Convert back to world coordinates
-        Vector3 quantizedWorldPos = simulationBoundsMin + new Vector3(
+        Vector3 quantizedWorldPos = new Vector3(
             quantizedPos.x / mortonNormalizationFactor.x,
             quantizedPos.y / mortonNormalizationFactor.y,
             quantizedPos.z / mortonNormalizationFactor.z
@@ -1578,9 +1647,22 @@ public class RadixSort
 
     private void ClearBuffer(ComputeBuffer buffer, uint count)
     {
-        sortShader.SetBuffer(clearBuffer32Kernel, "output", buffer);
-        sortShader.SetInt("count", (int)count);
-        int threadGroups = (int)((count + 511) / 512);
-        sortShader.Dispatch(clearBuffer32Kernel, threadGroups, 1, 1);
+        // Use clearBuffer64 for particle buffers (32-byte structures)
+        // and clearBuffer32 for uint buffers
+        if (buffer.stride == 32) // Particle buffer
+        {
+            int clearBuffer64Kernel = sortShader.FindKernel("clearBuffer64");
+            sortShader.SetBuffer(clearBuffer64Kernel, "outputParticles", buffer);
+            sortShader.SetInt("count", (int)count);
+            int threadGroups = (int)((count + 511) / 512);
+            sortShader.Dispatch(clearBuffer64Kernel, threadGroups, 1, 1);
+        }
+        else // uint buffer
+        {
+            sortShader.SetBuffer(clearBuffer32Kernel, "output", buffer);
+            sortShader.SetInt("count", (int)count);
+            int threadGroups = (int)((count + 511) / 512);
+            sortShader.Dispatch(clearBuffer32Kernel, threadGroups, 1, 1);
+        }
     }
 }

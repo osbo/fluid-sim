@@ -33,6 +33,8 @@ Shader "Custom/ParticlesPoints"
             float _PointSize;
             int _MinLayer;
             int _MaxLayer;
+            float3 _SimulationBoundsMin;
+            float3 _SimulationBoundsMax;
 
             float4 LayerToColor(uint layer)
             {
@@ -74,7 +76,11 @@ Shader "Custom/ParticlesPoints"
             {
                 VSOut o;
                 Particle p = _Particles[id];
-                float3 positionWS = p.position; // already in world-space
+                
+                // Convert normalized position (0-1024 range) back to world coordinates
+                float3 simulationSize = _SimulationBoundsMax - _SimulationBoundsMin;
+                float3 positionWS = _SimulationBoundsMin + (p.position * simulationSize / 1024.0);
+                
                 o.pos = TransformWorldToHClip(positionWS);
                 o.col = LayerToColor(p.layer);
                 o.psize = max(_PointSize, 1.0);
