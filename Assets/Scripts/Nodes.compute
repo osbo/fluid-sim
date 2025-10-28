@@ -529,13 +529,14 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
-            outNode.velocities.left = (float)coord.x;
-            outNode.velocities.right = (float)coord.y;
-            outNode.velocities.bottom = (float)coord.z;
-            outNode.velocities.top = (float)nx;
-            outNode.velocities.front = (float)ny;
-            outNode.velocities.back = (float)nz;
+            // outNode.velocities.left = (float)coord.x;
+            // outNode.velocities.right = (float)coord.y;
+            // outNode.velocities.bottom = (float)coord.z;
+            // outNode.velocities.top = (float)nx;
+            // outNode.velocities.front = (float)ny;
+            // outNode.velocities.back = (float)nz;
 
+            neighborsBuffer[threadIndex * 24 + faceOffset(d)] = numNodes+1;
             continue; // Skip this neighbor direction
         }
         
@@ -646,8 +647,6 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                     if (numChildNeighbors != 0.0)
                     {
                         divideFace(outNode, d, numChildNeighbors);
-                    } else {
-                        outNode.velocities.right = 75.0;
                     }
                 }
             }
@@ -742,7 +741,7 @@ void ApplyGravity(uint3 id : SV_DispatchThreadID)
 
     Node node = nodesBuffer[threadIndex];
     // Apply gravity to all face velocities consistently
-    node.velocities.top -= gravity * deltaTime;
+    // node.velocities.top -= gravity * deltaTime;
     node.velocities.bottom -= gravity * deltaTime;
     nodesBuffer[threadIndex] = node;
 }
