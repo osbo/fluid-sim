@@ -1,0 +1,262 @@
+#pragma kernel SolvePressureIteration
+#pragma kernel ApplyPressureGradient
+#pragma kernel InitializePressureBuffers
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+struct faceVelocities
+{
+    float left;
+    float right;
+    float bottom;
+    float top;
+    float front;
+    float back;
+};
+
+struct Node
+{
+    float3 position;    // 12 bytes
+    float3 velocity;    // 12 bytes
+    faceVelocities velocities;    // 24 bytes
+    float mass;          // 4 bytes
+    uint layer;         // 4 bytes
+    uint mortonCode;    // 4 bytes
+    uint active;        // 4 bytes
+};
+
+// Input/Output buffers
+RWStructuredBuffer<Node> nodesBuffer;        // Input: current node state
+RWStructuredBuffer<Node> tempNodesBuffer;    // Output: relaxed node state
+RWStructuredBuffer<uint> neighborsBuffer;    // Input: neighbor indices (24 per node)
+RWStructuredBuffer<float> pressureBuffer;    // Input: current pressure values
+RWStructuredBuffer<float> tempPressureBuffer; // Output: relaxed pressure values
+
+// Parameters
+uint numNodes;
+float deltaTime;
+
+// Relaxation parameters
+static const float relaxationFactor = 0.8;  // Under-relaxation factor (0 < w < 1)
+
+// Helper function to calculate divergence at a node
+float CalculateDivergence(Node node)
+{
+    faceVelocities v = node.velocities;
+    float dx = exp2((float)node.layer);
+    
+    // Calculate divergence: ∇·v = (v_right - v_left + v_top - v_bottom + v_back - v_front) / dx
+    float divergence = (v.right - v.left + v.top - v.bottom + v.back - v.front) / dx;
+    
+    return divergence;
+}
+
+// Helper function to get pressure from a neighbor node
+float GetNeighborPressure(uint neighborIndex, float currentPressure)
+{
+    if (neighborIndex >= numNodes)
+    {
+        // Boundary condition: use current pressure (Neumann boundary)
+        return currentPressure;
+    }
+    
+    return pressureBuffer[neighborIndex];
+}
+
+[numthreads(512, 1, 1)]
+void InitializePressureBuffers(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+    pressureBuffer[threadIndex] = 0.0f;
+    tempPressureBuffer[threadIndex] = 0.0f;
+}
+
+// Helper function to apply pressure gradient to velocities
+void ApplyPressureGradientToNode(inout Node node, float pressure, float neighborPressure, int direction)
+{
+    float dx = exp2((float)node.layer);
+    float pressureGradient;
+    
+    if (direction == 0) // left face
+    {
+        pressureGradient = (pressure - neighborPressure) / dx; // p_self - p_left
+        node.velocities.left -= deltaTime * pressureGradient;
+    }
+    else if (direction == 1) // right face
+    {
+        pressureGradient = (neighborPressure - pressure) / dx; // p_right - p_self
+        node.velocities.right -= deltaTime * pressureGradient;
+    }
+    else if (direction == 2) // bottom face
+    {
+        pressureGradient = (pressure - neighborPressure) / dx; // p_self - p_bottom
+        node.velocities.bottom -= deltaTime * pressureGradient;
+    }
+    else if (direction == 3) // top face
+    {
+        pressureGradient = (neighborPressure - pressure) / dx; // p_top - p_self
+        node.velocities.top -= deltaTime * pressureGradient;
+    }
+    else if (direction == 4) // front face
+    {
+        pressureGradient = (pressure - neighborPressure) / dx; // p_self - p_front
+        node.velocities.front -= deltaTime * pressureGradient;
+    }
+    else if (direction == 5) // back face
+    {
+        pressureGradient = (neighborPressure - pressure) / dx; // p_back - p_self
+        node.velocities.back -= deltaTime * pressureGradient;
+    }
+}
+
+[numthreads(512, 1, 1)]
+void SolvePressureIteration(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+    
+    // Get the current node
+    Node currentNode = nodesBuffer[threadIndex];
+    
+    // Skip inactive nodes
+    if (currentNode.active == 0) 
+    {
+        // Still need to write pressure, or it will be uninitialized
+        tempPressureBuffer[threadIndex] = pressureBuffer[threadIndex];
+        return;
+    }
+    
+    // Get current pressure from buffer
+    float currentPressure = pressureBuffer[threadIndex];
+    float dx = exp2((float)currentNode.layer);
+    
+    // Calculate current divergence
+    float currentDivergence = CalculateDivergence(currentNode);
+    
+    // Relaxation iteration: sum neighbor pressures
+    float sumNeighborPressure = 0.0;
+    float neighborCount = 0.0;
+    
+    // Get neighbor base index (24 neighbors per node)
+    uint neighborBaseIndex = threadIndex * 24;
+    
+    // Iterate through all 6 faces to sum neighbor pressures
+    bool isBoundary = false;
+    for (int d = 0; d < 6; d++)
+    {
+        uint faceNeighborBase = neighborBaseIndex + d * 4;
+        uint neighborIndex = neighborsBuffer[faceNeighborBase];
+        
+        for (int k = 0; k < 4; k++) {
+            uint neighborIndex = neighborsBuffer[faceNeighborBase + k];
+            if (neighborIndex < numNodes) {
+                float neighborPressure = GetNeighborPressure(neighborIndex, currentPressure);
+                // if (nodesBuffer[neighborIndex].layer > currentNode.layer) {
+                //     neighborPressure *= 0.25;
+                // }
+                sumNeighborPressure += neighborPressure;
+                neighborCount += 1.0;
+            } else if (neighborIndex == numNodes + 1) {
+                isBoundary = true;
+            }
+        }
+    }
+    
+    // Apply Jacobi relaxation with divergence term
+    float relaxedPressure = currentPressure;
+    if (neighborCount > 0.0)
+    {
+        // This is the "b" term from the Poisson equation
+        float divergenceTerm = (dx * dx / deltaTime) * currentDivergence;
+        
+        // Jacobi iteration for the Poisson equation
+        float jacobiPressure = (sumNeighborPressure - divergenceTerm) / neighborCount;
+        
+        // Apply under-relaxation
+        relaxedPressure = (1.0 - relaxationFactor) * currentPressure + relaxationFactor * jacobiPressure;
+    }
+    
+    // Update temp pressure buffer
+    tempPressureBuffer[threadIndex] = relaxedPressure;
+    
+    // -----------------------------------------------------------------
+    // REMOVE ALL VELOCITY CORRECTION CODE FROM THIS KERNEL
+    // This kernel should only solve for pressure, not modify velocities
+    // -----------------------------------------------------------------
+}
+
+[numthreads(512, 1, 1)]
+void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+    
+    // Get the current node
+    Node currentNode = nodesBuffer[threadIndex];
+    
+    // Skip inactive nodes
+    if (currentNode.active == 0) 
+    {
+        tempNodesBuffer[threadIndex] = currentNode;
+        return;
+    }
+    
+    // Get pressure from temp pressure buffer
+    float pressure = tempPressureBuffer[threadIndex];
+    float dx = exp2((float)currentNode.layer);
+    
+    // Create output node (start with copy of current)
+    Node outNode = currentNode;
+    
+    // Get neighbor base index (24 neighbors per node)
+    uint neighborBaseIndex = threadIndex * 24;
+    
+    // Iterate through all 6 faces to apply pressure gradients
+    for (int d = 0; d < 6; d++)
+    {
+        uint faceNeighborBase = neighborBaseIndex + d * 4;
+        uint neighborIndex = neighborsBuffer[faceNeighborBase];
+        
+        // Check if this face has a boundary neighbor
+        bool isBoundaryFace = false;
+        for (int k = 0; k < 4; k++) {
+            uint faceNeighborIndex = neighborsBuffer[faceNeighborBase + k];
+            if (faceNeighborIndex == numNodes + 1) {
+                isBoundaryFace = true;
+                break;
+            }
+        }
+        
+        if (neighborIndex < numNodes)
+        {
+            // Get pressure from this neighbor
+            float neighborPressure = tempPressureBuffer[neighborIndex];
+            
+            // Apply pressure gradient to correct velocities
+            ApplyPressureGradientToNode(outNode, pressure, neighborPressure, d);
+        }
+        else if (isBoundaryFace)
+        {
+            // Boundary face - don't apply pressure gradient across the boundary
+            // This prevents divergence across the boundary face while allowing
+            // the node to still participate in pressure solving
+        }
+        else
+        {
+            // Handle all 4 child neighbors
+            for (int k = 0; k < 4; k++)
+            {
+                uint childIndex = neighborsBuffer[faceNeighborBase + k];
+                if (childIndex < numNodes)
+                {
+                    float childPressure = tempPressureBuffer[childIndex];
+                    ApplyPressureGradientToNode(outNode, pressure, childPressure, d);
+                }
+            }
+        }
+    }
+    
+    // Write the corrected node to the output buffer
+    tempNodesBuffer[threadIndex] = outNode;
+}
