@@ -55,7 +55,6 @@ uint numParticles;                                      // total number of parti
 uint layer;                                             // current hierarchical layer
 float deltaTime;                                        // time step for pressure gradient application
 uint surfaceLayer;                                      // layer of the surface
-float maxDetailCellSize;                               // smallest cell size for scaling
 float velocitySensitivity;                              // sensitivity of velocity to layer
 uint minLayer;                                      // initial layer
 uint maxLayer;                                          // maximum layer
@@ -85,9 +84,9 @@ uint interleave(uint3 p)
     uint m = 0;
     for (uint i = 0; i < 10; i++)
     {
-        m |= ((p.x & (1u << i)) << (3 * i + 0));
-        m |= ((p.y & (1u << i)) << (3 * i + 1));
-        m |= ((p.z & (1u << i)) << (3 * i + 2));
+        m |= (((p.x >> i) & 1u) << (3 * i + 0));
+        m |= (((p.y >> i) & 1u) << (3 * i + 1));
+        m |= (((p.z >> i) & 1u) << (3 * i + 2));
     }
     return m;
 }
@@ -104,9 +103,9 @@ uint EncodeMorton3D(float3 pos)
     
     // Interleave bits for 32-bit Morton code (10 bits per axis = 30 bits total)
     for (int i = 0; i < 10; i++) {
-        result |= ((x & (1U << i)) << (3 * i));
-        result |= ((y & (1U << i)) << (3 * i + 1));
-        result |= ((z & (1U << i)) << (3 * i + 2));
+        result |= (((x >> i) & 1u) << (3 * i));
+        result |= (((y >> i) & 1u) << (3 * i + 1));
+        result |= (((z >> i) & 1u) << (3 * i + 2));
     }
     
     return result;
@@ -122,7 +121,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.x;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
+        lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.x, nNode.velocity.x, lerpFactor);
         outNode.velocities.left += faceVelocity;
     }
@@ -133,7 +132,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.x;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
+        lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.x, nNode.velocity.x, lerpFactor);
         outNode.velocities.right += faceVelocity;
     }
@@ -144,7 +143,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.y;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
+        lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.y, nNode.velocity.y, lerpFactor);
         outNode.velocities.bottom += faceVelocity;
     }
@@ -155,7 +154,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.y;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
+        lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.y, nNode.velocity.y, lerpFactor);
         outNode.velocities.top += faceVelocity;
     }
@@ -166,7 +165,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.z;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
+        lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.z, nNode.velocity.z, lerpFactor);
         outNode.velocities.front += faceVelocity;
     }
@@ -177,7 +176,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.z;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
+        lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.z, nNode.velocity.z, lerpFactor);
         outNode.velocities.back += faceVelocity;
     }
@@ -517,7 +516,7 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
 
     uint3 shiftedCoord = coord << shift;
     float3 cornerPosition = float3((float)shiftedCoord.x, (float)shiftedCoord.y, (float)shiftedCoord.z);
-    float nodeSideLength = maxDetailCellSize * exp2((float)node.layer);
+    float nodeSideLength = exp2((float)node.layer);
 
     for (int d = 0; d < 6; d++)
     {
@@ -530,6 +529,13 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
+            outNode.velocities.left = (float)coord.x;
+            outNode.velocities.right = (float)coord.y;
+            outNode.velocities.bottom = (float)coord.z;
+            outNode.velocities.top = (float)nx;
+            outNode.velocities.front = (float)ny;
+            outNode.velocities.back = (float)nz;
+
             continue; // Skip this neighbor direction
         }
         
@@ -640,6 +646,8 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                     if (numChildNeighbors != 0.0)
                     {
                         divideFace(outNode, d, numChildNeighbors);
+                    } else {
+                        outNode.velocities.right = 75.0;
                     }
                 }
             }
@@ -668,7 +676,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[threadIndex];
     Node outNode = node; // Start with a copy
     float p_i = pressureBuffer[threadIndex];
-    float dx_i = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
+    float dx_i = exp2((float)node.layer);
 
     uint neighborBaseIndex = threadIndex * 24;
 
@@ -685,7 +693,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
             // Case 1: Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
             float p_j = pressureBuffer[neighbor_idx];
-            float dx_j = max(maxDetailCellSize * exp2((float)nNode.layer), 1e-6);
+            float dx_j = exp2((float)nNode.layer);
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
             pressure_gradient = (p_j - p_i) / distance;
         }

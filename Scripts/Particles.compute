@@ -47,9 +47,9 @@ uint EncodeMorton3D(float3 pos)
     
     // Interleave bits for 32-bit Morton code (10 bits per axis = 30 bits total)
     for (int i = 0;i < 10;i++) {
-        result |= ((x & (1U << i)) << (3 * i));
-        result |= ((y & (1U << i)) << (3 * i + 1));
-        result |= ((z & (1U << i)) << (3 * i + 2));
+        result |= (((x >> i) & 1u) << (3 * i));
+        result |= (((y >> i) & 1u) << (3 * i + 1));
+        result |= (((z >> i) & 1u) << (3 * i + 2));
     }
     
     return result;
@@ -75,9 +75,9 @@ uint interleave(uint3 p)
     uint m = 0;
     for (uint i = 0;i < 10;i++)
     {
-        m |= ((p.x & (1u << i)) << (3 * i + 0));
-        m |= ((p.y & (1u << i)) << (3 * i + 1));
-        m |= ((p.z & (1u << i)) << (3 * i + 2));
+        m |= (((p.x >> i) & 1u) << (3 * i + 0));
+        m |= (((p.y >> i) & 1u) << (3 * i + 1));
+        m |= (((p.z >> i) & 1u) << (3 * i + 2));
     }
     return m;
 }
@@ -130,6 +130,7 @@ float3 fluidInitialBoundsMin;
 float3 fluidInitialBoundsMax;
 float3 simulationBoundsMin;
 float3 simulationBoundsMax;
+float3 simulationSize;
 float3 mortonNormalizationFactor;
 float mortonMaxValue;
 float gravity;
@@ -137,7 +138,6 @@ float deltaTime;
 float velocitySensitivity;
 float dispersionPower;// >1 concentrates near left, <1 concentrates near right
 float boundaryThreshold;// normalized u threshold near left edge considered boundary
-float maxDetailCellSize;// Grid cell size for consistent geometry
 uint minLayer;
 uint numNodes;
 uint numParticles;
@@ -193,7 +193,7 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     float xPos = lerp(fluidInitialBoundsMin.x, fluidInitialBoundsMax.x, saturate(skew));
 
     // particle.position = float3(xPos, basePos.y, basePos.z);
-    particle.position = float3(basePos.x, basePos.y, basePos.z);
+    particle.position = float3(basePos.x, basePos.y, basePos.z) * (float3)1024 / simulationSize;
 
     // Calculate center of simulation bounds
     float3 simulationCenter = (fluidInitialBoundsMin + fluidInitialBoundsMax) * 0.5;
@@ -216,12 +216,9 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     // if (nearCenter) {
     //     particle.velocity = float3(0.0, 100.0, 0.0);
     // }
-    
 
-    float3 normalizedPos = (particle.position - simulationBoundsMin) * mortonNormalizationFactor;
-    normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
     // Generate morton code from normalized position
-    particle.mortonCode = EncodeMorton3D(normalizedPos);
+    particle.mortonCode = EncodeMorton3D((uint3)particle.position);
 
     // particle.layer = particle.mortonCode % 10;
     
@@ -240,128 +237,97 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     Particle particle = particlesBuffer[index];
 
     // --- 1. Find Containing Grid Cell (Corrected Logic) ---
-    bool useFallback = (numNodes == 0);
     uint nodeIndex = 0;
 
-    if (!useFallback) {
-        uint target = particle.mortonCode;
-        uint left = 0;
-        uint right = numNodes;
-        
-        // Binary search to find the first node with a Morton code >= particle's code
-        while (left < right) {
-            uint mid = left + ((right - left) >> 1);
-            if (nodesBuffer[mid].mortonCode < target) {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-
-        // **THE FIX**: Check if the particle is truly outside the grid's bounds.
-        // It is outside if its code is smaller than the first node's code,
-        // or if the search result points past the end of the array.
-        if (left == numNodes || (left == 0 && particle.mortonCode < nodesBuffer[0].mortonCode)) {
-            useFallback = true;
+    uint target = particle.mortonCode;
+    uint left = 0;
+    uint right = numNodes;
+    
+    // Binary search to find the first node with a Morton code >= particle's code
+    while (left < right) {
+        uint mid = left + ((right - left) >> 1);
+        if (nodesBuffer[mid].mortonCode < target) {
+            left = mid + 1;
         } else {
-            // --- START OF FIX ---
-            // 'left' is the index of the first node with code >= target.
-            // If 'left' is not 0 AND the node's code is NOT an exact match,
-            // then the particle belongs to the *previous* node (left - 1).
-            if (left > 0 && nodesBuffer[left].mortonCode != target)
-            {
-                nodeIndex = left - 1;
-            }
-            else
-            {
-                // This correctly handles two cases:
-                // 1) left == 0 (particle is in the first node, [source 0])
-                // 2) nodesBuffer[left].mortonCode == target (particle is in node 'left')
-                nodeIndex = left;
-            }
-            // --- END OF FIX ---
+            right = mid;
         }
     }
 
-    if (useFallback) {
-        // Fallback for particles outside the main fluid body
-        particle.velocity.y -= gravity * deltaTime;
-        particle.position += particle.velocity * deltaTime;
-        
-        // Simplified boundary conditions for fallback particles
-        if (particle.position.y <= simulationBoundsMin.y) {
-             particle.position.y = simulationBoundsMin.y;
-             particle.velocity.y *= -0.5;
-        }
-        // ... (can add other boundary checks if needed) ...
-        particle.position = clamp(particle.position, simulationBoundsMin, simulationBoundsMax);
-    } else {
-        // --- Main Fluid Logic (Unchanged) ---
-        Node node = nodesBuffer[nodeIndex];
-        Node nodeOld = nodesBufferOld[nodeIndex];
-
-        // --- START OF FIX ---
-        // Replace the nodeMin/nodeMax/extent calculation [cite: 352-354]
-        
-        // 1. Get the cell's side length in world units, consistent with physics
-        float cellSideLength = maxDetailCellSize * exp2((float)node.layer);
-        
-        // 2. Get the cell's minimum corner coordinates in grid units (0-1023)
-        uint cellMortonCode = node.mortonCode & ~((1u << (3 * node.layer)) - 1);
-        uint3 cellGridMin = deinterleave(cellMortonCode); // Coords are 0-1023
-        
-        // 3. Calculate nodeMin and nodeMax in world units
-        //    (cellGridMin * maxDetailCellSize) maps the grid coord to world space
-        float3 nodeMin = simulationBoundsMin + (float3(cellGridMin) * maxDetailCellSize);
-        float3 nodeMax = nodeMin + float3(cellSideLength, cellSideLength, cellSideLength);
-
-        // --- END OF FIX ---
-
-        float3 extent = max(nodeMax - nodeMin, 1e-6); // This is now consistent
-        float3 t = saturate((particle.position - nodeMin) / extent);
-
-        // Interpolate new and old velocities for FLIP
-        float3 newGridVelocity;
-        newGridVelocity.x = lerp(node.velocities.left, node.velocities.right, t.x);
-        newGridVelocity.y = lerp(node.velocities.bottom, node.velocities.top, t.y);
-        newGridVelocity.z = lerp(node.velocities.front, node.velocities.back, t.z);
-        
-        float3 oldGridVelocity;
-        oldGridVelocity.x = lerp(nodeOld.velocities.left, nodeOld.velocities.right, t.x);
-        oldGridVelocity.y = lerp(nodeOld.velocities.bottom, nodeOld.velocities.top, t.y);
-        oldGridVelocity.z = lerp(nodeOld.velocities.front, nodeOld.velocities.back, t.z);
-
-        // FLIP method: Calculate velocity delta and blend
-        float3 grid_velocity_delta = newGridVelocity - oldGridVelocity;
-        float3 flip_velocity = particle.velocity + grid_velocity_delta;
-        float flip_ratio = 0.95f;
-        float3 newVelocity = lerp(newGridVelocity, flip_velocity, flip_ratio);
-
-        // Advect the particle and apply boundary conditions
-        float3 newPosition = particle.position + newVelocity * deltaTime;
-
-        newVelocity.y -= gravity * deltaTime;
-
-        float bounceDamping = 0.1f;  // Much more damping to reduce bouncing
-        float epsilon = 0.1f;  // Larger epsilon to prevent boundary sticking
-
-        if (newPosition.x <= simulationBoundsMin.x) { newPosition.x = simulationBoundsMin.x + epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
-        if (newPosition.x >= simulationBoundsMax.x) { newPosition.x = simulationBoundsMax.x - epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
-        if (newPosition.y <= simulationBoundsMin.y) { newPosition.y = simulationBoundsMin.y + epsilon;newVelocity.y *= -1.0 * bounceDamping;} 
-        if (newPosition.y >= simulationBoundsMax.y) { newPosition.y = simulationBoundsMax.y - epsilon;newVelocity.y *= -1.0 * bounceDamping;} 
-        if (newPosition.z <= simulationBoundsMin.z) { newPosition.z = simulationBoundsMin.z + epsilon;newVelocity.z *= -1.0 * bounceDamping;} 
-        if (newPosition.z >= simulationBoundsMax.z) { newPosition.z = simulationBoundsMax.z - epsilon;newVelocity.z *= -1.0 * bounceDamping;} 
-
-        particle.position = newPosition;
-        particle.velocity = newVelocity;
-
-        particle.layer = clamp(10-floor(log2(length(particle.velocity) * velocitySensitivity / 3.0)), minLayer, maxLayer);
+    if (left > 0 && nodesBuffer[left].mortonCode != target)
+    {
+        nodeIndex = left - 1;
     }
+    else
+    {
+        nodeIndex = left;
+    }
+        
+    // --- Main Fluid Logic (Unchanged) ---
+    Node node = nodesBuffer[nodeIndex];
+    Node nodeOld = nodesBufferOld[nodeIndex];
+    
+    // 1. Get the cell's side length in world units, consistent with physics
+    float cellSideLength = exp2((float)node.layer);
+    
+    // 2. Get the cell's minimum corner coordinates in grid units (0-1023)
+    uint cellMortonCode = node.mortonCode & ~((1u << (3 * node.layer)) - 1);
+    uint3 cellGridMin = deinterleave(cellMortonCode); // Coords are 0-1023
+    
+    // 3. Calculate nodeMin and nodeMax in world units
+    float3 extent = float3(cellSideLength, cellSideLength, cellSideLength);
+    float3 nodeMin = cellGridMin;
+    float3 nodeMax = cellGridMin + extent;
 
-    // --- 4. Update Morton Code for Next Frame ---
-    float3 normalizedPos = (particle.position - simulationBoundsMin) * mortonNormalizationFactor;
-    normalizedPos = clamp(normalizedPos, 0.0, mortonMaxValue);
-    particle.mortonCode = EncodeMorton3D(normalizedPos);
+    float3 t = saturate((particle.position - nodeMin) / extent);
+
+    // Interpolate new and old velocities for FLIP
+    float3 newGridVelocity;
+    newGridVelocity.x = lerp(node.velocities.left, node.velocities.right, t.x);
+    newGridVelocity.y = lerp(node.velocities.bottom, node.velocities.top, t.y);
+    newGridVelocity.z = lerp(node.velocities.front, node.velocities.back, t.z);
+    
+    float3 oldGridVelocity;
+    oldGridVelocity.x = lerp(nodeOld.velocities.left, nodeOld.velocities.right, t.x);
+    oldGridVelocity.y = lerp(nodeOld.velocities.bottom, nodeOld.velocities.top, t.y);
+    oldGridVelocity.z = lerp(nodeOld.velocities.front, nodeOld.velocities.back, t.z);
+
+    // FLIP method: Calculate velocity delta and blend
+    float3 grid_velocity_delta = newGridVelocity - oldGridVelocity;
+    float3 flip_velocity = particle.velocity + grid_velocity_delta;
+    float flip_ratio = 0.95f;
+    float3 newVelocity = lerp(newGridVelocity, flip_velocity, flip_ratio);
+
+    // float3 newVelocity = newGridVelocity;
+
+    // Advect the particle and apply boundary conditions
+    float3 newPosition = particle.position + newVelocity * deltaTime;
+    // float3 newPosition = particle.position;
+
+    // newVelocity.y -= gravity * deltaTime;
+
+    float bounceDamping = 0.1f;  // Much more damping to reduce bouncing
+    float epsilon = 0.1f;  // Larger epsilon to prevent boundary sticking
+
+    // if (newPosition.x <= simulationBoundsMin.x) { newPosition.x = simulationBoundsMin.x + epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
+    // if (newPosition.x >= simulationBoundsMax.x) { newPosition.x = simulationBoundsMax.x - epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
+    // if (newPosition.y <= simulationBoundsMin.y) { newPosition.y = simulationBoundsMin.y + epsilon;newVelocity.y *= -1.0 * bounceDamping;} 
+    // if (newPosition.y >= simulationBoundsMax.y) { newPosition.y = simulationBoundsMax.y - epsilon;newVelocity.y *= -1.0 * bounceDamping;} 
+    // if (newPosition.z <= simulationBoundsMin.z) { newPosition.z = simulationBoundsMin.z + epsilon;newVelocity.z *= -1.0 * bounceDamping;} 
+    // if (newPosition.z >= simulationBoundsMax.z) { newPosition.z = simulationBoundsMax.z - epsilon;newVelocity.z *= -1.0 * bounceDamping;}
+    
+    if (newPosition.x <= 0) { newPosition.x = 0; newVelocity.x *= -1.0 * bounceDamping;} 
+    if (newPosition.x >= 1024) { newPosition.x = 1024; newVelocity.x *= -1.0 * bounceDamping;}
+    if (newPosition.y <= 0) { newPosition.y = 0; newVelocity.y *= -1.0 * bounceDamping;}
+    if (newPosition.y >= 1024) { newPosition.y = 1024; newVelocity.y *= -1.0 * bounceDamping;}
+    if (newPosition.z <= 0) { newPosition.z = 0; newVelocity.z *= -1.0 * bounceDamping;}
+    if (newPosition.z >= 1024) { newPosition.z = 1024; newVelocity.z *= -1.0 * bounceDamping;}
+
+    particle.position = newPosition;
+    particle.velocity = newVelocity;
+
+    particle.layer = clamp(10-floor(log2(length(particle.velocity) * velocitySensitivity / 3.0)), minLayer, maxLayer);
+    
+    particle.mortonCode = EncodeMorton3D(newPosition);
 
     particlesBuffer[index] = particle;
 }

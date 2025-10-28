@@ -38,7 +38,6 @@ RWStructuredBuffer<float> ApBuffer; // The output vector 'Ap'
 RWStructuredBuffer<float> xBuffer;
 RWStructuredBuffer<float> yBuffer;
 uint numNodes;
-float maxDetailCellSize; // Smallest cell size in the simulation
 float a; // scalar 'a'
 float deltaTime; // Time step for physics scaling
 
@@ -55,7 +54,7 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     faceVelocities v = node.velocities;
 
     float divergence = v.right - v.left + v.top - v.bottom + v.back - v.front;
-    float dx = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
+    float dx = exp2((float)node.layer);
     float outVal = -divergence / dx;
     if (!isfinite(outVal)) outVal = 0.0;
     divergenceBuffer[i] = outVal;
@@ -74,7 +73,7 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
     // Guard against NaN values in input
     if (!isfinite(p_i)) p_i = 0.0;
 
-    float dx_i = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
+    float dx_i = exp2((float)node.layer);
     if (!isfinite(dx_i)) dx_i = 1e-6;
     uint neighborBaseIndex = i * 24;
 
@@ -95,7 +94,7 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
             // Guard against NaN values
             if (!isfinite(p_j)) p_j = 0.0;
             
-            float dx_j = max(maxDetailCellSize * exp2((float)nNode.layer), 1e-6);
+            float dx_j = exp2((float)nNode.layer);
             if (!isfinite(dx_j)) dx_j = 1e-6;
             
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
@@ -125,7 +124,7 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
                 if (child_idx < numNodes)
                 {
                     avg_p_children += pBuffer[child_idx];
-                    dx_c_avg += max(maxDetailCellSize * exp2((float)nodesBuffer[child_idx].layer), 1e-6);
+                    dx_c_avg += exp2((float)nodesBuffer[child_idx].layer);
                     childCount++;
                 }
             }
