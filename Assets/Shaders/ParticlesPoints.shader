@@ -90,6 +90,7 @@ Shader "Custom/ParticlesPoints"
             float4 PS(VSOut i) : SV_Target
             {
                 return i.col;
+                // return float4(0, 0, 0, 0);
             }
             ENDHLSL
 

@@ -530,16 +530,17 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   simulationBounds: {fileID: 72561709}
-  fluidInitialBounds: {fileID: 1326165318}
+  fluidInitialBounds: {fileID: 1326165319}
   radixSortShader: {fileID: 7200000, guid: 2adf52e88e342442488eba44ee38e2aa, type: 3}
   particlesShader: {fileID: 7200000, guid: 50811f54569ba494198b8c6b696cff81, type: 3}
   nodesPrefixSumsShader: {fileID: 7200000, guid: c32ad71b0afda4f7d827eb945c910544, type: 3}
   nodesShader: {fileID: 7200000, guid: eab82c62a627a4a2295451473985b296, type: 3}
   cgSolverShader: {fileID: 7200000, guid: d5297ef94acc94983b6222dcf43123f9, type: 3}
+  relaxationSolverShader: {fileID: 7200000, guid: b15206c7e07d744379321064b898d703, type: 3}
   numParticles: 1048576
-  maxCgIterations: 500
+  maxCgIterations: 20
   convergenceThreshold: 10
-  gravity: 10
+  gravity: 500
   frameRate: 30
   minLayer: 4
   maxLayer: 4
@@ -697,7 +698,7 @@ Transform:
   m_GameObject: {fileID: 1326165318}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 20, z: 0}
+  m_LocalPosition: {x: 0, y: 10, z: 0}
   m_LocalScale: {x: 5, y: 5, z: 5}
   m_ConstrainProportionsScale: 0
   m_Children: []

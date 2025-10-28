@@ -53,11 +53,22 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[i];
     faceVelocities v = node.velocities;
 
-    float divergence = v.right - v.left + v.top - v.bottom + v.back - v.front;
+    // This is the sum of (v_out - v_in) for all faces
+    float divergence_flux_sum = v.right - v.left + v.top - v.bottom + v.back - v.front;
+    
     float dx = exp2((float)node.layer);
-    float outVal = -divergence / dx;
+    if (!isfinite(dx) || dx < 1e-6) dx = 1e-6;
+
+    // This is b = (dx^2 / dt) * (sum of fluxes)
+    float b_val = (dx * dx / max(deltaTime, 1e-9)) * divergence_flux_sum;
+
+    // We are solving A'p = b'
+    // A' = -L
+    // b' = -b
+    float outVal = -b_val;
+    
     if (!isfinite(outVal)) outVal = 0.0;
-    divergenceBuffer[i] = outVal;
+    divergenceBuffer[i] = outVal; // This buffer is now b'
 }
 
 [numthreads(512, 1, 1)]
@@ -69,8 +80,6 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[i];
     float p_i = pBuffer[i];
     float laplacian_p = 0.0;
-
-    // Guard against NaN values in input
     if (!isfinite(p_i)) p_i = 0.0;
 
     float dx_i = exp2((float)node.layer);
@@ -82,18 +91,43 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
     {
         uint faceNeighborBase = neighborBaseIndex + d * 4;
         uint neighbor_idx = neighborsBuffer[faceNeighborBase]; // first slot: same/parent layer
-        bool isBoundary = (neighbor_idx >= numNodes);
-        // bool isFreeBoundary = (neighbor_idx == numNodes + 1);
 
-        if (!isBoundary && nodesBuffer[neighbor_idx].layer >= node.layer)
+        // --- NEW BOUNDARY LOGIC ---
+        bool isTrueBoundary = (neighbor_idx == numNodes + 1);
+        bool isFreeSpace = (neighbor_idx == numNodes);
+        bool isFluidNeighbor = (neighbor_idx < numNodes);
+        // --- END NEW LOGIC ---
+
+        if (isTrueBoundary)
         {
-            // Same-layer or Parent (coarser) neighbor
+            // Case 0: True Solid Wall (Neumann, dp/dn = 0)
+            // We do nothing, contribution is 0.
+            // This is correct.
+        }
+        else if (isFreeSpace)
+        {
+            // Case 1: Free Space (Dirichlet, p = 0)
+            // We calculate flux from p_i to p_j (which is 0)
+            float distance = max(0.5 * dx_i, 1e-6); // Distance from cell center to face
+            float a_shared = dx_i * dx_i;           // Area of the face
+            if (!isfinite(a_shared)) a_shared = 1e-12;
+            
+            float w = a_shared / distance;
+            if (!isfinite(w)) w = 0.0;
+            
+            float contribution = w * (0.0 - p_i); // p_j = 0
+            if (!isfinite(contribution)) contribution = 0.0;
+            
+            laplacian_p += contribution;
+        }
+        else if (isFluidNeighbor && nodesBuffer[neighbor_idx].layer >= node.layer)
+        {
+            // Case 2: Same-layer or Parent (coarser) fluid neighbor
+            // (This is your original logic, which is correct)
             Node nNode = nodesBuffer[neighbor_idx];
             float p_j = pBuffer[neighbor_idx];
             
-            // Guard against NaN values
             if (!isfinite(p_j)) p_j = 0.0;
-            
             float dx_j = exp2((float)nNode.layer);
             if (!isfinite(dx_j)) dx_j = 1e-6;
             
@@ -102,7 +136,6 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
             
             float a_shared = min(dx_i, dx_j) * min(dx_i, dx_j);
             if (!isfinite(a_shared)) a_shared = 1e-12;
-            
             float w = a_shared / distance;
             if (!isfinite(w)) w = 0.0;
             
@@ -111,21 +144,37 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
             
             laplacian_p += contribution;
         }
-        else if (!isBoundary)
+        else if (isFluidNeighbor) // Must be a Child (finer) fluid neighbor
         {
-            // Child (finer) neighbors. First, average their pressures.
+            // Case 3: Child (finer) neighbors.
+            // --- MODIFIED CHILD LOOP ---
             float avg_p_children = 0.0;
-            uint childCount = 0;
+            uint childCount = 0; // Count of all non-solid-wall children
             float dx_c_avg = 0.0;
-
+            
             for (int k = 0; k < 4; k++)
             {
                 uint child_idx = neighborsBuffer[faceNeighborBase + k];
-                if (child_idx < numNodes)
+
+                if (child_idx == numNodes + 1)
+                {
+                    // This child is a solid wall, skip it (Neumann)
+                    continue;
+                }
+
+                // Child is either fluid or free space, count it
+                childCount++;
+                
+                if (child_idx < numNodes) // It's fluid
                 {
                     avg_p_children += pBuffer[child_idx];
                     dx_c_avg += exp2((float)nodesBuffer[child_idx].layer);
-                    childCount++;
+                }
+                else // It's free space (child_idx == numNodes)
+                {
+                    // Pressure is 0, so add 0 to avg_p_children (a no-op)
+                    // But we still need its size for the average distance
+                    dx_c_avg += exp2((float)node.layer - 1.0); // Child layer is parent - 1
                 }
             }
 
@@ -134,48 +183,29 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
                 avg_p_children /= (float)childCount;
                 dx_c_avg /= (float)childCount;
 
-                // Now, calculate a SINGLE flux using the averaged pressure.
                 float p_j = avg_p_children;
                 if (!isfinite(p_j)) p_j = 0.0;
 
-                // Distance is between the center of the coarse cell and the center of the child face plane.
                 float distance = max(0.5 * (dx_i + dx_c_avg), 1e-6);
                 if (!isfinite(distance)) distance = 1e-6;
-
-                // The shared area is the area of the coarse face.
-                float a_shared = dx_i * dx_i;
+                float a_shared = dx_i * dx_i; // Area of the coarse face
                 if (!isfinite(a_shared)) a_shared = 1e-12;
 
                 float w = a_shared / distance;
                 if (!isfinite(w)) w = 0.0;
-
                 float contribution = w * (p_j - p_i);
                 if (!isfinite(contribution)) contribution = 0.0;
                 
                 laplacian_p += contribution;
             }
-            // If childCount is 0, it's a boundary, and we contribute nothing (Neumann BC).
+            // If childCount is 0, all 4 children are solid walls.
+            // We do nothing (Neumann).
+            // --- END MODIFIED CHILD LOOP ---
         }
-        // If isBoundary or isFreeBoundary, contribute nothing (Neumann BC)
     }
 
-    // --- START OF FIX ---
-    // The previous `laplacian_p` is Σ w*(p_j - p_i).
-    // We need to compute Ap = -Δt * (1/V) * Σ w*(p_i - p_j)
-    // This is equivalent to Ap = Δt * (1/V) * Σ w*(p_j - p_i)
-
-    float volume_i = dx_i * dx_i * dx_i;
-    float outVal = laplacian_p / max(volume_i, 1e-9); // This is (∇²p)_i
-    outVal *= deltaTime; // This is (Δt * ∇²p)_i
-    
-    // We are solving -Δt∇²p, so we need one final sign flip.
-    // However, your C# loop computes alpha = r_dot_r / p_dot_Ap, and your original
-    // Ap was -laplacian_p, so your code implicitly expects A to be positive definite.
-    // My math says Ap = Δt * ∇²p. To make it PD, we need Ap = -Δt * ∇²p.
-    // This is -deltaTime * (laplacian_p / volume).
-    
-    outVal = -outVal;
-    // --- END OF FIX ---
+    // (Rest of the function is unchanged)
+    float outVal = -laplacian_p;
 
     if (!isfinite(outVal)) outVal = 0.0;
     ApBuffer[i] = outVal;

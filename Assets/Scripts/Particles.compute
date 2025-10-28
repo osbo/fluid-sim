@@ -307,13 +307,6 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     float bounceDamping = 0.1f;  // Much more damping to reduce bouncing
     float epsilon = 0.1f;  // Larger epsilon to prevent boundary sticking
-
-    // if (newPosition.x <= simulationBoundsMin.x) { newPosition.x = simulationBoundsMin.x + epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
-    // if (newPosition.x >= simulationBoundsMax.x) { newPosition.x = simulationBoundsMax.x - epsilon;newVelocity.x *= -1.0 * bounceDamping;} 
-    // if (newPosition.y <= simulationBoundsMin.y) { newPosition.y = simulationBoundsMin.y + epsilon;newVelocity.y *= -1.0 * bounceDamping;} 
-    // if (newPosition.y >= simulationBoundsMax.y) { newPosition.y = simulationBoundsMax.y - epsilon;newVelocity.y *= -1.0 * bounceDamping;} 
-    // if (newPosition.z <= simulationBoundsMin.z) { newPosition.z = simulationBoundsMin.z + epsilon;newVelocity.z *= -1.0 * bounceDamping;} 
-    // if (newPosition.z >= simulationBoundsMax.z) { newPosition.z = simulationBoundsMax.z - epsilon;newVelocity.z *= -1.0 * bounceDamping;}
     
     if (newPosition.x <= 0) { newPosition.x = 0; newVelocity.x *= -1.0 * bounceDamping;} 
     if (newPosition.x >= 1024) { newPosition.x = 1024; newVelocity.x *= -1.0 * bounceDamping;}

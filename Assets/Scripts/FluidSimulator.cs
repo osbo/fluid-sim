@@ -15,6 +15,7 @@ public class FluidSimulator : MonoBehaviour
     public ComputeShader nodesPrefixSumsShader;
     public ComputeShader nodesShader;
     public ComputeShader cgSolverShader;
+    public ComputeShader relaxationSolverShader;
     public int numParticles;
     
     // CG Solver parameters
@@ -48,6 +49,8 @@ public class FluidSimulator : MonoBehaviour
     private int updateParticlesKernel;
     private int applyGravityKernel;
     private int enforceBoundaryConditionsKernel;
+    private int solvePressureIterationKernel;
+    private int initializePressureBuffersKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -82,9 +85,6 @@ public class FluidSimulator : MonoBehaviour
     public int surfaceLayer;
     public float velocitySensitivity;
 
-    private string str;
-    private int activeCount;
-    private int inactiveCount;
     private bool hasShownWaitMessage = false;
     
     private System.Diagnostics.Stopwatch totalOctreeSw;
@@ -130,6 +130,7 @@ public class FluidSimulator : MonoBehaviour
 
     private Node[] nodesCPU;
     private Particle[] particlesCPU;
+    private string str;
 
     // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
     public Material particlesMaterial;
@@ -212,28 +213,28 @@ public class FluidSimulator : MonoBehaviour
 
         // Frame loop: SortParticles -> findUniqueParticles -> CreateLeaves -> layer loop -> pullVelocities -> SolvePressure -> UpdateParticles
 
-        particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
-        string str = $"Start of frame: Particles {numParticles}:\n";
-        for (int i = 0; i < 40; i++)
-        {
-            str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z})\n";
-        }
-        Debug.Log(str);
+        // particlesCPU = new Particle[numParticles];
+        // particlesBuffer.GetData(particlesCPU);
+        // string str = $"Start of frame: Particles {numParticles}:\n";
+        // for (int i = 0; i < 40; i++)
+        // {
+        //     str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z})\n";
+        // }
+        // Debug.Log(str);
 
         // Step 1: Sort particles
         var sortSw = System.Diagnostics.Stopwatch.StartNew();
         SortParticles();
         sortSw.Stop();
 
-        particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
-        str = $"After sort particles: Particles {numParticles}:\n";
-        for (int i = 0; i < 40; i++)
-        {
-            str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
-        }
-        Debug.Log(str);
+        // particlesCPU = new Particle[numParticles];
+        // particlesBuffer.GetData(particlesCPU);
+        // str = $"After sort particles: Particles {numParticles}:\n";
+        // for (int i = 0; i < 40; i++)
+        // {
+        //     str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
+        // }
+        // Debug.Log(str);
 
         // Step 2: Find unique particles and create leaves
         var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
@@ -245,14 +246,14 @@ public class FluidSimulator : MonoBehaviour
         createLeavesSw.Stop();
         
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        str = $"After create leaves: Nodes:\n";
-        for (int i = 1; i < numNodes; i++)
-        {
-            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        }
-        Debug.Log(str);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // str = $"After create leaves: Nodes:\n";
+        // for (int i = 1; i < numNodes; i++)
+        // {
+        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        // }
+        // Debug.Log(str);
 
         // Step 3: Layer loop (layers 1-10)
         var layerLoopSw = System.Diagnostics.Stopwatch.StartNew();
@@ -277,28 +278,28 @@ public class FluidSimulator : MonoBehaviour
         }
         layerLoopSw.Stop();
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        str = $"End of layer loop: Nodes:\n";
-        for (int i = 1; i < numNodes; i++)
-        {
-            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        }
-        Debug.Log(str);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // str = $"End of layer loop: Nodes:\n";
+        // for (int i = 1; i < numNodes; i++)
+        // {
+        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        // }
+        // Debug.Log(str);
 
         // Step 4: Pull velocities
         var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
         pullVelocities();
         pullVelocitiesSw.Stop();
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        str = $"After pull velocities: Nodes:\n";
-        for (int i = 1; i < numNodes; i++)
-        {
-            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        }
-        Debug.Log(str);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // str = $"After pull velocities: Nodes:\n";
+        // for (int i = 1; i < numNodes; i++)
+        // {
+        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        // }
+        // Debug.Log(str);
 
         // Step 4.5: Store old velocities for FLIP method
         var storeOldVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
@@ -326,7 +327,8 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
-        // SolvePressure();
+        SolvePressure();
+        // SolvePressureSimple();
         solvePressureSw.Stop();
 
         nodesCPU = new Node[numNodes];
@@ -339,14 +341,14 @@ public class FluidSimulator : MonoBehaviour
         Debug.Log(str);
 
         
-        particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
-        str = $"Before update particles: Particles:\n";
-        for (int i = 0; i < 40; i++)
-        {
-            str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
-        }
-        Debug.Log(str);
+        // particlesCPU = new Particle[numParticles];
+        // particlesBuffer.GetData(particlesCPU);
+        // str = $"Before update particles: Particles:\n";
+        // for (int i = 0; i < 40; i++)
+        // {
+        //     str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
+        // }
+        // Debug.Log(str);
 
 
         // Step 7: Update particles
@@ -355,14 +357,14 @@ public class FluidSimulator : MonoBehaviour
         updateParticlesSw.Stop();
 
         
-        particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
-        str = $"End of frame: Particles:\n";
-        for (int i = 0; i < 40; i++)
-        {
-            str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
-        }
-        Debug.Log(str);
+        // particlesCPU = new Particle[numParticles];
+        // particlesBuffer.GetData(particlesCPU);
+        // str = $"End of frame: Particles:\n";
+        // for (int i = 0; i < 40; i++)
+        // {
+        //     str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
+        // }
+        // Debug.Log(str);
 
         // Draw particles as points using the particles buffer
         // Moved to OnRenderObject for reliable rendering timing
@@ -431,9 +433,99 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.Dispatch(updateParticlesKernel, threadGroups, 1, 1);
     }
 
+    private void SolvePressureSimple()
+    {
+        var totalSolveSw = System.Diagnostics.Stopwatch.StartNew();
+        Debug.Log("Solving pressure (simple)...");
+
+        if (relaxationSolverShader == null)
+        {
+            Debug.LogError("Relaxation solver compute shader is not assigned. Please assign `relaxationSolverShader` in the inspector.");
+            return;
+        }
+
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+        
+        solvePressureIterationKernel = relaxationSolverShader.FindKernel("SolvePressureIteration");
+        applyPressureGradientKernel = relaxationSolverShader.FindKernel("ApplyPressureGradient");
+        initializePressureBuffersKernel = relaxationSolverShader.FindKernel("InitializePressureBuffers");
+
+        // Create pressure buffer for relaxation solver
+        ComputeBuffer pressureBuffer = new ComputeBuffer(numNodes, sizeof(float));
+        ComputeBuffer tempPressureBuffer = new ComputeBuffer(numNodes, sizeof(float));
+
+        relaxationSolverShader.SetBuffer(initializePressureBuffersKernel, "pressureBuffer", pressureBuffer);
+        relaxationSolverShader.SetBuffer(initializePressureBuffersKernel, "tempPressureBuffer", tempPressureBuffer);
+        relaxationSolverShader.SetInt("numNodes", numNodes);
+        relaxationSolverShader.Dispatch(initializePressureBuffersKernel, threadGroups, 1, 1);
+
+        // float totalDivergence = 0.0f;
+        // Node[] nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     totalDivergence += nodesCPU[i].velocities.right - nodesCPU[i].velocities.left + nodesCPU[i].velocities.top - nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.back - nodesCPU[i].velocities.front;
+        // }
+        // Debug.Log($"Initial total divergence: {totalDivergence}");
+
+        for (int i = 0; i < maxCgIterations; i++)
+        {
+            // Set buffers for the pressure-ONLY solve
+            relaxationSolverShader.SetBuffer(solvePressureIterationKernel, "nodesBuffer", nodesBuffer); // READ-ONLY
+            relaxationSolverShader.SetBuffer(solvePressureIterationKernel, "neighborsBuffer", neighborsBuffer);
+            relaxationSolverShader.SetBuffer(solvePressureIterationKernel, "pressureBuffer", pressureBuffer); // Input pressure
+            relaxationSolverShader.SetBuffer(solvePressureIterationKernel, "tempPressureBuffer", tempPressureBuffer); // Output pressure
+            relaxationSolverShader.SetInt("numNodes", numNodes);
+            relaxationSolverShader.SetFloat("deltaTime", (1 / frameRate));
+            relaxationSolverShader.Dispatch(solvePressureIterationKernel, threadGroups, 1, 1);
+
+            // Swap ONLY the pressure buffers for ping-ponging
+            (pressureBuffer, tempPressureBuffer) = (tempPressureBuffer, pressureBuffer);
+        }
+
+        // --- Apply Pressure Gradient (ONCE) ---
+        // After the loop, the final pressure is in `pressureBuffer`
+        // The ApplyPressureGradient kernel reads pressure from its "tempPressureBuffer" slot.
+        // We must bind our final pressure (pressureBuffer) to that slot.
+
+        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "nodesBuffer", nodesBuffer); // Original nodes
+        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "tempNodesBuffer", tempNodesBuffer); // Output nodes
+        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "neighborsBuffer", neighborsBuffer);
+        
+        // FIX: Bind the *final* pressure (in C#'s pressureBuffer) to the
+        // slot the HLSL kernel *reads* from (tempPressureBuffer).
+        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "tempPressureBuffer", pressureBuffer); 
+        
+        // This slot is unused by the kernel, but good to set it.
+        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", tempPressureBuffer); 
+        
+        relaxationSolverShader.SetInt("numNodes", numNodes);
+        relaxationSolverShader.SetFloat("deltaTime", (1 / frameRate));
+        relaxationSolverShader.Dispatch(applyPressureGradientKernel, threadGroups, 1, 1);
+
+        (nodesBuffer, tempNodesBuffer) = (tempNodesBuffer, nodesBuffer);
+
+        // // --- Final Divergence Check ---
+        // totalDivergence = 0.0f;
+        
+        // // FIX: Read from 'nodesBuffer' (which now points to the corrected data)
+        // nodesBuffer.GetData(nodesCPU); 
+        
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     totalDivergence += nodesCPU[i].velocities.right - nodesCPU[i].velocities.left + nodesCPU[i].velocities.top - nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.back - nodesCPU[i].velocities.front;
+        // }
+        // Debug.Log($"Final total divergence: {totalDivergence}");
+
+        // Clean up pressure buffer
+        pressureBuffer.Release();
+        tempPressureBuffer.Release();
+    }
+
     private void SolvePressure()
     {
         var totalSolveSw = System.Diagnostics.Stopwatch.StartNew();
+        Debug.Log("Solving pressure...");
         
         if (cgSolverShader == null)
         {
@@ -480,15 +572,15 @@ public class FluidSimulator : MonoBehaviour
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
 
-        // // Debug: print total divergence
-        // float totalDivergence = 0.0f;
-        // float[] divergenceCPU = new float[numNodes];
-        // divergenceBuffer.GetData(divergenceCPU);
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     totalDivergence += divergenceCPU[i];
-        // }
-        // Debug.Log($"Total divergence: {totalDivergence}");
+        // Debug: print total divergence
+        float totalDivergence = 0.0f;
+        float[] divergenceCPU = new float[numNodes];
+        divergenceBuffer.GetData(divergenceCPU);
+        for (int i = 0; i < numNodes; i++)
+        {
+            totalDivergence += divergenceCPU[i];
+        }
+        Debug.Log($"Total divergence: {totalDivergence}");
 
         // Initialize: r = b, p = r (since initial pressure x = 0)
         var initSw = System.Diagnostics.Stopwatch.StartNew();
@@ -496,7 +588,10 @@ public class FluidSimulator : MonoBehaviour
         CopyBuffer(divergenceBuffer, pBuffer);
 
         float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
-        if (r_dot_r < convergenceThreshold) return; // Already converged
+        if (r_dot_r < convergenceThreshold) {
+            Debug.Log("Already converged");
+            return; // Already converged
+        }
         initSw.Stop();
 
         // Initialize residual tracking
@@ -521,6 +616,22 @@ public class FluidSimulator : MonoBehaviour
 
             // Calculate alpha with safety checks
             float p_dot_Ap = GpuDotProduct(pBuffer, ApBuffer);
+
+            float[] pCPU = new float[numNodes];
+            string pCPUString = "P Buffer:";
+            pBuffer.GetData(pCPU);
+            for (int j = 0; j < numNodes; j++) {
+                pCPUString += $"p[{j}] = {pCPU[j]}, ";
+            }
+            Debug.Log(pCPUString);
+
+            float[] ApCPU = new float[numNodes];
+            string ApCPUString = "AP Buffer:";
+            ApBuffer.GetData(ApCPU);
+            for (int j = 0; j < numNodes; j++) {
+                ApCPUString += $"Ap[{j}] = {ApCPU[j]}, ";
+            }
+            Debug.Log(ApCPUString);
             
             
             // Safety check for ill-conditioned matrix
@@ -539,7 +650,7 @@ public class FluidSimulator : MonoBehaviour
             float alpha = r_dot_r / (p_dot_Ap + 1e-12f);
             
             // Safety check for alpha with more reasonable bounds
-            if (Math.Abs(alpha) > 1e3f)
+            if (Math.Abs(alpha) > 1e10f)
             {
                 Debug.LogError($"CG Solver: Alpha is too large! alpha = {alpha:E6}, r_dot_r = {r_dot_r:E6}, p_dot_Ap = {p_dot_Ap:E6}");
                 Debug.LogError($"This suggests the matrix is still ill-conditioned. Consider preconditioning or different discretization.");
@@ -612,14 +723,14 @@ public class FluidSimulator : MonoBehaviour
         
         // Final timing summary
         totalSolveSw.Stop();
-        // Debug.Log($"SolvePressure Timing Summary:\n" +
-        //          $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• CG Loop: {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
+        Debug.Log($"SolvePressure Timing Summary:\n" +
+                 $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• CG Loop: {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     private void ApplyPressureGradient()
@@ -1327,9 +1438,10 @@ public class FluidSimulator : MonoBehaviour
         // With 10 bits per axis, we have 1024 possible values (0-1023)
         // The maximum detail cell size is simulation bounds divided by 1024
         // Use the normalized simulation bounds (simulationBoundsMin is now Vector3.zero)
-        Vector3 simulationSize = simulationBoundsMax;
+        Vector3 simulationSize = simulationBounds.bounds.size;
+        // float maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
         float maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
-        
+
         // Define 11 colors for different layers (0-10)
         Color[] layerColors = new Color[]
         {
@@ -1360,18 +1472,31 @@ public class FluidSimulator : MonoBehaviour
 
         nodesCPU = new Node[numNodes];
         nodesBuffer.GetData(nodesCPU);
-        
+
+        uint[] neighborsCPU = new uint[numNodes * 24];
+        neighborsBuffer.GetData(neighborsCPU);
         for (int i = 0; i < numNodes; i++)
         {
-            Node node = nodesCPU[i];
-            int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
-            Gizmos.color = layerColors[layerIndex];
+            // Node node = nodesCPU[i];
+            // int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
+            // Gizmos.color = layerColors[layerIndex];
             // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
             // float volume = Mathf.Pow(8, node.layer);
             // float divergenceNormalized = divergence * 50.0f / volume;
             // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
             // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
             // Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        }
+
+        int index = 9*numNodes/16;
+        Node node = nodesCPU[index];
+        Gizmos.color = new Color(1, 0, 0, 1);
+        Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        Gizmos.color = new Color(0, 1, 0, 1);
+        for (int i = 0; i < 24; i++) {
+            uint idx = neighborsCPU[index*24 + i];
+            if (idx >= numNodes) continue;
+            Gizmos.DrawCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, nodesCPU[idx].layer), 0.01f));
         }
 
         // // Read neighbors as a flat uint buffer: 24 uints per node (left4,right4,bottom4,top4,front4,back4)
