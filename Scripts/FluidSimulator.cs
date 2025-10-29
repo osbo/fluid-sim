@@ -281,7 +281,7 @@ public class FluidSimulator : MonoBehaviour
         // nodesCPU = new Node[numNodes];
         // nodesBuffer.GetData(nodesCPU);
         // str = $"End of layer loop: Nodes:\n";
-        // for (int i = 1; i < numNodes; i++)
+        // for (int i = 0; i < numNodes; i++)
         // {
         //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
         // }
@@ -295,9 +295,27 @@ public class FluidSimulator : MonoBehaviour
         // nodesCPU = new Node[numNodes];
         // nodesBuffer.GetData(nodesCPU);
         // str = $"After pull velocities: Nodes:\n";
-        // for (int i = 1; i < numNodes; i++)
+        // for (int i = 0; i < numNodes; i++)
         // {
         //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        // }
+        // Debug.Log(str);
+
+        // uint[] neighborsCPU = new uint[numNodes * 24];
+        // neighborsBuffer.GetData(neighborsCPU);
+        // str = $"Neighbors:\n";
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     str += $"Node {i} Neighbors: ";
+        //     for (int d = 0; d < 6; d++)
+        //     {
+        //         str += $"Direction {d}: ";
+        //         for (int j = 0; j < 4; j++)
+        //         {
+        //             str += $"{neighborsCPU[i*24+d*4+j]}, ";
+        //         }
+        //     }
+        //     str += "\n";
         // }
         // Debug.Log(str);
 
@@ -316,14 +334,14 @@ public class FluidSimulator : MonoBehaviour
         EnforceBoundaryConditions();
         enforceBoundarySw.Stop();
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        str = $"Before pressure solve: Nodes:\n";
-        for (int i = 1; i < numNodes; i++)
-        {
-            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        }
-        Debug.Log(str);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // str = $"Before pressure solve: Nodes:\n";
+        // for (int i = 1; i < numNodes; i++)
+        // {
+        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        // }
+        // Debug.Log(str);
 
         // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
@@ -331,14 +349,14 @@ public class FluidSimulator : MonoBehaviour
         // SolvePressureSimple();
         solvePressureSw.Stop();
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        str = $"After pressure solve: Nodes:\n";
-        for (int i = 1; i < numNodes; i++)
-        {
-            str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        }
-        Debug.Log(str);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // str = $"After pressure solve: Nodes:\n";
+        // for (int i = 1; i < numNodes; i++)
+        // {
+        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
+        // }
+        // Debug.Log(str);
 
         
         // particlesCPU = new Particle[numParticles];
@@ -525,7 +543,6 @@ public class FluidSimulator : MonoBehaviour
     private void SolvePressure()
     {
         var totalSolveSw = System.Diagnostics.Stopwatch.StartNew();
-        Debug.Log("Solving pressure...");
         
         if (cgSolverShader == null)
         {
@@ -588,10 +605,7 @@ public class FluidSimulator : MonoBehaviour
         CopyBuffer(divergenceBuffer, pBuffer);
 
         float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
-        if (r_dot_r < convergenceThreshold) {
-            Debug.Log("Already converged");
-            return; // Already converged
-        }
+        if (r_dot_r < convergenceThreshold) return; // Already converged
         initSw.Stop();
 
         // Initialize residual tracking
@@ -616,22 +630,6 @@ public class FluidSimulator : MonoBehaviour
 
             // Calculate alpha with safety checks
             float p_dot_Ap = GpuDotProduct(pBuffer, ApBuffer);
-
-            float[] pCPU = new float[numNodes];
-            string pCPUString = "P Buffer:";
-            pBuffer.GetData(pCPU);
-            for (int j = 0; j < numNodes; j++) {
-                pCPUString += $"p[{j}] = {pCPU[j]}, ";
-            }
-            Debug.Log(pCPUString);
-
-            float[] ApCPU = new float[numNodes];
-            string ApCPUString = "AP Buffer:";
-            ApBuffer.GetData(ApCPU);
-            for (int j = 0; j < numNodes; j++) {
-                ApCPUString += $"Ap[{j}] = {ApCPU[j]}, ";
-            }
-            Debug.Log(ApCPUString);
             
             
             // Safety check for ill-conditioned matrix
@@ -1477,7 +1475,19 @@ public class FluidSimulator : MonoBehaviour
         neighborsBuffer.GetData(neighborsCPU);
         for (int i = 0; i < numNodes; i++)
         {
-            // Node node = nodesCPU[i];
+            Node node = nodesCPU[i];
+            Color color = new Color(1, 1, 1, 0.5f);
+            for (int j = i * 24; j < (i + 1) * 24; j += 4) {
+                uint idx = neighborsCPU[j];
+                if (idx == numNodes) {
+                    color = new Color(1, 0, 0, 0.5f);
+                }
+                if (idx == numNodes + 1) {
+                    color = new Color(0, 1, 0, 0.5f);
+                    break;
+                }
+            }
+            Gizmos.color = color;
             // int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
             // Gizmos.color = layerColors[layerIndex];
             // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
@@ -1485,19 +1495,19 @@ public class FluidSimulator : MonoBehaviour
             // float divergenceNormalized = divergence * 50.0f / volume;
             // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
             // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
-            // Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+            // Gizmos.DrawCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
         }
 
-        int index = 9*numNodes/16;
-        Node node = nodesCPU[index];
-        Gizmos.color = new Color(1, 0, 0, 1);
-        Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        Gizmos.color = new Color(0, 1, 0, 1);
-        for (int i = 0; i < 24; i++) {
-            uint idx = neighborsCPU[index*24 + i];
-            if (idx >= numNodes) continue;
-            Gizmos.DrawCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, nodesCPU[idx].layer), 0.01f));
-        }
+        // int index = 9*numNodes/16;
+        // Node node = nodesCPU[index];
+        // Gizmos.color = new Color(1, 0, 0, 1);
+        // Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        // Gizmos.color = new Color(0, 1, 0, 1);
+        // for (int i = 0; i < 24; i++) {
+        //     uint idx = neighborsCPU[index*24 + i];
+        //     if (idx >= numNodes) continue;
+        //     Gizmos.DrawCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, nodesCPU[idx].layer), 0.01f));
+        // }
 
         // // Read neighbors as a flat uint buffer: 24 uints per node (left4,right4,bottom4,top4,front4,back4)
         // if (neighborsBuffer == null) return;
@@ -1553,42 +1563,20 @@ public class FluidSimulator : MonoBehaviour
 
     private Vector3 DecodeMorton3D(Node node)
     {
-        // Step 1: Quantize the node position to the appropriate level of detail for this layer
-        // Use the normalized simulation bounds (simulationBoundsMin is now Vector3.zero)
-        Vector3 simulationSize = simulationBoundsMax;
-        
-        // Calculate the grid resolution for this layer
-        // Layer 0: finest detail (1024 cells per axis)
-        // Layer 10: coarsest detail (1 cell per axis)
         int gridResolution = (int)Mathf.Pow(2, 10 - node.layer);
-        
-        // Normalize the node position to morton code range (0-1023)
-        Vector3 mortonNormalizationFactor = new Vector3(
-            1023.0f / simulationSize.x,
-            1023.0f / simulationSize.y,
-            1023.0f / simulationSize.z
-        );
-        
-        Vector3 normalizedPos = new Vector3(
-            node.position.x * mortonNormalizationFactor.x,
-            node.position.y * mortonNormalizationFactor.y,
-            node.position.z * mortonNormalizationFactor.z
-        );
-        
-        // Quantize to the grid resolution for this layer
-        // This snaps the position to the nearest grid cell at the appropriate level of detail
         float cellSize = 1024.0f / gridResolution;
         Vector3 quantizedPos = new Vector3(
-            Mathf.Floor(normalizedPos.x / cellSize) * cellSize + cellSize * 0.5f,
-            Mathf.Floor(normalizedPos.y / cellSize) * cellSize + cellSize * 0.5f,
-            Mathf.Floor(normalizedPos.z / cellSize) * cellSize + cellSize * 0.5f
+            Mathf.Floor(node.position.x / cellSize) * cellSize + cellSize * 0.5f,
+            Mathf.Floor(node.position.y / cellSize) * cellSize + cellSize * 0.5f,
+            Mathf.Floor(node.position.z / cellSize) * cellSize + cellSize * 0.5f
         );
+        Vector3 simulationSize = simulationBounds.bounds.max - simulationBounds.bounds.min;
         
         // Convert back to world coordinates
-        Vector3 quantizedWorldPos = new Vector3(
-            quantizedPos.x / mortonNormalizationFactor.x,
-            quantizedPos.y / mortonNormalizationFactor.y,
-            quantizedPos.z / mortonNormalizationFactor.z
+        Vector3 quantizedWorldPos = simulationBounds.bounds.min + new Vector3(
+            quantizedPos.x / 1024.0f * simulationSize.x,
+            quantizedPos.y / 1024.0f * simulationSize.y,
+            quantizedPos.z / 1024.0f * simulationSize.z
         );
 
         return quantizedWorldPos;
