@@ -40,27 +40,35 @@ float deltaTime;
 static const float relaxationFactor = 0.8;  // Under-relaxation factor (0 < w < 1)
 
 // Helper function to calculate divergence at a node
-float CalculateDivergence(Node node)
+float CalculateDivergence(Node node, uint threadIndex)
 {
     faceVelocities v = node.velocities;
     float dx = exp2((float)node.layer);
     
-    // Calculate divergence: ∇·v = (v_right - v_left + v_top - v_bottom + v_back - v_front) / dx
-    float divergence = (v.right - v.left + v.top - v.bottom + v.back - v.front) / dx;
-    
-    return divergence;
-}
-
-// Helper function to get pressure from a neighbor node
-float GetNeighborPressure(uint neighborIndex, float currentPressure)
-{
-    if (neighborIndex >= numNodes)
+    float totalDivergence = 0.0f;
+    uint neighborBaseIndex = threadIndex * 24;
+    for (int d = 0; d < 6; d++)
     {
-        // Boundary condition: use current pressure (Neumann boundary)
-        return currentPressure;
+        uint faceNeighborBase = neighborBaseIndex + d * 4;
+        uint neighborIndex = neighborsBuffer[faceNeighborBase];
+        if (neighborIndex != numNodes+1) {
+            if (d == 0) {
+                totalDivergence += v.left;
+            } else if (d == 1) {
+                totalDivergence += v.right;
+            } else if (d == 2) {
+                totalDivergence += v.bottom;
+            } else if (d == 3) {
+                totalDivergence += v.top;
+            } else if (d == 4) {
+                totalDivergence += v.front;
+            } else if (d == 5) {
+                totalDivergence += v.back;
+            }
+        }
     }
     
-    return pressureBuffer[neighborIndex];
+    return totalDivergence / dx;
 }
 
 [numthreads(512, 1, 1)]
@@ -81,7 +89,7 @@ void ApplyPressureGradientToNode(inout Node node, float pressure, float neighbor
     if (direction == 0) // left face
     {
         pressureGradient = (pressure - neighborPressure) / dx; // p_self - p_left
-        node.velocities.left -= deltaTime * pressureGradient;
+        node.velocities.left += deltaTime * pressureGradient;
     }
     else if (direction == 1) // right face
     {
@@ -91,7 +99,7 @@ void ApplyPressureGradientToNode(inout Node node, float pressure, float neighbor
     else if (direction == 2) // bottom face
     {
         pressureGradient = (pressure - neighborPressure) / dx; // p_self - p_bottom
-        node.velocities.bottom -= deltaTime * pressureGradient;
+        node.velocities.bottom += deltaTime * pressureGradient;
     }
     else if (direction == 3) // top face
     {
@@ -101,7 +109,7 @@ void ApplyPressureGradientToNode(inout Node node, float pressure, float neighbor
     else if (direction == 4) // front face
     {
         pressureGradient = (pressure - neighborPressure) / dx; // p_self - p_front
-        node.velocities.front -= deltaTime * pressureGradient;
+        node.velocities.front += deltaTime * pressureGradient;
     }
     else if (direction == 5) // back face
     {
@@ -132,7 +140,7 @@ void SolvePressureIteration(uint3 id : SV_DispatchThreadID)
     float dx = exp2((float)currentNode.layer);
     
     // Calculate current divergence
-    float currentDivergence = CalculateDivergence(currentNode);
+    float currentDivergence = CalculateDivergence(currentNode, threadIndex);
     
     // Relaxation iteration: sum neighbor pressures
     float sumNeighborPressure = 0.0;
@@ -142,23 +150,18 @@ void SolvePressureIteration(uint3 id : SV_DispatchThreadID)
     uint neighborBaseIndex = threadIndex * 24;
     
     // Iterate through all 6 faces to sum neighbor pressures
-    bool isBoundary = false;
     for (int d = 0; d < 6; d++)
     {
         uint faceNeighborBase = neighborBaseIndex + d * 4;
-        uint neighborIndex = neighborsBuffer[faceNeighborBase];
         
         for (int k = 0; k < 4; k++) {
             uint neighborIndex = neighborsBuffer[faceNeighborBase + k];
             if (neighborIndex < numNodes) {
-                float neighborPressure = GetNeighborPressure(neighborIndex, currentPressure);
-                // if (nodesBuffer[neighborIndex].layer > currentNode.layer) {
-                //     neighborPressure *= 0.25;
-                // }
-                sumNeighborPressure += neighborPressure;
+                sumNeighborPressure += pressureBuffer[neighborIndex];
                 neighborCount += 1.0;
-            } else if (neighborIndex == numNodes + 1) {
-                isBoundary = true;
+            } else if (neighborIndex == numNodes) {
+                sumNeighborPressure += currentPressure;
+                neighborCount += 1.0;
             }
         }
     }

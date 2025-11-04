@@ -303,7 +303,7 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     float3 newPosition = particle.position + newVelocity * deltaTime;
     // float3 newPosition = particle.position;
 
-    // newVelocity.y -= gravity * deltaTime;
+    newVelocity.y -= gravity * deltaTime;
 
     float bounceDamping = 0.1f;  // Much more damping to reduce bouncing
     float epsilon = 0.1f;  // Larger epsilon to prevent boundary sticking
