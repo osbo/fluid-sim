@@ -331,7 +331,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 5.5: Enforce boundary conditions
         var enforceBoundarySw = System.Diagnostics.Stopwatch.StartNew();
-        EnforceBoundaryConditions();
+        // EnforceBoundaryConditions();
         enforceBoundarySw.Stop();
 
         // nodesCPU = new Node[numNodes];
@@ -349,6 +349,18 @@ public class FluidSimulator : MonoBehaviour
         //     totalDivergence += Math.Abs(nodesCPU[i].velocities.right+nodesCPU[i].velocities.left + nodesCPU[i].velocities.top+nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.front+nodesCPU[i].velocities.back);
         // }
         // Debug.Log($"Total divergence: {totalDivergence/numNodes}");
+
+        // neighborsBuffer.GetData(neighborsCPU);
+        // str = $"Neighbors:\n";
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     str += $"Node {i} Neighbors: ";
+        //     for (int d = 0; d < 6; d++)
+        //     {
+        //         str += $"{neighborsCPU[i*24+d*4]}, ";
+        //     }
+        // }
+        // Debug.Log(str);
 
         // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
@@ -599,7 +611,6 @@ public class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
-        cgSolverShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
 
@@ -638,7 +649,6 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(applyLaplacianKernel, "ApBuffer", ApBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "neighborsBuffer", neighborsBuffer);
             cgSolverShader.SetInt("numNodes", numNodes);
-            cgSolverShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
             cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
             Dispatch(applyLaplacianKernel, numNodes);
 
@@ -659,7 +669,13 @@ public class FluidSimulator : MonoBehaviour
                 break;
             }
             
-            float alpha = r_dot_r / (p_dot_Ap + 1e-12f);
+            float alpha = r_dot_r / p_dot_Ap;
+
+            // Log alpha with context (only first few iterations to avoid spam)
+            if (i < 5 || i % 10 == 0)
+            {
+                Debug.Log($"CG Iter {i}: alpha = {alpha:E6}, r_dot_r = {r_dot_r:E6}, p_dot_Ap = {p_dot_Ap:E6}, residual_ratio = {r_dot_r / initialResidual:E3}");
+            }
             
             // Safety check for alpha with more reasonable bounds
             if (Math.Abs(alpha) > 1e10f)
@@ -668,11 +684,6 @@ public class FluidSimulator : MonoBehaviour
                 Debug.LogError($"This suggests the matrix is still ill-conditioned. Consider preconditioning or different discretization.");
                 break;
             }
-            
-            // Additional safety: limit alpha to prevent overshooting
-            // Use a more conservative cap based on the residual magnitude
-            float maxAlpha = Math.Min(1.0f, 1e6f / Math.Max(r_dot_r, 1e-6f));
-            alpha = Math.Min(alpha, maxAlpha);
 
             // Update pressure: x = x + alpha * p
             UpdateVector(pressureBuffer, pBuffer, alpha);
@@ -1487,32 +1498,32 @@ public class FluidSimulator : MonoBehaviour
 
         // uint[] neighborsCPU = new uint[numNodes * 24];
         // neighborsBuffer.GetData(neighborsCPU);
-        for (int i = 0; i < numNodes; i++)
-        {
-            // Node node = nodesCPU[i];
-            // // Color color = new Color(1, 1, 1, 0.5f);
-            // // for (int j = i * 24; j < (i + 1) * 24; j += 4) {
-            // //     uint idx = neighborsCPU[j];
-            // //     if (idx == numNodes) {
-            // //         color = new Color(1, 0, 0, 0.5f);
-            // //     }
-            // //     if (idx == numNodes + 1) {
-            // //         color = new Color(0, 1, 0, 0.5f);
-            // //         break;
-            // //     }
-            // // }
-            // float factor = 50.0f;
-            // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
-            // Gizmos.color = color;
-            // // int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
-            // // Gizmos.color = layerColors[layerIndex];
-            // // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-            // // float volume = Mathf.Pow(8, node.layer);
-            // // float divergenceNormalized = divergence * 50.0f / volume;
-            // // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-            // // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
-            // Gizmos.DrawCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        }
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     Node node = nodesCPU[i];
+        //     Color color = new Color(1, 1, 1, 0.5f);
+        //     for (int j = i * 24; j < (i + 1) * 24; j += 4) {
+        //         uint idx = neighborsCPU[j];
+        //         if (idx == numNodes) {
+        //             color = new Color(1, 0, 0, 0.5f);
+        //         }
+        //         if (idx == numNodes + 1) {
+        //             color = new Color(0, 1, 0, 0.5f);
+        //             break;
+        //         }
+        //     }
+        //     // float factor = 50.0f;
+        //     // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
+        //     Gizmos.color = color;
+        //     // int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
+        //     // Gizmos.color = layerColors[layerIndex];
+        //     // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
+        //     // float volume = Mathf.Pow(8, node.layer);
+        //     // float divergenceNormalized = divergence * 50.0f / volume;
+        //     // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+        //     // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+        //     Gizmos.DrawCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        // }
 
         // int index = 9*numNodes/16;
         // Node node = nodesCPU[index];
