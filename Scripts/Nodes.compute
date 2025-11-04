@@ -679,9 +679,13 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
         uint faceNeighborBase = neighborBaseIndex + d * 4;
         uint neighbor_idx = neighborsBuffer[faceNeighborBase];
         float pressure_gradient = 0.0;
-        // bool isBoundary = (neighbor_idx >= numNodes);
+        bool isBoundary = (neighbor_idx == numNodes + 1);
 
-        if (nodesBuffer[neighbor_idx].layer >= node.layer)
+        if (isBoundary) // Neumann BC: zero flux
+        {
+            pressure_gradient = 0.0;
+        }
+        else if (nodesBuffer[neighbor_idx].layer >= node.layer)
         {
             // Case 1: Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
@@ -690,27 +694,24 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
             pressure_gradient = (p_j - p_i) / distance;
         }
-        else if (dx_i > 0.0)
+        else
         {
-            // Case 2: Child (finer) neighbors
-            float avg_p_children = 0.0;
-            uint childCount = 0;
+            // Case 2: Child (finer) neighbors or Dirichlet boundary
             for (int k = 0; k < 4; k++)
             {
                 uint child_idx = neighborsBuffer[faceNeighborBase + k];
                 if (child_idx < numNodes)
                 {
-                    avg_p_children += pressureBuffer[child_idx];
-                    childCount++;
+                    Node cNode = nodesBuffer[child_idx];
+                    float p_k = pressureBuffer[child_idx];
+                    float dx_k = exp2((float)cNode.layer);
+                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
+                    pressure_gradient += (p_k - p_i) / distance / 4.0;
                 }
-            }
-
-            if (childCount > 0)
-            {
-                avg_p_children /= (float)childCount;
-                float dx_child = dx_i * 0.5;
-                float distance = max(0.5 * (dx_i + dx_child), 1e-6);
-                pressure_gradient = (avg_p_children - p_i) / distance;
+                else if (child_idx == numNodes)
+                {
+                    pressure_gradient -= p_i / dx_i / 4.0;
+                }
             }
         }
         

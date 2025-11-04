@@ -38,7 +38,6 @@ RWStructuredBuffer<float> ApBuffer; // The output vector 'Ap'
 RWStructuredBuffer<float> xBuffer;
 RWStructuredBuffer<float> yBuffer;
 uint numNodes;
-float maxDetailCellSize; // Smallest cell size in the simulation
 float a; // scalar 'a'
 float deltaTime; // Time step for physics scaling
 
@@ -55,7 +54,7 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     faceVelocities v = node.velocities;
 
     float divergence = v.right - v.left + v.top - v.bottom + v.back - v.front;
-    float dx = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
+    float dx = exp2((float)node.layer);
     float outVal = -divergence / dx;
     if (!isfinite(outVal)) outVal = 0.0;
     divergenceBuffer[i] = outVal;
@@ -74,7 +73,7 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
     // Guard against NaN values in input
     if (!isfinite(p_i)) p_i = 0.0;
 
-    float dx_i = max(maxDetailCellSize * exp2((float)node.layer), 1e-6);
+    float dx_i = exp2((float)node.layer);
     if (!isfinite(dx_i)) dx_i = 1e-6;
     uint neighborBaseIndex = i * 24;
 
@@ -84,120 +83,99 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
         uint faceNeighborBase = neighborBaseIndex + d * 4;
         uint neighbor_idx = neighborsBuffer[faceNeighborBase]; // first slot: same/parent layer
 
-        // --- MODIFICATION START ---
         // Check the three distinct neighbor cases
 
-        // Case 1: Internal Node (neighbor_idx < numNodes)
-        if (neighbor_idx < numNodes)
-        {
-            if (nodesBuffer[neighbor_idx].layer >= node.layer)
-            {
-                // Same-layer or Parent (coarser) neighbor
-                Node nNode = nodesBuffer[neighbor_idx];
-                float p_j = pBuffer[neighbor_idx];
-                
-                // Guard against NaN values
-                if (!isfinite(p_j)) p_j = 0.0;
-                
-                float dx_j = max(maxDetailCellSize * exp2((float)nNode.layer), 1e-6);
-                if (!isfinite(dx_j)) dx_j = 1e-6;
-                
-                float distance = max(0.5 * (dx_i + dx_j), 1e-6);
-                if (!isfinite(distance)) distance = 1e-6;
-                
-                float a_shared = min(dx_i, dx_j) * min(dx_i, dx_j);
-                if (!isfinite(a_shared)) a_shared = 1e-12;
-                
-                float w = a_shared / distance;
-                if (!isfinite(w)) w = 0.0;
-                
-                float contribution = w * (p_j - p_i);
-                if (!isfinite(contribution)) contribution = 0.0;
-                
-                laplacian_p += contribution;
-            }
-            else
-            {
-                // Child (finer) neighbors. First, average their pressures.
-                float avg_p_children = 0.0;
-                uint childCount = 0;
-                float dx_c_avg = 0.0;
-
-                for (int k = 0; k < 4; k++)
-                {
-                    uint child_idx = neighborsBuffer[faceNeighborBase + k];
-                    if (child_idx < numNodes)
-                    {
-                        avg_p_children += pBuffer[child_idx];
-                        dx_c_avg += max(maxDetailCellSize * exp2((float)nodesBuffer[child_idx].layer), 1e-6);
-                        childCount++;
-                    }
-                }
-
-                if (childCount > 0)
-                {
-                    avg_p_children /= (float)childCount;
-                    dx_c_avg /= (float)childCount;
-
-                    // Now, calculate a SINGLE flux using the averaged pressure.
-                    float p_j = avg_p_children;
-                    if (!isfinite(p_j)) p_j = 0.0;
-
-                    float distance = max(0.5 * (dx_i + dx_c_avg), 1e-6);
-                    if (!isfinite(distance)) distance = 1e-6;
-
-                    float a_shared = dx_i * dx_i;
-                    if (!isfinite(a_shared)) a_shared = 1e-12;
-
-                    float w = a_shared / distance;
-                    if (!isfinite(w)) w = 0.0;
-
-                    float contribution = w * (p_j - p_i);
-                    if (!isfinite(contribution)) contribution = 0.0;
-                    
-                    laplacian_p += contribution;
-                }
-                // If childCount is 0, it's a boundary, and we contribute nothing.
-            }
-        }
-        // Case 2: Free Space (Dirichlet BC, neighbor_idx == numNodes)
-        else if (neighbor_idx == numNodes)
-        {
-            // Dirichlet BC means pressure p_j is fixed.
-            // For free space, we assume p_j = 0.
-            // The contribution is w * (p_j - p_i) = w * (0 - p_i) = -w * p_i
-            
-            // w = a_shared / distance
-            // a_shared (face area) = dx_i * dx_i
-            // distance (node center to face) = 0.5 * dx_i
-            // w = (dx_i * dx_i) / (0.5 * dx_i) = 2.0 * dx_i
-            
-            float w = 2.0 * dx_i;
-            if (!isfinite(w)) w = 0.0;
-            
-            float contribution = -w * p_i;
-            if (!isfinite(contribution)) contribution = 0.0;
-            
-            laplacian_p += contribution;
-        }
-        // Case 3: True Boundary (Neumann BC, neighbor_idx == numNodes + 1)
-        else if (neighbor_idx == numNodes + 1)
+        // Case 1: True Boundary (Neumann BC, neighbor_idx == numNodes + 1)
+        if (neighbor_idx == numNodes + 1)
         {
             // Neumann BC means zero flux (dp/dn = 0).
             // The flux contribution is 0.
             laplacian_p += 0.0;
         }
-        // --- MODIFICATION END ---
+        // Case 2: Same-layer or Parent (coarser) neighbor
+        else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
+        {
+            Node nNode = nodesBuffer[neighbor_idx];
+            float p_j = pBuffer[neighbor_idx];
+            
+            float dx_j = exp2((float)nNode.layer);
+            
+            // Distance between cell centers
+            float distance = max(0.5 * (dx_i + dx_j), 1e-6);
+            
+            // Face area is the area of cell i's face (dx_i^2)
+            float a_shared = dx_i * dx_i;
+            
+            // Weight: area divided by distance
+            float w = a_shared / distance;
+            
+            float contribution = w * (p_j - p_i);
+            
+            laplacian_p += contribution;
+        }
+        else
+        {
+            // Case 3 or 4: Child (finer) neighbors or Dirichlet boundary
+            // The face of cell i is subdivided into 4 child cells
+            // Each child occupies 1/4 of the face area
+            float faceArea = dx_i * dx_i;
+            float childFaceArea = faceArea / 4.0; // Each child occupies 1/4 of the face
+            
+            for (int k = 0; k < 4; k++)
+            {
+                uint child_idx = neighborsBuffer[faceNeighborBase + k];
+                // Case 3: Child (finer) neighbor
+                if (child_idx < numNodes)
+                {
+                    Node cNode = nodesBuffer[child_idx];
+                    float p_k = pBuffer[child_idx];
+                    float dx_k = exp2((float)cNode.layer);
+                    
+                    // Distance between cell i center and child cell k center
+                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
+                    
+                    // Weight: child's portion of face area divided by distance
+                    float w = childFaceArea / distance;
+                    
+                    float contribution = w * (p_k - p_i);
+                    laplacian_p += contribution;
+                }
+                // Case 4: Dirichlet boundary
+                else if (child_idx == numNodes)
+                {
+                    float dx_k = dx_i * 0.5;
+                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
+                    
+                    // Weight: child's portion of face area divided by distance
+                    float w = childFaceArea / distance;
+                    
+                    float contribution = w * (-p_i); // No pressure over the boundary
+                    laplacian_p += contribution;
+                }
+            }
+        }
     }
 
     // --- (Rest of your kernel is unchanged) ---
     float volume_i = dx_i * dx_i * dx_i;
     float outVal = laplacian_p / max(volume_i, 1e-9);
     outVal *= deltaTime;
-    outVal = -outVal;
+    outVal = -outVal; // The Laplacian is negative for pressure
 
     if (!isfinite(outVal)) outVal = 0.0;
     ApBuffer[i] = outVal;
+}
+
+[numthreads(512, 1, 1)]
+void Scale(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i >= numNodes) return;
+    
+    float y_val = yBuffer[i];
+    
+    float result = a * y_val;
+    
+    yBuffer[i] = result;
 }
 
 [numthreads(512, 1, 1)]
@@ -208,28 +186,7 @@ void Axpy(uint3 id : SV_DispatchThreadID) {
     float x_val = xBuffer[i];
     float y_val = yBuffer[i];
     
-    // Guard against NaN values
-    if (!isfinite(x_val)) x_val = 0.0;
-    if (!isfinite(y_val)) y_val = 0.0;
-    if (!isfinite(a)) a = 0.0;
-    
     float result = a * x_val + y_val;
-    if (!isfinite(result)) result = 0.0;
-    
-    yBuffer[i] = result;
-}
-
-[numthreads(512, 1, 1)]
-void Scale(uint3 id : SV_DispatchThreadID) {
-    uint i = id.x;
-    if (i >= numNodes) return;
-    
-    float y_val = yBuffer[i];
-    if (!isfinite(y_val)) y_val = 0.0;
-    if (!isfinite(a)) a = 0.0;
-    
-    float result = a * y_val;
-    if (!isfinite(result)) result = 0.0;
     
     yBuffer[i] = result;
 }
