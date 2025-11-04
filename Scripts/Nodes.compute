@@ -679,9 +679,9 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
         uint faceNeighborBase = neighborBaseIndex + d * 4;
         uint neighbor_idx = neighborsBuffer[faceNeighborBase];
         float pressure_gradient = 0.0;
-        bool isBoundary = (neighbor_idx >= numNodes);
+        // bool isBoundary = (neighbor_idx >= numNodes);
 
-        if (!isBoundary && nodesBuffer[neighbor_idx].layer >= node.layer)
+        if (nodesBuffer[neighbor_idx].layer >= node.layer)
         {
             // Case 1: Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
@@ -690,7 +690,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
             pressure_gradient = (p_j - p_i) / distance;
         }
-        else if (!isBoundary && dx_i > 0.0)
+        else if (dx_i > 0.0)
         {
             // Case 2: Child (finer) neighbors
             float avg_p_children = 0.0;
@@ -716,11 +716,11 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
         
         float velocity_correction = deltaTime * pressure_gradient;
 
-        if (d == 0) outNode.velocities.left -= velocity_correction;
+        if (d == 0) outNode.velocities.left += velocity_correction;
         else if (d == 1) outNode.velocities.right -= velocity_correction;
-        else if (d == 2) outNode.velocities.bottom -= velocity_correction;
+        else if (d == 2) outNode.velocities.bottom += velocity_correction;
         else if (d == 3) outNode.velocities.top -= velocity_correction;
-        else if (d == 4) outNode.velocities.front -= velocity_correction;
+        else if (d == 4) outNode.velocities.front += velocity_correction;
         else outNode.velocities.back -= velocity_correction;
     }
 
@@ -736,7 +736,7 @@ void ApplyGravity(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[threadIndex];
     // Apply gravity to all face velocities consistently
     // node.velocities.top -= gravity * deltaTime;
-    node.velocities.bottom -= gravity * deltaTime;
+    // node.velocities.bottom -= gravity * deltaTime;
     nodesBuffer[threadIndex] = node;
 }
 
