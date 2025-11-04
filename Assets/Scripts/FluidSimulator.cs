@@ -343,6 +343,13 @@ public class FluidSimulator : MonoBehaviour
         // }
         // Debug.Log(str);
 
+        // float totalDivergence = 0.0f;
+        // for (int i = 1; i < numNodes; i++)
+        // {
+        //     totalDivergence += Math.Abs(nodesCPU[i].velocities.right+nodesCPU[i].velocities.left + nodesCPU[i].velocities.top+nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.front+nodesCPU[i].velocities.back);
+        // }
+        // Debug.Log($"Total divergence: {totalDivergence/numNodes}");
+
         // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
         SolvePressure();
@@ -357,6 +364,13 @@ public class FluidSimulator : MonoBehaviour
         //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
         // }
         // Debug.Log(str);
+
+        // totalDivergence = 0.0f;
+        // for (int i = 1; i < numNodes; i++)
+        // {
+        //     totalDivergence += Math.Abs(nodesCPU[i].velocities.right+nodesCPU[i].velocities.left + nodesCPU[i].velocities.top+nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.front+nodesCPU[i].velocities.back);
+        // }
+        // Debug.Log($"Total divergence: {totalDivergence/numNodes}");
 
         
         // particlesCPU = new Particle[numParticles];
@@ -1468,33 +1482,35 @@ public class FluidSimulator : MonoBehaviour
             // new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
 
-        uint[] neighborsCPU = new uint[numNodes * 24];
-        neighborsBuffer.GetData(neighborsCPU);
+        // uint[] neighborsCPU = new uint[numNodes * 24];
+        // neighborsBuffer.GetData(neighborsCPU);
         for (int i = 0; i < numNodes; i++)
         {
-            Node node = nodesCPU[i];
-            Color color = new Color(1, 1, 1, 0.5f);
-            for (int j = i * 24; j < (i + 1) * 24; j += 4) {
-                uint idx = neighborsCPU[j];
-                if (idx == numNodes) {
-                    color = new Color(1, 0, 0, 0.5f);
-                }
-                if (idx == numNodes + 1) {
-                    color = new Color(0, 1, 0, 0.5f);
-                    break;
-                }
-            }
-            Gizmos.color = color;
-            // int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
-            // Gizmos.color = layerColors[layerIndex];
-            // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-            // float volume = Mathf.Pow(8, node.layer);
-            // float divergenceNormalized = divergence * 50.0f / volume;
-            // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-            // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+            // Node node = nodesCPU[i];
+            // // Color color = new Color(1, 1, 1, 0.5f);
+            // // for (int j = i * 24; j < (i + 1) * 24; j += 4) {
+            // //     uint idx = neighborsCPU[j];
+            // //     if (idx == numNodes) {
+            // //         color = new Color(1, 0, 0, 0.5f);
+            // //     }
+            // //     if (idx == numNodes + 1) {
+            // //         color = new Color(0, 1, 0, 0.5f);
+            // //         break;
+            // //     }
+            // // }
+            // float factor = 50.0f;
+            // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
+            // Gizmos.color = color;
+            // // int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
+            // // Gizmos.color = layerColors[layerIndex];
+            // // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
+            // // float volume = Mathf.Pow(8, node.layer);
+            // // float divergenceNormalized = divergence * 50.0f / volume;
+            // // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+            // // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
             // Gizmos.DrawCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
         }
 
