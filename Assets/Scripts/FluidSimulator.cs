@@ -632,15 +632,15 @@ public class FluidSimulator : MonoBehaviour
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
 
-        // Debug: print total divergence
-        float totalDivergence = 0.0f;
-        float[] divergenceCPU = new float[numNodes];
-        divergenceBuffer.GetData(divergenceCPU);
-        for (int i = 0; i < numNodes; i++)
-        {
-            totalDivergence += divergenceCPU[i];
-        }
-        Debug.Log($"Total divergence: {totalDivergence}");
+        // // Debug: print total divergence
+        // float totalDivergence = 0.0f;
+        // float[] divergenceCPU = new float[numNodes];
+        // divergenceBuffer.GetData(divergenceCPU);
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     totalDivergence += divergenceCPU[i];
+        // }
+        // Debug.Log($"Total divergence: {totalDivergence}");
 
         // Initialize: r = b, p = r (since initial pressure x = 0)
         var initSw = System.Diagnostics.Stopwatch.StartNew();
@@ -758,14 +758,14 @@ public class FluidSimulator : MonoBehaviour
         
         // Final timing summary
         totalSolveSw.Stop();
-        Debug.Log($"SolvePressure Timing Summary:\n" +
-                 $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• CG Loop: {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
+        // Debug.Log($"SolvePressure Timing Summary:\n" +
+        //          $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• CG Loop: {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+        //          $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     private void ApplyPressureGradient()
