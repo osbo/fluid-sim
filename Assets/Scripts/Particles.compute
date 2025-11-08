@@ -303,21 +303,50 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     float3 newPosition = particle.position + newVelocity * deltaTime;
     // float3 newPosition = particle.position;
 
-    newVelocity.y -= gravity * deltaTime;
+    // newVelocity.y -= gravity * deltaTime;
 
-    float bounceDamping = 0.5f;  // Much more damping to reduce bouncing
+    float bounceDamping = 0.9f;  // Much more damping to reduce bouncing
     
-    if (newPosition.x <= 0) { newPosition.x = 0; newVelocity.x *= -1.0 * bounceDamping;} 
-    if (newPosition.x >= 1024) { newPosition.x = 1024; newVelocity.x *= -1.0 * bounceDamping;}
-    if (newPosition.y <= 0) { newPosition.y = 0; newVelocity.y *= -1.0 * bounceDamping;}
-    if (newPosition.y >= 1024) { newPosition.y = 1024; newVelocity.y *= -1.0 * bounceDamping;}
-    if (newPosition.z <= 0) { newPosition.z = 0; newVelocity.z *= -1.0 * bounceDamping;}
-    if (newPosition.z >= 1024) { newPosition.z = 1024; newVelocity.z *= -1.0 * bounceDamping;}
+    if (newPosition.x <= 0) {
+        // newPosition.x = 0;
+        newPosition.x = -newPosition.x;
+        newVelocity.x *= -1.0 * bounceDamping;
+    } 
+    if (newPosition.x >= 1024) {
+        // newPosition.x = 1024;
+        newPosition.x = 1024 - (newPosition.x - 1024);
+        newVelocity.x *= -1.0 * bounceDamping;
+    }
+    if (newPosition.y <= 0) {
+        // newPosition.y = 0;
+        newPosition.y = -newPosition.y;
+        newVelocity.y *= -1.0 * bounceDamping;
+    }
+    if (newPosition.y >= 1024) {
+        // newPosition.y = 1024;
+        newPosition.y = 1024 - (newPosition.y - 1024);
+        newVelocity.y *= -1.0 * bounceDamping;
+    }
+    if (newPosition.z <= 0) {
+        // newPosition.z = 0;
+        newPosition.z = -newPosition.z;
+        newVelocity.z *= -1.0 * bounceDamping;
+    }
+    if (newPosition.z >= 1024) {
+        // newPosition.z = 1024;
+        newPosition.z = 1024 - (newPosition.z - 1024);
+        newVelocity.z *= -1.0 * bounceDamping;
+    }
 
     particle.position = newPosition;
+
+    particle.layer = clamp(10-floor(log2(length(newVelocity) * velocitySensitivity / 3.0)), minLayer, maxLayer);
+
+    // newVelocity.y -= gravity * deltaTime;
+
     particle.velocity = newVelocity;
 
-    particle.layer = clamp(10-floor(log2(length(particle.velocity) * velocitySensitivity / 3.0)), minLayer, maxLayer);
+    
     
     particle.mortonCode = EncodeMorton3D(newPosition);
 
