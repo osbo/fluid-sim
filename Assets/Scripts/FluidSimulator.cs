@@ -287,6 +287,24 @@ public class FluidSimulator : MonoBehaviour
         // }
         // Debug.Log(str);
 
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+        int[] layerCounts = new int[maxLayer - minLayer + 1];
+        str = $"Number of nodes in each layer: ";
+        for (int i = 0; i < maxLayer - minLayer + 1; i++)
+        {
+            layerCounts[i] = 0;
+        }
+        for (int i = 0; i < numNodes; i++)
+        {
+            layerCounts[nodesCPU[i].layer - minLayer]++;
+        }
+        for (int i = 0; i < maxLayer - minLayer + 1; i++)
+        {
+            str += $"{i + minLayer}: {layerCounts[i]}, ";
+        }
+        Debug.Log(str);
+
         // Step 4: Pull velocities
         var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
         pullVelocities();
@@ -670,12 +688,6 @@ public class FluidSimulator : MonoBehaviour
             }
             
             float alpha = r_dot_r / p_dot_Ap;
-
-            // Log alpha with context (only first few iterations to avoid spam)
-            if (i < 5 || i % 10 == 0)
-            {
-                Debug.Log($"CG Iter {i}: alpha = {alpha:E6}, r_dot_r = {r_dot_r:E6}, p_dot_Ap = {p_dot_Ap:E6}, residual_ratio = {r_dot_r / initialResidual:E3}");
-            }
             
             // Safety check for alpha with more reasonable bounds
             if (Math.Abs(alpha) > 1e10f)
@@ -1496,27 +1508,27 @@ public class FluidSimulator : MonoBehaviour
         // nodesCPU = new Node[numNodes];
         // nodesBuffer.GetData(nodesCPU);
 
-        // uint[] neighborsCPU = new uint[numNodes * 24];
-        // neighborsBuffer.GetData(neighborsCPU);
+        // // uint[] neighborsCPU = new uint[numNodes * 24];
+        // // neighborsBuffer.GetData(neighborsCPU);
         // for (int i = 0; i < numNodes; i++)
         // {
         //     Node node = nodesCPU[i];
-        //     Color color = new Color(1, 1, 1, 0.5f);
-        //     for (int j = i * 24; j < (i + 1) * 24; j += 4) {
-        //         uint idx = neighborsCPU[j];
-        //         if (idx == numNodes) {
-        //             color = new Color(1, 0, 0, 0.5f);
-        //         }
-        //         if (idx == numNodes + 1) {
-        //             color = new Color(0, 1, 0, 0.5f);
-        //             break;
-        //         }
-        //     }
+        //     // Color color = new Color(1, 1, 1, 0.5f);
+        //     // for (int j = i * 24; j < (i + 1) * 24; j += 4) {
+        //     //     uint idx = neighborsCPU[j];
+        //     //     if (idx == numNodes) {
+        //     //         color = new Color(1, 0, 0, 0.5f);
+        //     //     }
+        //     //     if (idx == numNodes + 1) {
+        //     //         color = new Color(0, 1, 0, 0.5f);
+        //     //         break;
+        //     //     }
+        //     // }
         //     // float factor = 50.0f;
         //     // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
-        //     Gizmos.color = color;
-        //     // int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
-        //     // Gizmos.color = layerColors[layerIndex];
+        //     // Gizmos.color = color;
+        //     int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
+        //     Gizmos.color = layerColors[layerIndex];
         //     // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
         //     // float volume = Mathf.Pow(8, node.layer);
         //     // float divergenceNormalized = divergence * 50.0f / volume;
@@ -1580,6 +1592,43 @@ public class FluidSimulator : MonoBehaviour
         // Add simulation bounds for denormalizing particle positions
         particlesMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
         particlesMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
+        
+        // Calculate depth fade parameters based on simulation bounds and camera position
+        Vector3 cameraPos = cam.transform.position;
+        Bounds bounds = simulationBounds.bounds;
+        
+        // Calculate distance from camera to nearest and farthest points of the bounds
+        Vector3 boundsCenter = bounds.center;
+        Vector3 boundsSize = bounds.size;
+        
+        // Find the nearest point on the bounds to the camera
+        Vector3 nearestPoint = new Vector3(
+            Mathf.Clamp(cameraPos.x, bounds.min.x, bounds.max.x),
+            Mathf.Clamp(cameraPos.y, bounds.min.y, bounds.max.y),
+            Mathf.Clamp(cameraPos.z, bounds.min.z, bounds.max.z)
+        );
+        
+        // Calculate distances
+        float distanceToNearest = Vector3.Distance(cameraPos, nearestPoint);
+        float distanceToCenter = Vector3.Distance(cameraPos, boundsCenter);
+        float boundsDiagonal = boundsSize.magnitude; // Diagonal length of the bounds
+        
+        // Calculate fade start: start fading slightly before the nearest point
+        // Subtract half the diagonal to account for particles that might be at the edge
+        float fadeStart = Mathf.Max(0.0f, distanceToNearest - boundsDiagonal * 0.3f);
+        
+        // Calculate fade end: end fading at the farthest point plus some margin
+        // Use the diagonal to estimate the farthest possible distance
+        float fadeEnd = distanceToCenter + boundsDiagonal * 0.8f;
+        
+        // Ensure fade end is always greater than fade start
+        if (fadeEnd <= fadeStart)
+        {
+            fadeEnd = fadeStart + boundsDiagonal * 0.5f;
+        }
+        
+        particlesMaterial.SetFloat("_DepthFadeStart", fadeStart);
+        particlesMaterial.SetFloat("_DepthFadeEnd", fadeEnd);
 
         particlesMaterial.SetPass(0);
         Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);

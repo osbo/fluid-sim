@@ -121,7 +121,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.x;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        lerpFactor = 0.5;
+        // lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.x, nNode.velocity.x, lerpFactor);
         outNode.velocities.left += faceVelocity;
     }
@@ -132,7 +132,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.x;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        lerpFactor = 0.5;
+        // lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.x, nNode.velocity.x, lerpFactor);
         outNode.velocities.right += faceVelocity;
     }
@@ -143,7 +143,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.y;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        lerpFactor = 0.5;
+        // lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.y, nNode.velocity.y, lerpFactor);
         outNode.velocities.bottom += faceVelocity;
     }
@@ -154,7 +154,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.y;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        lerpFactor = 0.5;
+        // lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.y, nNode.velocity.y, lerpFactor);
         outNode.velocities.top += faceVelocity;
     }
@@ -165,7 +165,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.z;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        lerpFactor = 0.5;
+        // lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.z, nNode.velocity.z, lerpFactor);
         outNode.velocities.front += faceVelocity;
     }
@@ -176,7 +176,7 @@ void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, floa
         float nPosition = nNode.position.z;
         float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
         lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        lerpFactor = 0.5;
+        // lerpFactor = 0.5;
         float faceVelocity = lerp(outNode.velocity.z, nNode.velocity.z, lerpFactor);
         outNode.velocities.back += faceVelocity;
     }
