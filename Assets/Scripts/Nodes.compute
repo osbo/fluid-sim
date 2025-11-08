@@ -684,6 +684,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
         if (isBoundary) // Neumann BC: zero flux
         {
             pressure_gradient = 0.0;
+            // pressure_gradient -= p_i / dx_i;
         }
         else if (nodesBuffer[neighbor_idx].layer >= node.layer)
         {
@@ -736,8 +737,8 @@ void ApplyGravity(uint3 id : SV_DispatchThreadID)
 
     Node node = nodesBuffer[threadIndex];
     // Apply gravity to all face velocities consistently
-    // node.velocities.top -= gravity * deltaTime;
-    // node.velocities.bottom -= gravity * deltaTime;
+    node.velocities.top -= gravity * deltaTime;
+    node.velocities.bottom -= gravity * deltaTime;
     nodesBuffer[threadIndex] = node;
 }
 

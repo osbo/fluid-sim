@@ -349,7 +349,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 5.5: Enforce boundary conditions
         var enforceBoundarySw = System.Diagnostics.Stopwatch.StartNew();
-        // EnforceBoundaryConditions();
+        EnforceBoundaryConditions();
         enforceBoundarySw.Stop();
 
         // nodesCPU = new Node[numNodes];
