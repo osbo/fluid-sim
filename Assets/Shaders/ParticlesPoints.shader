@@ -5,6 +5,8 @@ Shader "Custom/ParticlesPoints"
         _PointSize ("Point Size", Float) = 2.0
         _MinLayer ("Min Layer", Int) = 0
         _MaxLayer ("Max Layer", Int) = 10
+        _DepthFadeStart ("Depth Fade Start", Float) = 0.0
+        _DepthFadeEnd ("Depth Fade End", Float) = 100.0
     }
     SubShader
     {
@@ -35,6 +37,8 @@ Shader "Custom/ParticlesPoints"
             int _MaxLayer;
             float3 _SimulationBoundsMin;
             float3 _SimulationBoundsMax;
+            float _DepthFadeStart;
+            float _DepthFadeEnd;
 
             float4 LayerToColor(uint layer)
             {
@@ -70,6 +74,7 @@ Shader "Custom/ParticlesPoints"
                 float4 pos : SV_POSITION;
                 float4 col : COLOR0;
                 float  psize : PSIZE;
+                float  depth : TEXCOORD0;
             };
 
             VSOut VS(uint id : SV_VertexID)
@@ -82,15 +87,30 @@ Shader "Custom/ParticlesPoints"
                 float3 positionWS = _SimulationBoundsMin + (p.position * simulationSize / 1024.0);
                 
                 o.pos = TransformWorldToHClip(positionWS);
-                o.col = LayerToColor(p.layer);
+                // o.col = LayerToColor(p.layer);
+                o.col = float4(0.0, 0.5, 1.0, 1.0);
                 o.psize = max(_PointSize, 1.0);
+                
+                // Calculate distance from camera to particle
+                // _WorldSpaceCameraPos is a built-in Unity variable available in all shaders
+                o.depth = distance(positionWS, _WorldSpaceCameraPos.xyz);
+                
                 return o;
             }
 
             float4 PS(VSOut i) : SV_Target
             {
-                return i.col;
-                // return float4(0, 0, 0, 0);
+                // Calculate depth-based shading factor
+                // Particles transition: black (far) -> color (near)
+                float depthNormalized = saturate((i.depth - _DepthFadeStart) / max(0.0001, _DepthFadeEnd - _DepthFadeStart));
+                
+                // Invert depth so near particles (low depth) have high value and far particles (high depth) have low value
+                float invertedDepth = 1.0 - depthNormalized;
+                
+                // Simple lerp from black (far) to color (near)
+                float4 finalColor = lerp(float4(0.0, 0.0, 0.0, 1.0), i.col, invertedDepth);
+                
+                return finalColor;
             }
             ENDHLSL
 
