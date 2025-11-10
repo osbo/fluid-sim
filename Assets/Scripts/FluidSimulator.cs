@@ -493,6 +493,11 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetInt("maxLayer", maxLayer);
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(updateParticlesKernel, threadGroups, 1, 1);
+
+        particlesCPU = new Particle[numParticles];
+        particlesBuffer.GetData(particlesCPU);
+        str = $"NaN count: {particlesCPU.Count(p => float.IsNaN(p.velocity.x) || float.IsNaN(p.velocity.y) || float.IsNaN(p.velocity.z))}";
+        Debug.Log(str);
     }
 
     private void SolvePressureSimple()
@@ -1534,7 +1539,7 @@ public class FluidSimulator : MonoBehaviour
         //     // float divergenceNormalized = divergence * 50.0f / volume;
         //     // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
         //     // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
-        //     Gizmos.DrawCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
         // }
 
         // int index = 9*numNodes/16;

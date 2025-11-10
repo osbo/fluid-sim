@@ -686,7 +686,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
             pressure_gradient = 0.0;
             // pressure_gradient -= p_i / dx_i;
         }
-        else if (nodesBuffer[neighbor_idx].layer >= node.layer)
+        else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
             // Case 1: Same-layer or Parent (coarser) neighbor
             Node nNode = nodesBuffer[neighbor_idx];
