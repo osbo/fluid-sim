@@ -15,7 +15,6 @@ public class FluidSimulator : MonoBehaviour
     public ComputeShader nodesPrefixSumsShader;
     public ComputeShader nodesShader;
     public ComputeShader cgSolverShader;
-    public ComputeShader relaxationSolverShader;
     public int numParticles;
     
     // CG Solver parameters
@@ -344,7 +343,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 5: Apply gravity on the grid
         var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
-        ApplyGravity();
+        // ApplyGravity();
         applyGravitySw.Stop();
 
         // Step 5.5: Enforce boundary conditions
@@ -383,7 +382,6 @@ public class FluidSimulator : MonoBehaviour
         // Step 6: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
         SolvePressure();
-        // SolvePressureSimple();
         solvePressureSw.Stop();
 
         // nodesCPU = new Node[numNodes];
@@ -498,95 +496,6 @@ public class FluidSimulator : MonoBehaviour
         particlesBuffer.GetData(particlesCPU);
         str = $"NaN count: {particlesCPU.Count(p => float.IsNaN(p.velocity.x) || float.IsNaN(p.velocity.y) || float.IsNaN(p.velocity.z))}";
         Debug.Log(str);
-    }
-
-    private void SolvePressureSimple()
-    {
-        var totalSolveSw = System.Diagnostics.Stopwatch.StartNew();
-        Debug.Log("Solving pressure (simple)...");
-
-        if (relaxationSolverShader == null)
-        {
-            Debug.LogError("Relaxation solver compute shader is not assigned. Please assign `relaxationSolverShader` in the inspector.");
-            return;
-        }
-
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        
-        solvePressureIterationKernel = relaxationSolverShader.FindKernel("SolvePressureIteration");
-        applyPressureGradientKernel = relaxationSolverShader.FindKernel("ApplyPressureGradient");
-        initializePressureBuffersKernel = relaxationSolverShader.FindKernel("InitializePressureBuffers");
-
-        // Create pressure buffer for relaxation solver
-        ComputeBuffer pressureBuffer = new ComputeBuffer(numNodes, sizeof(float));
-        ComputeBuffer tempPressureBuffer = new ComputeBuffer(numNodes, sizeof(float));
-
-        relaxationSolverShader.SetBuffer(initializePressureBuffersKernel, "pressureBuffer", pressureBuffer);
-        relaxationSolverShader.SetBuffer(initializePressureBuffersKernel, "tempPressureBuffer", tempPressureBuffer);
-        relaxationSolverShader.SetInt("numNodes", numNodes);
-        relaxationSolverShader.Dispatch(initializePressureBuffersKernel, threadGroups, 1, 1);
-
-        // float totalDivergence = 0.0f;
-        // Node[] nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     totalDivergence += nodesCPU[i].velocities.right - nodesCPU[i].velocities.left + nodesCPU[i].velocities.top - nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.back - nodesCPU[i].velocities.front;
-        // }
-        // Debug.Log($"Initial total divergence: {totalDivergence}");
-
-        for (int i = 0; i < maxCgIterations; i++)
-        {
-            // Set buffers for the pressure-ONLY solve
-            relaxationSolverShader.SetBuffer(solvePressureIterationKernel, "nodesBuffer", nodesBuffer); // READ-ONLY
-            relaxationSolverShader.SetBuffer(solvePressureIterationKernel, "neighborsBuffer", neighborsBuffer);
-            relaxationSolverShader.SetBuffer(solvePressureIterationKernel, "pressureBuffer", pressureBuffer); // Input pressure
-            relaxationSolverShader.SetBuffer(solvePressureIterationKernel, "tempPressureBuffer", tempPressureBuffer); // Output pressure
-            relaxationSolverShader.SetInt("numNodes", numNodes);
-            relaxationSolverShader.SetFloat("deltaTime", (1 / frameRate));
-            relaxationSolverShader.Dispatch(solvePressureIterationKernel, threadGroups, 1, 1);
-
-            // Swap ONLY the pressure buffers for ping-ponging
-            (pressureBuffer, tempPressureBuffer) = (tempPressureBuffer, pressureBuffer);
-        }
-
-        // --- Apply Pressure Gradient (ONCE) ---
-        // After the loop, the final pressure is in `pressureBuffer`
-        // The ApplyPressureGradient kernel reads pressure from its "tempPressureBuffer" slot.
-        // We must bind our final pressure (pressureBuffer) to that slot.
-
-        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "nodesBuffer", nodesBuffer); // Original nodes
-        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "tempNodesBuffer", tempNodesBuffer); // Output nodes
-        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "neighborsBuffer", neighborsBuffer);
-        
-        // FIX: Bind the *final* pressure (in C#'s pressureBuffer) to the
-        // slot the HLSL kernel *reads* from (tempPressureBuffer).
-        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "tempPressureBuffer", pressureBuffer); 
-        
-        // This slot is unused by the kernel, but good to set it.
-        relaxationSolverShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", tempPressureBuffer); 
-        
-        relaxationSolverShader.SetInt("numNodes", numNodes);
-        relaxationSolverShader.SetFloat("deltaTime", (1 / frameRate));
-        relaxationSolverShader.Dispatch(applyPressureGradientKernel, threadGroups, 1, 1);
-
-        (nodesBuffer, tempNodesBuffer) = (tempNodesBuffer, nodesBuffer);
-
-        // // --- Final Divergence Check ---
-        // totalDivergence = 0.0f;
-        
-        // // FIX: Read from 'nodesBuffer' (which now points to the corrected data)
-        // nodesBuffer.GetData(nodesCPU); 
-        
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     totalDivergence += nodesCPU[i].velocities.right - nodesCPU[i].velocities.left + nodesCPU[i].velocities.top - nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.back - nodesCPU[i].velocities.front;
-        // }
-        // Debug.Log($"Final total divergence: {totalDivergence}");
-
-        // Clean up pressure buffer
-        pressureBuffer.Release();
-        tempPressureBuffer.Release();
     }
 
     private void SolvePressure()
@@ -1389,11 +1298,11 @@ public class FluidSimulator : MonoBehaviour
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(pullVelocitiesKernel, threadGroups, 1, 1);
 
-        copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
-        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
-        nodesShader.SetInt("numNodes", numNodes);
-        nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
+        // copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
+        // nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
+        // nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
+        // nodesShader.SetInt("numNodes", numNodes);
+        // nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
     }
 
     private void ApplyGravity()
