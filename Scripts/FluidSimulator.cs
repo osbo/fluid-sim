@@ -343,7 +343,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 5: Apply gravity on the grid
         var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
-        // ApplyGravity();
+        ApplyGravity();
         applyGravitySw.Stop();
 
         // Step 5.5: Enforce boundary conditions

@@ -829,9 +829,17 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
                     pressure_gradient += (p_k - p_i) / distance / 4.0;
                 }
+                // Case 4: Dirichlet boundary (air)
                 else if (child_idx == numNodes)
                 {
-                    pressure_gradient -= p_i / dx_i / 4.0;
+                    // BUG FIX: This calculation must be identical to the one in
+                    // ApplyLaplacian to maintain consistency.
+                    float dx_k = dx_i * 0.5; // Virtual child cell is half-size
+                    float distance = max(0.5 * (dx_i + dx_k), 1e-6); // 0.75 * dx_i
+                    
+                    // The gradient is (p_k - p_i) / distance.
+                    // Air pressure p_k is 0.
+                    pressure_gradient += (0.0 - p_i) / distance / 4.0;
                 }
             }
         }
