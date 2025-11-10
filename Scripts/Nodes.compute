@@ -254,15 +254,36 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     uint threadIndex = id.x;
     if (threadIndex >= numNodes) return;
     
-    // Get the index into sorted arrays for this unique morton code
+    // Get the index range for particles in this node
     uint rangeStart = uniqueIndices[threadIndex];
+    uint rangeEnd = threadIndex + 1 < numNodes ?
+        uniqueIndices[threadIndex + 1] : numParticles;
     
-    // Find how many particles share this morton code
-    uint rangeEnd = threadIndex + 1 < numNodes ? uniqueIndices[threadIndex + 1] : numParticles;
+    // --- Pass 1: Find the minimum layer to define node bounds ---
+    uint minSubLayer = maxLayer;
+    for (uint i = rangeStart; i < rangeEnd; i++)
+    {
+        minSubLayer = min(minSubLayer, particlesBuffer[i].layer);
+    }
+
+    // --- Define Node Geometry ---
+    uint nodeLayer = minSubLayer;
+    uint mortonCode = particlesBuffer[rangeStart].mortonCode;
     
-    // Aggregate particle data with weighted average
+    // Calculate node's world-space bounds (logic from UpdateParticles)
+    float cellSideLength = exp2((float)nodeLayer);
+    uint cellMortonCode = mortonCode & ~((1u << (3 * nodeLayer)) - 1);
+    uint3 cellGridMin = deinterleave(cellMortonCode);
+    
+    float3 nodeMin = cellGridMin;
+    float3 extent = float3(cellSideLength, cellSideLength, cellSideLength);
+
+    // --- Initialize Aggregation Variables ---
     float3 weightedPosition = float3(0, 0, 0);
     float3 weightedVelocity = float3(0, 0, 0);
+    float count = 0.0;
+
+    // Initialize face velocities and weights for normalization
     faceVelocities leafVelocities;
     leafVelocities.left = 0.0;
     leafVelocities.right = 0.0;
@@ -270,45 +291,82 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     leafVelocities.top = 0.0;
     leafVelocities.front = 0.0;
     leafVelocities.back = 0.0;
-    
-    float count = 0.0;
-    uint minSubLayer = maxLayer;
-    
-    // Process all particles with this morton code
+
+    faceVelocities leafWeights; // Accumulate weights for normalization
+    leafWeights.left = 0.0;
+    leafWeights.right = 0.0;
+    leafWeights.bottom = 0.0;
+    leafWeights.top = 0.0;
+    leafWeights.front = 0.0;
+    leafWeights.back = 0.0;
+
+    // --- Pass 2: Aggregate and Splat Velocities ---
     for (uint i = rangeStart; i < rangeEnd; i++)
     {
         Particle particle = particlesBuffer[i];
-        
         count += 1.0;
+        
+        // Aggregate cell-centered data (for coarsening)
         weightedPosition += particle.position;
         weightedVelocity += particle.velocity;
         
-        // Track minimum layer
-        minSubLayer = min(minSubLayer, particle.layer);
+        // --- Particle-to-Grid Splatting ---
+        // Get normalized position (0-1) within the node
+        float3 t = saturate((particle.position - nodeMin) / extent);
+
+        // This splat reverses the interpolation from UpdateParticles
+        // We splat each velocity component to its two corresponding faces
+        
+        // Splat X velocity (to Left/Right faces)
+        float w_x_left = (1.0 - t.x); // Weight for left face
+        float w_x_right = t.x;        // Weight for right face
+        leafVelocities.left += particle.velocity.x * w_x_left;
+        leafVelocities.right += particle.velocity.x * w_x_right;
+        leafWeights.left += w_x_left;
+        leafWeights.right += w_x_right;
+
+        // Splat Y velocity (to Bottom/Top faces)
+        float w_y_bottom = (1.0 - t.y); // Weight for bottom face
+        float w_y_top = t.y;          // Weight for top face
+        leafVelocities.bottom += particle.velocity.y * w_y_bottom;
+        leafVelocities.top += particle.velocity.y * w_y_top;
+        leafWeights.bottom += w_y_bottom;
+        leafWeights.top += w_y_top;
+
+        // Splat Z velocity (to Front/Back faces)
+        float w_z_front = (1.0 - t.z); // Weight for front face
+        float w_z_back = t.z;         // Weight for back face
+        leafVelocities.front += particle.velocity.z * w_z_front;
+        leafVelocities.back += particle.velocity.z * w_z_back;
+        leafWeights.front += w_z_front;
+        leafWeights.back += w_z_back;
     }
     
-    // Normalize by total weight (center of mass)
-    // Safety check: prevent division by zero
+    // --- Normalize Aggregated Data ---
     if (count > 0.0) {
         weightedPosition /= count;
         weightedVelocity /= count;
     }
 
-    uint mortonCode = particlesBuffer[rangeStart].mortonCode;
+    // Normalize face velocities by their accumulated weights
+    float epsilon = 1e-9; // Avoid division by zero
+    leafVelocities.left   /= max(epsilon, leafWeights.left);
+    leafVelocities.right  /= max(epsilon, leafWeights.right);
+    leafVelocities.bottom /= max(epsilon, leafWeights.bottom);
+    leafVelocities.top    /= max(epsilon, leafWeights.top);
+    leafVelocities.front  /= max(epsilon, leafWeights.front);
+    leafVelocities.back   /= max(epsilon, leafWeights.back);
 
-    // weightedPosition = clamp(weightedPosition, simulationBoundsMin, simulationBoundsMax);
-    
-    // Create the node
+    // --- Create the Final Node ---
     Node node;
     node.position = weightedPosition;
     node.velocity = weightedVelocity;
-    node.velocities = leafVelocities;
-    node.layer = minSubLayer;  // Use the minimum layer found
+    node.velocities = leafVelocities; // Store the splatted face velocities
+    node.layer = minSubLayer;
     node.mass = count;
     node.mortonCode = mortonCode;
-    node.active = 1u; // Set last bit to 1
+    node.active = 1u;
     
-    // Write outputs
     nodesBuffer[threadIndex] = node;
 }
 
@@ -449,12 +507,110 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             weightedVelocity /= totalMass;
         }
 
+        // --- Coarsen Face Velocities: Average external faces from children ---
+        // Children are ordered by morton code: 0=(0,0,0), 1=(1,0,0), 2=(0,1,0), 3=(1,1,0),
+        //                                      4=(0,0,1), 5=(1,0,1), 6=(0,1,1), 7=(1,1,1)
+        // External faces: only average faces that are on the boundary of the parent cell
+        faceVelocities aggregatedVelocities;
+        aggregatedVelocities.left = 0.0;
+        aggregatedVelocities.right = 0.0;
+        aggregatedVelocities.bottom = 0.0;
+        aggregatedVelocities.top = 0.0;
+        aggregatedVelocities.front = 0.0;
+        aggregatedVelocities.back = 0.0;
+        
+        // Count valid children for each face (for averaging)
+        float leftCount = 0.0;
+        float rightCount = 0.0;
+        float bottomCount = 0.0;
+        float topCount = 0.0;
+        float frontCount = 0.0;
+        float backCount = 0.0;
+        
+        // Iterate through children and accumulate external face velocities
+        // The children are already in the uniqueStart to uniqueEnd range
+        uint baseCode = nodesBuffer[uniqueStart].mortonCode;
+        uint parentShift = layer * 3;  // Parent's prefix is at this bit position
+        uint childShift = (layer - 1) * 3;  // Children's prefix starts here
+        uint parentPrefix = baseCode >> parentShift;
+        
+        for (uint i = uniqueStart; i < uniqueEnd; i++)
+        {
+            Node childNode = nodesBuffer[i];
+            
+            // Only process children at layer-1
+            if (childNode.layer != layer - 1) continue;
+            
+            // Extract the child prefix and check if it belongs to this parent
+            uint childMortonCode = childNode.mortonCode;
+            uint childPrefix = childMortonCode >> childShift;
+            
+            // Check if this child belongs to this parent (parent prefix matches child prefix >> 3)
+            if ((childPrefix >> 3) != parentPrefix) continue;
+            
+            // Extract child octant index (0-7) from the last 3 bits of childPrefix
+            // These are the 3 bits that determine which octant of the parent this child occupies
+            uint childIdx = childPrefix & 0x7;
+            
+            // Accumulate external face velocities based on child position
+            // Left face (x=0): children 0, 2, 4, 6
+            if ((childIdx & 1) == 0) // x bit is 0
+            {
+                aggregatedVelocities.left += childNode.velocities.left;
+                leftCount += 1.0;
+            }
+            
+            // Right face (x=1): children 1, 3, 5, 7
+            if ((childIdx & 1) == 1) // x bit is 1
+            {
+                aggregatedVelocities.right += childNode.velocities.right;
+                rightCount += 1.0;
+            }
+            
+            // Bottom face (y=0): children 0, 1, 4, 5
+            if ((childIdx & 2) == 0) // y bit is 0
+            {
+                aggregatedVelocities.bottom += childNode.velocities.bottom;
+                bottomCount += 1.0;
+            }
+            
+            // Top face (y=1): children 2, 3, 6, 7
+            if ((childIdx & 2) == 2) // y bit is 1
+            {
+                aggregatedVelocities.top += childNode.velocities.top;
+                topCount += 1.0;
+            }
+            
+            // Front face (z=0): children 0, 1, 2, 3
+            if ((childIdx & 4) == 0) // z bit is 0
+            {
+                aggregatedVelocities.front += childNode.velocities.front;
+                frontCount += 1.0;
+            }
+            
+            // Back face (z=1): children 4, 5, 6, 7
+            if ((childIdx & 4) == 4) // z bit is 1
+            {
+                aggregatedVelocities.back += childNode.velocities.back;
+                backCount += 1.0;
+            }
+        }
+        
+        // Average the accumulated face velocities
+        float epsilon = 1e-9;
+        aggregatedVelocities.left   /= max(epsilon, leftCount);
+        aggregatedVelocities.right  /= max(epsilon, rightCount);
+        aggregatedVelocities.bottom /= max(epsilon, bottomCount);
+        aggregatedVelocities.top    /= max(epsilon, topCount);
+        aggregatedVelocities.front  /= max(epsilon, frontCount);
+        aggregatedVelocities.back   /= max(epsilon, backCount);
+
         // weightedPosition = clamp(weightedPosition, simulationBoundsMin, simulationBoundsMax);
 
         Node aggregatedNode;
         aggregatedNode.position = weightedPosition;
         aggregatedNode.velocity = weightedVelocity;
-        aggregatedNode.velocities = nodesBuffer[uniqueStart].velocities;
+        aggregatedNode.velocities = aggregatedVelocities;
         aggregatedNode.layer = minSubLayer;
         aggregatedNode.mass = totalMass;
         aggregatedNode.mortonCode = nodesBuffer[uniqueStart].mortonCode;
@@ -487,18 +643,6 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
     if (threadIndex >= numNodes) return;
 
     Node node = nodesBuffer[threadIndex];
-    faceVelocities selfVelocities = node.velocities;
-    float3 selfPosition = node.position;
-    float3 selfVelocity = node.velocity;
-
-    Node outNode;
-    outNode.position = selfPosition;
-    outNode.velocity = selfVelocity;
-    outNode.velocities = selfVelocities;
-    outNode.mass = node.mass;
-    outNode.layer = node.layer;
-    outNode.mortonCode = node.mortonCode;
-    outNode.active = node.active;
 
     // Initialize neighbors to invalid index (numNodes) for all 24 slots
     uint nbBase = threadIndex * 24;
@@ -514,13 +658,8 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
     uint prefix = node.mortonCode >> shift;
     uint3 coord = deinterleave(prefix);
 
-    uint3 shiftedCoord = coord << shift;
-    float3 cornerPosition = float3((float)shiftedCoord.x, (float)shiftedCoord.y, (float)shiftedCoord.z);
-    float nodeSideLength = exp2((float)node.layer);
-
     for (int d = 0; d < 6; d++)
     {
-
         int nx = (int)coord.x + deltas[d].x;
         int ny = (int)coord.y + deltas[d].y;
         int nz = (int)coord.z + deltas[d].z;
@@ -529,14 +668,7 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
-            // outNode.velocities.left = (float)coord.x;
-            // outNode.velocities.right = (float)coord.y;
-            // outNode.velocities.bottom = (float)coord.z;
-            // outNode.velocities.top = (float)nx;
-            // outNode.velocities.front = (float)ny;
-            // outNode.velocities.back = (float)nz;
-
-            neighborsBuffer[threadIndex * 24 + faceOffset(d)] = numNodes+1;
+            neighborsBuffer[threadIndex * 24 + faceOffset(d)] = numNodes + 1;
             continue; // Skip this neighbor direction
         }
         
@@ -565,13 +697,11 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
         if (idx_leq_mc_prefix == nPrefix && idx_leq_layer == node.layer)
         {
             // same-layer neighbor
-            addToFace(outNode, d, nNode, cornerPosition, nodeSideLength);
             neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
         }
         else if ((idx_leq_mc >> (shift + 3)) == (nPrefix >> 3) && idx_leq_layer == node.layer + 1)
         {
             // parent neighbor
-            addToFace(outNode, d, nNode, cornerPosition, nodeSideLength);
             neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
         }
         else
@@ -617,7 +747,6 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                         subNodesLower[3] = 3;
                     }
                     
-                    float numChildNeighbors = 0.0;
                     for (int i = 0; i < 4; i++)
                     {
                         uint subPrefix = nPrefixShifted + subNodesLower[i];
@@ -632,23 +761,14 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
                             uint idx_sub_layer = cNode.layer;
                             if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
                             {
-                                addToFace(outNode, d, cNode, cornerPosition, nodeSideLength);
                                 neighborsBuffer[threadIndex * 24 + faceOffset(d) + i] = idx_sub;
-                                numChildNeighbors += 1.0;
                             }
                         }
-                    }
-                    if (numChildNeighbors != 0.0)
-                    {
-                        divideFace(outNode, d, numChildNeighbors);
                     }
                 }
             }
         }
     }
-
-    // Write gathered deltas to temp buffer for this node
-    tempNodesBuffer[threadIndex] = outNode;
 }
 
 [numthreads(512, 1, 1)]
