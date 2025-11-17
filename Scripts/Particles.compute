@@ -305,7 +305,7 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     // newVelocity.y -= gravity * deltaTime;
 
-    float bounceDamping = 0.9f;  // Much more damping to reduce bouncing
+    float bounceDamping = 0.0f;  // Much more damping to reduce bouncing
     
     if (newPosition.x <= 0) {
         // newPosition.x = 0;
