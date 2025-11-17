@@ -87,8 +87,8 @@ Shader "Custom/ParticlesPoints"
                 float3 positionWS = _SimulationBoundsMin + (p.position * simulationSize / 1024.0);
                 
                 o.pos = TransformWorldToHClip(positionWS);
-                // o.col = LayerToColor(p.layer);
-                o.col = float4(0.0, 0.5, 1.0, 1.0);
+                o.col = LayerToColor(p.layer);
+                // o.col = float4(0.0, 0.5, 1.0, 1.0);
                 o.psize = max(_PointSize, 1.0);
                 
                 // Calculate distance from camera to particle
