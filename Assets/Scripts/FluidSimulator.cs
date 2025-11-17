@@ -491,11 +491,6 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetInt("maxLayer", maxLayer);
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(updateParticlesKernel, threadGroups, 1, 1);
-
-        particlesCPU = new Particle[numParticles];
-        particlesBuffer.GetData(particlesCPU);
-        str = $"NaN count: {particlesCPU.Count(p => float.IsNaN(p.velocity.x) || float.IsNaN(p.velocity.y) || float.IsNaN(p.velocity.z))}";
-        Debug.Log(str);
     }
 
     private void SolvePressure()
@@ -1419,37 +1414,37 @@ public class FluidSimulator : MonoBehaviour
             // new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
 
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
 
-        // // uint[] neighborsCPU = new uint[numNodes * 24];
-        // // neighborsBuffer.GetData(neighborsCPU);
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     Node node = nodesCPU[i];
-        //     // Color color = new Color(1, 1, 1, 0.5f);
-        //     // for (int j = i * 24; j < (i + 1) * 24; j += 4) {
-        //     //     uint idx = neighborsCPU[j];
-        //     //     if (idx == numNodes) {
-        //     //         color = new Color(1, 0, 0, 0.5f);
-        //     //     }
-        //     //     if (idx == numNodes + 1) {
-        //     //         color = new Color(0, 1, 0, 0.5f);
-        //     //         break;
-        //     //     }
-        //     // }
-        //     // float factor = 50.0f;
-        //     // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
-        //     // Gizmos.color = color;
-        //     int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
-        //     Gizmos.color = layerColors[layerIndex];
-        //     // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-        //     // float volume = Mathf.Pow(8, node.layer);
-        //     // float divergenceNormalized = divergence * 50.0f / volume;
-        //     // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-        //     // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
-        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        // }
+        // uint[] neighborsCPU = new uint[numNodes * 24];
+        // neighborsBuffer.GetData(neighborsCPU);
+        for (int i = 0; i < numNodes; i++)
+        {
+            Node node = nodesCPU[i];
+            // Color color = new Color(1, 1, 1, 0.5f);
+            // for (int j = i * 24; j < (i + 1) * 24; j += 4) {
+            //     uint idx = neighborsCPU[j];
+            //     if (idx == numNodes) {
+            //         color = new Color(1, 0, 0, 0.5f);
+            //     }
+            //     if (idx == numNodes + 1) {
+            //         color = new Color(0, 1, 0, 0.5f);
+            //         break;
+            //     }
+            // }
+            // float factor = 50.0f;
+            // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
+            // Gizmos.color = color;
+            int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
+            Gizmos.color = layerColors[layerIndex];
+            // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
+            // float volume = Mathf.Pow(8, node.layer);
+            // float divergenceNormalized = divergence * 50.0f / volume;
+            // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+            // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+            Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        }
 
         // int index = 9*numNodes/16;
         // Node node = nodesCPU[index];
