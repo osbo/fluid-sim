@@ -50,6 +50,8 @@ public class FluidSimulator : MonoBehaviour
     private int enforceBoundaryConditionsKernel;
     private int solvePressureIterationKernel;
     private int initializePressureBuffersKernel;
+    private int initializePhiKernel;
+    private int propagatePhiKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -70,6 +72,9 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer ApBuffer;
     private ComputeBuffer residualBuffer;
     private ComputeBuffer pressureBuffer;
+    private ComputeBuffer phiBuffer;
+    private ComputeBuffer phiBuffer_Read;
+    private ComputeBuffer dirtyFlagBuffer;
     
     // add previous active node count, but that can be a cpu variable 
     
@@ -309,6 +314,11 @@ public class FluidSimulator : MonoBehaviour
         pullVelocities();
         pullVelocitiesSw.Stop();
 
+        // Step 4.5: Compute level set (distance field)
+        var computeLevelSetSw = System.Diagnostics.Stopwatch.StartNew();
+        ComputeLevelSet();
+        computeLevelSetSw.Stop();
+
         // nodesCPU = new Node[numNodes];
         // nodesBuffer.GetData(nodesCPU);
         // str = $"After pull velocities: Nodes:\n";
@@ -336,7 +346,7 @@ public class FluidSimulator : MonoBehaviour
         // }
         // Debug.Log(str);
 
-        // Step 4.5: Store old velocities for FLIP method
+        // Step 4.6: Store old velocities for FLIP method
         var storeOldVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
         StoreOldVelocities();
         storeOldVelocitiesSw.Stop();
@@ -438,6 +448,7 @@ public class FluidSimulator : MonoBehaviour
                  $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Pull Velocities: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Compute Level Set: {computeLevelSetSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Apply Gravity: {applyGravitySw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Enforce Boundaries: {enforceBoundarySw.Elapsed.TotalMilliseconds:F2} ms\n" +
@@ -1300,6 +1311,96 @@ public class FluidSimulator : MonoBehaviour
         // nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
     }
 
+    private void ComputeLevelSet()
+    {
+        if (nodesShader == null)
+        {
+            Debug.LogError("Nodes compute shader is not assigned. Please assign `nodesShader` in the inspector.");
+            return;
+        }
+
+        // Release and recreate buffers each frame since numNodes changes
+        phiBuffer?.Release();
+        phiBuffer_Read?.Release();
+        dirtyFlagBuffer?.Release();
+        
+        phiBuffer = new ComputeBuffer(numNodes, sizeof(float));
+        phiBuffer_Read = new ComputeBuffer(numNodes, sizeof(float));
+        dirtyFlagBuffer = new ComputeBuffer(1, sizeof(uint));
+
+        // Find kernels
+        initializePhiKernel = nodesShader.FindKernel("InitializePhi");
+        propagatePhiKernel = nodesShader.FindKernel("PropagatePhi");
+
+        if (initializePhiKernel < 0 || propagatePhiKernel < 0)
+        {
+            Debug.LogError("One or more level set kernels not found. Check Nodes.compute shader compilation.");
+            return;
+        }
+
+        int dispatchSize = Mathf.CeilToInt(numNodes / 512.0f);
+
+        // 1. Initialize the Phi field
+        nodesShader.SetBuffer(initializePhiKernel, "phiBuffer", phiBuffer);
+        nodesShader.SetBuffer(initializePhiKernel, "neighborsBuffer", neighborsBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.Dispatch(initializePhiKernel, dispatchSize, 1, 1);
+
+        // Copy initial phi values to read buffer
+        CopyBuffer(phiBuffer, phiBuffer_Read);
+
+        // 2. Iteratively Propagate (Relax) the Phi field
+        ComputeBuffer readBuffer = phiBuffer_Read;
+        ComputeBuffer writeBuffer = phiBuffer; // Start with phiBuffer as write buffer
+        uint[] dirtyData = { 0 };
+
+        int maxIterations = 32; // Safety break, e.g., max grid dimension
+        for (int i = 0; i < maxIterations; i++)
+        {
+            // Swap buffers (ping-pong)
+            (readBuffer, writeBuffer) = (writeBuffer, readBuffer);
+
+            // Reset the dirty flag to 0 before dispatching
+            dirtyData[0] = 0;
+            dirtyFlagBuffer.SetData(dirtyData);
+
+            // Set buffers for the PropagatePhi kernel
+            nodesShader.SetBuffer(propagatePhiKernel, "phiBuffer_Read", readBuffer);
+            nodesShader.SetBuffer(propagatePhiKernel, "phiBuffer", writeBuffer);
+            nodesShader.SetBuffer(propagatePhiKernel, "dirtyFlagBuffer", dirtyFlagBuffer);
+            nodesShader.SetBuffer(propagatePhiKernel, "nodesBuffer", nodesBuffer);
+            nodesShader.SetBuffer(propagatePhiKernel, "neighborsBuffer", neighborsBuffer);
+            nodesShader.SetInt("numNodes", numNodes);
+
+            // Run the propagation
+            nodesShader.Dispatch(propagatePhiKernel, dispatchSize, 1, 1);
+
+            // Check the dirty flag
+            dirtyFlagBuffer.GetData(dirtyData);
+
+            if (dirtyData[0] == 0)
+            {
+                // No nodes changed their phi value. We are done.
+                break; 
+            }
+        }
+
+        // At this point, `writeBuffer` holds the final, correct phi values.
+        // If the final write was to phiBuffer_Read, copy it back to phiBuffer
+        if (writeBuffer == phiBuffer_Read)
+        {
+            CopyBuffer(phiBuffer_Read, phiBuffer);
+        }
+
+        float[] phiCPU = new float[numNodes];
+        phiBuffer.GetData(phiCPU);
+
+        float maxPhi = phiCPU.Max();
+        float minPhi = phiCPU.Min();
+        str = $"max phi: {maxPhi}, min phi: {minPhi}, max-min: {maxPhi - minPhi}";
+        Debug.Log(str);
+    }
+
     private void ApplyGravity()
     {
         if (nodesShader == null) return;
@@ -1417,34 +1518,45 @@ public class FluidSimulator : MonoBehaviour
         nodesCPU = new Node[numNodes];
         nodesBuffer.GetData(nodesCPU);
 
-        // uint[] neighborsCPU = new uint[numNodes * 24];
-        // neighborsBuffer.GetData(neighborsCPU);
+        float[] phiCPU = new float[numNodes];
+        phiBuffer.GetData(phiCPU);
+
         for (int i = 0; i < numNodes; i++)
         {
             Node node = nodesCPU[i];
-            // Color color = new Color(1, 1, 1, 0.5f);
-            // for (int j = i * 24; j < (i + 1) * 24; j += 4) {
-            //     uint idx = neighborsCPU[j];
-            //     if (idx == numNodes) {
-            //         color = new Color(1, 0, 0, 0.5f);
-            //     }
-            //     if (idx == numNodes + 1) {
-            //         color = new Color(0, 1, 0, 0.5f);
-            //         break;
-            //     }
-            // }
-            // float factor = 50.0f;
-            // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
-            // Gizmos.color = color;
-            int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
-            Gizmos.color = layerColors[layerIndex];
-            // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-            // float volume = Mathf.Pow(8, node.layer);
-            // float divergenceNormalized = divergence * 50.0f / volume;
-            // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-            // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+            int tuningFactor = 444;
+            Gizmos.color = new Color(phiCPU[i]/tuningFactor, phiCPU[i]/tuningFactor, phiCPU[i]/tuningFactor, 0.5f);
             Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
         }
+
+        // // uint[] neighborsCPU = new uint[numNodes * 24];
+        // // neighborsBuffer.GetData(neighborsCPU);
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     Node node = nodesCPU[i];
+        //     // Color color = new Color(1, 1, 1, 0.5f);
+        //     // for (int j = i * 24; j < (i + 1) * 24; j += 4) {
+        //     //     uint idx = neighborsCPU[j];
+        //     //     if (idx == numNodes) {
+        //     //         color = new Color(1, 0, 0, 0.5f);
+        //     //     }
+        //     //     if (idx == numNodes + 1) {
+        //     //         color = new Color(0, 1, 0, 0.5f);
+        //     //         break;
+        //     //     }
+        //     // }
+        //     // float factor = 50.0f;
+        //     // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
+        //     // Gizmos.color = color;
+        //     int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
+        //     Gizmos.color = layerColors[layerIndex];
+        //     // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
+        //     // float volume = Mathf.Pow(8, node.layer);
+        //     // float divergenceNormalized = divergence * 50.0f / volume;
+        //     // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
+        //     // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
+        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        // }
 
         // int index = 9*numNodes/16;
         // Node node = nodesCPU[index];
@@ -1589,6 +1701,9 @@ public class FluidSimulator : MonoBehaviour
         pBuffer?.Release();
         ApBuffer?.Release();
         pressureBuffer?.Release();
+        phiBuffer?.Release();
+        phiBuffer_Read?.Release();
+        dirtyFlagBuffer?.Release();
     }
 }
 

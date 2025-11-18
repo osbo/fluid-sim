@@ -5,6 +5,8 @@
 #pragma kernel ApplyPressureGradient
 #pragma kernel ApplyGravity
 #pragma kernel EnforceBoundaryConditions
+#pragma kernel InitializePhi
+#pragma kernel PropagatePhi
 
 struct faceVelocities
 {
@@ -48,6 +50,9 @@ RWStructuredBuffer<float> pressureBuffer;               // input: pressure value
 RWStructuredBuffer<Node> nodesBuffer;                   // output: aggregated nodes
 RWStructuredBuffer<Node> tempNodesBuffer;               // output: per-node gathered face deltas
 RWStructuredBuffer<uint> neighborsBuffer;               // output: neighbor indices per node (numNodes * 24)
+RWStructuredBuffer<float> phiBuffer;                    // level set distance field (read/write)
+StructuredBuffer<float> phiBuffer_Read;                 // level set distance field (read-only copy for propagation)
+RWStructuredBuffer<uint> dirtyFlagBuffer;               // single-element buffer for convergence flag
 
 uint numUniqueNodes;                              // number of unique morton codes
 uint numNodes;                                          // number of nodes
@@ -885,4 +890,119 @@ void EnforceBoundaryConditions(uint3 id : SV_DispatchThreadID)
     if (coord.z == gridDim - 1) node.velocities.back = 0;
     
     nodesBuffer[threadIndex] = node;
+}
+
+[numthreads(512, 1, 1)]
+void InitializePhi(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    bool isSurfaceNode = false;
+    uint neighborBase = threadIndex * 24;
+
+    // Iterate through all 6 faces
+    for (int d = 0; d < 6; d++)
+    {
+        uint faceNeighborBase = neighborBase + d * 4;
+        bool hasFluidNeighborOnFace = false;
+        bool hasAirNeighborOnFace = false;
+
+        // Check all 4 potential neighbors on this face
+        for (int k = 0; k < 4; k++)
+        {
+            uint neighbor_idx = neighborsBuffer[faceNeighborBase + k];
+
+            if (neighbor_idx < numNodes || neighbor_idx == numNodes + 1)
+            {
+                hasFluidNeighborOnFace = true;
+            }
+            else if (neighbor_idx == numNodes) // "air"
+            {
+                hasAirNeighborOnFace = true;
+            }
+        }
+
+        // A face is a *true* surface if it has at least one "air" slot
+        // AND *zero* "fluid" slots. This correctly ignores padding.
+        if (hasAirNeighborOnFace && !hasFluidNeighborOnFace)
+        {
+            isSurfaceNode = true;
+            break; // Found a surface face, no need to check others
+        }
+    }
+
+    if (isSurfaceNode)
+    {
+        phiBuffer[threadIndex] = 0.0; // Seed the surface
+    }
+    else
+    {
+        // Use a large positive number for "infinity"
+        phiBuffer[threadIndex] = 1e+20; 
+    }
+}
+
+[numthreads(512, 1, 1)]
+void PropagatePhi(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    Node selfNode = nodesBuffer[threadIndex];
+    float selfSide = exp2((float)selfNode.layer);
+    
+    // Read this node's current phi value
+    float oldPhi = phiBuffer_Read[threadIndex];
+    float minPropagatedPhi = oldPhi;
+
+    uint neighborBase = threadIndex * 24;
+
+    // Iterate through all 6 faces
+    for (int d = 0; d < 6; d++)
+    {
+        uint faceNeighborBase = neighborBase + d * 4;
+
+        // Check all 4 potential neighbors on this face (for 2:1 balance)
+        for (int k = 0; k < 4; k++)
+        {
+            uint neighbor_idx = neighborsBuffer[faceNeighborBase + k];
+
+            // Only check valid fluid nodes
+            if (neighbor_idx < numNodes)
+            {
+                // Read the neighbor's phi value
+                float neighborPhi = phiBuffer_Read[neighbor_idx];
+                
+                // Don't propagate from un-set (infinite) nodes
+                if (neighborPhi < 1e+19)
+                {
+                    Node neighborNode = nodesBuffer[neighbor_idx];
+                    float neighborSide = exp2((float)neighborNode.layer);
+
+                    // Use the *exact* distance logic from your ApplyPressureGradient
+                    // to ensure consistency.
+                    float distance = max(0.5 * (selfSide + neighborSide), 1e-6);
+
+                    // The new phi is the neighbor's distance + the distance to that neighbor
+                    float propagatedPhi = neighborPhi + distance;
+
+                    // We want the *minimum* distance from all neighbors
+                    minPropagatedPhi = min(minPropagatedPhi, propagatedPhi);
+                }
+            }
+        }
+    }
+
+    // Write the new minimum phi value
+    phiBuffer[threadIndex] = minPropagatedPhi;
+
+    // If we found a shorter path, mark the "dirty" flag.
+    // This tells the C# script to run another iteration.
+    if (minPropagatedPhi < oldPhi - 1e-5) // Use a small epsilon for float compare
+    {
+        // This is a non-atomic write, but it's fine.
+        // We only care if *any* thread writes 1, not which one.
+        dirtyFlagBuffer[0] = 1;
+    }
 }
