@@ -146,7 +146,7 @@ public class FluidSimulator : MonoBehaviour
 
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
-        DrawParticles(cam);
+        // DrawParticles(cam);
     }
 
     void Start()
@@ -186,19 +186,19 @@ public class FluidSimulator : MonoBehaviour
 
     void Update()
     {
-        // // Check for space key press to advance frame
-        // if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
-        // {
-        //     if (!hasShownWaitMessage)
-        //     {
-        //         Debug.Log("Press SPACE to advance simulation frame");
-        //         hasShownWaitMessage = true;
-        //     }
-        //     return; // Wait for space key press
-        // }
+        // Check for space key press to advance frame
+        if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
+        {
+            if (!hasShownWaitMessage)
+            {
+                Debug.Log("Press SPACE to advance simulation frame");
+                hasShownWaitMessage = true;
+            }
+            return; // Wait for space key press
+        }
         
-        // // Reset wait message flag when frame advances
-        // hasShownWaitMessage = false;
+        // Reset wait message flag when frame advances
+        hasShownWaitMessage = false;
 
         layer = minLayer;
         
