@@ -261,10 +261,6 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     
     // --- Pass 1: Find the minimum layer to define node bounds ---
     uint minSubLayer = maxLayer;
-    for (uint i = rangeStart; i < rangeEnd; i++)
-    {
-        minSubLayer = min(minSubLayer, particlesBuffer[i].layer);
-    }
 
     // --- Define Node Geometry ---
     uint nodeLayer = minSubLayer;
@@ -292,14 +288,6 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     leafVelocities.front = 0.0;
     leafVelocities.back = 0.0;
 
-    faceVelocities leafWeights; // Accumulate weights for normalization
-    leafWeights.left = 0.0;
-    leafWeights.right = 0.0;
-    leafWeights.bottom = 0.0;
-    leafWeights.top = 0.0;
-    leafWeights.front = 0.0;
-    leafWeights.back = 0.0;
-
     // --- Pass 2: Aggregate and Splat Velocities ---
     for (uint i = rangeStart; i < rangeEnd; i++)
     {
@@ -309,37 +297,6 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         // Aggregate cell-centered data (for coarsening)
         weightedPosition += particle.position;
         weightedVelocity += particle.velocity;
-        
-        // --- Particle-to-Grid Splatting ---
-        // Get normalized position (0-1) within the node
-        float3 t = saturate((particle.position - nodeMin) / extent);
-
-        // This splat reverses the interpolation from UpdateParticles
-        // We splat each velocity component to its two corresponding faces
-        
-        // Splat X velocity (to Left/Right faces)
-        float w_x_left = (1.0 - t.x); // Weight for left face
-        float w_x_right = t.x;        // Weight for right face
-        leafVelocities.left += particle.velocity.x * w_x_left;
-        leafVelocities.right += particle.velocity.x * w_x_right;
-        leafWeights.left += w_x_left;
-        leafWeights.right += w_x_right;
-
-        // Splat Y velocity (to Bottom/Top faces)
-        float w_y_bottom = (1.0 - t.y); // Weight for bottom face
-        float w_y_top = t.y;          // Weight for top face
-        leafVelocities.bottom += particle.velocity.y * w_y_bottom;
-        leafVelocities.top += particle.velocity.y * w_y_top;
-        leafWeights.bottom += w_y_bottom;
-        leafWeights.top += w_y_top;
-
-        // Splat Z velocity (to Front/Back faces)
-        float w_z_front = (1.0 - t.z); // Weight for front face
-        float w_z_back = t.z;         // Weight for back face
-        leafVelocities.front += particle.velocity.z * w_z_front;
-        leafVelocities.back += particle.velocity.z * w_z_back;
-        leafWeights.front += w_z_front;
-        leafWeights.back += w_z_back;
     }
     
     // --- Normalize Aggregated Data ---
@@ -347,15 +304,6 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         weightedPosition /= count;
         weightedVelocity /= count;
     }
-
-    // Normalize face velocities by their accumulated weights
-    float epsilon = 1e-9; // Avoid division by zero
-    leafVelocities.left   /= max(epsilon, leafWeights.left);
-    leafVelocities.right  /= max(epsilon, leafWeights.right);
-    leafVelocities.bottom /= max(epsilon, leafWeights.bottom);
-    leafVelocities.top    /= max(epsilon, leafWeights.top);
-    leafVelocities.front  /= max(epsilon, leafWeights.front);
-    leafVelocities.back   /= max(epsilon, leafWeights.back);
 
     // --- Create the Final Node ---
     Node node;
@@ -405,82 +353,123 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         uint numNeighbors = 0;
 
         int3 deltas[6] = { int3(-1,0,0), int3(1,0,0), int3(0,-1,0), int3(0,1,0), int3(0,0,-1), int3(0,0,1) };
-        // [unroll]
         for (int d = 0; d < 6 && coarsen; d++)
         {
             int nx = (int)coord.x + deltas[d].x;
             int ny = (int)coord.y + deltas[d].y;
             int nz = (int)coord.z + deltas[d].z;
 
-            // Bounds at this layer's grid (disabled for now)
-            // if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
-            // {
-            //     coarsen = false;
-            //     break;
-            // }
+            // Bounds at this layer's grid
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
+            {
+                continue;
+            }
 
             uint3 ncoord = uint3((uint)nx, (uint)ny, (uint)nz);
             uint nPrefix = interleave(ncoord);
 
-            uint lower = nPrefix << shift;
-            uint upper = (nPrefix + 1u) << shift; // exclusive
+            uint target = nPrefix << shift;
+            uint upper = (nPrefix + 1u) << shift; // start of next region
 
-            int subNodesLower[4];
-            if (d == 0) { // right face
-                subNodesLower[0] = 1;
-                subNodesLower[1] = 3;
-                subNodesLower[2] = 5;
-                subNodesLower[3] = 7;
-            } else if (d == 1) { // left face
-                subNodesLower[0] = 0;
-                subNodesLower[1] = 2;
-                subNodesLower[2] = 4;
-                subNodesLower[3] = 6;
-            } else if (d == 2) { // top face
-                subNodesLower[0] = 2;
-                subNodesLower[1] = 3;
-                subNodesLower[2] = 6;
-                subNodesLower[3] = 7;
-            } else if (d == 3) { // bottom face
-                subNodesLower[0] = 0;
-                subNodesLower[1] = 1;
-                subNodesLower[2] = 4;
-                subNodesLower[3] = 5;
-            } else if (d == 4) { // back face
-                subNodesLower[0] = 4;
-                subNodesLower[1] = 5;
-                subNodesLower[2] = 6;
-                subNodesLower[3] = 7;
-            } else if (d == 5) { // front face
-                subNodesLower[0] = 0;
-                subNodesLower[1] = 1;
-                subNodesLower[2] = 2;
-                subNodesLower[3] = 3;
+            // Find the last node in this region by finding first node in next region, then subtract 1
+            uint idx_next = lowerBoundMorton(upper, 0, numNodes);
+            uint idx_leq = (idx_next > 0) ? idx_next - 1u : 0u;
+
+            // Skip if no valid neighbor found
+            if (idx_leq >= numNodes)
+            {
+                coarsen = false;
+                break;
             }
 
-            uint nPrefixShifted = nPrefix << 3;
-            for (int i = 0; i < 4 && coarsen; i++)
-            {
-                uint subPrefix = nPrefixShifted + subNodesLower[i];
-                uint subLower = subPrefix << (shift - 3);
-                uint subUpper = (subPrefix + 1u) << (shift - 3);
-                uint idx_sub = lowerBoundMorton(subLower, 0, numNodes);
-                if (idx_sub < numNodes)
-                {
-                    Node cNode = nodesBuffer[idx_sub];
-                    if (cNode.mortonCode < subUpper)
+            Node nNode = nodesBuffer[idx_leq];
+            uint idx_leq_mc = nNode.mortonCode;
+            uint idx_leq_mc_prefix = idx_leq_mc >> shift;
+            uint idx_leq_layer = nNode.layer;
+
+            if (idx_leq_mc_prefix == nPrefix && idx_leq_layer >= layer) {
+                continue;
+            }
+            // else if ((idx_leq_mc >> (shift + 3)) == (nPrefix >> 3) && idx_leq_layer >= layer + 1) {
+            //     continue;
+            // }
+            else {
+                // Child neighbor case: need to verify all 4 child nodes exist
+                if (shift >= 3) {
+                    uint idx_target = lowerBoundMorton(target, 0, numNodes); // low child bound
+                    uint idx_upper = lowerBoundMorton(upper, 0, numNodes); // high child bound
+                    if (idx_target < idx_upper)
                     {
-                        if (cNode.layer < layer - 1)
-                        {
-                            coarsen = false;
+                        uint nPrefixShifted = nPrefix << 3;
+                        int subNodesLower[4];
+                        if (d == 0) { // right face
+                            subNodesLower[0] = 1;
+                            subNodesLower[1] = 3;
+                            subNodesLower[2] = 5;
+                            subNodesLower[3] = 7;
+                        } else if (d == 1) { // left face
+                            subNodesLower[0] = 0;
+                            subNodesLower[1] = 2;
+                            subNodesLower[2] = 4;
+                            subNodesLower[3] = 6;
+                        } else if (d == 2) { // top face
+                            subNodesLower[0] = 2;
+                            subNodesLower[1] = 3;
+                            subNodesLower[2] = 6;
+                            subNodesLower[3] = 7;
+                        } else if (d == 3) { // bottom face
+                            subNodesLower[0] = 0;
+                            subNodesLower[1] = 1;
+                            subNodesLower[2] = 4;
+                            subNodesLower[3] = 5;
+                        } else if (d == 4) { // back face
+                            subNodesLower[0] = 4;
+                            subNodesLower[1] = 5;
+                            subNodesLower[2] = 6;
+                            subNodesLower[3] = 7;
+                        } else if (d == 5) { // front face
+                            subNodesLower[0] = 0;
+                            subNodesLower[1] = 1;
+                            subNodesLower[2] = 2;
+                            subNodesLower[3] = 3;
                         }
-                        numNeighbors++;
+                        
+                        uint validChildCount = 0;
+
+                        for (int i = 0; i < 4; i++)
+                        {
+                            uint subPrefix = nPrefixShifted + subNodesLower[i];
+                            uint subLower = subPrefix << (shift - 3);
+                            uint subUpper = (subPrefix + 1u) << (shift - 3);
+                            uint idx_sub = lowerBoundMorton(subLower, idx_target, idx_upper);
+                            
+                            // Verify the child node exists and is valid
+                            if (idx_sub < idx_upper)
+                            {
+                                Node cNode = nodesBuffer[idx_sub];
+                                uint idx_sub_mc = cNode.mortonCode;
+                                uint idx_sub_mc_prefix = idx_sub_mc >> (shift - 3);
+                                uint idx_sub_layer = cNode.layer;
+                                
+                                // Check if this is the correct child node
+                                if (idx_sub_mc_prefix == subPrefix && idx_sub_layer >= layer - 1)
+                                {
+                                    validChildCount++;
+                                }
+                            }
+                        }
+                        
+                        // All 4 child neighbors must exist and be valid
+                        if (validChildCount == 4)
+                        {
+                            // continue; // Valid child neighbors found, continue to next face
+                        }
                     }
                 }
+                // If we reach here, neighbor validation failed
+                coarsen = false;
+                break;
             }
-        }
-        if (numNeighbors < 8 && layer > surfaceLayer) {
-            coarsen = false;
         }
     }
 
