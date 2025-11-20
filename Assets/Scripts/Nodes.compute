@@ -1,7 +1,9 @@
 #pragma kernel CreateLeaves
 #pragma kernel ProcessNodes
-#pragma kernel pullVelocities
+#pragma kernel findNeighbors
+#pragma kernel interpolateFaceVelocities
 #pragma kernel copyFaceVelocities
+#pragma kernel gatherFaceVelocities
 #pragma kernel ApplyPressureGradient
 #pragma kernel ApplyGravity
 #pragma kernel EnforceBoundaryConditions
@@ -116,87 +118,6 @@ uint EncodeMorton3D(float3 pos)
     return result;
 }
 
-void addToFace(inout Node outNode, int d, Node nNode, uint3 cornerPosition, float nodeSideLength)
-{
-    if (d == 0)
-    {
-        // get face position in x axis
-        float facePosition = cornerPosition.x;
-        float selfPosition = outNode.position.x;
-        float nPosition = nNode.position.x;
-        float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
-        lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
-        float faceVelocity = lerp(outNode.velocity.x, nNode.velocity.x, lerpFactor);
-        outNode.velocities.left += faceVelocity;
-    }
-    else if (d == 1)
-    {
-        float facePosition = cornerPosition.x + nodeSideLength;
-        float selfPosition = outNode.position.x;
-        float nPosition = nNode.position.x;
-        float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
-        lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
-        float faceVelocity = lerp(outNode.velocity.x, nNode.velocity.x, lerpFactor);
-        outNode.velocities.right += faceVelocity;
-    }
-    else if (d == 2)
-    {
-        float facePosition = cornerPosition.y;
-        float selfPosition = outNode.position.y;
-        float nPosition = nNode.position.y;
-        float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
-        lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
-        float faceVelocity = lerp(outNode.velocity.y, nNode.velocity.y, lerpFactor);
-        outNode.velocities.bottom += faceVelocity;
-    }
-    else if (d == 3)
-    {
-        float facePosition = cornerPosition.y + nodeSideLength;
-        float selfPosition = outNode.position.y;
-        float nPosition = nNode.position.y;
-        float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
-        lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
-        float faceVelocity = lerp(outNode.velocity.y, nNode.velocity.y, lerpFactor);
-        outNode.velocities.top += faceVelocity;
-    }
-    else if (d == 4)
-    {
-        float facePosition = cornerPosition.z;
-        float selfPosition = outNode.position.z;
-        float nPosition = nNode.position.z;
-        float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
-        lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
-        float faceVelocity = lerp(outNode.velocity.z, nNode.velocity.z, lerpFactor);
-        outNode.velocities.front += faceVelocity;
-    }
-    else // d == 5
-    {
-        float facePosition = cornerPosition.z + nodeSideLength;
-        float selfPosition = outNode.position.z;
-        float nPosition = nNode.position.z;
-        float lerpFactor = abs(facePosition - selfPosition) / max(1e-6, abs(nPosition - selfPosition));
-        lerpFactor = clamp(lerpFactor, 0.0, 1.0); // Clamp to [0,1] range
-        // lerpFactor = 0.5;
-        float faceVelocity = lerp(outNode.velocity.z, nNode.velocity.z, lerpFactor);
-        outNode.velocities.back += faceVelocity;
-    }
-}
-
-void divideFace(inout Node outNode, int d, float value)
-{
-    if (d == 0) outNode.velocities.left /= value;
-    else if (d == 1) outNode.velocities.right /= value;
-    else if (d == 2) outNode.velocities.bottom /= value;
-    else if (d == 3) outNode.velocities.top /= value;
-    else if (d == 4) outNode.velocities.front /= value;
-    else outNode.velocities.back /= value; // d == 5
-}
-
 // Helper: face offset inside 24-wide neighbors block
 uint faceOffset(int d)
 {
@@ -207,6 +128,16 @@ uint faceOffset(int d)
     if (d == 3) return 12u;
     if (d == 4) return 16u;
     return 20u; // d == 5
+}
+
+float selectOpposingFace(faceVelocities v, int d)
+{
+    if (d == 0) return v.right;
+    if (d == 1) return v.left;
+    if (d == 2) return v.top;
+    if (d == 3) return v.bottom;
+    if (d == 4) return v.back;
+    return v.front;
 }
 
 // Lower-bound search: first index with mortonCode >= target
@@ -263,12 +194,9 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     uint rangeStart = uniqueIndices[threadIndex];
     uint rangeEnd = threadIndex + 1 < numNodes ?
         uniqueIndices[threadIndex + 1] : numParticles;
-    
-    // --- Pass 1: Find the minimum layer to define node bounds ---
-    uint minSubLayer = maxLayer;
 
     // --- Define Node Geometry ---
-    uint nodeLayer = minSubLayer;
+    uint nodeLayer = minLayer;
     uint mortonCode = particlesBuffer[rangeStart].mortonCode;
     
     // Calculate node's world-space bounds (logic from UpdateParticles)
@@ -293,6 +221,14 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     leafVelocities.front = 0.0;
     leafVelocities.back = 0.0;
 
+    faceVelocities leafWeights; // Accumulate weights for normalization
+    leafWeights.left = 0.0;
+    leafWeights.right = 0.0;
+    leafWeights.bottom = 0.0;
+    leafWeights.top = 0.0;
+    leafWeights.front = 0.0;
+    leafWeights.back = 0.0;
+
     // --- Pass 2: Aggregate and Splat Velocities ---
     for (uint i = rangeStart; i < rangeEnd; i++)
     {
@@ -302,6 +238,37 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         // Aggregate cell-centered data (for coarsening)
         weightedPosition += particle.position;
         weightedVelocity += particle.velocity;
+        
+        // --- Particle-to-Grid Splatting ---
+        // Get normalized position (0-1) within the node
+        float3 t = saturate((particle.position - nodeMin) / extent);
+
+        // This splat reverses the interpolation from UpdateParticles
+        // We splat each velocity component to its two corresponding faces
+        
+        // Splat X velocity (to Left/Right faces)
+        float w_x_left = (1.0 - t.x); // Weight for left face
+        float w_x_right = t.x;        // Weight for right face
+        leafVelocities.left += particle.velocity.x * w_x_left;
+        leafVelocities.right += particle.velocity.x * w_x_right;
+        leafWeights.left += w_x_left;
+        leafWeights.right += w_x_right;
+
+        // Splat Y velocity (to Bottom/Top faces)
+        float w_y_bottom = (1.0 - t.y); // Weight for bottom face
+        float w_y_top = t.y;          // Weight for top face
+        leafVelocities.bottom += particle.velocity.y * w_y_bottom;
+        leafVelocities.top += particle.velocity.y * w_y_top;
+        leafWeights.bottom += w_y_bottom;
+        leafWeights.top += w_y_top;
+
+        // Splat Z velocity (to Front/Back faces)
+        float w_z_front = (1.0 - t.z); // Weight for front face
+        float w_z_back = t.z;         // Weight for back face
+        leafVelocities.front += particle.velocity.z * w_z_front;
+        leafVelocities.back += particle.velocity.z * w_z_back;
+        leafWeights.front += w_z_front;
+        leafWeights.back += w_z_back;
     }
     
     // --- Normalize Aggregated Data ---
@@ -310,12 +277,21 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
         weightedVelocity /= count;
     }
 
+    // Normalize face velocities by their accumulated weights
+    float epsilon = 1e-9; // Avoid division by zero
+    leafVelocities.left   /= max(epsilon, leafWeights.left);
+    leafVelocities.right  /= max(epsilon, leafWeights.right);
+    leafVelocities.bottom /= max(epsilon, leafWeights.bottom);
+    leafVelocities.top    /= max(epsilon, leafWeights.top);
+    leafVelocities.front  /= max(epsilon, leafWeights.front);
+    leafVelocities.back   /= max(epsilon, leafWeights.back);
+
     // --- Create the Final Node ---
     Node node;
     node.position = weightedPosition;
     node.velocity = weightedVelocity;
     node.velocities = leafVelocities; // Store the splatted face velocities
-    node.layer = minSubLayer;
+    node.layer = maxLayer;
     node.mass = count;
     node.mortonCode = mortonCode;
     node.active = 1u;
@@ -631,7 +607,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
 // Do multiplier when aggregating based on layer
 
 [numthreads(512, 1, 1)]
-void pullVelocities(uint3 id : SV_DispatchThreadID)
+void findNeighbors(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
     if (threadIndex >= numNodes) return;
@@ -766,12 +742,175 @@ void pullVelocities(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(512, 1, 1)]
+void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    Node node = nodesBuffer[threadIndex];
+    Node outNode = node;
+
+    uint neighborBaseIndex = threadIndex * 24;
+
+    for (int d = 0; d < 6; d++) {
+        uint n0_idx = neighborsBuffer[neighborBaseIndex + d * 4];
+
+        if (n0_idx < numNodes + 1) {
+            if (n0_idx < numNodes && nodesBuffer[n0_idx].layer == node.layer) {
+                Node n0 = nodesBuffer[n0_idx];
+                // same-layer neighbor. Linear interpolate shared face velocity, factor 0.5
+                if (d == 0) outNode.velocities.left = 0.5 * (node.velocities.left + n0.velocities.right);
+                else if (d == 1) outNode.velocities.right = 0.5 * (node.velocities.right + n0.velocities.left);
+                else if (d == 2) outNode.velocities.bottom = 0.5 * (node.velocities.bottom + n0.velocities.top);
+                else if (d == 3) outNode.velocities.top = 0.5 * (node.velocities.top + n0.velocities.bottom);
+                else if (d == 4) outNode.velocities.front = 0.5 * (node.velocities.front + n0.velocities.back);
+                else outNode.velocities.back = 0.5 * (node.velocities.back + n0.velocities.front);
+            }
+            else if (n0_idx < numNodes && nodesBuffer[n0_idx].layer == node.layer + 1) {
+                Node n0 = nodesBuffer[n0_idx];
+                // Case: Fine Node (Self) bordering Coarse Node (Parent)
+                // We use Bilinear Interpolation: V_fine = V_coarse + Gradient * Offset
+                // For octrees, Gradient * Offset = 1/8 * (V_pos - V_neg)
+
+                // 1. Get the Base Coarse Velocity (The parent's face touching us)
+                float coarseVel = 0.0;
+                if (d == 0) coarseVel = n0.velocities.right;      // Neighbor is Left, read its Right
+                else if (d == 1) coarseVel = n0.velocities.left;  // Neighbor is Right, read its Left
+                else if (d == 2) coarseVel = n0.velocities.top;   // Neighbor is Bottom, read its Top
+                else if (d == 3) coarseVel = n0.velocities.bottom;// Neighbor is Top, read its Bottom
+                else if (d == 4) coarseVel = n0.velocities.back;  // Neighbor is Front, read its Back
+                else coarseVel = n0.velocities.front;             // Neighbor is Back, read its Front
+
+                // 2. Determine Transverse Directions and Signs
+                // We need the directions perpendicular to the face normal 'd'
+                // We also determine if we are on the positive or negative side of the parent's center
+                int t1_neg, t1_pos; // Index of negative/positive neighbor for first transverse axis
+                int t2_neg, t2_pos; // Index of negative/positive neighbor for second transverse axis
+                float sign1 = 0.0;  // +1 if we are on the positive side, -1 if negative
+                float sign2 = 0.0;
+
+                if (d == 0 || d == 1) { // X-Face (Left/Right) -> Transverse are Y (2,3) and Z (4,5)
+                    t1_neg = 2; t1_pos = 3; // Bottom, Top
+                    t2_neg = 4; t2_pos = 5; // Front, Back
+                    sign1 = (node.position.y >= n0.position.y) ? 1.0 : -1.0;
+                    sign2 = (node.position.z >= n0.position.z) ? 1.0 : -1.0;
+                } 
+                else if (d == 2 || d == 3) { // Y-Face (Bottom/Top) -> Transverse are X (0,1) and Z (4,5)
+                    t1_neg = 0; t1_pos = 1; // Left, Right
+                    t2_neg = 4; t2_pos = 5; // Front, Back
+                    sign1 = (node.position.x >= n0.position.x) ? 1.0 : -1.0;
+                    sign2 = (node.position.z >= n0.position.z) ? 1.0 : -1.0;
+                } 
+                else { // Z-Face (Front/Back) -> Transverse are X (0,1) and Y (2,3)
+                    t1_neg = 0; t1_pos = 1; // Left, Right
+                    t2_neg = 2; t2_pos = 3; // Bottom, Top
+                    sign1 = (node.position.x >= n0.position.x) ? 1.0 : -1.0;
+                    sign2 = (node.position.y >= n0.position.y) ? 1.0 : -1.0;
+                }
+
+                // 3. Fetch Transverse Neighbor Velocities
+                // We look at the PARENT'S neighbors.
+                uint n0NeighborBaseIndex = n0_idx * 24;
+                
+                // Helper Macro/Lambda logic to fetch velocity or fallback to coarseVel (0 gradient)
+                // We check slot 0 (assuming parent's neighbors are usually 1:1 or coarser)
+                float v_t1_neg = coarseVel;
+                uint idx = neighborsBuffer[n0NeighborBaseIndex + t1_neg * 4];
+                if (idx < numNodes) v_t1_neg = selectOpposingFace(nodesBuffer[idx].velocities, d);
+
+                float v_t1_pos = coarseVel;
+                idx = neighborsBuffer[n0NeighborBaseIndex + t1_pos * 4];
+                if (idx < numNodes) v_t1_pos = selectOpposingFace(nodesBuffer[idx].velocities, d);
+
+                float v_t2_neg = coarseVel;
+                idx = neighborsBuffer[n0NeighborBaseIndex + t2_neg * 4];
+                if (idx < numNodes) v_t2_neg = selectOpposingFace(nodesBuffer[idx].velocities, d);
+
+                float v_t2_pos = coarseVel;
+                idx = neighborsBuffer[n0NeighborBaseIndex + t2_pos * 4];
+                if (idx < numNodes) v_t2_pos = selectOpposingFace(nodesBuffer[idx].velocities, d);
+
+                // 4. Calculate the 1/8th Gradient Correction
+                float correction = 0.125 * ((v_t1_pos - v_t1_neg) * sign1 + (v_t2_pos - v_t2_neg) * sign2);
+                
+                // 5. Apply to Output
+                if (d == 0) outNode.velocities.left = coarseVel + correction;
+                else if (d == 1) outNode.velocities.right = coarseVel + correction;
+                else if (d == 2) outNode.velocities.bottom = coarseVel + correction;
+                else if (d == 3) outNode.velocities.top = coarseVel + correction;
+                else if (d == 4) outNode.velocities.front = coarseVel + correction;
+                else outNode.velocities.back = coarseVel + correction;
+            }
+        }
+    }
+
+    tempNodesBuffer[threadIndex] = outNode;
+}
+
+[numthreads(512, 1, 1)]
 void copyFaceVelocities(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
     if (threadIndex >= numNodes) return;
 
     nodesBuffer[threadIndex] = tempNodesBuffer[threadIndex];
+}
+
+[numthreads(512, 1, 1)]
+void gatherFaceVelocities(uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    if (threadIndex >= numNodes) return;
+
+    Node node = nodesBuffer[threadIndex];
+    Node outNode = node; 
+
+    uint neighborBaseIndex = threadIndex * 24;
+
+    // Iterate through all 6 faces (0:Left, 1:Right, 2:Bottom, 3:Top, 4:Front, 5:Back)
+    for (int d = 0; d < 6; d++) {
+        float sumVel = 0.0;
+        float validCount = 0.0;
+        bool isFineInterface = false;
+
+        // Loop through the 4 potential sub-neighbor slots for this face
+        for (int k = 0; k < 4; k++) {
+            uint neighbor_idx = neighborsBuffer[neighborBaseIndex + d * 4 + k];
+
+            // Check if neighbor exists (is not Air/Wall)
+            if (neighbor_idx < numNodes) {
+                Node neighborNode = nodesBuffer[neighbor_idx];
+
+                // CRITICAL CHECK: We only gather if the neighbor is SMALLER (Fine)
+                // If neighbor.layer >= node.layer, it's handled by specific logic elsewhere 
+                // or simple averaging, so we skip it here.
+                if (neighborNode.layer < node.layer) {
+                    isFineInterface = true;
+
+                    // Gather the velocity from the neighbor's OPPOSING face.
+                    // If d=0 (My Left Face), neighbor is to the Left.
+                    // We read neighbor.velocities.right (the face touching me).
+                    sumVel += selectOpposingFace(neighborNode.velocities, d);
+                    validCount += 1.0;
+                }
+            }
+        }
+
+        // If we detected this is a Coarse->Fine interface and we found valid fluid neighbors
+        if (isFineInterface && validCount > 0.0) {
+            float avgVel = sumVel / validCount;
+
+            // Update the specific face on the coarse node
+            if (d == 0) outNode.velocities.left = avgVel;
+            else if (d == 1) outNode.velocities.right = avgVel;
+            else if (d == 2) outNode.velocities.bottom = avgVel;
+            else if (d == 3) outNode.velocities.top = avgVel;
+            else if (d == 4) outNode.velocities.front = avgVel;
+            else outNode.velocities.back = avgVel;
+        }
+    }
+
+    nodesBuffer[threadIndex] = outNode;
 }
 
 [numthreads(512, 1, 1)]
@@ -787,7 +926,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
 
     uint neighborBaseIndex = threadIndex * 24;
 
-    // Loop through all 6 faces, same as pullVelocities and ApplyLaplacian
+    // Loop through all 6 faces, same as findNeighbors and ApplyLaplacian
     for (int d = 0; d < 6; d++)
     {
         uint faceNeighborBase = neighborBaseIndex + d * 4;

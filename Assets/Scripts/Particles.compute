@@ -340,7 +340,7 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     particle.position = newPosition;
 
-    particle.layer = clamp(10-floor(log2(length(newVelocity) * velocitySensitivity / 3.0)), minLayer, maxLayer);
+    particle.layer = node.layer;
 
     // newVelocity.y -= gravity * deltaTime;
 
