@@ -38,8 +38,10 @@ public class FluidSimulator : MonoBehaviour
     private int writeNodeCountKernel;
     private int radixPrefixSumKernelId;
     private int radixPrefixFixupKernelId;
-    private int pullVelocitiesKernel;
+    private int findNeighborsKernel;
+    private int interpolateFaceVelocitiesKernel;
     private int copyFaceVelocitiesKernel;
+    private int gatherFaceVelocitiesKernel;
     private int calculateDivergenceKernel;
     private int applyLaplacianKernel;
     private int axpyKernel;
@@ -151,7 +153,7 @@ public class FluidSimulator : MonoBehaviour
 
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
-        // DrawParticles(cam);
+        DrawParticles(cam);
     }
 
     void Start()
@@ -191,19 +193,19 @@ public class FluidSimulator : MonoBehaviour
 
     void Update()
     {
-        // Check for space key press to advance frame
-        if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
-        {
-            if (!hasShownWaitMessage)
-            {
-                Debug.Log("Press SPACE to advance simulation frame");
-                hasShownWaitMessage = true;
-            }
-            return; // Wait for space key press
-        }
+        // // Check for space key press to advance frame
+        // if (Keyboard.current == null || !Keyboard.current.spaceKey.wasPressedThisFrame)
+        // {
+        //     if (!hasShownWaitMessage)
+        //     {
+        //         Debug.Log("Press SPACE to advance simulation frame");
+        //         hasShownWaitMessage = true;
+        //     }
+        //     return; // Wait for space key press
+        // }
         
-        // Reset wait message flag when frame advances
-        hasShownWaitMessage = false;
+        // // Reset wait message flag when frame advances
+        // hasShownWaitMessage = false;
 
         layer = minLayer;
         
@@ -215,7 +217,7 @@ public class FluidSimulator : MonoBehaviour
         Vector3 simulationSize = simulationBoundsMax;
         maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
 
-        // Frame loop: SortParticles -> findUniqueParticles -> CreateLeaves -> layer loop -> pullVelocities -> SolvePressure -> UpdateParticles
+        // Frame loop: SortParticles -> findUniqueParticles -> CreateLeaves -> layer loop -> findNeighbors -> SolvePressure -> UpdateParticles
 
         // particlesCPU = new Particle[numParticles];
         // particlesBuffer.GetData(particlesCPU);
@@ -309,10 +311,10 @@ public class FluidSimulator : MonoBehaviour
         }
         Debug.Log(str);
 
-        // Step 4: Pull velocities
-        var pullVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
-        pullVelocities();
-        pullVelocitiesSw.Stop();
+        // Step 4: Find neighbors
+        var findNeighborsSw = System.Diagnostics.Stopwatch.StartNew();
+        findNeighbors();
+        findNeighborsSw.Stop();
 
         // Step 4.5: Compute level set (distance field)
         var computeLevelSetSw = System.Diagnostics.Stopwatch.StartNew();
@@ -447,7 +449,7 @@ public class FluidSimulator : MonoBehaviour
                  $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Pull Velocities: {pullVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Find Neighbors: {findNeighborsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Compute Level Set: {computeLevelSetSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Apply Gravity: {applyGravitySw.Elapsed.TotalMilliseconds:F2} ms\n" +
@@ -1284,7 +1286,7 @@ public class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.Dispatch(copyNodesKernel, copyGroups, 1, 1);
     }
 
-    private void pullVelocities()
+    private void findNeighbors()
     {
         if (nodesShader == null)
         {
@@ -1295,20 +1297,69 @@ public class FluidSimulator : MonoBehaviour
         // Release and recreate neighbors buffer each frame since numNodes changes
         neighborsBuffer?.Release();
         neighborsBuffer = new ComputeBuffer(numNodes, sizeof(uint) * 24);
+        
+        // Print face velocities BEFORE velocity interpolation
+        Node[] nodesBeforeMLS = new Node[numNodes];
+        nodesBuffer.GetData(nodesBeforeMLS);
+        string beforeMLS = "Face Velocities (non-zero nodes):\n";
+        float totalVelocity = 0.0f;
+        for (int i = 0; i < Mathf.Min(200,numNodes); i++)
+        {
+            Node n = nodesBeforeMLS[i];
+            if (n.velocities.left != 0.0f || n.velocities.right != 0.0f || n.velocities.bottom != 0.0f || n.velocities.top != 0.0f || n.velocities.front != 0.0f || n.velocities.back != 0.0f) {
+                beforeMLS += $"Node {i}, layer {n.layer}: L={n.velocities.left:F4}, R={n.velocities.right:F4}, " +
+                                $"B={n.velocities.bottom:F4}, T={n.velocities.top:F4}, " +
+                                $"F={n.velocities.front:F4}, Ba={n.velocities.back:F4}\n";
+                    totalVelocity += n.velocities.left + n.velocities.right + n.velocities.bottom + n.velocities.top + n.velocities.front + n.velocities.back;
+            }
+        }
+        Debug.Log("Total velocity before velocity interpolation: " + totalVelocity +", " + beforeMLS);
 
-        pullVelocitiesKernel = nodesShader.FindKernel("pullVelocities");
-        nodesShader.SetBuffer(pullVelocitiesKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetBuffer(pullVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
-        nodesShader.SetBuffer(pullVelocitiesKernel, "neighborsBuffer", neighborsBuffer);
+        findNeighborsKernel = nodesShader.FindKernel("findNeighbors");
+        nodesShader.SetBuffer(findNeighborsKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(findNeighborsKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesShader.SetBuffer(findNeighborsKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        nodesShader.Dispatch(pullVelocitiesKernel, threadGroups, 1, 1);
+        nodesShader.Dispatch(findNeighborsKernel, threadGroups, 1, 1);
 
-        // copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
-        // nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
-        // nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
-        // nodesShader.SetInt("numNodes", numNodes);
-        // nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
+        interpolateFaceVelocitiesKernel = nodesShader.FindKernel("interpolateFaceVelocities");
+        nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "neighborsBuffer", neighborsBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.Dispatch(interpolateFaceVelocitiesKernel, threadGroups, 1, 1);
+
+        // Bring the new, velocity interpolated face velocities from tempNodesBuffer back to nodesBuffer
+        copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
+        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
+
+        // Gather the face velocities from child faces to parent face
+        gatherFaceVelocitiesKernel = nodesShader.FindKernel("gatherFaceVelocities");
+        nodesShader.SetBuffer(gatherFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(gatherFaceVelocitiesKernel, "neighborsBuffer", neighborsBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.Dispatch(gatherFaceVelocitiesKernel, threadGroups, 1, 1);
+
+        // Print face velocities AFTER velocity interpolation
+        Node[] nodesAfterMLS = new Node[numNodes];
+        nodesBuffer.GetData(nodesAfterMLS);
+        string afterMLS = "Face Velocities (non-zero nodes):\n";
+        totalVelocity = 0.0f;
+        for (int i = 0; i < Mathf.Min(200,numNodes); i++)
+        {
+            Node n = nodesAfterMLS[i];
+            if (n.velocities.left != 0.0f || n.velocities.right != 0.0f || n.velocities.bottom != 0.0f || n.velocities.top != 0.0f || n.velocities.front != 0.0f || n.velocities.back != 0.0f) {
+                afterMLS += $"Node {i}, layer {n.layer}: L={n.velocities.left:F4}, R={n.velocities.right:F4}, " +
+                                $"B={n.velocities.bottom:F4}, T={n.velocities.top:F4}, " +
+                                $"F={n.velocities.front:F4}, Ba={n.velocities.back:F4}\n";
+                    totalVelocity += n.velocities.left + n.velocities.right + n.velocities.bottom + n.velocities.top + n.velocities.front + n.velocities.back;
+            }
+        }
+        Debug.Log("Total velocity after velocity interpolation: " + totalVelocity +", " + afterMLS);
     }
 
     private void ComputeLevelSet()
@@ -1515,19 +1566,19 @@ public class FluidSimulator : MonoBehaviour
             // new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
 
-        float[] phiCPU = new float[numNodes];
-        phiBuffer.GetData(phiCPU);
+        // float[] phiCPU = new float[numNodes];
+        // phiBuffer.GetData(phiCPU);
 
-        for (int i = 0; i < numNodes; i++)
-        {
-            Node node = nodesCPU[i];
-            int tuningFactor = 444;
-            Gizmos.color = new Color(phiCPU[i]/tuningFactor, phiCPU[i]/tuningFactor, phiCPU[i]/tuningFactor, 0.5f);
-            Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        }
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     Node node = nodesCPU[i];
+        //     int tuningFactor = 444;
+        //     Gizmos.color = new Color(phiCPU[i]/tuningFactor, phiCPU[i]/tuningFactor, phiCPU[i]/tuningFactor, 0.5f);
+        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        // }
 
         // // uint[] neighborsCPU = new uint[numNodes * 24];
         // // neighborsBuffer.GetData(neighborsCPU);
