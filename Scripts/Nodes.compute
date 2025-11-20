@@ -781,19 +781,19 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
 
                 // average the child velocities.
                 float sumChildren = 0.0;
+                int numChildren = 0;
                 for (int k = 0; k < 4; k++) {
                     uint child_idx = neighborsBuffer[n0BaseNeighborFaceIndex + k];
                     if (child_idx < numNodes) {
                         Node childNode = nodesBuffer[child_idx];
                         sumChildren += selectOpposingFace(childNode.velocities, neighborD);
-                    }
-                    else {
-                        sumChildren += selectFace(n0.velocities, neighborD);
+                        numChildren += 1;
                     }
                 }
-                float childrenAverage = sumChildren / 4.0;
+                float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
                 float parentVal = selectOpposingFace(n0.velocities, d);
-                float target = parentVal * 0.5 + childrenAverage * 0.5;
+                float mixFactor = 0.5;
+                float target = parentVal * (1.0f - mixFactor) + childrenAverage * mixFactor;
                 float offset = target - childrenAverage;
 
                 if (d == 0) outNode.velocities.left += offset;
@@ -806,18 +806,20 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
             else {
                 // child neighbor
                 float sumChildren = 0.0;
-                
+                int numChildren = 0;
                 for (int k = 0; k < 4; k++) {
                     uint child_idx = neighborsBuffer[neighborBaseIndex + d * 4 + k];
                     if (child_idx < numNodes) {
                         Node childNode = nodesBuffer[child_idx];
                         sumChildren += selectOpposingFace(childNode.velocities, d);
-                    }
-                    else {
-                        sumChildren += selectFace(node.velocities, d);
+                        numChildren += 1;
                     }
                 }
-                float newVel = 0.5 * (sumChildren / 4.0) + 0.5 * selectFace(node.velocities, d);
+                float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
+                float parentVal = selectFace(node.velocities, d);
+                float mixFactor = 0.5;
+                float newVel = parentVal * (1.0f - mixFactor) + childrenAverage * mixFactor;
+
                 if (d == 0) outNode.velocities.left = newVel;
                 else if (d == 1) outNode.velocities.right = newVel;
                 else if (d == 2) outNode.velocities.bottom = newVel;

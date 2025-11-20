@@ -135,9 +135,8 @@ float3 mortonNormalizationFactor;
 float mortonMaxValue;
 float gravity;
 float deltaTime;
-float velocitySensitivity;
-float dispersionPower;// >1 concentrates near left, <1 concentrates near right
-float boundaryThreshold;// normalized u threshold near left edge considered boundary
+float dispersionPower; // >1 concentrates near left, <1 concentrates near right
+float boundaryThreshold; // normalized u threshold near left edge considered boundary
 uint minLayer;
 uint numNodes;
 uint numParticles;
