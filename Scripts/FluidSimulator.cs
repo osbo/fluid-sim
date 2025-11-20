@@ -41,7 +41,6 @@ public class FluidSimulator : MonoBehaviour
     private int findNeighborsKernel;
     private int interpolateFaceVelocitiesKernel;
     private int copyFaceVelocitiesKernel;
-    private int gatherFaceVelocitiesKernel;
     private int calculateDivergenceKernel;
     private int applyLaplacianKernel;
     private int axpyKernel;
@@ -88,8 +87,6 @@ public class FluidSimulator : MonoBehaviour
     public float frameRate;
     public int minLayer;
     public int maxLayer;
-    public int surfaceLayer;
-    public float velocitySensitivity;
 
     private bool hasShownWaitMessage = false;
     
@@ -318,7 +315,7 @@ public class FluidSimulator : MonoBehaviour
 
         // Step 4.5: Compute level set (distance field)
         var computeLevelSetSw = System.Diagnostics.Stopwatch.StartNew();
-        ComputeLevelSet();
+        // ComputeLevelSet();
         computeLevelSetSw.Stop();
 
         // nodesCPU = new Node[numNodes];
@@ -494,7 +491,6 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetInt("numParticles", numParticles);
         particlesShader.SetFloat("deltaTime", (1 / frameRate));
         particlesShader.SetFloat("gravity", gravity);
-        particlesShader.SetFloat("velocitySensitivity", velocitySensitivity);
         particlesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
         particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
@@ -709,7 +705,6 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetFloat("deltaTime", (1 / frameRate)); // Use the same deltaTime as in advection
         nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
-        nodesShader.SetFloat("velocitySensitivity", velocitySensitivity);
         nodesShader.SetInt("minLayer", minLayer);
 
         // Dispatch the kernel to update velocities
@@ -1171,7 +1166,6 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("layer", layer);
         nodesShader.SetInt("minLayer", minLayer);
         nodesShader.SetInt("maxLayer", maxLayer);
-        nodesShader.SetInt("surfaceLayer", surfaceLayer);
         
         // Dispatch one thread per unique node
         int threadGroups = Mathf.CeilToInt(numUniqueNodes / 512.0f);
@@ -1303,10 +1297,10 @@ public class FluidSimulator : MonoBehaviour
         nodesBuffer.GetData(nodesBeforeMLS);
         string beforeMLS = "Face Velocities (non-zero nodes):\n";
         float totalVelocity = 0.0f;
-        for (int i = 0; i < Mathf.Min(200,numNodes); i++)
+        for (int i = 0; i < Mathf.Min(numNodes,numNodes); i++)
         {
             Node n = nodesBeforeMLS[i];
-            if (n.velocities.left != 0.0f || n.velocities.right != 0.0f || n.velocities.bottom != 0.0f || n.velocities.top != 0.0f || n.velocities.front != 0.0f || n.velocities.back != 0.0f) {
+            if (n.layer == 5 && (n.velocities.left != 0.0f || n.velocities.right != 0.0f || n.velocities.bottom != 0.0f || n.velocities.top != 0.0f || n.velocities.front != 0.0f || n.velocities.back != 0.0f)) {
                 beforeMLS += $"Node {i}, layer {n.layer}: L={n.velocities.left:F4}, R={n.velocities.right:F4}, " +
                                 $"B={n.velocities.bottom:F4}, T={n.velocities.top:F4}, " +
                                 $"F={n.velocities.front:F4}, Ba={n.velocities.back:F4}\n";
@@ -1337,22 +1331,15 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
 
-        // Gather the face velocities from child faces to parent face
-        gatherFaceVelocitiesKernel = nodesShader.FindKernel("gatherFaceVelocities");
-        nodesShader.SetBuffer(gatherFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetBuffer(gatherFaceVelocitiesKernel, "neighborsBuffer", neighborsBuffer);
-        nodesShader.SetInt("numNodes", numNodes);
-        nodesShader.Dispatch(gatherFaceVelocitiesKernel, threadGroups, 1, 1);
-
         // Print face velocities AFTER velocity interpolation
         Node[] nodesAfterMLS = new Node[numNodes];
         nodesBuffer.GetData(nodesAfterMLS);
         string afterMLS = "Face Velocities (non-zero nodes):\n";
         totalVelocity = 0.0f;
-        for (int i = 0; i < Mathf.Min(200,numNodes); i++)
+        for (int i = 0; i < Mathf.Min(numNodes,numNodes); i++)
         {
             Node n = nodesAfterMLS[i];
-            if (n.velocities.left != 0.0f || n.velocities.right != 0.0f || n.velocities.bottom != 0.0f || n.velocities.top != 0.0f || n.velocities.front != 0.0f || n.velocities.back != 0.0f) {
+            if (n.layer == 5 && (n.velocities.left != 0.0f || n.velocities.right != 0.0f || n.velocities.bottom != 0.0f || n.velocities.top != 0.0f || n.velocities.front != 0.0f || n.velocities.back != 0.0f)) {
                 afterMLS += $"Node {i}, layer {n.layer}: L={n.velocities.left:F4}, R={n.velocities.right:F4}, " +
                                 $"B={n.velocities.bottom:F4}, T={n.velocities.top:F4}, " +
                                 $"F={n.velocities.front:F4}, Ba={n.velocities.back:F4}\n";
@@ -1566,89 +1553,14 @@ public class FluidSimulator : MonoBehaviour
             // new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
 
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
 
-        // float[] phiCPU = new float[numNodes];
-        // phiBuffer.GetData(phiCPU);
-
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     Node node = nodesCPU[i];
-        //     int tuningFactor = 444;
-        //     Gizmos.color = new Color(phiCPU[i]/tuningFactor, phiCPU[i]/tuningFactor, phiCPU[i]/tuningFactor, 0.5f);
-        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        // }
-
-        // // uint[] neighborsCPU = new uint[numNodes * 24];
-        // // neighborsBuffer.GetData(neighborsCPU);
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     Node node = nodesCPU[i];
-        //     // Color color = new Color(1, 1, 1, 0.5f);
-        //     // for (int j = i * 24; j < (i + 1) * 24; j += 4) {
-        //     //     uint idx = neighborsCPU[j];
-        //     //     if (idx == numNodes) {
-        //     //         color = new Color(1, 0, 0, 0.5f);
-        //     //     }
-        //     //     if (idx == numNodes + 1) {
-        //     //         color = new Color(0, 1, 0, 0.5f);
-        //     //         break;
-        //     //     }
-        //     // }
-        //     // float factor = 50.0f;
-        //     // Color color = new Color(Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, Mathf.Abs(node.velocities.top-node.velocities.bottom)/factor, 0.5f);
-        //     // Gizmos.color = color;
-        //     int layerIndex = Mathf.Clamp((int)node.layer, 0, layerColors.Length - 1);
-        //     Gizmos.color = layerColors[layerIndex];
-        //     // float divergence = node.velocities.right - node.velocities.left + node.velocities.top - node.velocities.bottom + node.velocities.front - node.velocities.back;
-        //     // float volume = Mathf.Pow(8, node.layer);
-        //     // float divergenceNormalized = divergence * 50.0f / volume;
-        //     // float hue = Mathf.Clamp(divergenceNormalized+0.5f, 0, 1);
-        //     // Gizmos.color = Color.HSVToRGB(hue, 1, 1);
-        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        // }
-
-        // int index = 9*numNodes/16;
-        // Node node = nodesCPU[index];
-        // Gizmos.color = new Color(1, 0, 0, 1);
-        // Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        // Gizmos.color = new Color(0, 1, 0, 1);
-        // for (int i = 0; i < 24; i++) {
-        //     uint idx = neighborsCPU[index*24 + i];
-        //     if (idx >= numNodes) continue;
-        //     Gizmos.DrawCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, nodesCPU[idx].layer), 0.01f));
-        // }
-
-        // // Read neighbors as a flat uint buffer: 24 uints per node (left4,right4,bottom4,top4,front4,back4)
-        // if (neighborsBuffer == null) return;
-        // uint[] neighborsCPU = new uint[numNodes * 24];
-        // neighborsBuffer.GetData(neighborsCPU);
-        // Gizmos.color = new Color(1, 0, 0, 1);
-        // if (selectedNode >= numNodes) return;
-        // Gizmos.DrawCube(DecodeMorton3D(nodesCPU[selectedNode]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[selectedNode].layer, layer)), 0.01f));
-        // Gizmos.DrawWireCube(DecodeMorton3D(nodesCPU[selectedNode]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[selectedNode].layer, layer)), 0.01f));
-        // int nb = selectedNode * 24;
-        // for (int i = 0; i < 24; i++) {
-        //     uint idx = neighborsCPU[nb + i];
-        //     if (idx >= numNodes) continue;
-        //     Gizmos.color = new Color(0, 1, 0, 0.25f);
-        //     Gizmos.DrawCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[idx].layer, layer)), 0.01f));
-        //     Gizmos.color = new Color(0, 1, 0, 1);
-        //     Gizmos.DrawWireCube(DecodeMorton3D(nodesCPU[idx]), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, Mathf.Min(nodesCPU[idx].layer, layer)), 0.01f));
-        // }
-
-
-        // Particle[] particlesCPU = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesCPU);
-
-        // for (int i = 0; i < numParticles; i++)
-        // {
-        //     Particle particle = particlesCPU[i];
-        //     int layerIndex = Mathf.Clamp((int)particle.layer, 0, layerColors.Length - 1);
-        //     Gizmos.color = layerColors[layerIndex];
-        //     Gizmos.DrawCube(particle.position, Vector3.one * 0.25f);
-        // }
+        for (int i = 0; i < numNodes; i++) {
+            Node node = nodesCPU[i];
+            Gizmos.color = layerColors[(int)node.layer];
+            Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        }
     }
 
     private void DrawParticles(Camera cam)
