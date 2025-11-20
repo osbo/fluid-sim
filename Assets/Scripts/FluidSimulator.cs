@@ -1291,23 +1291,6 @@ public class FluidSimulator : MonoBehaviour
         // Release and recreate neighbors buffer each frame since numNodes changes
         neighborsBuffer?.Release();
         neighborsBuffer = new ComputeBuffer(numNodes, sizeof(uint) * 24);
-        
-        // Print face velocities BEFORE velocity interpolation
-        Node[] nodesBeforeMLS = new Node[numNodes];
-        nodesBuffer.GetData(nodesBeforeMLS);
-        string beforeMLS = "Face Velocities (non-zero nodes):\n";
-        float totalVelocity = 0.0f;
-        for (int i = 0; i < Mathf.Min(numNodes,numNodes); i++)
-        {
-            Node n = nodesBeforeMLS[i];
-            if (n.layer == 5 && (n.velocities.left != 0.0f || n.velocities.right != 0.0f || n.velocities.bottom != 0.0f || n.velocities.top != 0.0f || n.velocities.front != 0.0f || n.velocities.back != 0.0f)) {
-                beforeMLS += $"Node {i}, layer {n.layer}: L={n.velocities.left:F4}, R={n.velocities.right:F4}, " +
-                                $"B={n.velocities.bottom:F4}, T={n.velocities.top:F4}, " +
-                                $"F={n.velocities.front:F4}, Ba={n.velocities.back:F4}\n";
-                    totalVelocity += n.velocities.left + n.velocities.right + n.velocities.bottom + n.velocities.top + n.velocities.front + n.velocities.back;
-            }
-        }
-        Debug.Log("Total velocity before velocity interpolation: " + totalVelocity +", " + beforeMLS);
 
         findNeighborsKernel = nodesShader.FindKernel("findNeighbors");
         nodesShader.SetBuffer(findNeighborsKernel, "nodesBuffer", nodesBuffer);
@@ -1316,6 +1299,81 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("numNodes", numNodes);
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(findNeighborsKernel, threadGroups, 1, 1);
+        
+        // // Print face velocities BEFORE velocity interpolation
+        // Node[] nodesBeforeMLS = new Node[numNodes];
+        // nodesBuffer.GetData(nodesBeforeMLS);
+        // uint[] neighborsCPU = new uint[numNodes * 24];
+        // neighborsBuffer.GetData(neighborsCPU);
+        // string beforeMLS = "Before balancing, shared faces that violate conservation:\n";
+        // int totalThatViolate = 0;
+        // for (int i = 0; i < Mathf.Min(numNodes,numNodes); i++)
+        // {
+        //     Node n = nodesBeforeMLS[i];
+        //     int neighborBaseIndex = i * 24;
+        //     for (int d = 0; d < 6; d++) {
+        //         uint n0_idx = neighborsCPU[neighborBaseIndex + d * 4];
+        //         bool hasChild = false;
+        //         float parentFaceVel = 0.0f;
+        //         if (d == 0) parentFaceVel = n.velocities.left;
+        //         else if (d == 1) parentFaceVel = n.velocities.right;
+        //         else if (d == 2) parentFaceVel = n.velocities.bottom;
+        //         else if (d == 3) parentFaceVel = n.velocities.top;
+        //         else if (d == 4) parentFaceVel = n.velocities.front;
+        //         else parentFaceVel = n.velocities.back;
+
+        //         float totalChildFaceVel = 0.0f;
+        //         int numChildren = 0;
+                
+        //         for (int k = 0; k < 4; k++) {
+        //             uint child_idx = neighborsCPU[neighborBaseIndex + d * 4 + k];
+        //             if (child_idx < numNodes) {
+        //                 Node childNode = nodesBeforeMLS[child_idx];
+        //                 if (childNode.layer < n.layer) {
+        //                     hasChild = true;
+        //                     numChildren += 1;
+        //                     if (d == 0) totalChildFaceVel += childNode.velocities.right;
+        //                     else if (d == 1) totalChildFaceVel += childNode.velocities.left;
+        //                     else if (d == 2) totalChildFaceVel += childNode.velocities.top;
+        //                     else if (d == 3) totalChildFaceVel += childNode.velocities.bottom;
+        //                     else if (d == 4) totalChildFaceVel += childNode.velocities.back;
+        //                     else totalChildFaceVel += childNode.velocities.front;
+        //                 }
+        //             }
+        //         }
+        //         if (hasChild) {
+        //             float childFaceVel = totalChildFaceVel / numChildren;
+        //             if (Mathf.Abs(childFaceVel - parentFaceVel) > 1e-4f) {
+        //                 totalThatViolate += 1;
+        //                 beforeMLS += $"Node {i}, layer {n.layer}, face {d}: parent={parentFaceVel:F4}, child={childFaceVel:F4}, neighbor indices: (" + neighborsCPU[neighborBaseIndex + d * 4] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 1] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 2] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 3] + "), parent face velocity: ";
+        //                 if (d == 0) beforeMLS += n.velocities.left;
+        //                 else if (d == 1) beforeMLS += n.velocities.right;
+        //                 else if (d == 2) beforeMLS += n.velocities.bottom;
+        //                 else if (d == 3) beforeMLS += n.velocities.top;
+        //                 else if (d == 4) beforeMLS += n.velocities.front;
+        //                 else beforeMLS += n.velocities.back;
+        //                 beforeMLS += ", child face velocity: ";
+        //                 for (int k = 0; k < 4; k++) {
+        //                     uint child_idx = neighborsCPU[neighborBaseIndex + d * 4 + k];
+        //                     if (child_idx < numNodes) {
+        //                         Node childNode = nodesBeforeMLS[child_idx];
+        //                         if (childNode.layer < n.layer) {
+        //                             if (d == 0) beforeMLS += childNode.velocities.right;
+        //                             else if (d == 1) beforeMLS += childNode.velocities.left;
+        //                             else if (d == 2) beforeMLS += childNode.velocities.top;
+        //                             else if (d == 3) beforeMLS += childNode.velocities.bottom;
+        //                             else if (d == 4) beforeMLS += childNode.velocities.back;
+        //                             else beforeMLS += childNode.velocities.front;
+        //                             beforeMLS += ", ";
+        //                         }
+        //                     }
+        //                 }
+        //                 beforeMLS += "\n";
+        //             }
+        //         }
+        //     }
+        // }
+        // Debug.Log(totalThatViolate + " shared faces that violate conservation before balancing:\n" + beforeMLS);
 
         interpolateFaceVelocitiesKernel = nodesShader.FindKernel("interpolateFaceVelocities");
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
@@ -1331,22 +1389,78 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
 
-        // Print face velocities AFTER velocity interpolation
-        Node[] nodesAfterMLS = new Node[numNodes];
-        nodesBuffer.GetData(nodesAfterMLS);
-        string afterMLS = "Face Velocities (non-zero nodes):\n";
-        totalVelocity = 0.0f;
-        for (int i = 0; i < Mathf.Min(numNodes,numNodes); i++)
-        {
-            Node n = nodesAfterMLS[i];
-            if (n.layer == 5 && (n.velocities.left != 0.0f || n.velocities.right != 0.0f || n.velocities.bottom != 0.0f || n.velocities.top != 0.0f || n.velocities.front != 0.0f || n.velocities.back != 0.0f)) {
-                afterMLS += $"Node {i}, layer {n.layer}: L={n.velocities.left:F4}, R={n.velocities.right:F4}, " +
-                                $"B={n.velocities.bottom:F4}, T={n.velocities.top:F4}, " +
-                                $"F={n.velocities.front:F4}, Ba={n.velocities.back:F4}\n";
-                    totalVelocity += n.velocities.left + n.velocities.right + n.velocities.bottom + n.velocities.top + n.velocities.front + n.velocities.back;
-            }
-        }
-        Debug.Log("Total velocity after velocity interpolation: " + totalVelocity +", " + afterMLS);
+        // // Print face velocities AFTER velocity interpolation
+        // Node[] nodesAfterMLS = new Node[numNodes];
+        // nodesBuffer.GetData(nodesAfterMLS);
+        // neighborsBuffer.GetData(neighborsCPU);
+        // string afterMLS = "After balancing, shared faces that violate conservation:\n";
+        // totalThatViolate = 0;
+        // for (int i = 0; i < Mathf.Min(numNodes,numNodes); i++)
+        // {
+        //     Node n = nodesAfterMLS[i];
+        //     int neighborBaseIndex = i * 24;
+        //     for (int d = 0; d < 6; d++) {
+        //         uint n0_idx = neighborsCPU[neighborBaseIndex + d * 4];
+        //         bool hasChild = false;
+        //         float parentFaceVel = 0.0f;
+        //         if (d == 0) parentFaceVel = n.velocities.left;
+        //         else if (d == 1) parentFaceVel = n.velocities.right;
+        //         else if (d == 2) parentFaceVel = n.velocities.bottom;
+        //         else if (d == 3) parentFaceVel = n.velocities.top;
+        //         else if (d == 4) parentFaceVel = n.velocities.front;
+        //         else parentFaceVel = n.velocities.back;
+
+        //         float totalChildFaceVel = 0.0f;
+        //         int numChildren = 0;
+        //         for (int k = 0; k < 4; k++) {
+        //             uint child_idx = neighborsCPU[neighborBaseIndex + d * 4 + k];
+        //             if (child_idx < numNodes) {
+        //                 Node childNode = nodesAfterMLS[child_idx];
+        //                 if (childNode.layer < n.layer) {
+        //                     hasChild = true;
+        //                     numChildren += 1;
+        //                     if (d == 0) totalChildFaceVel += childNode.velocities.right;
+        //                     else if (d == 1) totalChildFaceVel += childNode.velocities.left;
+        //                     else if (d == 2) totalChildFaceVel += childNode.velocities.top;
+        //                     else if (d == 3) totalChildFaceVel += childNode.velocities.bottom;
+        //                     else if (d == 4) totalChildFaceVel += childNode.velocities.back;
+        //                     else totalChildFaceVel += childNode.velocities.front;
+        //                 }
+        //             }
+        //         }
+        //         if (hasChild) {
+        //             float childFaceVel = totalChildFaceVel / numChildren;
+        //             if (Mathf.Abs(childFaceVel - parentFaceVel) > 1e-4f) {
+        //                 totalThatViolate += 1;
+        //                 afterMLS += $"Node {i}, layer {n.layer}, face {d}: parent={parentFaceVel:F4}, child={childFaceVel:F4}, neighbor indices: (" + neighborsCPU[neighborBaseIndex + d * 4] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 1] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 2] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 3] + "), parent face velocity: ";
+        //                 if (d == 0) afterMLS += n.velocities.left;
+        //                 else if (d == 1) afterMLS += n.velocities.right;
+        //                 else if (d == 2) afterMLS += n.velocities.bottom;
+        //                 else if (d == 3) afterMLS += n.velocities.top;
+        //                 else if (d == 4) afterMLS += n.velocities.front;
+        //                 else afterMLS += n.velocities.back;
+        //                 afterMLS += ", child face velocity: ";
+        //                 for (int k = 0; k < 4; k++) {
+        //                     uint child_idx = neighborsCPU[neighborBaseIndex + d * 4 + k];
+        //                     if (child_idx < numNodes) {
+        //                         Node childNode = nodesAfterMLS[child_idx];
+        //                         if (childNode.layer < n.layer) {
+        //                             if (d == 0) afterMLS += childNode.velocities.right;
+        //                             else if (d == 1) afterMLS += childNode.velocities.left;
+        //                             else if (d == 2) afterMLS += childNode.velocities.top;
+        //                             else if (d == 3) afterMLS += childNode.velocities.bottom;
+        //                             else if (d == 4) afterMLS += childNode.velocities.back;
+        //                             else afterMLS += childNode.velocities.front;
+        //                             afterMLS += ", ";
+        //                         }
+        //                     }
+        //                 }
+        //                 afterMLS += "\n";
+        //             }
+        //         }
+        //     }
+        // }
+        // Debug.Log(totalThatViolate + " shared faces that violate conservation after balancing:\n" + afterMLS);
     }
 
     private void ComputeLevelSet()
@@ -1553,14 +1667,14 @@ public class FluidSimulator : MonoBehaviour
             // new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
 
-        for (int i = 0; i < numNodes; i++) {
-            Node node = nodesCPU[i];
-            Gizmos.color = layerColors[(int)node.layer];
-            Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        }
+        // for (int i = 0; i < numNodes; i++) {
+        //     Node node = nodesCPU[i];
+        //     Gizmos.color = layerColors[(int)node.layer];
+        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        // }
     }
 
     private void DrawParticles(Camera cam)
