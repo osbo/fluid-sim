@@ -53,9 +53,17 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[i];
     faceVelocities v = node.velocities;
 
-    float divergence = v.right - v.left + v.top - v.bottom + v.back - v.front;
+    // Calculate Net Flux of Velocity
+    // Flux = Sum(Velocity * FaceArea)
     float dx = exp2((float)node.layer);
-    float outVal = -divergence / dx;
+    float faceArea = dx * dx;
+    
+    // Net flux leaving the cell
+    float netFlux = (v.right - v.left + v.top - v.bottom + v.back - v.front) * faceArea;
+    
+    // We solve Ap = b. If A is negative Laplacian, b should be negative Divergence.
+    float outVal = -netFlux;
+    
     if (!isfinite(outVal)) outVal = 0.0;
     divergenceBuffer[i] = outVal;
 }
@@ -156,11 +164,16 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    // --- (Rest of your kernel is unchanged) ---
-    float volume_i = dx_i * dx_i * dx_i;
-    float outVal = laplacian_p / max(volume_i, 1e-9);
-    outVal *= deltaTime;
-    outVal = -outVal; // The Laplacian is negative for pressure
+    // --- Return Net Flux (not volume-normalized) ---
+    // REMOVE division by volume_i
+    // float volume_i = dx_i * dx_i * dx_i; <-- Delete or comment out
+    // float outVal = laplacian_p / max(volume_i, 1e-9); <-- Delete this
+    
+    // KEEP this (assuming negative sign is desired for the operator)
+    float outVal = -laplacian_p; 
+    
+    // Apply time step if needed, though typically handled in the update step
+    outVal *= deltaTime; 
 
     if (!isfinite(outVal)) outVal = 0.0;
     ApBuffer[i] = outVal;
