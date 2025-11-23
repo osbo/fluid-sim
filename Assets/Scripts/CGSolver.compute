@@ -93,7 +93,7 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
 
         // Check the three distinct neighbor cases
 
-        // Case 1: True Boundary (Neumann BC, neighbor_idx == numNodes + 1)
+        // Case 1: True Boundary (Neumann BC, neighbor_idx == numNodes + 1 )
         if (neighbor_idx == numNodes + 1)
         {
             // Neumann BC means zero flux (dp/dn = 0).
@@ -161,6 +161,26 @@ void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
                     laplacian_p += contribution;
                 }
             }
+
+            // float sumChildren = 0.0;
+            // int numChildren = 0;
+            // for (int k = 0; k < 4; k++) {
+            //     uint child_idx = neighborsBuffer[faceNeighborBase + k];
+            //     if (child_idx < numNodes) {
+            //         Node cNode = nodesBuffer[child_idx];
+            //         float p_k = pBuffer[child_idx];
+            //         sumChildren += p_k;
+            //         numChildren += 1;
+            //     }
+            // }
+
+            // // float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
+            // float childrenAverage = sumChildren / 4.0;
+            // float dx_j = exp2((float)node.layer - 1);
+            // float distance = max(0.5 * (dx_i + dx_j), 1e-6);
+            // float w = childFaceArea / distance;
+            // float contribution = w * (childrenAverage - p_i);
+            // laplacian_p += contribution;
         }
     }
 

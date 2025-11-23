@@ -341,7 +341,7 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     particle.layer = node.layer;
 
-    // newVelocity.y -= gravity * deltaTime;
+    // newVelocity.y -= gravity * deltaTime; 
 
     particle.velocity = newVelocity;
 

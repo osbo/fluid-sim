@@ -446,12 +446,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
                                 }
                             }
                         }
-                        
-                        // All 4 child neighbors must exist and be valid
-                        if (validChildCount == 4)
-                        {
-                            // continue; // Valid child neighbors found, continue to next face
-                        }
                     }
                 }
                 // If we reach here, neighbor validation failed
@@ -496,13 +490,13 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         aggregatedVelocities.front = 0.0;
         aggregatedVelocities.back = 0.0;
         
-        // Count valid children for each face (for averaging)
-        float leftCount = 0.0;
-        float rightCount = 0.0;
-        float bottomCount = 0.0;
-        float topCount = 0.0;
-        float frontCount = 0.0;
-        float backCount = 0.0;
+        // Accumulate mass-weighted face velocities for each face (for mass-weighted averaging)
+        float leftMass = 0.0;
+        float rightMass = 0.0;
+        float bottomMass = 0.0;
+        float topMass = 0.0;
+        float frontMass = 0.0;
+        float backMass = 0.0;
         
         // Iterate through children and accumulate external face velocities
         // The children are already in the uniqueStart to uniqueEnd range
@@ -515,9 +509,6 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         {
             Node childNode = nodesBuffer[i];
             
-            // Only process children at layer-1
-            if (childNode.layer != layer - 1) continue;
-            
             // Extract the child prefix and check if it belongs to this parent
             uint childMortonCode = childNode.mortonCode;
             uint childPrefix = childMortonCode >> childShift;
@@ -528,59 +519,60 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             // Extract child octant index (0-7) from the last 3 bits of childPrefix
             // These are the 3 bits that determine which octant of the parent this child occupies
             uint childIdx = childPrefix & 0x7;
+            float childMass = childNode.mass;
             
-            // Accumulate external face velocities based on child position
+            // Accumulate mass-weighted external face velocities based on child position
             // Left face (x=0): children 0, 2, 4, 6
             if ((childIdx & 1) == 0) // x bit is 0
             {
-                aggregatedVelocities.left += childNode.velocities.left;
-                leftCount += 1.0;
+                aggregatedVelocities.left += childNode.velocities.left * childMass;
+                leftMass += childMass;
             }
             
             // Right face (x=1): children 1, 3, 5, 7
             if ((childIdx & 1) == 1) // x bit is 1
             {
-                aggregatedVelocities.right += childNode.velocities.right;
-                rightCount += 1.0;
+                aggregatedVelocities.right += childNode.velocities.right * childMass;
+                rightMass += childMass;
             }
             
             // Bottom face (y=0): children 0, 1, 4, 5
             if ((childIdx & 2) == 0) // y bit is 0
             {
-                aggregatedVelocities.bottom += childNode.velocities.bottom;
-                bottomCount += 1.0;
+                aggregatedVelocities.bottom += childNode.velocities.bottom * childMass;
+                bottomMass += childMass;
             }
             
             // Top face (y=1): children 2, 3, 6, 7
             if ((childIdx & 2) == 2) // y bit is 1
             {
-                aggregatedVelocities.top += childNode.velocities.top;
-                topCount += 1.0;
+                aggregatedVelocities.top += childNode.velocities.top * childMass;
+                topMass += childMass;
             }
             
             // Front face (z=0): children 0, 1, 2, 3
             if ((childIdx & 4) == 0) // z bit is 0
             {
-                aggregatedVelocities.front += childNode.velocities.front;
-                frontCount += 1.0;
+                aggregatedVelocities.front += childNode.velocities.front * childMass;
+                frontMass += childMass;
             }
             
             // Back face (z=1): children 4, 5, 6, 7
             if ((childIdx & 4) == 4) // z bit is 1
             {
-                aggregatedVelocities.back += childNode.velocities.back;
-                backCount += 1.0;
+                aggregatedVelocities.back += childNode.velocities.back * childMass;
+                backMass += childMass;
             }
         }
         
-        // Average the accumulated face velocities
+        // Normalize by total mass to get mass-weighted average face velocities
         float epsilon = 1e-9;
-        aggregatedVelocities.left   /= max(epsilon, leftCount);
-        aggregatedVelocities.right  /= max(epsilon, rightCount);
-        aggregatedVelocities.bottom /= max(epsilon, bottomCount);
-        aggregatedVelocities.top    /= max(epsilon, topCount);
-        aggregatedVelocities.front  /= max(epsilon, frontCount);
-        aggregatedVelocities.back   /= max(epsilon, backCount);
+        aggregatedVelocities.left   /= max(epsilon, leftMass);
+        aggregatedVelocities.right  /= max(epsilon, rightMass);
+        aggregatedVelocities.bottom /= max(epsilon, bottomMass);
+        aggregatedVelocities.top    /= max(epsilon, topMass);
+        aggregatedVelocities.front  /= max(epsilon, frontMass);
+        aggregatedVelocities.back   /= max(epsilon, backMass);
 
         // weightedPosition = clamp(weightedPosition, simulationBoundsMin, simulationBoundsMax);
 
@@ -871,6 +863,7 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
         else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
             // Case 1: Same-layer or Parent (coarser) neighbor
+            // Same layer works, not sure about parent. Probably works.
             Node nNode = nodesBuffer[neighbor_idx];
             float p_j = pressureBuffer[neighbor_idx];
             float dx_j = exp2((float)nNode.layer);
@@ -880,30 +873,22 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
         else
         {
             // Case 2: Child (finer) neighbors or Dirichlet boundary
+            float sumChildren = 0.0;
+            int numChildren = 0;
             for (int k = 0; k < 4; k++)
             {
                 uint child_idx = neighborsBuffer[faceNeighborBase + k];
                 if (child_idx < numNodes)
                 {
                     Node cNode = nodesBuffer[child_idx];
-                    float p_k = pressureBuffer[child_idx];
-                    float dx_k = exp2((float)cNode.layer);
-                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    pressure_gradient += (p_k - p_i) / distance / 4.0;
-                }
-                // Case 4: Dirichlet boundary (air)
-                else if (child_idx == numNodes)
-                {
-                    // BUG FIX: This calculation must be identical to the one in
-                    // ApplyLaplacian to maintain consistency.
-                    float dx_k = dx_i * 0.5; // Virtual child cell is half-size
-                    float distance = max(0.5 * (dx_i + dx_k), 1e-6); // 0.75 * dx_i
-                    
-                    // The gradient is (p_k - p_i) / distance.
-                    // Air pressure p_k is 0.
-                    pressure_gradient += (0.0 - p_i) / distance / 4.0;
+                    sumChildren += pressureBuffer[child_idx];
+                    numChildren += 1;
                 }
             }
+            float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
+            float dx_j = exp2((float)node.layer - 1);
+            float distance = max(0.5 * (dx_i + dx_j), 1e-6);
+            pressure_gradient = (childrenAverage - p_i) / distance;
         }
         
         float velocity_correction = deltaTime * pressure_gradient;
