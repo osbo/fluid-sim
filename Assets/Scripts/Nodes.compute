@@ -747,68 +747,107 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
     if (threadIndex >= numNodes) return;
 
     Node node = nodesBuffer[threadIndex];
-    Node outNode = node;
+    Node outNode = node; // Start with current velocities
 
     uint neighborBaseIndex = threadIndex * 24;
 
     for (int d = 0; d < 6; d++) {
-        uint n0_idx = neighborsBuffer[neighborBaseIndex + d * 4];
+        uint baseFaceIndex = neighborBaseIndex + d * 4;
+        uint n0_idx = neighborsBuffer[baseFaceIndex]; 
 
-        if (n0_idx < numNodes + 1) {
-            if (n0_idx < numNodes && nodesBuffer[n0_idx].layer == node.layer) {
-                Node n0 = nodesBuffer[n0_idx];
-                // same-layer neighbor. Linear interpolate shared face velocity, factor 0.5
-                if (d == 0) outNode.velocities.left = 0.5 * (node.velocities.left + n0.velocities.right);
-                else if (d == 1) outNode.velocities.right = 0.5 * (node.velocities.right + n0.velocities.left);
-                else if (d == 2) outNode.velocities.bottom = 0.5 * (node.velocities.bottom + n0.velocities.top);
-                else if (d == 3) outNode.velocities.top = 0.5 * (node.velocities.top + n0.velocities.bottom);
-                else if (d == 4) outNode.velocities.front = 0.5 * (node.velocities.front + n0.velocities.back);
-                else outNode.velocities.back = 0.5 * (node.velocities.back + n0.velocities.front);
-            }
-            else if (n0_idx < numNodes && nodesBuffer[n0_idx].layer == node.layer + 1) {
-                // parent neighbor
-                Node n0 = nodesBuffer[n0_idx];
-                uint neighborD = d ^ 1;
-                uint n0BaseNeighborFaceIndex = n0_idx * 24 + neighborD * 4;
+        // --- 1. Check for Wall Boundary (Neumann) ---
+        // If the first slot is a wall, the whole face is a wall.
+        // (Assuming walls are not finer than the current node)
+        if (n0_idx == numNodes + 1) {
+             if (d == 0) outNode.velocities.left = 0;
+             else if (d == 1) outNode.velocities.right = 0;
+             else if (d == 2) outNode.velocities.bottom = 0;
+             else if (d == 3) outNode.velocities.top = 0;
+             else if (d == 4) outNode.velocities.front = 0;
+             else outNode.velocities.back = 0;
+             continue; 
+        }
 
-                // average the child velocities.
-                float sumChildren = 0.0;
-                int numChildren = 0;
-                for (int k = 0; k < 4; k++) {
-                    uint child_idx = neighborsBuffer[n0BaseNeighborFaceIndex + k];
-                    if (child_idx < numNodes) {
-                        Node childNode = nodesBuffer[child_idx];
-                        sumChildren += selectOpposingFace(childNode.velocities, neighborD);
-                        numChildren += 1;
+        // --- 2. Check for Same-Layer or Parent (Coarser) ---
+        // These are single-node neighbors. They MUST be valid (< numNodes) 
+        // AND have a layer >= current layer to qualify.
+        bool isCoarserOrSame = false;
+        if (n0_idx < numNodes) {
+            Node n0 = nodesBuffer[n0_idx];
+            if (n0.layer >= node.layer) {
+                isCoarserOrSame = true;
+                
+                if (n0.layer == node.layer) {
+                    // --- Same Layer Logic ---
+                    if (d == 0) outNode.velocities.left = 0.5 * (node.velocities.left + n0.velocities.right);
+                    else if (d == 1) outNode.velocities.right = 0.5 * (node.velocities.right + n0.velocities.left);
+                    else if (d == 2) outNode.velocities.bottom = 0.5 * (node.velocities.bottom + n0.velocities.top);
+                    else if (d == 3) outNode.velocities.top = 0.5 * (node.velocities.top + n0.velocities.bottom);
+                    else if (d == 4) outNode.velocities.front = 0.5 * (node.velocities.front + n0.velocities.back);
+                    else outNode.velocities.back = 0.5 * (node.velocities.back + n0.velocities.front);
+                } 
+                else { 
+                    // --- Parent Logic ---
+                    uint neighborD = d ^ 1;
+                    uint n0BaseNeighborFaceIndex = n0_idx * 24 + neighborD * 4;
+
+                    // average the child velocities.
+                    float sumChildren = 0.0;
+                    int numChildren = 0;
+                    // Note: Parent's neighbors are US (and our siblings). 
+                    // We look at the parent's view to ensure conservation.
+                    for (int k = 0; k < 4; k++) {
+                        uint child_idx = neighborsBuffer[n0BaseNeighborFaceIndex + k];
+                        if (child_idx < numNodes) {
+                            Node childNode = nodesBuffer[child_idx];
+                            sumChildren += selectOpposingFace(childNode.velocities, neighborD);
+                            numChildren += 1;
+                        }
                     }
-                }
-                float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
-                float parentVal = selectOpposingFace(n0.velocities, d);
-                float mixFactor = 0.5;
-                float target = parentVal * (1.0f - mixFactor) + childrenAverage * mixFactor;
-                float offset = target - childrenAverage;
+                    float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
+                    float parentVal = selectOpposingFace(n0.velocities, d);
+                    float mixFactor = 0.5;
+                    float target = parentVal * (1.0f - mixFactor) + childrenAverage * mixFactor;
+                    float offset = target - childrenAverage;
 
-                if (d == 0) outNode.velocities.left += offset;
-                else if (d == 1) outNode.velocities.right += offset;
-                else if (d == 2) outNode.velocities.bottom += offset;
-                else if (d == 3) outNode.velocities.top += offset;
-                else if (d == 4) outNode.velocities.front += offset;
-                else outNode.velocities.back += offset;
-            }
-            else {
-                // child neighbor
-                float sumChildren = 0.0;
-                int numChildren = 0;
-                for (int k = 0; k < 4; k++) {
-                    uint child_idx = neighborsBuffer[neighborBaseIndex + d * 4 + k];
-                    if (child_idx < numNodes) {
-                        Node childNode = nodesBuffer[child_idx];
-                        sumChildren += selectOpposingFace(childNode.velocities, d);
-                        numChildren += 1;
-                    }
+                    if (d == 0) outNode.velocities.left += offset;
+                    else if (d == 1) outNode.velocities.right += offset;
+                    else if (d == 2) outNode.velocities.bottom += offset;
+                    else if (d == 3) outNode.velocities.top += offset;
+                    else if (d == 4) outNode.velocities.front += offset;
+                    else outNode.velocities.back += offset;
                 }
-                float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
+            }
+        }
+
+        // --- 3. Mixed / Child / Open Air Logic ---
+        // If it wasn't a Wall, and it wasn't a Same/Parent node, 
+        // it MUST be a Child (Finer) face, partially Air, or fully Air.
+        if (!isCoarserOrSame) {
+            float sumChildren = 0.0;
+            int validChildCount = 0;
+
+            // Loop through ALL 4 slots. 
+            // Even if slot 0 is Air, slot 1 might be valid.
+            for (int k = 0; k < 4; k++) {
+                uint child_idx = neighborsBuffer[baseFaceIndex + k];
+                
+                if (child_idx < numNodes) {
+                    // VALID FLUID CHILD
+                    Node childNode = nodesBuffer[child_idx];
+                    sumChildren += selectOpposingFace(childNode.velocities, d);
+                    validChildCount++;
+                }
+                // If child_idx >= numNodes, it is AIR. 
+                // We simply IGNORE it. We do not add 0. We do not increment count.
+                // This prevents "dragging" the velocity down.
+            }
+
+            // Only interpolate if we found at least one valid fluid neighbor.
+            if (validChildCount > 0) {
+                float childrenAverage = sumChildren / (float)validChildCount;
                 float parentVal = selectFace(node.velocities, d);
+                
                 float mixFactor = 0.5;
                 float newVel = parentVal * (1.0f - mixFactor) + childrenAverage * mixFactor;
 
@@ -819,6 +858,8 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
                 else if (d == 4) outNode.velocities.front = newVel;
                 else outNode.velocities.back = newVel;
             }
+            // If validChildCount == 0, that means the entire face is Air.
+            // We do nothing, preserving the original velocity (Free-slip/Open boundary).
         }
     }
 
