@@ -551,7 +551,7 @@ MonoBehaviour:
   gravity: 100
   frameRate: 30
   minLayer: 4
-  maxLayer: 10
+  maxLayer: 4
   particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
 --- !u!1 &832575517
 GameObject:
