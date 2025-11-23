@@ -147,6 +147,14 @@ float selectOpposingFace(faceVelocities v, int d)
     return v.front;
 }
 
+float calculateMassWeight(float selfMass, float neighborMass)
+{
+    float total = selfMass + neighborMass;
+    // If both are near zero (air-to-air), fallback to 0.5
+    if (total < 1e-6) return 0.5; 
+    return selfMass / total;
+}
+
 // Lower-bound search: first index with mortonCode >= target
 // left is inclusive, right is exclusive
 uint lowerBoundMorton(uint target, uint left_bound, uint right_bound)
@@ -747,17 +755,17 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
     if (threadIndex >= numNodes) return;
 
     Node node = nodesBuffer[threadIndex];
-    Node outNode = node; // Start with current velocities
+    Node outNode = node; 
+    
+    // Cache self mass for performance
+    float m_i = node.mass; 
 
     uint neighborBaseIndex = threadIndex * 24;
-
     for (int d = 0; d < 6; d++) {
         uint baseFaceIndex = neighborBaseIndex + d * 4;
         uint n0_idx = neighborsBuffer[baseFaceIndex]; 
 
-        // --- 1. Check for Wall Boundary (Neumann) ---
-        // If the first slot is a wall, the whole face is a wall.
-        // (Assuming walls are not finer than the current node)
+        // --- 1. Wall Boundary (Neumann) ---
         if (n0_idx == numNodes + 1) {
              if (d == 0) outNode.velocities.left = 0;
              else if (d == 1) outNode.velocities.right = 0;
@@ -768,48 +776,67 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
              continue; 
         }
 
-        // --- 2. Check for Same-Layer or Parent (Coarser) ---
-        // These are single-node neighbors. They MUST be valid (< numNodes) 
-        // AND have a layer >= current layer to qualify.
         bool isCoarserOrSame = false;
         if (n0_idx < numNodes) {
             Node n0 = nodesBuffer[n0_idx];
+            float m_j = n0.mass; // Get neighbor mass
+
             if (n0.layer >= node.layer) {
                 isCoarserOrSame = true;
-                
                 if (n0.layer == node.layer) {
-                    // --- Same Layer Logic ---
-                    if (d == 0) outNode.velocities.left = 0.5 * (node.velocities.left + n0.velocities.right);
-                    else if (d == 1) outNode.velocities.right = 0.5 * (node.velocities.right + n0.velocities.left);
-                    else if (d == 2) outNode.velocities.bottom = 0.5 * (node.velocities.bottom + n0.velocities.top);
-                    else if (d == 3) outNode.velocities.top = 0.5 * (node.velocities.top + n0.velocities.bottom);
-                    else if (d == 4) outNode.velocities.front = 0.5 * (node.velocities.front + n0.velocities.back);
-                    else outNode.velocities.back = 0.5 * (node.velocities.back + n0.velocities.front);
+                    // --- Case A: Same Layer Logic (Mass Weighted) ---
+                    // Calculate weight based on mass ratio
+                    float alpha = calculateMassWeight(m_i, m_j);
+                    
+                    // Note: We want to blend OUR velocity with THEIRS.
+                    // If we have much more mass (alpha ~ 1.0), we keep our velocity.
+                    // If they have much more mass (alpha ~ 0.0), we take theirs.
+                    
+                    if (d == 0) outNode.velocities.left = lerp(n0.velocities.right, node.velocities.left, alpha);
+                    else if (d == 1) outNode.velocities.right = lerp(n0.velocities.left, node.velocities.right, alpha);
+                    else if (d == 2) outNode.velocities.bottom = lerp(n0.velocities.top, node.velocities.bottom, alpha);
+                    else if (d == 3) outNode.velocities.top = lerp(n0.velocities.bottom, node.velocities.top, alpha);
+                    else if (d == 4) outNode.velocities.front = lerp(n0.velocities.back, node.velocities.front, alpha);
+                    else outNode.velocities.back = lerp(n0.velocities.front, node.velocities.back, alpha);
                 } 
                 else { 
-                    // --- Parent Logic ---
+                    // --- Case B: Parent/Coarse Logic (Mass Weighted T-Junction) ---
                     uint neighborD = d ^ 1;
                     uint n0BaseNeighborFaceIndex = n0_idx * 24 + neighborD * 4;
 
-                    // average the child velocities.
-                    float sumChildren = 0.0;
+                    // We need to compare the Parent's Mass vs The Sum of all Children's Mass on this face
+                    float sumChildrenVel = 0.0;
+                    float sumChildrenMass = 0.0; // New accumulator
                     int numChildren = 0;
-                    // Note: Parent's neighbors are US (and our siblings). 
-                    // We look at the parent's view to ensure conservation.
+                    
                     for (int k = 0; k < 4; k++) {
                         uint child_idx = neighborsBuffer[n0BaseNeighborFaceIndex + k];
                         if (child_idx < numNodes) {
                             Node childNode = nodesBuffer[child_idx];
-                            sumChildren += selectOpposingFace(childNode.velocities, neighborD);
+                            float childVal = selectOpposingFace(childNode.velocities, neighborD);
+                            
+                            // Mass-weighted velocity accumulation
+                            sumChildrenVel += childVal * childNode.mass;
+                            sumChildrenMass += childNode.mass;
                             numChildren += 1;
                         }
                     }
-                    float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
+                    
+                    // Calculate the mass-weighted average velocity of the children interface
+                    float childrenAverage = (sumChildrenMass > 1e-6) ? (sumChildrenVel / sumChildrenMass) : 0.0;
+                    
                     float parentVal = selectOpposingFace(n0.velocities, d);
-                    float mixFactor = 0.5;
-                    float target = parentVal * (1.0f - mixFactor) + childrenAverage * mixFactor;
-                    float offset = target - childrenAverage;
+                    
+                    // Determine mix factor based on Parent Mass vs Total Child Mass
+                    // If Parent is massive (body of water) and children are light (spray), Parent wins.
+                    float totalMass = m_j + sumChildrenMass;
+                    float mixFactor = (totalMass > 1e-6) ? (sumChildrenMass / totalMass) : 0.5;
 
+                    float target = parentVal * (1.0f - mixFactor) + childrenAverage * mixFactor;
+                    
+                    // Apply offset to maintain local gradients while enforcing the constraint
+                    float offset = target - childrenAverage;
+                    
                     if (d == 0) outNode.velocities.left += offset;
                     else if (d == 1) outNode.velocities.right += offset;
                     else if (d == 2) outNode.velocities.bottom += offset;
@@ -820,35 +847,35 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
             }
         }
 
-        // --- 3. Mixed / Child / Open Air Logic ---
-        // If it wasn't a Wall, and it wasn't a Same/Parent node, 
-        // it MUST be a Child (Finer) face, partially Air, or fully Air.
+        // --- Case C: Mixed / Child / Open Air Logic (Mass Weighted) ---
         if (!isCoarserOrSame) {
-            float sumChildren = 0.0;
+            float sumChildrenVel = 0.0;
+            float sumChildrenMass = 0.0;
             int validChildCount = 0;
 
-            // Loop through ALL 4 slots. 
-            // Even if slot 0 is Air, slot 1 might be valid.
             for (int k = 0; k < 4; k++) {
                 uint child_idx = neighborsBuffer[baseFaceIndex + k];
-                
                 if (child_idx < numNodes) {
-                    // VALID FLUID CHILD
                     Node childNode = nodesBuffer[child_idx];
-                    sumChildren += selectOpposingFace(childNode.velocities, d);
+                    
+                    // Accumulate Mass and Velocity
+                    float childVal = selectOpposingFace(childNode.velocities, d);
+                    sumChildrenVel += childVal * childNode.mass;
+                    sumChildrenMass += childNode.mass;
+                    
                     validChildCount++;
                 }
-                // If child_idx >= numNodes, it is AIR. 
-                // We simply IGNORE it. We do not add 0. We do not increment count.
-                // This prevents "dragging" the velocity down.
             }
 
-            // Only interpolate if we found at least one valid fluid neighbor.
             if (validChildCount > 0) {
-                float childrenAverage = sumChildren / (float)validChildCount;
+                // Average velocity of the valid children (Mass Weighted)
+                float childrenAverage = (sumChildrenMass > 1e-6) ? (sumChildrenVel / sumChildrenMass) : 0.0;
                 float parentVal = selectFace(node.velocities, d);
                 
-                float mixFactor = 0.5;
+                // Weight the Parent (current node) vs the Combined Children
+                float totalMass = m_i + sumChildrenMass;
+                float mixFactor = (totalMass > 1e-6) ? (sumChildrenMass / totalMass) : 0.5;
+                
                 float newVel = parentVal * (1.0f - mixFactor) + childrenAverage * mixFactor;
 
                 if (d == 0) outNode.velocities.left = newVel;
@@ -858,8 +885,6 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
                 else if (d == 4) outNode.velocities.front = newVel;
                 else outNode.velocities.back = newVel;
             }
-            // If validChildCount == 0, that means the entire face is Air.
-            // We do nothing, preserving the original velocity (Free-slip/Open boundary).
         }
     }
 
