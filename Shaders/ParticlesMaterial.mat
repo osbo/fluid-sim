@@ -115,7 +115,7 @@ Material:
     - _GlossMapScale: 0
     - _Glossiness: 0
     - _GlossyReflections: 0
-    - _MaxLayer: 3
+    - _MaxLayer: 10
     - _Metallic: 0
     - _MinLayer: 3
     - _OcclusionStrength: 1
