@@ -81,6 +81,11 @@ public class FluidSimulator : MonoBehaviour
     
     // Number of nodes, active nodes, and unique active nodes
     private int numNodes;
+    
+    // Public accessors for external scripts (e.g., FluidMeshRenderer)
+    public ComputeBuffer NodesBuffer => nodesBuffer;
+    public ComputeBuffer PhiBuffer => phiBuffer;
+    public int NumNodes => numNodes;
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
     public float gravity;
@@ -139,6 +144,12 @@ public class FluidSimulator : MonoBehaviour
     // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
     public Material particlesMaterial;
     
+    // Material to render fluid surface using raymarching (assign a shader like Custom/Raymarching)
+    public Material raymarchingMaterial;
+    public bool useRaymarching = false; // Toggle between particle rendering and raymarching
+    public float debugPhiMin = 0.0f;
+    public float debugPhiMax = 10.0f;
+    
     // Training data recorder
     public TrainingDataRecorder recorder;
 
@@ -154,7 +165,14 @@ public class FluidSimulator : MonoBehaviour
 
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
-        DrawParticles(cam);
+        if (useRaymarching)
+        {
+            DrawRaymarching(cam);
+        }
+        else
+        {
+            DrawParticles(cam);
+        }
     }
 
     void Start()
@@ -165,7 +183,7 @@ public class FluidSimulator : MonoBehaviour
         // Auto-find recorder if not assigned
         if (recorder == null)
         {
-            recorder = FindObjectOfType<TrainingDataRecorder>();
+            recorder = FindFirstObjectByType<TrainingDataRecorder>();
             if (recorder == null)
             {
                 Debug.LogWarning("TrainingDataRecorder is not assigned and not found in scene. No training data will be recorded.");
@@ -234,30 +252,10 @@ public class FluidSimulator : MonoBehaviour
         Vector3 simulationSize = simulationBoundsMax;
         maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
 
-        // Frame loop: SortParticles -> findUniqueParticles -> CreateLeaves -> layer loop -> findNeighbors -> SolvePressure -> UpdateParticles
-
-        // particlesCPU = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesCPU);
-        // string str = $"Start of frame: Particles {numParticles}:\n";
-        // for (int i = 0; i < 40; i++)
-        // {
-        //     str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z})\n";
-        // }
-        // Debug.Log(str);
-
         // Step 1: Sort particles
         var sortSw = System.Diagnostics.Stopwatch.StartNew();
         SortParticles();
         sortSw.Stop();
-
-        // particlesCPU = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesCPU);
-        // str = $"After sort particles: Particles {numParticles}:\n";
-        // for (int i = 0; i < 40; i++)
-        // {
-        //     str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
-        // }
-        // Debug.Log(str);
 
         // Step 2: Find unique particles and create leaves
         var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
@@ -267,196 +265,52 @@ public class FluidSimulator : MonoBehaviour
         var createLeavesSw = System.Diagnostics.Stopwatch.StartNew();
         CreateLeaves();
         createLeavesSw.Stop();
-        
-
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // str = $"After create leaves: Nodes:\n";
-        // for (int i = 1; i < numNodes; i++)
-        // {
-        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        // }
-        // Debug.Log(str);
 
         // Step 3: Layer loop (layers 1-10)
         var layerLoopSw = System.Diagnostics.Stopwatch.StartNew();
         for (layer = layer + 1; layer <= maxLayer; layer++)
         {
-            var totalLayerSw = System.Diagnostics.Stopwatch.StartNew();
             
-            var findUniqueNodesSw = System.Diagnostics.Stopwatch.StartNew();
             findUniqueNodes();
-            findUniqueNodesSw.Stop();
-            
-            var processNodesSw = System.Diagnostics.Stopwatch.StartNew();
             ProcessNodes();
-            processNodesSw.Stop();
-            
-            var compactNodesSw = System.Diagnostics.Stopwatch.StartNew();
             compactNodes();
-            compactNodesSw.Stop();
-
-            totalLayerSw.Stop();
-            // Debug.Log($"Layer {layer}: {numNodes} nodes, Total: {totalLayerSw.Elapsed.TotalMilliseconds:F2} ms (Find Unique: {findUniqueNodesSw.Elapsed.TotalMilliseconds:F2} ms, Process: {processNodesSw.Elapsed.TotalMilliseconds:F2} ms, Compact: {compactNodesSw.Elapsed.TotalMilliseconds:F2} ms)");
         }
         layerLoopSw.Stop();
-
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // str = $"End of layer loop: Nodes:\n";
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        // }
-        // Debug.Log(str);
-
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // int[] layerCounts = new int[maxLayer - minLayer + 1];
-        // str = $"Number of nodes in each layer: ";
-        // for (int i = 0; i < maxLayer - minLayer + 1; i++)
-        // {
-        //     layerCounts[i] = 0;
-        // }
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     layerCounts[nodesCPU[i].layer - minLayer]++;
-        // }
-        // for (int i = 0; i < maxLayer - minLayer + 1; i++)
-        // {
-        //     str += $"{i + minLayer}: {layerCounts[i]}, ";
-        // }
-        // Debug.Log(str);
 
         // Step 4: Find neighbors
         var findNeighborsSw = System.Diagnostics.Stopwatch.StartNew();
         findNeighbors();
         findNeighborsSw.Stop();
 
-        // Step 4.5: Compute level set (distance field)
+        // Step 5: Compute level set (distance field)
         var computeLevelSetSw = System.Diagnostics.Stopwatch.StartNew();
         // ComputeLevelSet();
         computeLevelSetSw.Stop();
 
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // str = $"After pull velocities: Nodes:\n";
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        // }
-        // Debug.Log(str);
-
-        // uint[] neighborsCPU = new uint[numNodes * 24];
-        // neighborsBuffer.GetData(neighborsCPU);
-        // str = $"Neighbors:\n";
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     str += $"Node {i} Neighbors: ";
-        //     for (int d = 0; d < 6; d++)
-        //     {
-        //         str += $"Direction {d}: ";
-        //         for (int j = 0; j < 4; j++)
-        //         {
-        //             str += $"{neighborsCPU[i*24+d*4+j]}, ";
-        //         }
-        //     }
-        //     str += "\n";
-        // }
-        // Debug.Log(str);
-
-        // Step 4.6: Store old velocities for FLIP method
+        // Step 6: Store old velocities for FLIP method
         var storeOldVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
         StoreOldVelocities();
         storeOldVelocitiesSw.Stop();
 
-        // Apply gravity on the grid
+        // Step 7: Apply gravity on the grid
         var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
         ApplyGravity();
         applyGravitySw.Stop();
 
-        // Enforce boundary conditions
+        // Step 8: Enforce boundary conditions
         var enforceBoundarySw = System.Diagnostics.Stopwatch.StartNew();
         EnforceBoundaryConditions();
         enforceBoundarySw.Stop();
 
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // str = $"Before pressure solve: Nodes:\n";
-        // for (int i = 1; i < numNodes; i++)
-        // {
-        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        // }
-        // Debug.Log(str);
-
-        // float totalDivergence = 0.0f;
-        // for (int i = 1; i < numNodes; i++)
-        // {
-        //     totalDivergence += Math.Abs(nodesCPU[i].velocities.right+nodesCPU[i].velocities.left + nodesCPU[i].velocities.top+nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.front+nodesCPU[i].velocities.back);
-        // }
-        // Debug.Log($"Total divergence: {totalDivergence/numNodes}");
-
-        // neighborsBuffer.GetData(neighborsCPU);
-        // str = $"Neighbors:\n";
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     str += $"Node {i} Neighbors: ";
-        //     for (int d = 0; d < 6; d++)
-        //     {
-        //         str += $"{neighborsCPU[i*24+d*4]}, ";
-        //     }
-        // }
-        // Debug.Log(str);
-
-        // Step 6: Solve pressure
+        // Step 9: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
         SolvePressure();
         solvePressureSw.Stop();
 
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
-        // str = $"After pressure solve: Nodes:\n";
-        // for (int i = 1; i < numNodes; i++)
-        // {
-        //     str += $"Node {i}: Morton code {nodesCPU[i].mortonCode}, Position ({nodesCPU[i].position.x}, {nodesCPU[i].position.y}, {nodesCPU[i].position.z}), Velocities (Left: {nodesCPU[i].velocities.left}, Right: {nodesCPU[i].velocities.right}, Bottom: {nodesCPU[i].velocities.bottom}, Top: {nodesCPU[i].velocities.top}, Front: {nodesCPU[i].velocities.front}, Back: {nodesCPU[i].velocities.back})\n";
-        // }
-        // Debug.Log(str);
-
-        // totalDivergence = 0.0f;
-        // for (int i = 1; i < numNodes; i++)
-        // {
-        //     totalDivergence += Math.Abs(nodesCPU[i].velocities.right+nodesCPU[i].velocities.left + nodesCPU[i].velocities.top+nodesCPU[i].velocities.bottom + nodesCPU[i].velocities.front+nodesCPU[i].velocities.back);
-        // }
-        // Debug.Log($"Total divergence: {totalDivergence/numNodes}");
-
-        
-        // particlesCPU = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesCPU);
-        // str = $"Before update particles: Particles:\n";
-        // for (int i = 0; i < 40; i++)
-        // {
-        //     str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
-        // }
-        // Debug.Log(str);
-
-
-        // Step 7: Update particles
+        // Step 10: Update particles
         var updateParticlesSw = System.Diagnostics.Stopwatch.StartNew();
         UpdateParticles();
         updateParticlesSw.Stop();
-
-        
-        // particlesCPU = new Particle[numParticles];
-        // particlesBuffer.GetData(particlesCPU);
-        // str = $"End of frame: Particles:\n";
-        // for (int i = 0; i < 40; i++)
-        // {
-        //     str += $"Particle {i}: Morton code {particlesCPU[i].mortonCode}, Position ({particlesCPU[i].position.x}, {particlesCPU[i].position.y}, {particlesCPU[i].position.z}), Velocity {particlesCPU[i].velocity}\n";
-        // }
-        // Debug.Log(str);
-
-        // Draw particles as points using the particles buffer
-        // Moved to OnRenderObject for reliable rendering timing
 
         // Frame timing summary
         frameSw.Stop();
@@ -570,16 +424,6 @@ public class FluidSimulator : MonoBehaviour
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
-
-        // // Debug: print total divergence
-        // float totalDivergence = 0.0f;
-        // float[] divergenceCPU = new float[numNodes];
-        // divergenceBuffer.GetData(divergenceCPU);
-        // for (int i = 0; i < numNodes; i++)
-        // {
-        //     totalDivergence += divergenceCPU[i];
-        // }
-        // Debug.Log($"Total divergence: {totalDivergence}");
 
         // Initialize: r = b, p = r (since initial pressure x = 0)
         var initSw = System.Diagnostics.Stopwatch.StartNew();
@@ -1342,81 +1186,6 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("numNodes", numNodes);
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(findNeighborsKernel, threadGroups, 1, 1);
-        
-        // // Print face velocities BEFORE velocity interpolation
-        // Node[] nodesBeforeMLS = new Node[numNodes];
-        // nodesBuffer.GetData(nodesBeforeMLS);
-        // uint[] neighborsCPU = new uint[numNodes * 24];
-        // neighborsBuffer.GetData(neighborsCPU);
-        // string beforeMLS = "Before balancing, shared faces that violate conservation:\n";
-        // int totalThatViolate = 0;
-        // for (int i = 0; i < Mathf.Min(numNodes,numNodes); i++)
-        // {
-        //     Node n = nodesBeforeMLS[i];
-        //     int neighborBaseIndex = i * 24;
-        //     for (int d = 0; d < 6; d++) {
-        //         uint n0_idx = neighborsCPU[neighborBaseIndex + d * 4];
-        //         bool hasChild = false;
-        //         float parentFaceVel = 0.0f;
-        //         if (d == 0) parentFaceVel = n.velocities.left;
-        //         else if (d == 1) parentFaceVel = n.velocities.right;
-        //         else if (d == 2) parentFaceVel = n.velocities.bottom;
-        //         else if (d == 3) parentFaceVel = n.velocities.top;
-        //         else if (d == 4) parentFaceVel = n.velocities.front;
-        //         else parentFaceVel = n.velocities.back;
-
-        //         float totalChildFaceVel = 0.0f;
-        //         int numChildren = 0;
-                
-        //         for (int k = 0; k < 4; k++) {
-        //             uint child_idx = neighborsCPU[neighborBaseIndex + d * 4 + k];
-        //             if (child_idx < numNodes) {
-        //                 Node childNode = nodesBeforeMLS[child_idx];
-        //                 if (childNode.layer < n.layer) {
-        //                     hasChild = true;
-        //                     numChildren += 1;
-        //                     if (d == 0) totalChildFaceVel += childNode.velocities.right;
-        //                     else if (d == 1) totalChildFaceVel += childNode.velocities.left;
-        //                     else if (d == 2) totalChildFaceVel += childNode.velocities.top;
-        //                     else if (d == 3) totalChildFaceVel += childNode.velocities.bottom;
-        //                     else if (d == 4) totalChildFaceVel += childNode.velocities.back;
-        //                     else totalChildFaceVel += childNode.velocities.front;
-        //                 }
-        //             }
-        //         }
-        //         if (hasChild) {
-        //             float childFaceVel = totalChildFaceVel / numChildren;
-        //             if (Mathf.Abs(childFaceVel - parentFaceVel) > 1e-4f) {
-        //                 totalThatViolate += 1;
-        //                 beforeMLS += $"Node {i}, layer {n.layer}, face {d}: parent={parentFaceVel:F4}, child={childFaceVel:F4}, neighbor indices: (" + neighborsCPU[neighborBaseIndex + d * 4] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 1] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 2] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 3] + "), parent face velocity: ";
-        //                 if (d == 0) beforeMLS += n.velocities.left;
-        //                 else if (d == 1) beforeMLS += n.velocities.right;
-        //                 else if (d == 2) beforeMLS += n.velocities.bottom;
-        //                 else if (d == 3) beforeMLS += n.velocities.top;
-        //                 else if (d == 4) beforeMLS += n.velocities.front;
-        //                 else beforeMLS += n.velocities.back;
-        //                 beforeMLS += ", child face velocity: ";
-        //                 for (int k = 0; k < 4; k++) {
-        //                     uint child_idx = neighborsCPU[neighborBaseIndex + d * 4 + k];
-        //                     if (child_idx < numNodes) {
-        //                         Node childNode = nodesBeforeMLS[child_idx];
-        //                         if (childNode.layer < n.layer) {
-        //                             if (d == 0) beforeMLS += childNode.velocities.right;
-        //                             else if (d == 1) beforeMLS += childNode.velocities.left;
-        //                             else if (d == 2) beforeMLS += childNode.velocities.top;
-        //                             else if (d == 3) beforeMLS += childNode.velocities.bottom;
-        //                             else if (d == 4) beforeMLS += childNode.velocities.back;
-        //                             else beforeMLS += childNode.velocities.front;
-        //                             beforeMLS += ", ";
-        //                         }
-        //                     }
-        //                 }
-        //                 beforeMLS += "\n";
-        //             }
-        //         }
-        //     }
-        // }
-        // Debug.Log(totalThatViolate + " shared faces that violate conservation before balancing:\n" + beforeMLS);
 
         interpolateFaceVelocitiesKernel = nodesShader.FindKernel("interpolateFaceVelocities");
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
@@ -1431,79 +1200,6 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
-
-        // // Print face velocities AFTER velocity interpolation
-        // Node[] nodesAfterMLS = new Node[numNodes];
-        // nodesBuffer.GetData(nodesAfterMLS);
-        // neighborsBuffer.GetData(neighborsCPU);
-        // string afterMLS = "After balancing, shared faces that violate conservation:\n";
-        // totalThatViolate = 0;
-        // for (int i = 0; i < Mathf.Min(numNodes,numNodes); i++)
-        // {
-        //     Node n = nodesAfterMLS[i];
-        //     int neighborBaseIndex = i * 24;
-        //     for (int d = 0; d < 6; d++) {
-        //         uint n0_idx = neighborsCPU[neighborBaseIndex + d * 4];
-        //         bool hasChild = false;
-        //         float parentFaceVel = 0.0f;
-        //         if (d == 0) parentFaceVel = n.velocities.left;
-        //         else if (d == 1) parentFaceVel = n.velocities.right;
-        //         else if (d == 2) parentFaceVel = n.velocities.bottom;
-        //         else if (d == 3) parentFaceVel = n.velocities.top;
-        //         else if (d == 4) parentFaceVel = n.velocities.front;
-        //         else parentFaceVel = n.velocities.back;
-
-        //         float totalChildFaceVel = 0.0f;
-        //         int numChildren = 0;
-        //         for (int k = 0; k < 4; k++) {
-        //             uint child_idx = neighborsCPU[neighborBaseIndex + d * 4 + k];
-        //             if (child_idx < numNodes) {
-        //                 Node childNode = nodesAfterMLS[child_idx];
-        //                 if (childNode.layer < n.layer) {
-        //                     hasChild = true;
-        //                     numChildren += 1;
-        //                     if (d == 0) totalChildFaceVel += childNode.velocities.right;
-        //                     else if (d == 1) totalChildFaceVel += childNode.velocities.left;
-        //                     else if (d == 2) totalChildFaceVel += childNode.velocities.top;
-        //                     else if (d == 3) totalChildFaceVel += childNode.velocities.bottom;
-        //                     else if (d == 4) totalChildFaceVel += childNode.velocities.back;
-        //                     else totalChildFaceVel += childNode.velocities.front;
-        //                 }
-        //             }
-        //         }
-        //         if (hasChild) {
-        //             float childFaceVel = totalChildFaceVel / numChildren;
-        //             if (Mathf.Abs(childFaceVel - parentFaceVel) > 1e-4f) {
-        //                 totalThatViolate += 1;
-        //                 afterMLS += $"Node {i}, layer {n.layer}, face {d}: parent={parentFaceVel:F4}, child={childFaceVel:F4}, neighbor indices: (" + neighborsCPU[neighborBaseIndex + d * 4] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 1] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 2] + ", " + neighborsCPU[neighborBaseIndex + d * 4 + 3] + "), parent face velocity: ";
-        //                 if (d == 0) afterMLS += n.velocities.left;
-        //                 else if (d == 1) afterMLS += n.velocities.right;
-        //                 else if (d == 2) afterMLS += n.velocities.bottom;
-        //                 else if (d == 3) afterMLS += n.velocities.top;
-        //                 else if (d == 4) afterMLS += n.velocities.front;
-        //                 else afterMLS += n.velocities.back;
-        //                 afterMLS += ", child face velocity: ";
-        //                 for (int k = 0; k < 4; k++) {
-        //                     uint child_idx = neighborsCPU[neighborBaseIndex + d * 4 + k];
-        //                     if (child_idx < numNodes) {
-        //                         Node childNode = nodesAfterMLS[child_idx];
-        //                         if (childNode.layer < n.layer) {
-        //                             if (d == 0) afterMLS += childNode.velocities.right;
-        //                             else if (d == 1) afterMLS += childNode.velocities.left;
-        //                             else if (d == 2) afterMLS += childNode.velocities.top;
-        //                             else if (d == 3) afterMLS += childNode.velocities.bottom;
-        //                             else if (d == 4) afterMLS += childNode.velocities.back;
-        //                             else afterMLS += childNode.velocities.front;
-        //                             afterMLS += ", ";
-        //                         }
-        //                     }
-        //                 }
-        //                 afterMLS += "\n";
-        //             }
-        //         }
-        //     }
-        // }
-        // Debug.Log(totalThatViolate + " shared faces that violate conservation after balancing:\n" + afterMLS);
     }
 
     private void ComputeLevelSet()
@@ -1670,9 +1366,6 @@ public class FluidSimulator : MonoBehaviour
     private void OnDrawGizmos()
     {
         if (nodesBuffer == null) return;
-
-        // Node[] nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
         
         // Calculate the maximum detail cell size (smallest possible cell)
         // With 10 bits per axis, we have 1024 possible values (0-1023)
@@ -1696,18 +1389,6 @@ public class FluidSimulator : MonoBehaviour
             new Color(0f, 0.5f, 1f),   // Light blue - Layer 8
             new Color(0f, 0f, 1f),     // Blue - Layer 9
             new Color(0.5f, 0f, 1f)    // Violet - Layer 10
-
-            // new Color(1f, 0f, 0f),     // Red - Layer 0
-            // new Color(0f, 1f, 0f),     // Green - Layer 5
-            // new Color(1f, 0.3f, 0f),   // Orange-red - Layer 1
-            // new Color(0f, 1f, 0.5f),   // Blue-green - Layer 6
-            // new Color(1f, 0.6f, 0f),   // Orange - Layer 2
-            // new Color(0f, 1f, 1f),     // Cyan - Layer 7
-            // new Color(1f, 1f, 0f),     // Yellow - Layer 3
-            // new Color(0f, 0.5f, 1f),   // Light blue - Layer 8
-            // new Color(0.5f, 1f, 0f),   // Yellow-green - Layer 4
-            // new Color(0f, 0f, 1f),     // Blue - Layer 9
-            // new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
 
         // nodesCPU = new Node[numNodes];
@@ -1790,6 +1471,40 @@ public class FluidSimulator : MonoBehaviour
 
         particlesMaterial.SetPass(0);
         Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
+    }
+
+    private void DrawRaymarching(Camera cam)
+    {
+        if (raymarchingMaterial == null || nodesBuffer == null || neighborsBuffer == null || numNodes <= 0) return;
+        if (cam == null) return;
+
+        // Set buffers
+        raymarchingMaterial.SetBuffer("_NodesBuffer", nodesBuffer);
+        raymarchingMaterial.SetBuffer("_NeighborsBuffer", neighborsBuffer);
+        raymarchingMaterial.SetInt("_NumNodes", numNodes);
+        
+        // Set simulation bounds
+        Bounds bounds = simulationBounds.bounds;
+        Vector3 boundsMin = bounds.min;
+        Vector3 boundsMax = bounds.max;
+        Vector3 boundsSize = bounds.size;
+
+        raymarchingMaterial.SetVector("_SimulationBoundsMin", boundsMin);
+        raymarchingMaterial.SetVector("_SimulationBoundsMax", boundsMax);
+
+        // Derive base step/maxSteps from bounds (grid resolution = 2^10 per axis)
+        float smallestAxis = Mathf.Max(1e-3f, Mathf.Min(boundsSize.x, Mathf.Min(boundsSize.y, boundsSize.z)));
+        float baseStepSize = smallestAxis / 1024f;
+        float diagonal = boundsSize.magnitude;
+        int baseMaxSteps = Mathf.Max(1, Mathf.CeilToInt(diagonal / Mathf.Max(baseStepSize, 1e-4f)));
+
+        raymarchingMaterial.SetFloat("_BaseStepSize", baseStepSize);
+        raymarchingMaterial.SetInt("_BaseMaxSteps", baseMaxSteps);
+        raymarchingMaterial.SetInt("_MinLayer", Mathf.Max(0, minLayer));
+        
+        // Draw full-screen quad (3 vertices using vertex ID to generate full screen)
+        raymarchingMaterial.SetPass(0);
+        Graphics.DrawProceduralNow(MeshTopology.Triangles, 3, 1);
     }
 
     // remove legacy OnRenderObject path
