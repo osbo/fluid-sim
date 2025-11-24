@@ -144,12 +144,6 @@ public class FluidSimulator : MonoBehaviour
     // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
     public Material particlesMaterial;
     
-    // Material to render fluid surface using raymarching (assign a shader like Custom/Raymarching)
-    public Material raymarchingMaterial;
-    public bool useRaymarching = false; // Toggle between particle rendering and raymarching
-    public float debugPhiMin = 0.0f;
-    public float debugPhiMax = 10.0f;
-    
     // Training data recorder
     public TrainingDataRecorder recorder;
 
@@ -165,14 +159,7 @@ public class FluidSimulator : MonoBehaviour
 
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
-        if (useRaymarching)
-        {
-            DrawRaymarching(cam);
-        }
-        else
-        {
-            DrawParticles(cam);
-        }
+        DrawParticles(cam);
     }
 
     void Start()
@@ -1472,43 +1459,6 @@ public class FluidSimulator : MonoBehaviour
         particlesMaterial.SetPass(0);
         Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
     }
-
-    private void DrawRaymarching(Camera cam)
-    {
-        if (raymarchingMaterial == null || nodesBuffer == null || neighborsBuffer == null || numNodes <= 0) return;
-        if (cam == null) return;
-
-        // Set buffers
-        raymarchingMaterial.SetBuffer("_NodesBuffer", nodesBuffer);
-        raymarchingMaterial.SetBuffer("_NeighborsBuffer", neighborsBuffer);
-        raymarchingMaterial.SetInt("_NumNodes", numNodes);
-        
-        // Set simulation bounds
-        Bounds bounds = simulationBounds.bounds;
-        Vector3 boundsMin = bounds.min;
-        Vector3 boundsMax = bounds.max;
-        Vector3 boundsSize = bounds.size;
-
-        raymarchingMaterial.SetVector("_SimulationBoundsMin", boundsMin);
-        raymarchingMaterial.SetVector("_SimulationBoundsMax", boundsMax);
-
-        // Derive base step/maxSteps from bounds (grid resolution = 2^10 per axis)
-        float smallestAxis = Mathf.Max(1e-3f, Mathf.Min(boundsSize.x, Mathf.Min(boundsSize.y, boundsSize.z)));
-        float baseStepSize = smallestAxis / 1024f;
-        float diagonal = boundsSize.magnitude;
-        int baseMaxSteps = Mathf.Max(1, Mathf.CeilToInt(diagonal / Mathf.Max(baseStepSize, 1e-4f)));
-
-        raymarchingMaterial.SetFloat("_BaseStepSize", baseStepSize);
-        raymarchingMaterial.SetInt("_BaseMaxSteps", baseMaxSteps);
-        raymarchingMaterial.SetInt("_MinLayer", Mathf.Max(0, minLayer));
-        
-        // Draw full-screen quad (3 vertices using vertex ID to generate full screen)
-        raymarchingMaterial.SetPass(0);
-        Graphics.DrawProceduralNow(MeshTopology.Triangles, 3, 1);
-    }
-
-    // remove legacy OnRenderObject path
-    // void OnRenderObject() { DrawParticles(Camera.current != null ? Camera.current : Camera.main); }
 
     private Vector3 DecodeMorton3D(Node node)
     {
