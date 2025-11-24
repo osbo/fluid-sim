@@ -298,44 +298,49 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     // float3 newVelocity = newGridVelocity;
 
-    // Advect the particle and apply boundary conditions
+    // Advect the particle
     float3 newPosition = particle.position + newVelocity * deltaTime;
-    // float3 newPosition = particle.position;
 
-    // newVelocity.y -= gravity * deltaTime;
-
-    float bounceDamping = 0.0f;  // Much more damping to reduce bouncing
+    // FIX START: Add Epsilon and Bounce
+    // 1. Give particles a tiny bounce so they don't lose all momentum
+    float bounceDamping = 0.3f;
     
+    // 2. Add an epsilon buffer. This ensures the particle sits slightly *inside* 
+    // the cell (e.g. at 1023.9) rather than on the wall (1024.0).
+    // At 1023.9, the lerp will sample ~99% wall (0 vel) and ~1% internal fluid (active vel).
+    // That 1% is enough for gravity/pressure to pull it back in.
+    float eps = 0.05f;
+    
+    // X Axis
     if (newPosition.x <= 0) {
-        // newPosition.x = 0;
-        newPosition.x = -newPosition.x;
+        newPosition.x = eps; // Clamp with epsilon
         newVelocity.x *= -1.0 * bounceDamping;
     } 
-    if (newPosition.x >= 1024) {
-        // newPosition.x = 1024;
-        newPosition.x = 1024 - (newPosition.x - 1024);
+    else if (newPosition.x >= 1024) {
+        newPosition.x = 1024 - eps; // Clamp with epsilon
         newVelocity.x *= -1.0 * bounceDamping;
     }
+    
+    // Y Axis (Ceiling/Floor)
     if (newPosition.y <= 0) {
-        // newPosition.y = 0;
-        newPosition.y = -newPosition.y;
+        newPosition.y = eps;
         newVelocity.y *= -1.0 * bounceDamping;
     }
-    if (newPosition.y >= 1024) {
-        // newPosition.y = 1024;
-        newPosition.y = 1024 - (newPosition.y - 1024);
+    else if (newPosition.y >= 1024) {
+        newPosition.y = 1024 - eps;
         newVelocity.y *= -1.0 * bounceDamping;
     }
+    
+    // Z Axis
     if (newPosition.z <= 0) {
-        // newPosition.z = 0;
-        newPosition.z = -newPosition.z;
+        newPosition.z = eps;
         newVelocity.z *= -1.0 * bounceDamping;
     }
-    if (newPosition.z >= 1024) {
-        // newPosition.z = 1024;
-        newPosition.z = 1024 - (newPosition.z - 1024);
+    else if (newPosition.z >= 1024) {
+        newPosition.z = 1024 - eps;
         newVelocity.z *= -1.0 * bounceDamping;
     }
+    // FIX END
 
     particle.position = newPosition;
 
