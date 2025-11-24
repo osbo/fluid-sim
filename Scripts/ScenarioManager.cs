@@ -12,7 +12,7 @@ public class ScenarioManager : MonoBehaviour
     {
         if (simulator == null)
         {
-            simulator = FindObjectOfType<FluidSimulator>();
+            simulator = FindFirstObjectByType<FluidSimulator>();
             if (simulator == null)
             {
                 Debug.LogError("ScenarioManager: FluidSimulator not found!");
@@ -23,7 +23,7 @@ public class ScenarioManager : MonoBehaviour
 
         if (recorder == null)
         {
-            recorder = FindObjectOfType<TrainingDataRecorder>();
+            recorder = FindFirstObjectByType<TrainingDataRecorder>();
             if (recorder == null)
             {
                 Debug.LogError("ScenarioManager: TrainingDataRecorder not found!");
