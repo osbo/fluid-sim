@@ -7,8 +7,8 @@ using UnityEngine.Rendering;
 
 public class FluidSimulator : MonoBehaviour
 {
-    [SerializeField] private BoxCollider simulationBounds;
-    [SerializeField] private BoxCollider fluidInitialBounds;
+    public BoxCollider simulationBounds;
+    public BoxCollider fluidInitialBounds;
     
     public ComputeShader radixSortShader;
     public ComputeShader particlesShader;
@@ -137,6 +137,9 @@ public class FluidSimulator : MonoBehaviour
 
     // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
     public Material particlesMaterial;
+    
+    // Training data recorder
+    public TrainingDataRecorder recorder;
 
     void OnEnable()
     {
@@ -157,6 +160,22 @@ public class FluidSimulator : MonoBehaviour
     {
         InitializeParticleSystem();
         // InitializeInitialParticles();
+        
+        // Auto-find recorder if not assigned
+        if (recorder == null)
+        {
+            recorder = FindObjectOfType<TrainingDataRecorder>();
+            if (recorder == null)
+            {
+                Debug.LogWarning("TrainingDataRecorder is not assigned and not found in scene. No training data will be recorded.");
+            }
+        }
+        
+        // Start recording automatically if recorder is assigned
+        if (recorder != null)
+        {
+            recorder.StartNewRun();
+        }
     }
 
     private void InitializeInitialParticles()
@@ -669,6 +688,22 @@ public class FluidSimulator : MonoBehaviour
             
         Debug.Log(summary);
 
+        // Save training data: At this point, pressureBuffer contains the converged result (Target).
+        // nodesBuffer and neighborsBuffer contain the Geometry (Input).
+        // divergenceBuffer contains the RHS (Input).
+        if (recorder != null && recorder.isRecording)
+        {
+            // Get actual world-space bounds (not normalized)
+            Vector3 simBoundsMin = simulationBounds != null ? simulationBounds.bounds.min : Vector3.zero;
+            Vector3 simBoundsMax = simulationBounds != null ? simulationBounds.bounds.max : Vector3.zero;
+            Vector3 fluidBoundsMin = fluidInitialBounds != null ? fluidInitialBounds.bounds.min : Vector3.zero;
+            Vector3 fluidBoundsMax = fluidInitialBounds != null ? fluidInitialBounds.bounds.max : Vector3.zero;
+            
+            recorder.SaveFrame(nodesBuffer, neighborsBuffer, divergenceBuffer, pressureBuffer, numNodes,
+                minLayer, maxLayer, gravity, numParticles, maxCgIterations, convergenceThreshold, frameRate,
+                simBoundsMin, simBoundsMax, fluidBoundsMin, fluidBoundsMax);
+        }
+
         // --- Step 3: Apply pressure to velocities ---
         var pressureGradientSw = System.Diagnostics.Stopwatch.StartNew();
         ApplyPressureGradient();
@@ -922,6 +957,12 @@ public class FluidSimulator : MonoBehaviour
         particlesShader.SetFloat("boundaryThreshold", 0.01f); // near-left threshold in normalized X
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
+    }
+    
+    // Public method for ScenarioManager to reset the simulation
+    public void ResetSimulation()
+    {
+        InitializeParticleSystem();
     }
     
     private void SortParticles()
