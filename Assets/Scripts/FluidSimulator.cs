@@ -89,6 +89,7 @@ public class FluidSimulator : MonoBehaviour
     public int maxLayer;
 
     private bool hasShownWaitMessage = false;
+    private int frameNumber = 0;
     
     private System.Diagnostics.Stopwatch totalOctreeSw;
     
@@ -309,23 +310,23 @@ public class FluidSimulator : MonoBehaviour
         // }
         // Debug.Log(str);
 
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-        int[] layerCounts = new int[maxLayer - minLayer + 1];
-        str = $"Number of nodes in each layer: ";
-        for (int i = 0; i < maxLayer - minLayer + 1; i++)
-        {
-            layerCounts[i] = 0;
-        }
-        for (int i = 0; i < numNodes; i++)
-        {
-            layerCounts[nodesCPU[i].layer - minLayer]++;
-        }
-        for (int i = 0; i < maxLayer - minLayer + 1; i++)
-        {
-            str += $"{i + minLayer}: {layerCounts[i]}, ";
-        }
-        Debug.Log(str);
+        // nodesCPU = new Node[numNodes];
+        // nodesBuffer.GetData(nodesCPU);
+        // int[] layerCounts = new int[maxLayer - minLayer + 1];
+        // str = $"Number of nodes in each layer: ";
+        // for (int i = 0; i < maxLayer - minLayer + 1; i++)
+        // {
+        //     layerCounts[i] = 0;
+        // }
+        // for (int i = 0; i < numNodes; i++)
+        // {
+        //     layerCounts[nodesCPU[i].layer - minLayer]++;
+        // }
+        // for (int i = 0; i < maxLayer - minLayer + 1; i++)
+        // {
+        //     str += $"{i + minLayer}: {layerCounts[i]}, ";
+        // }
+        // Debug.Log(str);
 
         // Step 4: Find neighbors
         var findNeighborsSw = System.Diagnostics.Stopwatch.StartNew();
@@ -459,7 +460,8 @@ public class FluidSimulator : MonoBehaviour
 
         // Frame timing summary
         frameSw.Stop();
-        Debug.Log($"Frame Summary:\n" +
+        frameNumber++;
+        Debug.Log($"Frame {frameNumber} Summary:\n" +
                  $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
@@ -667,26 +669,26 @@ public class FluidSimulator : MonoBehaviour
         }
         cgLoopSw.Stop();
         
-        // Create clean summary report
-        float finalResidual = r_dot_r;
-        float totalImprovement = ((initialResidual - finalResidual) / initialResidual) * 100.0f;
-        float residualRatio = finalResidual / initialResidual;
+        // // Create clean summary report
+        // float finalResidual = r_dot_r;
+        // float totalImprovement = ((initialResidual - finalResidual) / initialResidual) * 100.0f;
+        // float residualRatio = finalResidual / initialResidual;
         
-        string summary = $"CG Solver Summary: Iterations {totalIterations}/{maxCgIterations}, Total {((totalImprovement > 0) ? "Convergence" : "Divergence")} {totalImprovement:F2}%, Residual Ratio {residualRatio:E3}x initial\n";
-        summary += $"• Iterations: {totalIterations}/{maxCgIterations}\n";
-        summary += $"• Initial residual: {initialResidual:E6}\n";
-        summary += $"• Final residual: {finalResidual:E6}\n";
-        summary += $"• Total improvement: {totalImprovement:F2}%\n";
-        summary += $"• Residual ratio: {residualRatio:E3}x initial\n";
+        // string summary = $"CG Solver Summary: Iterations {totalIterations}/{maxCgIterations}, Total {((totalImprovement > 0) ? "Convergence" : "Divergence")} {totalImprovement:F2}%, Residual Ratio {residualRatio:E3}x initial\n";
+        // summary += $"• Iterations: {totalIterations}/{maxCgIterations}\n";
+        // summary += $"• Initial residual: {initialResidual:E6}\n";
+        // summary += $"• Final residual: {finalResidual:E6}\n";
+        // summary += $"• Total improvement: {totalImprovement:F2}%\n";
+        // summary += $"• Residual ratio: {residualRatio:E3}x initial\n";
         
-        if (totalImprovement > 0)
-            summary += $"• Status: Converged successfully\n";
-        else if (totalImprovement > -10)
-            summary += $"• Status: Converged (slight increase)\n";
-        else
-            summary += $"• Status: Diverged ({Math.Abs(totalImprovement):F1}% increase)\n";
+        // if (totalImprovement > 0)
+        //     summary += $"• Status: Converged successfully\n";
+        // else if (totalImprovement > -10)
+        //     summary += $"• Status: Converged (slight increase)\n";
+        // else
+        //     summary += $"• Status: Diverged ({Math.Abs(totalImprovement):F1}% increase)\n";
             
-        Debug.Log(summary);
+        // Debug.Log(summary);
 
         // Save training data: At this point, pressureBuffer contains the converged result (Target).
         // nodesBuffer and neighborsBuffer contain the Geometry (Input).
@@ -1585,13 +1587,13 @@ public class FluidSimulator : MonoBehaviour
             CopyBuffer(phiBuffer_Read, phiBuffer);
         }
 
-        float[] phiCPU = new float[numNodes];
-        phiBuffer.GetData(phiCPU);
+        // float[] phiCPU = new float[numNodes];
+        // phiBuffer.GetData(phiCPU);
 
-        float maxPhi = phiCPU.Max();
-        float minPhi = phiCPU.Min();
-        str = $"max phi: {maxPhi}, min phi: {minPhi}, max-min: {maxPhi - minPhi}";
-        Debug.Log(str);
+        // float maxPhi = phiCPU.Max();
+        // float minPhi = phiCPU.Min();
+        // str = $"max phi: {maxPhi}, min phi: {minPhi}, max-min: {maxPhi - minPhi}";
+        // Debug.Log(str);
     }
 
     private void ApplyGravity()
