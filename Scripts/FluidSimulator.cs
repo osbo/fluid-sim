@@ -5,6 +5,12 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using UnityEngine.Rendering;
 
+public enum RenderingMode
+{
+    Particles,
+    ScreenSpace
+}
+
 public class FluidSimulator : MonoBehaviour
 {
     public BoxCollider simulationBounds;
@@ -141,8 +147,14 @@ public class FluidSimulator : MonoBehaviour
     private Particle[] particlesCPU;
     private string str;
 
+    // Rendering mode enum
+    public RenderingMode renderingMode = RenderingMode.Particles;
+    
     // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
     public Material particlesMaterial;
+    
+    // Material to render particles with screen-space shader (assign a shader like Custom/ParticleDepth)
+    public Material particleDepthMaterial;
     
     // Training data recorder
     public TrainingDataRecorder recorder;
@@ -1407,17 +1419,31 @@ public class FluidSimulator : MonoBehaviour
 
     private void DrawParticles(Camera cam)
     {
-        if (particlesMaterial == null || particlesBuffer == null || numParticles <= 0) return;
+        if (particlesBuffer == null || numParticles <= 0) return;
         if (cam == null) return;
 
-        particlesMaterial.SetBuffer("_Particles", particlesBuffer);
-        particlesMaterial.SetFloat("_PointSize", 2.0f);
-        particlesMaterial.SetInt("_MinLayer", minLayer);
-        particlesMaterial.SetInt("_MaxLayer", maxLayer);
+        // Select material based on rendering mode
+        Material currentMaterial = null;
+        switch (renderingMode)
+        {
+            case RenderingMode.Particles:
+                currentMaterial = particlesMaterial;
+                break;
+            case RenderingMode.ScreenSpace:
+                currentMaterial = particleDepthMaterial;
+                break;
+        }
+
+        if (currentMaterial == null) return;
+
+        currentMaterial.SetBuffer("_Particles", particlesBuffer);
+        currentMaterial.SetFloat("_PointSize", 2.0f);
+        currentMaterial.SetInt("_MinLayer", minLayer);
+        currentMaterial.SetInt("_MaxLayer", maxLayer);
         
         // Add simulation bounds for denormalizing particle positions
-        particlesMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
-        particlesMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
+        currentMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
+        currentMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
         
         // Calculate depth fade parameters based on simulation bounds and camera position
         Vector3 cameraPos = cam.transform.position;
@@ -1453,10 +1479,51 @@ public class FluidSimulator : MonoBehaviour
             fadeEnd = fadeStart + boundsDiagonal * 0.5f;
         }
         
-        particlesMaterial.SetFloat("_DepthFadeStart", fadeStart);
-        particlesMaterial.SetFloat("_DepthFadeEnd", fadeEnd);
+        currentMaterial.SetFloat("_DepthFadeStart", fadeStart);
+        currentMaterial.SetFloat("_DepthFadeEnd", fadeEnd);
+        
+        // Calculate depth min/max for depth visualization (only for depth material)
+        if (renderingMode == RenderingMode.ScreenSpace)
+        {
+            // Calculate the 8 corners of the bounding box
+            Vector3[] corners = new Vector3[]
+            {
+                bounds.min,
+                new Vector3(bounds.max.x, bounds.min.y, bounds.min.z),
+                new Vector3(bounds.min.x, bounds.max.y, bounds.min.z),
+                new Vector3(bounds.max.x, bounds.max.y, bounds.min.z),
+                new Vector3(bounds.min.x, bounds.min.y, bounds.max.z),
+                new Vector3(bounds.max.x, bounds.min.y, bounds.max.z),
+                new Vector3(bounds.min.x, bounds.max.y, bounds.max.z),
+                bounds.max
+            };
+            
+            // Find min and max distances from camera to all corners
+            float minDepth = float.MaxValue;
+            float maxDepth = float.MinValue;
+            
+            foreach (Vector3 corner in corners)
+            {
+                float distance = Vector3.Distance(cameraPos, corner);
+                minDepth = Mathf.Min(minDepth, distance);
+                maxDepth = Mathf.Max(maxDepth, distance);
+            }
+            
+            // Add some margin to ensure we capture all particles
+            minDepth = Mathf.Max(0.0f, minDepth - boundsDiagonal * 0.1f);
+            maxDepth = maxDepth + boundsDiagonal * 0.1f;
+            
+            // Ensure max is greater than min
+            if (maxDepth <= minDepth)
+            {
+                maxDepth = minDepth + boundsDiagonal * 0.5f;
+            }
+            
+            currentMaterial.SetFloat("_DepthMin", minDepth);
+            currentMaterial.SetFloat("_DepthMax", maxDepth);
+        }
 
-        particlesMaterial.SetPass(0);
+        currentMaterial.SetPass(0);
         Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
     }
 

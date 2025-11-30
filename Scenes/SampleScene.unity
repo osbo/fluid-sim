@@ -552,11 +552,9 @@ MonoBehaviour:
   frameRate: 30
   minLayer: 4
   maxLayer: 10
+  renderingMode: 1
   particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
-  raymarchingMaterial: {fileID: 2100000, guid: b6528f416d1bc4b99a89f7ac8ae33607, type: 2}
-  useRaymarching: 0
-  debugPhiMin: 0
-  debugPhiMax: 10
+  particleDepthMaterial: {fileID: 2100000, guid: 02cdf3bcc869241a49f58b5e8d42a8ea, type: 2}
   recorder: {fileID: 944897176}
 --- !u!1 &832575517
 GameObject:
