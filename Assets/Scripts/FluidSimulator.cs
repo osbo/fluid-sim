@@ -8,7 +8,8 @@ using UnityEngine.Rendering;
 public enum RenderingMode
 {
     Particles,
-    ScreenSpace
+    Depth,
+    Thickness
 }
 
 public class FluidSimulator : MonoBehaviour
@@ -153,8 +154,14 @@ public class FluidSimulator : MonoBehaviour
     // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
     public Material particlesMaterial;
     
-    // Material to render particles with screen-space shader (assign a shader like Custom/ParticleDepth)
+    // Material to render particles with depth shader (assign a shader like Fluid/ParticleDepth)
     public Material particleDepthMaterial;
+    
+    // Material to render particles with thickness shader (assign a shader like Custom/ParticleThickness)
+    public Material particleThicknessMaterial;
+    
+    // Thickness contribution per particle (controls how much each particle adds to the thickness map)
+    public float thicknessContribution = 1.0f / 1024.0f;
     
     // Training data recorder
     public TrainingDataRecorder recorder;
@@ -1429,8 +1436,11 @@ public class FluidSimulator : MonoBehaviour
             case RenderingMode.Particles:
                 currentMaterial = particlesMaterial;
                 break;
-            case RenderingMode.ScreenSpace:
+            case RenderingMode.Depth:
                 currentMaterial = particleDepthMaterial;
+                break;
+            case RenderingMode.Thickness:
+                currentMaterial = particleThicknessMaterial;
                 break;
         }
 
@@ -1483,7 +1493,7 @@ public class FluidSimulator : MonoBehaviour
         currentMaterial.SetFloat("_DepthFadeEnd", fadeEnd);
         
         // Calculate depth min/max for depth visualization (only for depth material)
-        if (renderingMode == RenderingMode.ScreenSpace)
+        if (renderingMode == RenderingMode.Depth)
         {
             // Calculate the 8 corners of the bounding box
             Vector3[] corners = new Vector3[]
@@ -1521,6 +1531,11 @@ public class FluidSimulator : MonoBehaviour
             
             currentMaterial.SetFloat("_DepthMin", minDepth);
             currentMaterial.SetFloat("_DepthMax", maxDepth);
+        }
+        else if (renderingMode == RenderingMode.Thickness)
+        {
+            // Set thickness-specific properties
+            currentMaterial.SetFloat("_ThicknessContribution", thicknessContribution);
         }
 
         currentMaterial.SetPass(0);
