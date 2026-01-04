@@ -77,29 +77,57 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
         float dx = GetDx(n.layer);
         uint n_base = i * 24;
         int wall_starts[6] = {0, 4, 8, 12, 16, 20};
-        
+
+        // --- NEW LOGIC START ---
         for (int f = 0; f < 6; f++) {
+            // Check Wall Flag (First slot only, as per Python)
             uint w_idx = neighborsBuffer[n_base + wall_starts[f]];
-            if (w_idx == numNodes + 1) feats[3 + f] = 1.0; 
-            
+            if (w_idx == numNodes + 1) feats[3 + f] = 1.0;
+
+            // Check if this face is handled by a single Coarse/Same neighbor (Slot 0)
+            bool isCoarseOrSame = false;
+            uint slot0_idx = neighborsBuffer[n_base + f * 4];
+            if (slot0_idx < numNodes) {
+                Node n0 = nodesBuffer[slot0_idx];
+                if (n0.layer >= n.layer) isCoarseOrSame = true;
+            }
+
             for (int s = 0; s < 4; s++) {
                 int local_idx = f * 4 + s;
+                
+                // CRITICAL FIX: If this face is Coarse/Same, ONLY Slot 0 is valid.
+                // Slots 1, 2, 3 must be skipped (weight = 0) to match Python training.
+                if (isCoarseOrSame && s > 0) {
+                    continue; 
+                }
+
                 uint n_idx = neighborsBuffer[n_base + local_idx];
-                if (n_idx == numNodes) feats[9 + local_idx] = 1.0; 
+                if (n_idx == numNodes) feats[9 + local_idx] = 1.0; // Air flag
                 
                 float weight = 0.0;
                 if (n_idx < numNodes) {
                     Node nb = nodesBuffer[n_idx];
                     float dist = max(0.5 * (dx + GetDx(nb.layer)), 1e-6);
-                    float area = (s == 0 && nb.layer >= n.layer) ? (dx*dx) : (dx*dx*0.25);
+                    
+                    // Python Logic:
+                    // If Coarse/Same (s==0 checked above): area = dx*dx
+                    // If Fine (not coarse): area = dx*dx*0.25
+                    float area = (isCoarseOrSame) ? (dx*dx) : (dx*dx*0.25);
+                    
                     weight = area / dist;
                     feats[34 + local_idx] = -weight;
-                } else if (n_idx == numNodes) {
+                } else if (n_idx == numNodes) { // Dirichlet (Air)
+                    // Python Logic: weight_s = (dx^2 / 4.0) / dist_s
+                    // Note: Python computes this for all slots unless blocked by Coarse
                     weight = (dx*dx*0.25) / max(0.5 * dx, 1e-6);
                 }
+                
+                // Only accumulate diagonal if we calculated a valid weight
                 A_diag += weight;
             }
         }
+        // --- NEW LOGIC END ---
+        
         feats[33] = A_diag;
     }
 
@@ -159,57 +187,58 @@ void ComputeAttention(uint3 id : SV_DispatchThreadID)
     uint i = id.x;
     if (i >= maxNodes) return;
 
-    uint win_start = (i / 512) * 512; // Start index of this window
+    uint win_start = (i / 512) * 512;
     
-    // Read My Q (split into 4 heads of 32 dim)
+    // 1. Load My Query (We still need this cached)
     float my_q[128];
     for(int k=0; k<128; k++) my_q[k] = bufferQ[i*128 + k];
 
-    // Accumulators for Online Softmax (per head)
+    // Accumulators
     float m[4] = {-1e9, -1e9, -1e9, -1e9}; // max score
     float d[4] = {0, 0, 0, 0};             // denominator
-    float res[128];                        // numerator (weighted sum)
+    float res[128];                        // numerator
     for(int z=0; z<128; z++) res[z] = 0;
 
-    float scale = rsqrt(32.0); // 1 / sqrt(head_dim)
+    float scale = rsqrt(32.0);
 
-    // Loop over all 512 nodes in this window
+    // Loop over window
     for(uint j=0; j<512; j++)
     {
         uint target_idx = win_start + j;
         
-        // Load K and V for target node
-        // (Coalesced reads are decent here since threads read sequential addresses)
-        float target_k[128];
-        float target_v[128];
-        for(int x=0; x<128; x++) {
-            target_k[x] = bufferK[target_idx*128 + x];
-            target_v[x] = bufferV[target_idx*128 + x];
+        // OPTIMIZATION: Do not load full K/V vectors into registers.
+        // Compute score on the fly to save register spill.
+        
+        // 2. Compute Scores for 4 Heads
+        float scores[4] = {0, 0, 0, 0};
+        
+        for (int h=0; h<4; h++) {
+            int offset = h * 32;
+            float s = 0;
+            // Unroll small loop manually or let compiler handle it
+            for (int dim=0; dim<32; dim++) {
+                s += my_q[offset + dim] * bufferK[target_idx*128 + offset + dim];
+            }
+            scores[h] = s * scale;
         }
 
-        // Compute Score per head
-        for(int h=0; h<4; h++)
-        {
-            float score = 0;
-            int offset = h * 32;
-            for(int dim=0; dim<32; dim++) {
-                score += my_q[offset + dim] * target_k[offset + dim];
-            }
-            score *= scale;
-
-            // Online Softmax Update
+        // 3. Update Softmax Statistics
+        for (int h=0; h<4; h++) {
             float m_prev = m[h];
-            float m_new = max(m_prev, score);
-            
-            float e_score = exp(score - m_new);
+            float m_new = max(m_prev, scores[h]);
+            float e_score = exp(scores[h] - m_new);
             float e_prev = exp(m_prev - m_new);
             
             d[h] = d[h] * e_prev + e_score;
-            
-            for(int d_v=0; d_v<32; d_v++) {
-                res[offset + d_v] = res[offset + d_v] * e_prev + target_v[offset + d_v] * e_score;
-            }
             m[h] = m_new;
+
+            // Update weighted sum (res)
+            // We read V directly from global memory here
+            int offset = h * 32;
+            for(int dim=0; dim<32; dim++) {
+                 float v_val = bufferV[target_idx*128 + offset + dim];
+                 res[offset + dim] = res[offset + dim] * e_prev + v_val * e_score;
+            }
         }
     }
 
