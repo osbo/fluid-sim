@@ -4,6 +4,8 @@ using System;
 using System.Linq;
 using System.Runtime.InteropServices;
 using UnityEngine.Rendering;
+using System.IO;
+using System.Collections.Generic;
 
 public enum RenderingMode
 {
@@ -22,6 +24,7 @@ public class FluidSimulator : MonoBehaviour
     public ComputeShader nodesPrefixSumsShader;
     public ComputeShader nodesShader;
     public ComputeShader cgSolverShader;
+    public ComputeShader preconditionerShader; // Assign Preconditioner.compute in Inspector
     public int numParticles;
     
     // CG Solver parameters
@@ -83,6 +86,24 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer phiBuffer;
     private ComputeBuffer phiBuffer_Read;
     private ComputeBuffer dirtyFlagBuffer;
+    private ComputeBuffer tokenBuffer; // For neural preconditioner token assembly
+    private ComputeBuffer tokenBufferOut; // Output buffer for transformer layers
+    private ComputeBuffer matrixGBuffer; // Output buffer for preconditioner matrix G
+    private ComputeBuffer zBuffer; // Intermediate buffer for PCG preconditioner application
+    private ComputeBuffer bufferQ; // Q buffer for attention
+    private ComputeBuffer bufferK; // K buffer for attention
+    private ComputeBuffer bufferV; // V buffer for attention
+    private ComputeBuffer bufferAttn; // Attention output buffer
+    public TextAsset modelWeightsAsset; // Assign model_weights.bytes from Assets/Scripts/ in Inspector
+    private Dictionary<string, ComputeBuffer> weightBuffers = new Dictionary<string, ComputeBuffer>();
+    private float p_mean;
+    private float p_std;
+    private int d_model, num_heads, num_layers, input_dim;
+
+    private int computeQKVKernel = -1;
+    private int computeAttentionKernel = -1;
+    private int computeFFNKernel = -1;
+    private int computeHeadKernel = -1;
     
     // add previous active node count, but that can be a cpu variable 
     
@@ -99,9 +120,14 @@ public class FluidSimulator : MonoBehaviour
     public float frameRate;
     public int minLayer;
     public int maxLayer;
+    public bool useNeuralPreconditioner = true;
 
     private bool hasShownWaitMessage = false;
     private int frameNumber = 0;
+    private double cumulativeFrameTimeMs = 0.0;
+    private double cumulativeCgIterations = 0.0;
+    private int cgSolveFrameCount = 0;
+    private float averageCgIterations = 0.0f;
     
     private System.Diagnostics.Stopwatch totalOctreeSw;
     
@@ -186,6 +212,9 @@ public class FluidSimulator : MonoBehaviour
         InitializeParticleSystem();
         // InitializeInitialParticles();
         
+        // Load neural preconditioner model metadata
+        LoadModelMetadata();
+        
         // Auto-find recorder if not assigned
         if (recorder == null)
         {
@@ -230,6 +259,95 @@ public class FluidSimulator : MonoBehaviour
         }
 
         particlesBuffer.SetData(particlesCPU);
+    }
+
+    private void LoadModelMetadata()
+    {
+        if (modelWeightsAsset == null)
+        {
+            Debug.LogWarning("Model weights asset is not assigned. Please assign model_weights.bytes in the Inspector.");
+            return;
+        }
+
+        byte[] fileBytes = modelWeightsAsset.bytes;
+        
+        if (fileBytes == null || fileBytes.Length < 24)
+        {
+            Debug.LogWarning("Model weights file is too small or invalid. Neural preconditioner will not work.");
+            return;
+        }
+
+        try
+        {
+            using (BinaryReader reader = new BinaryReader(new MemoryStream(fileBytes)))
+            {
+                // 1. Header
+                p_mean = reader.ReadSingle();
+                p_std = reader.ReadSingle();
+                d_model = reader.ReadInt32();
+                num_heads = reader.ReadInt32();
+                num_layers = reader.ReadInt32();
+                input_dim = reader.ReadInt32();
+
+                // 2. Helper to read float arrays into ComputeBuffers
+                // Note: PyTorch exports float32. 
+                ComputeBuffer ReadBuffer(int count)
+                {
+                    float[] data = new float[count];
+                    for (int i = 0; i < count; i++) data[i] = reader.ReadSingle();
+                    
+                    ComputeBuffer buffer = new ComputeBuffer(count, sizeof(float));
+                    buffer.SetData(data);
+                    return buffer;
+                }
+
+                // 3. Load weights into dictionary (Order matches NeuralPreconditioner.py export_weights)
+                // Clear old buffers if reloading
+                foreach(var b in weightBuffers.Values) b?.Release();
+                weightBuffers.Clear();
+
+                // Stem weights
+                weightBuffers["feature_proj.weight"] = ReadBuffer(input_dim * d_model); // [58, 128] -> transposed
+                weightBuffers["feature_proj.bias"] = ReadBuffer(d_model);
+                weightBuffers["layer_embed"] = ReadBuffer(12 * d_model); // [12, 128]
+                weightBuffers["window_pos_embed"] = ReadBuffer(512 * d_model); // [1, 512, 128] flattened
+
+                // Transformer layers
+                for (int i = 0; i < num_layers; i++)
+                {
+                    string prefix = $"layer_{i}.";
+                    // Order matches NeuralPreconditioner.py export_weights function
+                    weightBuffers[prefix + "in_proj_w"] = ReadBuffer(d_model * 3 * d_model); // [128, 384] transposed
+                    weightBuffers[prefix + "in_proj_b"] = ReadBuffer(3 * d_model); // [384]
+                    weightBuffers[prefix + "out_proj_w"] = ReadBuffer(d_model * d_model); // [128, 128] transposed
+                    weightBuffers[prefix + "out_proj_b"] = ReadBuffer(d_model); // [128]
+                    weightBuffers[prefix + "norm1_w"] = ReadBuffer(d_model);
+                    weightBuffers[prefix + "norm1_b"] = ReadBuffer(d_model);
+                    weightBuffers[prefix + "linear1_w"] = ReadBuffer(d_model * 2 * d_model); // [128, 256] transposed
+                    weightBuffers[prefix + "linear1_b"] = ReadBuffer(2 * d_model); // [256]
+                    weightBuffers[prefix + "linear2_w"] = ReadBuffer(2 * d_model * d_model); // [256, 128] transposed
+                    weightBuffers[prefix + "linear2_b"] = ReadBuffer(d_model); // [128]
+                    weightBuffers[prefix + "norm2_w"] = ReadBuffer(d_model);
+                    weightBuffers[prefix + "norm2_b"] = ReadBuffer(d_model);
+                }
+
+                // Head weights
+                weightBuffers["norm_out.weight"] = ReadBuffer(d_model);
+                weightBuffers["norm_out.bias"] = ReadBuffer(d_model);
+                weightBuffers["head.weight"] = ReadBuffer(d_model * 25); // [128, 25] transposed
+                weightBuffers["head.bias"] = ReadBuffer(25);
+
+                Debug.Log("Loaded all weights into dictionary.");
+            }
+            
+            Debug.Log("Loaded " + num_layers + " Transformer layers.");
+            
+            Debug.Log($"Loaded Model Config: Mean={p_mean}, Std={p_std}, d_model={d_model}, Heads={num_heads}, Layers={num_layers}, InputDim={input_dim}");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to load model metadata: {e.Message}");
+        }
     }
 
     void Update()
@@ -321,8 +439,12 @@ public class FluidSimulator : MonoBehaviour
         // Frame timing summary
         frameSw.Stop();
         frameNumber++;
+        cumulativeFrameTimeMs += frameSw.Elapsed.TotalMilliseconds;
+        double averageFrameTimeMs = cumulativeFrameTimeMs / Math.Max(1, frameNumber);
+        string averageCgIterationsText = cgSolveFrameCount > 0 ? averageCgIterations.ToString("F2") : "N/A";
         Debug.Log($"Frame {frameNumber} Summary:\n" +
                  $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Avg Frame Time: {averageFrameTimeMs:F2} ms\n" +
                  $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
@@ -333,7 +455,8 @@ public class FluidSimulator : MonoBehaviour
                  $"• Apply Gravity: {applyGravitySw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Enforce Boundaries: {enforceBoundarySw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms");
+                 $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Avg CG Iterations: {averageCgIterationsText}");
     }
 
     private void StoreOldVelocities()
@@ -407,19 +530,36 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // Initialize buffers - release and recreate each frame since numNodes changes
+        // Initialize buffers - only resize if we need MORE space (grow-only)
         var bufferInitSw = System.Diagnostics.Stopwatch.StartNew();
-        divergenceBuffer?.Release();
-        residualBuffer?.Release();
-        pBuffer?.Release();
-        ApBuffer?.Release();
-        pressureBuffer?.Release();
+        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512)); // Power of 2, minimum 512
         
-        divergenceBuffer = new ComputeBuffer(numNodes, sizeof(float));
-        residualBuffer = new ComputeBuffer(numNodes, sizeof(float));
-        pBuffer = new ComputeBuffer(numNodes, sizeof(float));
-        ApBuffer = new ComputeBuffer(numNodes, sizeof(float));
-        pressureBuffer = new ComputeBuffer(numNodes, sizeof(float));
+        if (divergenceBuffer == null || divergenceBuffer.count < requiredSize)
+        {
+            divergenceBuffer?.Release();
+            divergenceBuffer = new ComputeBuffer(requiredSize, sizeof(float));
+        }
+        if (residualBuffer == null || residualBuffer.count < requiredSize)
+        {
+            residualBuffer?.Release();
+            residualBuffer = new ComputeBuffer(requiredSize, sizeof(float));
+        }
+        if (pBuffer == null || pBuffer.count < requiredSize)
+        {
+            pBuffer?.Release();
+            pBuffer = new ComputeBuffer(requiredSize, sizeof(float));
+        }
+        if (ApBuffer == null || ApBuffer.count < requiredSize)
+        {
+            ApBuffer?.Release();
+            ApBuffer = new ComputeBuffer(requiredSize, sizeof(float));
+        }
+        if (pressureBuffer == null || pressureBuffer.count < requiredSize)
+        {
+            pressureBuffer?.Release();
+            pressureBuffer = new ComputeBuffer(requiredSize, sizeof(float));
+        }
+        
         bufferInitSw.Stop();
 
         // --- Step 1: Calculate Divergence and Initialize ---
@@ -431,10 +571,49 @@ public class FluidSimulator : MonoBehaviour
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
 
-        // Initialize: r = b, p = r (since initial pressure x = 0)
+        // --- Step 1.5: Run Neural Preconditioner (Generate Matrix G) ---
+        if (useNeuralPreconditioner && preconditionerShader != null)
+        {
+            RunNeuralPreconditioner();
+        }
+        else
+        {
+            // Fallback: x0 = 0 if neural preconditioner is unavailable
+            if (pressureBuffer != null)
+            {
+                float[] zeros = new float[numNodes];
+                pressureBuffer.SetData(zeros);
+            }
+        }
+
+        // --- Step 1.6: Calculate Initial Residual (r = b - A * x0) ---
         var initSw = System.Diagnostics.Stopwatch.StartNew();
-        CopyBuffer(divergenceBuffer, residualBuffer);
-        CopyBuffer(divergenceBuffer, pBuffer);
+
+        // Initialize x0 = 0
+        if (pressureBuffer != null)
+        {
+            float[] zeros = new float[numNodes];
+            pressureBuffer.SetData(zeros);
+        }
+
+        // 1. Compute Ap = A * x0 (which is 0, so Ap = 0)
+        // Skip this since x0 = 0, so Ap = 0
+
+        // 2. Compute r = b - Ap = b - 0 = b
+        CopyBuffer(divergenceBuffer, residualBuffer);       // r = b
+
+        // 3. Initialize search direction p = r
+        CopyBuffer(residualBuffer, pBuffer);
+
+        // Debug: print a small section of the initial pressure buffer (neural or zero guess)
+        int pressureSampleCount = Mathf.Min(16, numNodes);
+        if (pressureSampleCount > 0)
+        {
+            float[] pressureSample = new float[pressureSampleCount];
+            pressureBuffer.GetData(pressureSample, 0, 0, pressureSampleCount);
+            string pressureJoined = string.Join(", ", pressureSample.Select(v => v.ToString("E3")));
+            Debug.Log($"[CG Init] Pressure buffer sample (first {pressureSampleCount} values): [{pressureJoined}]");
+        }
 
         float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
         if (r_dot_r < convergenceThreshold) return; // Already converged
@@ -445,11 +624,17 @@ public class FluidSimulator : MonoBehaviour
         float previousResidual = r_dot_r;
         int totalIterations = 0;
 
+        // Reset CG loop timers
+        laplacianSw.Reset();
+        dotProductSw.Reset();
+        updateVectorSw.Reset();
+
         // --- Step 2: Main CG Loop ---
         var cgLoopSw = System.Diagnostics.Stopwatch.StartNew();
         for (int i = 0; i < maxCgIterations; i++)
         {
             // Calculate Ap = A * p
+            laplacianSw.Start();
             cgSolverShader.SetBuffer(applyLaplacianKernel, "nodesBuffer", nodesBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "neighborsBuffer", neighborsBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "pBuffer", pBuffer);
@@ -458,9 +643,12 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetInt("numNodes", numNodes);
             cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
             Dispatch(applyLaplacianKernel, numNodes);
+            laplacianSw.Stop();
 
             // Calculate alpha with safety checks
+            dotProductSw.Start();
             float p_dot_Ap = GpuDotProduct(pBuffer, ApBuffer);
+            dotProductSw.Stop();
             
             
             // Safety check for ill-conditioned matrix
@@ -487,31 +675,56 @@ public class FluidSimulator : MonoBehaviour
             }
 
             // Update pressure: x = x + alpha * p
+            updateVectorSw.Start();
             UpdateVector(pressureBuffer, pBuffer, alpha);
+            updateVectorSw.Stop();
 
             // Update residual: r = r - alpha * Ap
+            updateVectorSw.Start();
             UpdateVector(residualBuffer, ApBuffer, -alpha);
+            updateVectorSw.Stop();
 
-            // Check for convergence
-            float r_dot_r_new = GpuDotProduct(residualBuffer, residualBuffer);
+            // Check for convergence every 10 iterations to avoid CPU stall from GPU readback
+            // Only check on first iteration, last iteration, or every 10th iteration
+            bool shouldCheckConvergence = (i == 0) || (i == maxCgIterations - 1) || (i % 10 == 0);
+            float r_dot_r_new = r_dot_r; // Default to old value if not checking
             
-            // Early stopping for diverging solver
-            if (r_dot_r_new > 10.0f * initialResidual)
+            if (shouldCheckConvergence)
             {
-                totalIterations = i + 1;
-                // Debug.LogError($"CG Solver diverged after {i + 1} iterations. Residual grew to {r_dot_r_new / initialResidual:F1}x initial value.");
-                break;
+                dotProductSw.Start();
+                r_dot_r_new = GpuDotProduct(residualBuffer, residualBuffer);
+                dotProductSw.Stop();
+                
+                // Early stopping for diverging solver
+                if (r_dot_r_new > 10.0f * initialResidual)
+                {
+                    totalIterations = i + 1;
+                    // Debug.LogError($"CG Solver diverged after {i + 1} iterations. Residual grew to {r_dot_r_new / initialResidual:F1}x initial value.");
+                    break;
+                }
+                
+                if (r_dot_r_new < convergenceThreshold) 
+                {
+                    totalIterations = i + 1;
+                    break;
+                }
             }
-            
-            if (r_dot_r_new < convergenceThreshold) 
+            else
             {
-                totalIterations = i + 1;
-                break;
+                // Estimate r_dot_r_new using the recurrence relation (no GPU readback)
+                // From CG theory: r_new = r_old - alpha * Ap
+                // r_dot_r_new = r_new · r_new = (r_old - alpha*Ap) · (r_old - alpha*Ap)
+                //              = r_dot_r - 2*alpha*(r_old·Ap) + alpha^2*(Ap·Ap)
+                // Since r_old = p (in standard CG), and we already computed p·Ap, we can estimate
+                // For simplicity, use a conservative decay estimate based on typical CG convergence
+                r_dot_r_new = r_dot_r * 0.9f; // Conservative estimate (will be corrected on next check)
             }
 
             // Update search direction: p = r + (r_new_dot_r_new / r_dot_r) * p
             float beta = r_dot_r_new / r_dot_r;
+            updateVectorSw.Start();
             UpdateVector(pBuffer, residualBuffer, 1.0f, beta); // Special AXPY: p = r + beta * p
+            updateVectorSw.Stop();
 
             r_dot_r = r_dot_r_new;
             previousResidual = r_dot_r_new;
@@ -519,26 +732,31 @@ public class FluidSimulator : MonoBehaviour
         }
         cgLoopSw.Stop();
         
-        // // Create clean summary report
-        // float finalResidual = r_dot_r;
-        // float totalImprovement = ((initialResidual - finalResidual) / initialResidual) * 100.0f;
-        // float residualRatio = finalResidual / initialResidual;
+        // Update running statistics for average CG iterations
+        cgSolveFrameCount++;
+        cumulativeCgIterations += totalIterations;
+        averageCgIterations = (float)(cumulativeCgIterations / Math.Max(1, cgSolveFrameCount));
         
-        // string summary = $"CG Solver Summary: Iterations {totalIterations}/{maxCgIterations}, Total {((totalImprovement > 0) ? "Convergence" : "Divergence")} {totalImprovement:F2}%, Residual Ratio {residualRatio:E3}x initial\n";
-        // summary += $"• Iterations: {totalIterations}/{maxCgIterations}\n";
-        // summary += $"• Initial residual: {initialResidual:E6}\n";
-        // summary += $"• Final residual: {finalResidual:E6}\n";
-        // summary += $"• Total improvement: {totalImprovement:F2}%\n";
-        // summary += $"• Residual ratio: {residualRatio:E3}x initial\n";
+        // Create clean summary report
+        float finalResidual = r_dot_r;
+        float totalImprovement = ((initialResidual - finalResidual) / initialResidual) * 100.0f;
+        float residualRatio = finalResidual / initialResidual;
         
-        // if (totalImprovement > 0)
-        //     summary += $"• Status: Converged successfully\n";
-        // else if (totalImprovement > -10)
-        //     summary += $"• Status: Converged (slight increase)\n";
-        // else
-        //     summary += $"• Status: Diverged ({Math.Abs(totalImprovement):F1}% increase)\n";
-            
-        // Debug.Log(summary);
+        string summary = $"CG Solver Summary: Iterations {totalIterations}/{maxCgIterations}, Total {((totalImprovement > 0) ? "Convergence" : "Divergence")} {totalImprovement:F2}%, Residual Ratio {residualRatio:E3}x initial\n";
+        summary += $"• Iterations: {totalIterations}/{maxCgIterations}\n";
+        summary += $"• Initial residual: {initialResidual:E6}\n";
+        summary += $"• Final residual: {finalResidual:E6}\n";
+        summary += $"• Total improvement: {totalImprovement:F2}%\n";
+        summary += $"• Residual ratio: {residualRatio:E3}x initial\n";
+        
+        if (totalImprovement > 0)
+            summary += $"• Status: Converged successfully\n";
+        else if (totalImprovement > -10)
+            summary += $"• Status: Converged (slight increase)\n";
+        else
+            summary += $"• Status: Diverged ({Math.Abs(totalImprovement):F1}% increase)\n";
+             
+        Debug.Log(summary);
 
         // Save training data: At this point, pressureBuffer contains the converged result (Target).
         // nodesBuffer and neighborsBuffer contain the Geometry (Input).
@@ -563,14 +781,23 @@ public class FluidSimulator : MonoBehaviour
         
         // Final timing summary
         totalSolveSw.Stop();
-        // Debug.Log($"SolvePressure Timing Summary:\n" +
-        //          $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• CG Loop: {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-        //          $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
+        Debug.Log($"SolvePressure Timing Summary:\n" +
+                 $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Preconditioner:\n" +
+                 $"  - ComputeFeatures: {featSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - ComputeQKV (4x): {qkvSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - ComputeAttention (4x): {attnSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - ComputeFFN (4x): {ffnSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - PredictHead: {headSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• CG Loop ({totalIterations} iterations): {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - ApplyLaplacian: {laplacianSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - DotProduct: {dotProductSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - UpdateVector: {updateVectorSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     private void ApplyPressureGradient()
@@ -610,6 +837,213 @@ public class FluidSimulator : MonoBehaviour
     {
         int threadGroups = Mathf.CeilToInt(count / 512.0f);
         cgSolverShader.Dispatch(kernel, threadGroups, 1, 1);
+    }
+
+    // Timing variables for preconditioner
+    private System.Diagnostics.Stopwatch featSw = new System.Diagnostics.Stopwatch();
+    private System.Diagnostics.Stopwatch qkvSw = new System.Diagnostics.Stopwatch();
+    private System.Diagnostics.Stopwatch attnSw = new System.Diagnostics.Stopwatch();
+    private System.Diagnostics.Stopwatch ffnSw = new System.Diagnostics.Stopwatch();
+    private System.Diagnostics.Stopwatch headSw = new System.Diagnostics.Stopwatch();
+    
+    // Timing variables for CG loop
+    private System.Diagnostics.Stopwatch laplacianSw = new System.Diagnostics.Stopwatch();
+    private System.Diagnostics.Stopwatch dotProductSw = new System.Diagnostics.Stopwatch();
+    private System.Diagnostics.Stopwatch updateVectorSw = new System.Diagnostics.Stopwatch();
+
+    private void RunNeuralPreconditioner()
+    {
+        if (preconditionerShader == null)
+        {
+            return;
+        }
+
+        // --- NEURAL PRECONDITIONER INFERENCE ---
+        int paddedNodes = Mathf.CeilToInt(numNodes / 512.0f) * 512;
+        int groups = paddedNodes / 512;
+
+        // 1. Resize Buffers (grow-only to avoid constant reallocation)
+        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
+        int requiredPaddedSize = Mathf.CeilToInt(requiredSize / 512.0f) * 512;
+        
+        if (matrixGBuffer == null || matrixGBuffer.count < requiredSize)
+        {
+            matrixGBuffer?.Release();
+            matrixGBuffer = new ComputeBuffer(requiredSize, 4 * 25);
+        }
+        if (zBuffer == null || zBuffer.count < requiredSize)
+        {
+            zBuffer?.Release();
+            zBuffer = new ComputeBuffer(requiredSize, 4);
+        }
+        if (tokenBuffer == null || tokenBuffer.count < requiredPaddedSize * 128)
+        {
+            tokenBuffer?.Release();
+            tokenBuffer = new ComputeBuffer(requiredPaddedSize * 128, 4);
+        }
+        if (tokenBufferOut == null || tokenBufferOut.count < requiredPaddedSize * 128)
+        {
+            tokenBufferOut?.Release();
+            tokenBufferOut = new ComputeBuffer(requiredPaddedSize * 128, 4);
+        }
+        if (bufferQ == null || bufferQ.count < requiredPaddedSize * 128)
+        {
+            bufferQ?.Release();
+            bufferQ = new ComputeBuffer(requiredPaddedSize * 128, 4);
+        }
+        if (bufferK == null || bufferK.count < requiredPaddedSize * 128)
+        {
+            bufferK?.Release();
+            bufferK = new ComputeBuffer(requiredPaddedSize * 128, 4);
+        }
+        if (bufferV == null || bufferV.count < requiredPaddedSize * 128)
+        {
+            bufferV?.Release();
+            bufferV = new ComputeBuffer(requiredPaddedSize * 128, 4);
+        }
+        if (bufferAttn == null || bufferAttn.count < requiredPaddedSize * 128)
+        {
+            bufferAttn?.Release();
+            bufferAttn = new ComputeBuffer(requiredPaddedSize * 128, 4);
+        }
+
+        // Reset timers
+        featSw.Reset();
+        qkvSw.Reset();
+        attnSw.Reset();
+        ffnSw.Reset();
+        headSw.Reset();
+
+        // 2. Compute Features
+        featSw.Start();
+        int kFeat = preconditionerShader.FindKernel("ComputeFeatures");
+        preconditionerShader.SetBuffer(kFeat, "nodesBuffer", nodesBuffer);
+        preconditionerShader.SetBuffer(kFeat, "neighborsBuffer", neighborsBuffer);
+        preconditionerShader.SetBuffer(kFeat, "tokenBuffer", tokenBuffer);
+        preconditionerShader.SetInt("numNodes", numNodes);
+        preconditionerShader.SetInt("maxNodes", paddedNodes);
+        
+        // Set Feature/Embed weights
+        if (weightBuffers.ContainsKey("feature_proj.weight"))
+            preconditionerShader.SetBuffer(kFeat, "weightsFeatureProj", weightBuffers["feature_proj.weight"]);
+        if (weightBuffers.ContainsKey("feature_proj.bias"))
+            preconditionerShader.SetBuffer(kFeat, "biasFeatureProj", weightBuffers["feature_proj.bias"]);
+        if (weightBuffers.ContainsKey("layer_embed"))
+            preconditionerShader.SetBuffer(kFeat, "weightsLayerEmbed", weightBuffers["layer_embed"]);
+        if (weightBuffers.ContainsKey("window_pos_embed"))
+            preconditionerShader.SetBuffer(kFeat, "weightsPosEmbed", weightBuffers["window_pos_embed"]);
+        
+        preconditionerShader.Dispatch(kFeat, groups, 1, 1);
+        featSw.Stop();
+
+        // 3. Run Layers Loop
+        int kQKV = preconditionerShader.FindKernel("ComputeQKV");
+        int kAttn = preconditionerShader.FindKernel("ComputeAttention");
+        int kFFN = preconditionerShader.FindKernel("ComputeFFN");
+
+        for (int i = 0; i < 4; i++) // 4 Layers
+        {
+            string p = $"layer_{i}.";
+
+            // Step A: QKV
+            qkvSw.Start();
+            preconditionerShader.SetBuffer(kQKV, "tokenBuffer", tokenBuffer);
+            preconditionerShader.SetBuffer(kQKV, "bufferQ", bufferQ);
+            preconditionerShader.SetBuffer(kQKV, "bufferK", bufferK);
+            preconditionerShader.SetBuffer(kQKV, "bufferV", bufferV);
+            preconditionerShader.SetInt("numNodes", numNodes);
+            preconditionerShader.SetInt("maxNodes", paddedNodes);
+            
+            if (weightBuffers.ContainsKey(p + "norm1_w"))
+                preconditionerShader.SetBuffer(kQKV, "w_norm1", weightBuffers[p + "norm1_w"]);
+            if (weightBuffers.ContainsKey(p + "norm1_b"))
+                preconditionerShader.SetBuffer(kQKV, "b_norm1", weightBuffers[p + "norm1_b"]);
+            if (weightBuffers.ContainsKey(p + "in_proj_w"))
+                preconditionerShader.SetBuffer(kQKV, "w_attn_in", weightBuffers[p + "in_proj_w"]);
+            if (weightBuffers.ContainsKey(p + "in_proj_b"))
+                preconditionerShader.SetBuffer(kQKV, "b_attn_in", weightBuffers[p + "in_proj_b"]);
+            
+            preconditionerShader.Dispatch(kQKV, groups, 1, 1);
+            qkvSw.Stop();
+
+            // Step B: Attention
+            attnSw.Start();
+            preconditionerShader.SetBuffer(kAttn, "bufferQ", bufferQ);
+            preconditionerShader.SetBuffer(kAttn, "bufferK", bufferK);
+            preconditionerShader.SetBuffer(kAttn, "bufferV", bufferV);
+            preconditionerShader.SetBuffer(kAttn, "bufferAttn", bufferAttn);
+            preconditionerShader.SetInt("numNodes", numNodes);
+            preconditionerShader.SetInt("maxNodes", paddedNodes);
+            
+            if (weightBuffers.ContainsKey(p + "out_proj_w"))
+                preconditionerShader.SetBuffer(kAttn, "w_attn_out", weightBuffers[p + "out_proj_w"]);
+            if (weightBuffers.ContainsKey(p + "out_proj_b"))
+                preconditionerShader.SetBuffer(kAttn, "b_attn_out", weightBuffers[p + "out_proj_b"]);
+            
+            preconditionerShader.Dispatch(kAttn, groups, 1, 1);
+            attnSw.Stop();
+
+            // Step C: FFN & Residuals
+            ffnSw.Start();
+            preconditionerShader.SetBuffer(kFFN, "tokenBuffer", tokenBuffer);
+            preconditionerShader.SetBuffer(kFFN, "bufferAttn", bufferAttn);
+            preconditionerShader.SetBuffer(kFFN, "tokenBufferOut", tokenBufferOut);
+            preconditionerShader.SetInt("numNodes", numNodes);
+            preconditionerShader.SetInt("maxNodes", paddedNodes);
+            
+            if (weightBuffers.ContainsKey(p + "norm2_w"))
+                preconditionerShader.SetBuffer(kFFN, "w_norm2", weightBuffers[p + "norm2_w"]);
+            if (weightBuffers.ContainsKey(p + "norm2_b"))
+                preconditionerShader.SetBuffer(kFFN, "b_norm2", weightBuffers[p + "norm2_b"]);
+            if (weightBuffers.ContainsKey(p + "linear1_w"))
+                preconditionerShader.SetBuffer(kFFN, "w_ffn1", weightBuffers[p + "linear1_w"]);
+            if (weightBuffers.ContainsKey(p + "linear1_b"))
+                preconditionerShader.SetBuffer(kFFN, "b_ffn1", weightBuffers[p + "linear1_b"]);
+            if (weightBuffers.ContainsKey(p + "linear2_w"))
+                preconditionerShader.SetBuffer(kFFN, "w_ffn2", weightBuffers[p + "linear2_w"]);
+            if (weightBuffers.ContainsKey(p + "linear2_b"))
+                preconditionerShader.SetBuffer(kFFN, "b_ffn2", weightBuffers[p + "linear2_b"]);
+            
+            preconditionerShader.Dispatch(kFFN, groups, 1, 1);
+            ffnSw.Stop();
+
+            // Swap Buffers for next layer
+            var temp = tokenBuffer;
+            tokenBuffer = tokenBufferOut;
+            tokenBufferOut = temp;
+        }
+
+        // 4. Head
+        headSw.Start();
+        int kHead = preconditionerShader.FindKernel("PredictHead");
+        preconditionerShader.SetBuffer(kHead, "tokenBuffer", tokenBuffer);
+        preconditionerShader.SetBuffer(kHead, "matrixGBuffer", matrixGBuffer);
+        preconditionerShader.SetInt("numNodes", numNodes);
+        preconditionerShader.SetInt("maxNodes", paddedNodes);
+        
+        if (weightBuffers.ContainsKey("norm_out.weight"))
+            preconditionerShader.SetBuffer(kHead, "w_normOut", weightBuffers["norm_out.weight"]);
+        if (weightBuffers.ContainsKey("norm_out.bias"))
+            preconditionerShader.SetBuffer(kHead, "b_normOut", weightBuffers["norm_out.bias"]);
+        if (weightBuffers.ContainsKey("head.weight"))
+            preconditionerShader.SetBuffer(kHead, "w_head", weightBuffers["head.weight"]);
+        if (weightBuffers.ContainsKey("head.bias"))
+            preconditionerShader.SetBuffer(kHead, "b_head", weightBuffers["head.bias"]);
+        
+        preconditionerShader.Dispatch(kHead, groups, 1, 1);
+        headSw.Stop();
+    }
+
+    private void ReleasePreconditionerBuffers()
+    {
+        bufferQ?.Release();
+        bufferK?.Release();
+        bufferV?.Release();
+        bufferAttn?.Release();
+        tokenBuffer?.Release();
+        tokenBufferOut?.Release();
+        matrixGBuffer?.Release();
+        zBuffer?.Release();
     }
 
     // Helper for copying buffer data
@@ -1588,6 +2022,9 @@ public class FluidSimulator : MonoBehaviour
         phiBuffer?.Release();
         phiBuffer_Read?.Release();
         dirtyFlagBuffer?.Release();
+        ReleasePreconditionerBuffers();
+        foreach(var b in weightBuffers.Values) b?.Release();
+        weightBuffers.Clear();
     }
 }
 
