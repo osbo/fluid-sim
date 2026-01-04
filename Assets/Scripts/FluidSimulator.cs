@@ -684,40 +684,23 @@ public class FluidSimulator : MonoBehaviour
             UpdateVector(residualBuffer, ApBuffer, -alpha);
             updateVectorSw.Stop();
 
-            // Check for convergence every 10 iterations to avoid CPU stall from GPU readback
-            // Only check on first iteration, last iteration, or every 10th iteration
-            bool shouldCheckConvergence = (i == 0) || (i == maxCgIterations - 1) || (i % 10 == 0);
-            float r_dot_r_new = r_dot_r; // Default to old value if not checking
+            // Check for convergence
+            dotProductSw.Start();
+            float r_dot_r_new = GpuDotProduct(residualBuffer, residualBuffer);
+            dotProductSw.Stop();
             
-            if (shouldCheckConvergence)
+            // Early stopping for diverging solver
+            if (r_dot_r_new > 10.0f * initialResidual)
             {
-                dotProductSw.Start();
-                r_dot_r_new = GpuDotProduct(residualBuffer, residualBuffer);
-                dotProductSw.Stop();
-                
-                // Early stopping for diverging solver
-                if (r_dot_r_new > 10.0f * initialResidual)
-                {
-                    totalIterations = i + 1;
-                    // Debug.LogError($"CG Solver diverged after {i + 1} iterations. Residual grew to {r_dot_r_new / initialResidual:F1}x initial value.");
-                    break;
-                }
-                
-                if (r_dot_r_new < convergenceThreshold) 
-                {
-                    totalIterations = i + 1;
-                    break;
-                }
+                totalIterations = i + 1;
+                // Debug.LogError($"CG Solver diverged after {i + 1} iterations. Residual grew to {r_dot_r_new / initialResidual:F1}x initial value.");
+                break;
             }
-            else
+            
+            if (r_dot_r_new < convergenceThreshold) 
             {
-                // Estimate r_dot_r_new using the recurrence relation (no GPU readback)
-                // From CG theory: r_new = r_old - alpha * Ap
-                // r_dot_r_new = r_new · r_new = (r_old - alpha*Ap) · (r_old - alpha*Ap)
-                //              = r_dot_r - 2*alpha*(r_old·Ap) + alpha^2*(Ap·Ap)
-                // Since r_old = p (in standard CG), and we already computed p·Ap, we can estimate
-                // For simplicity, use a conservative decay estimate based on typical CG convergence
-                r_dot_r_new = r_dot_r * 0.9f; // Conservative estimate (will be corrected on next check)
+                totalIterations = i + 1;
+                break;
             }
 
             // Update search direction: p = r + (r_new_dot_r_new / r_dot_r) * p
