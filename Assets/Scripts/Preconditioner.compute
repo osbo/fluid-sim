@@ -1,0 +1,307 @@
+#pragma kernel ComputeFeatures
+#pragma kernel ComputeQKV
+#pragma kernel ComputeAttention
+#pragma kernel ComputeFFN
+#pragma kernel PredictHead
+
+// --- STRUCTS & CONSTANTS ---
+struct faceVelocities { float left, right, bottom, top, front, back; };
+struct Node {
+    float3 position; float3 velocity; faceVelocities velocities;
+    float mass; uint layer; uint mortonCode; uint active;
+};
+
+// --- BUFFERS ---
+StructuredBuffer<Node> nodesBuffer;
+StructuredBuffer<uint> neighborsBuffer;
+
+// Weights (Loaded from .bytes)
+StructuredBuffer<float> weightsFeatureProj; // [58 * 128]
+StructuredBuffer<float> biasFeatureProj;    // [128]
+StructuredBuffer<float> weightsLayerEmbed;  // [12 * 128]
+StructuredBuffer<float> weightsPosEmbed;    // [512 * 128]
+
+// Transformer Layer Weights
+StructuredBuffer<float> w_attn_in;  // [128 * 384] (Combined QKV)
+StructuredBuffer<float> b_attn_in;  // [384]
+StructuredBuffer<float> w_attn_out; // [128 * 128]
+StructuredBuffer<float> b_attn_out; // [128]
+StructuredBuffer<float> w_norm1;    // [128]
+StructuredBuffer<float> b_norm1;    // [128]
+StructuredBuffer<float> w_ffn1;     // [128 * 256]
+StructuredBuffer<float> b_ffn1;     // [256]
+StructuredBuffer<float> w_ffn2;     // [256 * 128]
+StructuredBuffer<float> b_ffn2;     // [128]
+StructuredBuffer<float> w_norm2;    // [128]
+StructuredBuffer<float> b_norm2;    // [128]
+
+// Head Weights
+StructuredBuffer<float> w_normOut;
+StructuredBuffer<float> b_normOut;
+StructuredBuffer<float> w_head;     // [128 * 25]
+StructuredBuffer<float> b_head;     // [25]
+
+// Data Buffers
+RWStructuredBuffer<float> tokenBuffer;      // [MaxNodes * 128] (Input/Residual)
+RWStructuredBuffer<float> tokenBufferOut;   // [MaxNodes * 128] (Output of Layer)
+RWStructuredBuffer<float> bufferQ;          // [MaxNodes * 128]
+RWStructuredBuffer<float> bufferK;          // [MaxNodes * 128]
+RWStructuredBuffer<float> bufferV;          // [MaxNodes * 128]
+RWStructuredBuffer<float> bufferAttn;       // [MaxNodes * 128] (Post-Attention)
+RWStructuredBuffer<float> matrixGBuffer;    // [NumNodes * 25] Output
+
+uint numNodes;
+uint maxNodes; // Padded to 512
+
+// --- HELPERS ---
+float GetDx(uint layer) { return pow(2.0, (float)layer); }
+
+// --- KERNEL 1: FEATURES ---
+[numthreads(512, 1, 1)]
+void ComputeFeatures(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= maxNodes) return;
+
+    float feats[58]; // Zero init
+    for(int k=0; k<58; k++) feats[k] = 0.0;
+
+    if (i < numNodes)
+    {
+        Node n = nodesBuffer[i];
+        feats[0] = n.position.x / 1024.0;
+        feats[1] = n.position.y / 1024.0;
+        feats[2] = n.position.z / 1024.0;
+
+        float A_diag = 0.0;
+        float dx = GetDx(n.layer);
+        uint n_base = i * 24;
+        int wall_starts[6] = {0, 4, 8, 12, 16, 20};
+        
+        for (int f = 0; f < 6; f++) {
+            uint w_idx = neighborsBuffer[n_base + wall_starts[f]];
+            if (w_idx == numNodes + 1) feats[3 + f] = 1.0; 
+            
+            for (int s = 0; s < 4; s++) {
+                int local_idx = f * 4 + s;
+                uint n_idx = neighborsBuffer[n_base + local_idx];
+                if (n_idx == numNodes) feats[9 + local_idx] = 1.0; 
+                
+                float weight = 0.0;
+                if (n_idx < numNodes) {
+                    Node nb = nodesBuffer[n_idx];
+                    float dist = max(0.5 * (dx + GetDx(nb.layer)), 1e-6);
+                    float area = (s == 0 && nb.layer >= n.layer) ? (dx*dx) : (dx*dx*0.25);
+                    weight = area / dist;
+                    feats[34 + local_idx] = -weight;
+                } else if (n_idx == numNodes) {
+                    weight = (dx*dx*0.25) / max(0.5 * dx, 1e-6);
+                }
+                A_diag += weight;
+            }
+        }
+        feats[33] = A_diag;
+    }
+
+    uint layer = (i < numNodes) ? nodesBuffer[i].layer : 0;
+    uint win_pos = i % 512;
+    
+    for (int d = 0; d < 128; d++) {
+        float val = biasFeatureProj[d];
+        for (int f = 0; f < 58; f++) val += feats[f] * weightsFeatureProj[f * 128 + d];
+        val += weightsLayerEmbed[layer * 128 + d];
+        val += weightsPosEmbed[win_pos * 128 + d];
+        tokenBuffer[i * 128 + d] = val;
+    }
+}
+
+// --- KERNEL 2: NORM + PROJECT QKV ---
+[numthreads(512, 1, 1)]
+void ComputeQKV(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= maxNodes) return;
+
+    // 1. Read Input & Apply Norm1
+    float x[128];
+    float mean = 0, var = 0;
+    for(int k=0; k<128; k++) { x[k] = tokenBuffer[i*128 + k]; mean += x[k]; }
+    mean /= 128.0;
+    for(int v=0; v<128; v++) var += (x[v]-mean)*(x[v]-mean);
+    float invStd = rsqrt(var/128.0 + 1e-5);
+    
+    float x_norm[128];
+    for(int n=0; n<128; n++) x_norm[n] = (x[n] - mean) * invStd * w_norm1[n] + b_norm1[n];
+
+    // 2. Project to Q, K, V
+    for(int d=0; d<128; d++) {
+        float q = b_attn_in[d];
+        float k_val = b_attn_in[128 + d];
+        float v_val = b_attn_in[256 + d];
+        
+        for(int in_d=0; in_d<128; in_d++) {
+            float val = x_norm[in_d];
+            q += val * w_attn_in[in_d * 384 + d];
+            k_val += val * w_attn_in[in_d * 384 + 128 + d];
+            v_val += val * w_attn_in[in_d * 384 + 256 + d];
+        }
+        
+        bufferQ[i*128 + d] = q;
+        bufferK[i*128 + d] = k_val;
+        bufferV[i*128 + d] = v_val;
+    }
+}
+
+// --- KERNEL 3: WINDOWED ATTENTION (Online Softmax) ---
+[numthreads(512, 1, 1)]
+void ComputeAttention(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= maxNodes) return;
+
+    uint win_start = (i / 512) * 512; // Start index of this window
+    
+    // Read My Q (split into 4 heads of 32 dim)
+    float my_q[128];
+    for(int k=0; k<128; k++) my_q[k] = bufferQ[i*128 + k];
+
+    // Accumulators for Online Softmax (per head)
+    float m[4] = {-1e9, -1e9, -1e9, -1e9}; // max score
+    float d[4] = {0, 0, 0, 0};             // denominator
+    float res[128];                        // numerator (weighted sum)
+    for(int z=0; z<128; z++) res[z] = 0;
+
+    float scale = rsqrt(32.0); // 1 / sqrt(head_dim)
+
+    // Loop over all 512 nodes in this window
+    for(uint j=0; j<512; j++)
+    {
+        uint target_idx = win_start + j;
+        
+        // Load K and V for target node
+        // (Coalesced reads are decent here since threads read sequential addresses)
+        float target_k[128];
+        float target_v[128];
+        for(int x=0; x<128; x++) {
+            target_k[x] = bufferK[target_idx*128 + x];
+            target_v[x] = bufferV[target_idx*128 + x];
+        }
+
+        // Compute Score per head
+        for(int h=0; h<4; h++)
+        {
+            float score = 0;
+            int offset = h * 32;
+            for(int dim=0; dim<32; dim++) {
+                score += my_q[offset + dim] * target_k[offset + dim];
+            }
+            score *= scale;
+
+            // Online Softmax Update
+            float m_prev = m[h];
+            float m_new = max(m_prev, score);
+            
+            float e_score = exp(score - m_new);
+            float e_prev = exp(m_prev - m_new);
+            
+            d[h] = d[h] * e_prev + e_score;
+            
+            for(int d_v=0; d_v<32; d_v++) {
+                res[offset + d_v] = res[offset + d_v] * e_prev + target_v[offset + d_v] * e_score;
+            }
+            m[h] = m_new;
+        }
+    }
+
+    // Final Normalize & Project Out
+    float attn_out[128];
+    for(int h=0; h<4; h++) {
+        int offset = h * 32;
+        float inv_d = 1.0 / (d[h] + 1e-6);
+        for(int d_v=0; d_v<32; d_v++) {
+            attn_out[offset + d_v] = res[offset + d_v] * inv_d;
+        }
+    }
+
+    // Output Projection
+    for(int d=0; d<128; d++) {
+        float val = b_attn_out[d];
+        for(int in_d=0; in_d<128; in_d++) val += attn_out[in_d] * w_attn_out[in_d * 128 + d];
+        bufferAttn[i*128 + d] = val;
+    }
+}
+
+// --- KERNEL 4: FFN & RESIDUALS ---
+[numthreads(512, 1, 1)]
+void ComputeFFN(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= maxNodes) return;
+
+    // 1. Residual 1 (Input + Attn) & Norm2
+    float x[128];
+    float x_skip[128];
+    
+    // Load original input for residual
+    for(int k=0; k<128; k++) x_skip[k] = tokenBuffer[i*128 + k];
+    
+    float mean = 0, var = 0;
+    for(int k=0; k<128; k++) { 
+        x[k] = x_skip[k] + bufferAttn[i*128 + k]; // Add Residual
+        x_skip[k] = x[k]; // Save for next residual
+        mean += x[k]; 
+    }
+    
+    mean /= 128.0;
+    for(int v=0; v<128; v++) var += (x[v]-mean)*(x[v]-mean);
+    float invStd = rsqrt(var/128.0 + 1e-5);
+    
+    float x_norm[128];
+    for(int n=0; n<128; n++) x_norm[n] = (x[n] - mean) * invStd * w_norm2[n] + b_norm2[n];
+
+    // 2. FFN (128 -> 256 -> 128)
+    // Layer 1 (Expand + GELU)
+    float hidden[256];
+    for(int h=0; h<256; h++) {
+        float val = b_ffn1[h];
+        for(int in_d=0; in_d<128; in_d++) val += x_norm[in_d] * w_ffn1[in_d * 256 + h];
+        // GELU Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        // Simple ReLU or GELU:
+        hidden[h] = val * 0.5 * (1.0 + tanh(0.79788 * (val + 0.044715 * val * val * val)));
+    }
+
+    // Layer 2 (Contract) + Final Residual
+    for(int out_d=0; out_d<128; out_d++) {
+        float val = b_ffn2[out_d];
+        for(int h=0; h<256; h++) val += hidden[h] * w_ffn2[h * 128 + out_d];
+        tokenBufferOut[i*128 + out_d] = x_skip[out_d] + val; // Add 2nd Residual
+    }
+}
+
+// --- KERNEL 5: HEAD ---
+[numthreads(512, 1, 1)]
+void PredictHead(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+    
+    float x[128];
+    // Read from tokenBufferOut (result of last layer) OR tokenBuffer (if swapped)
+    // NOTE: C# must ensure the final result is in 'tokenBuffer' bound here
+    for(int k=0; k<128; k++) x[k] = tokenBuffer[i*128 + k];
+    
+    // Norm Out
+    float mean = 0, var = 0;
+    for(int m=0; m<128; m++) mean += x[m]; mean /= 128.0;
+    for(int v=0; v<128; v++) var += (x[v]-mean)*(x[v]-mean);
+    float invStd = rsqrt(var/128.0 + 1e-5);
+    for(int n=0; n<128; n++) x[n] = (x[n] - mean) * invStd * w_normOut[n] + b_normOut[n];
+    
+    // Linear 128 -> 25
+    for(int out_d=0; out_d<25; out_d++)
+    {
+        float val = b_head[out_d];
+        for(int in_d=0; in_d<128; in_d++) val += x[in_d] * w_head[in_d * 25 + out_d];
+        matrixGBuffer[i*25 + out_d] = val;
+    }
+}
