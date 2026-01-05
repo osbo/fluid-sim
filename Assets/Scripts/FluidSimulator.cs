@@ -89,7 +89,8 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer tokenBuffer; // For neural preconditioner token assembly
     private ComputeBuffer tokenBufferOut; // Output buffer for transformer layers
     private ComputeBuffer matrixGBuffer; // Output buffer for preconditioner matrix G
-    private ComputeBuffer zBuffer; // Intermediate buffer for PCG preconditioner application
+    private ComputeBuffer zBuffer; // Intermediate buffer for PCG preconditioner application (used as 'u' in shader)
+    private ComputeBuffer zVectorBuffer; // Preconditioned residual vector 'z' for PCG
     private ComputeBuffer bufferQ; // Q buffer for attention
     private ComputeBuffer bufferK; // K buffer for attention
     private ComputeBuffer bufferV; // V buffer for attention
@@ -516,12 +517,16 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // Find kernel indices
+        // --- Kernel Lookups ---
         var kernelFindSw = System.Diagnostics.Stopwatch.StartNew();
         int calculateDivergenceKernel = cgSolverShader.FindKernel("CalculateDivergence");
         int applyLaplacianKernel = cgSolverShader.FindKernel("ApplyLaplacian");
         int axpyKernel = cgSolverShader.FindKernel("Axpy");
         int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
+        // Preconditioner Kernels from CGSolver.compute
+        int applySparseGTKernel = cgSolverShader.FindKernel("ApplySparseGT"); 
+        int applySparseGKernel = cgSolverShader.FindKernel("ApplySparseG");
+        int clearBufferFloatKernel = cgSolverShader.FindKernel("ClearBufferFloat");
         kernelFindSw.Stop();
         
         if (calculateDivergenceKernel < 0 || applyLaplacianKernel < 0 || axpyKernel < 0 || dotProductKernel < 0)
@@ -530,39 +535,43 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // Initialize buffers - only resize if we need MORE space (grow-only)
+        // --- Buffer Init (Grow-only) ---
         var bufferInitSw = System.Diagnostics.Stopwatch.StartNew();
-        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512)); // Power of 2, minimum 512
+        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
         
         if (divergenceBuffer == null || divergenceBuffer.count < requiredSize)
         {
-            divergenceBuffer?.Release();
+            divergenceBuffer?.Release(); 
             divergenceBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
         if (residualBuffer == null || residualBuffer.count < requiredSize)
         {
-            residualBuffer?.Release();
+            residualBuffer?.Release(); 
             residualBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
         if (pBuffer == null || pBuffer.count < requiredSize)
         {
-            pBuffer?.Release();
+            pBuffer?.Release(); 
             pBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
         if (ApBuffer == null || ApBuffer.count < requiredSize)
         {
-            ApBuffer?.Release();
+            ApBuffer?.Release(); 
             ApBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
         if (pressureBuffer == null || pressureBuffer.count < requiredSize)
         {
-            pressureBuffer?.Release();
+            pressureBuffer?.Release(); 
             pressureBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
-        
+        if (zVectorBuffer == null || zVectorBuffer.count < requiredSize)
+        {
+            zVectorBuffer?.Release(); 
+            zVectorBuffer = new ComputeBuffer(requiredSize, sizeof(float));
+        }
         bufferInitSw.Stop();
 
-        // --- Step 1: Calculate Divergence and Initialize ---
+        // --- Step 1: Init (r = b) ---
         var divergenceSw = System.Diagnostics.Stopwatch.StartNew();
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
@@ -571,182 +580,164 @@ public class FluidSimulator : MonoBehaviour
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
 
-        // --- Step 1.5: Run Neural Preconditioner (Generate Matrix G) ---
+        // Generate Matrix G (Neural Inference)
         if (useNeuralPreconditioner && preconditionerShader != null)
         {
-            RunNeuralPreconditioner();
-        }
-        else
-        {
-            // Fallback: x0 = 0 if neural preconditioner is unavailable
-            if (pressureBuffer != null)
-            {
-                float[] zeros = new float[numNodes];
-                pressureBuffer.SetData(zeros);
-            }
+            RunNeuralPreconditioner(); // Fills matrixGBuffer
         }
 
-        // --- Step 1.6: Calculate Initial Residual (r = b - A * x0) ---
+        // Init Pressure x=0
         var initSw = System.Diagnostics.Stopwatch.StartNew();
+        float[] zeros = new float[numNodes];
+        pressureBuffer.SetData(zeros);
 
-        // Initialize x0 = 0
-        if (pressureBuffer != null)
+        // r = b
+        CopyBuffer(divergenceBuffer, residualBuffer);
+
+        // --- Step 2: Preconditioned Initialization ---
+        // z = M^-1 * r
+        ApplyPreconditioner(residualBuffer, zVectorBuffer, applySparseGTKernel, applySparseGKernel, clearBufferFloatKernel);
+
+        // p = z
+        CopyBuffer(zVectorBuffer, pBuffer);
+
+        // rho = r . z (PCG uses r.z instead of r.r)
+        float rho = GpuDotProduct(residualBuffer, zVectorBuffer);
+
+        float initialResidual = GpuDotProduct(residualBuffer, residualBuffer); // For convergence check only
+        if (initialResidual < convergenceThreshold)
         {
-            float[] zeros = new float[numNodes];
-            pressureBuffer.SetData(zeros);
+            initSw.Stop();
+            totalSolveSw.Stop();
+            return;
         }
-
-        // 1. Compute Ap = A * x0 (which is 0, so Ap = 0)
-        // Skip this since x0 = 0, so Ap = 0
-
-        // 2. Compute r = b - Ap = b - 0 = b
-        CopyBuffer(divergenceBuffer, residualBuffer);       // r = b
-
-        // 3. Initialize search direction p = r
-        CopyBuffer(residualBuffer, pBuffer);
-
-        // Debug: print a small section of the initial pressure buffer (neural or zero guess)
-        int pressureSampleCount = Mathf.Min(16, numNodes);
-        if (pressureSampleCount > 0)
-        {
-            float[] pressureSample = new float[pressureSampleCount];
-            pressureBuffer.GetData(pressureSample, 0, 0, pressureSampleCount);
-            string pressureJoined = string.Join(", ", pressureSample.Select(v => v.ToString("E3")));
-            Debug.Log($"[CG Init] Pressure buffer sample (first {pressureSampleCount} values): [{pressureJoined}]");
-        }
-
-        float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
-        if (r_dot_r < convergenceThreshold) return; // Already converged
         initSw.Stop();
-
-        // Initialize residual tracking
-        float initialResidual = r_dot_r;
-        float previousResidual = r_dot_r;
-        int totalIterations = 0;
 
         // Reset CG loop timers
         laplacianSw.Reset();
         dotProductSw.Reset();
         updateVectorSw.Reset();
 
-        // --- Step 2: Main CG Loop ---
+        // --- Step 3: PCG Loop ---
         var cgLoopSw = System.Diagnostics.Stopwatch.StartNew();
-        for (int i = 0; i < maxCgIterations; i++)
+        int totalIterations = 0;
+        
+        for (int k = 0; k < maxCgIterations; k++)
         {
-            // Calculate Ap = A * p
+            // 1. Ap = A * p
             laplacianSw.Start();
             cgSolverShader.SetBuffer(applyLaplacianKernel, "nodesBuffer", nodesBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "neighborsBuffer", neighborsBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "pBuffer", pBuffer);
             cgSolverShader.SetBuffer(applyLaplacianKernel, "ApBuffer", ApBuffer);
-            cgSolverShader.SetBuffer(applyLaplacianKernel, "neighborsBuffer", neighborsBuffer);
-            cgSolverShader.SetInt("numNodes", numNodes);
             cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
+            cgSolverShader.SetInt("numNodes", numNodes);
             Dispatch(applyLaplacianKernel, numNodes);
+            // Force GPU sync for accurate timing (debugging only - remove in production)
+            UnityEngine.Rendering.AsyncGPUReadback.Request(ApBuffer, (r) => { }).WaitForCompletion();
             laplacianSw.Stop();
 
-            // Calculate alpha with safety checks
+            // 2. alpha = rho / (p . Ap)
             dotProductSw.Start();
             float p_dot_Ap = GpuDotProduct(pBuffer, ApBuffer);
             dotProductSw.Stop();
             
-            
-            // Safety check for ill-conditioned matrix
-            if (Math.Abs(p_dot_Ap) < 1e-12f)
+            if (Mathf.Abs(p_dot_Ap) < 1e-12f)
             {
-                Debug.LogError($"CG Solver: Matrix is singular or ill-conditioned! p_dot_Ap = {p_dot_Ap:E6}");
+                Debug.LogError($"PCG Solver: Matrix is singular or ill-conditioned! p_dot_Ap = {p_dot_Ap:E6}");
                 break;
             }
             
             if (p_dot_Ap <= 0.0f)
             {
-                Debug.LogError($"CG Solver: Matrix is not positive definite! p_dot_Ap = {p_dot_Ap:E6}");
+                Debug.LogError($"PCG Solver: Matrix is not positive definite! p_dot_Ap = {p_dot_Ap:E6}");
                 break;
             }
             
-            float alpha = r_dot_r / p_dot_Ap;
+            float alpha = rho / p_dot_Ap;
             
-            // Safety check for alpha with more reasonable bounds
-            if (Math.Abs(alpha) > 1e10f)
+            if (Mathf.Abs(alpha) > 1e10f)
             {
-                Debug.LogError($"CG Solver: Alpha is too large! alpha = {alpha:E6}, r_dot_r = {r_dot_r:E6}, p_dot_Ap = {p_dot_Ap:E6}");
-                Debug.LogError($"This suggests the matrix is still ill-conditioned. Consider preconditioning or different discretization.");
+                Debug.LogError($"PCG Solver: Alpha is too large! alpha = {alpha:E6}, rho = {rho:E6}, p_dot_Ap = {p_dot_Ap:E6}");
                 break;
             }
 
-            // Update pressure: x = x + alpha * p
+            // 3. x = x + alpha * p
             updateVectorSw.Start();
             UpdateVector(pressureBuffer, pBuffer, alpha);
+            // Force GPU sync for accurate timing (debugging only - remove in production)
+            UnityEngine.Rendering.AsyncGPUReadback.Request(pressureBuffer, (r) => { }).WaitForCompletion();
             updateVectorSw.Stop();
 
-            // Update residual: r = r - alpha * Ap
+            // 4. r = r - alpha * Ap
             updateVectorSw.Start();
             UpdateVector(residualBuffer, ApBuffer, -alpha);
+            // Force GPU sync for accurate timing (debugging only - remove in production)
+            UnityEngine.Rendering.AsyncGPUReadback.Request(residualBuffer, (r) => { }).WaitForCompletion();
             updateVectorSw.Stop();
 
-            // Check for convergence
+            // Check Convergence (using true residual r.r)
             dotProductSw.Start();
-            float r_dot_r_new = GpuDotProduct(residualBuffer, residualBuffer);
+            float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
             dotProductSw.Stop();
             
-            // Early stopping for diverging solver
-            if (r_dot_r_new > 10.0f * initialResidual)
+            if (r_dot_r > 10.0f * initialResidual)
             {
-                totalIterations = i + 1;
-                // Debug.LogError($"CG Solver diverged after {i + 1} iterations. Residual grew to {r_dot_r_new / initialResidual:F1}x initial value.");
+                totalIterations = k + 1;
                 break;
             }
             
-            if (r_dot_r_new < convergenceThreshold) 
+            if (r_dot_r < convergenceThreshold)
             {
-                totalIterations = i + 1;
+                totalIterations = k + 1;
                 break;
             }
 
-            // Update search direction: p = r + (r_new_dot_r_new / r_dot_r) * p
-            float beta = r_dot_r_new / r_dot_r;
+            // --- PRECONDITIONER STEP ---
+            // 5. z_new = M^-1 * r_new
+            ApplyPreconditioner(residualBuffer, zVectorBuffer, applySparseGTKernel, applySparseGKernel, clearBufferFloatKernel);
+
+            // 6. rho_new = r_new . z_new
+            dotProductSw.Start();
+            float rho_new = GpuDotProduct(residualBuffer, zVectorBuffer);
+            dotProductSw.Stop();
+
+            // 7. beta = rho_new / rho
+            float beta = rho_new / rho;
+
+            // 8. p = z_new + beta * p
             updateVectorSw.Start();
-            UpdateVector(pBuffer, residualBuffer, 1.0f, beta); // Special AXPY: p = r + beta * p
+            UpdateVector(pBuffer, zVectorBuffer, 1.0f, beta);
+            // Force GPU sync for accurate timing (debugging only - remove in production)
+            UnityEngine.Rendering.AsyncGPUReadback.Request(pBuffer, (r) => { }).WaitForCompletion();
             updateVectorSw.Stop();
 
-            r_dot_r = r_dot_r_new;
-            previousResidual = r_dot_r_new;
-            totalIterations = i + 1;
+            rho = rho_new;
+            totalIterations = k + 1;
         }
         cgLoopSw.Stop();
         
-        // Update running statistics for average CG iterations
+        // Update running statistics
         cgSolveFrameCount++;
         cumulativeCgIterations += totalIterations;
         averageCgIterations = (float)(cumulativeCgIterations / Math.Max(1, cgSolveFrameCount));
         
-        // Create clean summary report
-        float finalResidual = r_dot_r;
+        // Summary report
+        float finalResidual = GpuDotProduct(residualBuffer, residualBuffer);
         float totalImprovement = ((initialResidual - finalResidual) / initialResidual) * 100.0f;
         float residualRatio = finalResidual / initialResidual;
         
-        string summary = $"CG Solver Summary: Iterations {totalIterations}/{maxCgIterations}, Total {((totalImprovement > 0) ? "Convergence" : "Divergence")} {totalImprovement:F2}%, Residual Ratio {residualRatio:E3}x initial\n";
+        string summary = $"PCG Solver Summary: Iterations {totalIterations}/{maxCgIterations}, Residual {initialResidual:E6} -> {finalResidual:E6}\n";
         summary += $"• Iterations: {totalIterations}/{maxCgIterations}\n";
         summary += $"• Initial residual: {initialResidual:E6}\n";
         summary += $"• Final residual: {finalResidual:E6}\n";
         summary += $"• Total improvement: {totalImprovement:F2}%\n";
         summary += $"• Residual ratio: {residualRatio:E3}x initial\n";
-        
-        if (totalImprovement > 0)
-            summary += $"• Status: Converged successfully\n";
-        else if (totalImprovement > -10)
-            summary += $"• Status: Converged (slight increase)\n";
-        else
-            summary += $"• Status: Diverged ({Math.Abs(totalImprovement):F1}% increase)\n";
-             
         Debug.Log(summary);
 
-        // Save training data: At this point, pressureBuffer contains the converged result (Target).
-        // nodesBuffer and neighborsBuffer contain the Geometry (Input).
-        // divergenceBuffer contains the RHS (Input).
+        // Save training data
         if (recorder != null && recorder.isRecording)
         {
-            // Get actual world-space bounds (not normalized)
             Vector3 simBoundsMin = simulationBounds != null ? simulationBounds.bounds.min : Vector3.zero;
             Vector3 simBoundsMax = simulationBounds != null ? simulationBounds.bounds.max : Vector3.zero;
             Vector3 fluidBoundsMin = fluidInitialBounds != null ? fluidInitialBounds.bounds.min : Vector3.zero;
@@ -757,7 +748,7 @@ public class FluidSimulator : MonoBehaviour
                 simBoundsMin, simBoundsMax, fluidBoundsMin, fluidBoundsMax);
         }
 
-        // --- Step 3: Apply pressure to velocities ---
+        // --- Step 4: Apply pressure to velocities ---
         var pressureGradientSw = System.Diagnostics.Stopwatch.StartNew();
         ApplyPressureGradient();
         pressureGradientSw.Stop();
@@ -776,11 +767,60 @@ public class FluidSimulator : MonoBehaviour
                  $"  - ComputeAttention (4x): {attnSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - ComputeFFN (4x): {ffnSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - PredictHead: {headSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• CG Loop ({totalIterations} iterations): {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• PCG Loop ({totalIterations} iterations): {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - ApplyLaplacian: {laplacianSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - DotProduct: {dotProductSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - UpdateVector: {updateVectorSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
+    }
+
+    // --- Helper to Run the Preconditioner Pipeline ---
+    private void ApplyPreconditioner(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kClear)
+    {
+        if (!useNeuralPreconditioner || matrixGBuffer == null)
+        {
+            // Identity fallback: z = r
+            CopyBuffer(r, z_out);
+            return;
+        }
+
+        // Ensure zBuffer is allocated (used as intermediate 'u' in shader)
+        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
+        if (zBuffer == null || zBuffer.count < requiredSize)
+        {
+            zBuffer?.Release();
+            zBuffer = new ComputeBuffer(requiredSize, 4);
+        }
+
+        // 1. Clear Intermediate 'zBuffer' (used as 'u' in Shader)
+        cgSolverShader.SetBuffer(kClear, "zBuffer", zBuffer); 
+        cgSolverShader.SetInt("numNodes", numNodes);
+        Dispatch(kClear, numNodes);
+        // Force GPU sync for accurate timing (debugging only - remove in production)
+        UnityEngine.Rendering.AsyncGPUReadback.Request(zBuffer, (r) => { }).WaitForCompletion();
+
+        // 2. u = G^T * r  (Scatter)
+        // CGSolver.compute: ApplySparseGT reads 'xBuffer' (r), writes 'zBuffer' (u)
+        cgSolverShader.SetBuffer(kGT, "xBuffer", r);
+        cgSolverShader.SetBuffer(kGT, "zBuffer", zBuffer); // Intermediate
+        cgSolverShader.SetBuffer(kGT, "matrixGBuffer", matrixGBuffer);
+        cgSolverShader.SetBuffer(kGT, "neighborsBuffer", neighborsBuffer);
+        cgSolverShader.SetInt("numNodes", numNodes);
+        Dispatch(kGT, numNodes);
+        // Force GPU sync for accurate timing (debugging only - remove in production)
+        UnityEngine.Rendering.AsyncGPUReadback.Request(zBuffer, (r) => { }).WaitForCompletion();
+
+        // 3. z = G * u + eps * r (Gather)
+        // CGSolver.compute: ApplySparseG reads 'zBuffer'(u), 'xBuffer'(r), writes 'yBuffer'(z_out)
+        cgSolverShader.SetBuffer(kG, "zBuffer", zBuffer); // Intermediate input
+        cgSolverShader.SetBuffer(kG, "xBuffer", r);       // For epsilon skip connection
+        cgSolverShader.SetBuffer(kG, "yBuffer", z_out);   // Final Output
+        cgSolverShader.SetBuffer(kG, "matrixGBuffer", matrixGBuffer);
+        cgSolverShader.SetBuffer(kG, "neighborsBuffer", neighborsBuffer);
+        cgSolverShader.SetInt("numNodes", numNodes);
+        Dispatch(kG, numNodes);
+        // Force GPU sync for accurate timing (debugging only - remove in production)
+        UnityEngine.Rendering.AsyncGPUReadback.Request(z_out, (r) => { }).WaitForCompletion();
     }
 
     private void ApplyPressureGradient()
@@ -917,6 +957,8 @@ public class FluidSimulator : MonoBehaviour
             preconditionerShader.SetBuffer(kFeat, "weightsPosEmbed", weightBuffers["window_pos_embed"]);
         
         preconditionerShader.Dispatch(kFeat, groups, 1, 1);
+        // Force GPU sync for accurate timing (debugging only - remove in production)
+        UnityEngine.Rendering.AsyncGPUReadback.Request(tokenBuffer, (r) => { }).WaitForCompletion();
         featSw.Stop();
 
         // 3. Run Layers Loop
@@ -947,6 +989,8 @@ public class FluidSimulator : MonoBehaviour
                 preconditionerShader.SetBuffer(kQKV, "b_attn_in", weightBuffers[p + "in_proj_b"]);
             
             preconditionerShader.Dispatch(kQKV, groups, 1, 1);
+            // Force GPU sync for accurate timing (debugging only - remove in production)
+            UnityEngine.Rendering.AsyncGPUReadback.Request(bufferQ, (r) => { }).WaitForCompletion();
             qkvSw.Stop();
 
             // Step B: Attention
@@ -964,6 +1008,8 @@ public class FluidSimulator : MonoBehaviour
                 preconditionerShader.SetBuffer(kAttn, "b_attn_out", weightBuffers[p + "out_proj_b"]);
             
             preconditionerShader.Dispatch(kAttn, groups, 1, 1);
+            // Force GPU sync for accurate timing (debugging only - remove in production)
+            UnityEngine.Rendering.AsyncGPUReadback.Request(bufferAttn, (r) => { }).WaitForCompletion();
             attnSw.Stop();
 
             // Step C: FFN & Residuals
@@ -988,6 +1034,8 @@ public class FluidSimulator : MonoBehaviour
                 preconditionerShader.SetBuffer(kFFN, "b_ffn2", weightBuffers[p + "linear2_b"]);
             
             preconditionerShader.Dispatch(kFFN, groups, 1, 1);
+            // Force GPU sync for accurate timing (debugging only - remove in production)
+            UnityEngine.Rendering.AsyncGPUReadback.Request(tokenBufferOut, (r) => { }).WaitForCompletion();
             ffnSw.Stop();
 
             // Swap Buffers for next layer
@@ -1014,6 +1062,8 @@ public class FluidSimulator : MonoBehaviour
             preconditionerShader.SetBuffer(kHead, "b_head", weightBuffers["head.bias"]);
         
         preconditionerShader.Dispatch(kHead, groups, 1, 1);
+        // Force GPU sync for accurate timing (debugging only - remove in production)
+        UnityEngine.Rendering.AsyncGPUReadback.Request(matrixGBuffer, (r) => { }).WaitForCompletion();
         headSw.Stop();
     }
 
@@ -1027,6 +1077,7 @@ public class FluidSimulator : MonoBehaviour
         tokenBufferOut?.Release();
         matrixGBuffer?.Release();
         zBuffer?.Release();
+        zVectorBuffer?.Release();
     }
 
     // Helper for copying buffer data
