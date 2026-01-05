@@ -633,8 +633,6 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
             cgSolverShader.SetInt("numNodes", numNodes);
             Dispatch(applyLaplacianKernel, numNodes);
-            // Force GPU sync for accurate timing (debugging only - remove in production)
-            UnityEngine.Rendering.AsyncGPUReadback.Request(ApBuffer, (r) => { }).WaitForCompletion();
             laplacianSw.Stop();
 
             // 2. alpha = rho / (p . Ap)
@@ -665,15 +663,11 @@ public class FluidSimulator : MonoBehaviour
             // 3. x = x + alpha * p
             updateVectorSw.Start();
             UpdateVector(pressureBuffer, pBuffer, alpha);
-            // Force GPU sync for accurate timing (debugging only - remove in production)
-            UnityEngine.Rendering.AsyncGPUReadback.Request(pressureBuffer, (r) => { }).WaitForCompletion();
             updateVectorSw.Stop();
 
             // 4. r = r - alpha * Ap
             updateVectorSw.Start();
             UpdateVector(residualBuffer, ApBuffer, -alpha);
-            // Force GPU sync for accurate timing (debugging only - remove in production)
-            UnityEngine.Rendering.AsyncGPUReadback.Request(residualBuffer, (r) => { }).WaitForCompletion();
             updateVectorSw.Stop();
 
             // Check Convergence (using true residual r.r)
@@ -708,8 +702,6 @@ public class FluidSimulator : MonoBehaviour
             // 8. p = z_new + beta * p
             updateVectorSw.Start();
             UpdateVector(pBuffer, zVectorBuffer, 1.0f, beta);
-            // Force GPU sync for accurate timing (debugging only - remove in production)
-            UnityEngine.Rendering.AsyncGPUReadback.Request(pBuffer, (r) => { }).WaitForCompletion();
             updateVectorSw.Stop();
 
             rho = rho_new;
@@ -796,8 +788,6 @@ public class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(kClear, "zBuffer", zBuffer); 
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(kClear, numNodes);
-        // Force GPU sync for accurate timing (debugging only - remove in production)
-        UnityEngine.Rendering.AsyncGPUReadback.Request(zBuffer, (r) => { }).WaitForCompletion();
 
         // 2. u = G^T * r  (Scatter)
         // CGSolver.compute: ApplySparseGT reads 'xBuffer' (r), writes 'zBuffer' (u)
@@ -807,8 +797,6 @@ public class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(kGT, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(kGT, numNodes);
-        // Force GPU sync for accurate timing (debugging only - remove in production)
-        UnityEngine.Rendering.AsyncGPUReadback.Request(zBuffer, (r) => { }).WaitForCompletion();
 
         // 3. z = G * u + eps * r (Gather)
         // CGSolver.compute: ApplySparseG reads 'zBuffer'(u), 'xBuffer'(r), writes 'yBuffer'(z_out)
@@ -819,8 +807,6 @@ public class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(kG, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(kG, numNodes);
-        // Force GPU sync for accurate timing (debugging only - remove in production)
-        UnityEngine.Rendering.AsyncGPUReadback.Request(z_out, (r) => { }).WaitForCompletion();
     }
 
     private void ApplyPressureGradient()
@@ -957,8 +943,6 @@ public class FluidSimulator : MonoBehaviour
             preconditionerShader.SetBuffer(kFeat, "weightsPosEmbed", weightBuffers["window_pos_embed"]);
         
         preconditionerShader.Dispatch(kFeat, groups, 1, 1);
-        // Force GPU sync for accurate timing (debugging only - remove in production)
-        UnityEngine.Rendering.AsyncGPUReadback.Request(tokenBuffer, (r) => { }).WaitForCompletion();
         featSw.Stop();
 
         // 3. Run Layers Loop
@@ -989,8 +973,6 @@ public class FluidSimulator : MonoBehaviour
                 preconditionerShader.SetBuffer(kQKV, "b_attn_in", weightBuffers[p + "in_proj_b"]);
             
             preconditionerShader.Dispatch(kQKV, groups, 1, 1);
-            // Force GPU sync for accurate timing (debugging only - remove in production)
-            UnityEngine.Rendering.AsyncGPUReadback.Request(bufferQ, (r) => { }).WaitForCompletion();
             qkvSw.Stop();
 
             // Step B: Attention
@@ -1008,8 +990,6 @@ public class FluidSimulator : MonoBehaviour
                 preconditionerShader.SetBuffer(kAttn, "b_attn_out", weightBuffers[p + "out_proj_b"]);
             
             preconditionerShader.Dispatch(kAttn, groups, 1, 1);
-            // Force GPU sync for accurate timing (debugging only - remove in production)
-            UnityEngine.Rendering.AsyncGPUReadback.Request(bufferAttn, (r) => { }).WaitForCompletion();
             attnSw.Stop();
 
             // Step C: FFN & Residuals
@@ -1034,8 +1014,6 @@ public class FluidSimulator : MonoBehaviour
                 preconditionerShader.SetBuffer(kFFN, "b_ffn2", weightBuffers[p + "linear2_b"]);
             
             preconditionerShader.Dispatch(kFFN, groups, 1, 1);
-            // Force GPU sync for accurate timing (debugging only - remove in production)
-            UnityEngine.Rendering.AsyncGPUReadback.Request(tokenBufferOut, (r) => { }).WaitForCompletion();
             ffnSw.Stop();
 
             // Swap Buffers for next layer
@@ -1062,8 +1040,6 @@ public class FluidSimulator : MonoBehaviour
             preconditionerShader.SetBuffer(kHead, "b_head", weightBuffers["head.bias"]);
         
         preconditionerShader.Dispatch(kHead, groups, 1, 1);
-        // Force GPU sync for accurate timing (debugging only - remove in production)
-        UnityEngine.Rendering.AsyncGPUReadback.Request(matrixGBuffer, (r) => { }).WaitForCompletion();
         headSw.Stop();
     }
 
