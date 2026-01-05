@@ -100,11 +100,6 @@ public class FluidSimulator : MonoBehaviour
     private float p_mean;
     private float p_std;
     private int d_model, num_heads, num_layers, input_dim;
-
-    private int computeQKVKernel = -1;
-    private int computeAttentionKernel = -1;
-    private int computeFFNKernel = -1;
-    private int computeHeadKernel = -1;
     
     // add previous active node count, but that can be a cpu variable 
     
@@ -868,8 +863,9 @@ public class FluidSimulator : MonoBehaviour
         }
 
         // --- NEURAL PRECONDITIONER INFERENCE ---
+        // Align to window size for attention
         int paddedNodes = Mathf.CeilToInt(numNodes / 512.0f) * 512;
-        int groups = paddedNodes / 512;
+        int windowGroups = paddedNodes / 512;
 
         // 1. Resize Buffers (grow-only to avoid constant reallocation)
         int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
@@ -923,7 +919,7 @@ public class FluidSimulator : MonoBehaviour
         ffnSw.Reset();
         headSw.Reset();
 
-        // 2. Compute Features
+        // 1. Compute Features (Keep existing dispatch: 512 threads per window)
         featSw.Start();
         int kFeat = preconditionerShader.FindKernel("ComputeFeatures");
         preconditionerShader.SetBuffer(kFeat, "nodesBuffer", nodesBuffer);
@@ -942,19 +938,21 @@ public class FluidSimulator : MonoBehaviour
         if (weightBuffers.ContainsKey("window_pos_embed"))
             preconditionerShader.SetBuffer(kFeat, "weightsPosEmbed", weightBuffers["window_pos_embed"]);
         
-        preconditionerShader.Dispatch(kFeat, groups, 1, 1);
+        // Dispatch features using Window Groups (512 threads)
+        preconditionerShader.Dispatch(kFeat, windowGroups, 1, 1);
         featSw.Stop();
 
-        // 3. Run Layers Loop
+        // Loop Layers
         int kQKV = preconditionerShader.FindKernel("ComputeQKV");
         int kAttn = preconditionerShader.FindKernel("ComputeAttention");
         int kFFN = preconditionerShader.FindKernel("ComputeFFN");
 
-        for (int i = 0; i < 4; i++) // 4 Layers
+        for (int i = 0; i < 4; i++)
         {
             string p = $"layer_{i}.";
 
             // Step A: QKV
+            // CHANGED: Node Parallel Dispatch
             qkvSw.Start();
             preconditionerShader.SetBuffer(kQKV, "tokenBuffer", tokenBuffer);
             preconditionerShader.SetBuffer(kQKV, "bufferQ", bufferQ);
@@ -972,34 +970,37 @@ public class FluidSimulator : MonoBehaviour
             if (weightBuffers.ContainsKey(p + "in_proj_b"))
                 preconditionerShader.SetBuffer(kQKV, "b_attn_in", weightBuffers[p + "in_proj_b"]);
             
-            preconditionerShader.Dispatch(kQKV, groups, 1, 1);
+            // Dispatch QKV: 1 Group per Node (128 threads)
+            preconditionerShader.Dispatch(kQKV, paddedNodes, 1, 1);
             qkvSw.Stop();
 
             // Step B: Attention
+            // CHANGED: Head Parallel Dispatch (4 heads on Y axis)
             attnSw.Start();
             preconditionerShader.SetBuffer(kAttn, "bufferQ", bufferQ);
             preconditionerShader.SetBuffer(kAttn, "bufferK", bufferK);
             preconditionerShader.SetBuffer(kAttn, "bufferV", bufferV);
-            preconditionerShader.SetBuffer(kAttn, "bufferAttn", bufferAttn);
+            preconditionerShader.SetBuffer(kAttn, "bufferAttn", bufferAttn); // Intermediate write
+            preconditionerShader.SetInt("numNodes", numNodes);
+            preconditionerShader.SetInt("maxNodes", paddedNodes);
+            
+            // Dispatch Attention: Window Groups X, 4 Heads Y
+            preconditionerShader.Dispatch(kAttn, windowGroups, 4, 1);
+            attnSw.Stop();
+
+            // Step C: FFN (Includes Attn Projection, Norm2, FFN, Residual)
+            // CHANGED: Node Parallel Dispatch
+            ffnSw.Start();
+            preconditionerShader.SetBuffer(kFFN, "tokenBuffer", tokenBuffer); // Input (for residual)
+            preconditionerShader.SetBuffer(kFFN, "bufferAttn", bufferAttn);   // Attn Head Output
+            preconditionerShader.SetBuffer(kFFN, "tokenBufferOut", tokenBufferOut); // Result
             preconditionerShader.SetInt("numNodes", numNodes);
             preconditionerShader.SetInt("maxNodes", paddedNodes);
             
             if (weightBuffers.ContainsKey(p + "out_proj_w"))
-                preconditionerShader.SetBuffer(kAttn, "w_attn_out", weightBuffers[p + "out_proj_w"]);
+                preconditionerShader.SetBuffer(kFFN, "w_attn_out", weightBuffers[p + "out_proj_w"]);
             if (weightBuffers.ContainsKey(p + "out_proj_b"))
-                preconditionerShader.SetBuffer(kAttn, "b_attn_out", weightBuffers[p + "out_proj_b"]);
-            
-            preconditionerShader.Dispatch(kAttn, groups, 1, 1);
-            attnSw.Stop();
-
-            // Step C: FFN & Residuals
-            ffnSw.Start();
-            preconditionerShader.SetBuffer(kFFN, "tokenBuffer", tokenBuffer);
-            preconditionerShader.SetBuffer(kFFN, "bufferAttn", bufferAttn);
-            preconditionerShader.SetBuffer(kFFN, "tokenBufferOut", tokenBufferOut);
-            preconditionerShader.SetInt("numNodes", numNodes);
-            preconditionerShader.SetInt("maxNodes", paddedNodes);
-            
+                preconditionerShader.SetBuffer(kFFN, "b_attn_out", weightBuffers[p + "out_proj_b"]);
             if (weightBuffers.ContainsKey(p + "norm2_w"))
                 preconditionerShader.SetBuffer(kFFN, "w_norm2", weightBuffers[p + "norm2_w"]);
             if (weightBuffers.ContainsKey(p + "norm2_b"))
@@ -1013,10 +1014,11 @@ public class FluidSimulator : MonoBehaviour
             if (weightBuffers.ContainsKey(p + "linear2_b"))
                 preconditionerShader.SetBuffer(kFFN, "b_ffn2", weightBuffers[p + "linear2_b"]);
             
-            preconditionerShader.Dispatch(kFFN, groups, 1, 1);
+            // Dispatch FFN: 1 Group per Node
+            preconditionerShader.Dispatch(kFFN, paddedNodes, 1, 1);
             ffnSw.Stop();
 
-            // Swap Buffers for next layer
+            // Swap Buffers
             var temp = tokenBuffer;
             tokenBuffer = tokenBufferOut;
             tokenBufferOut = temp;
@@ -1025,10 +1027,9 @@ public class FluidSimulator : MonoBehaviour
         // 4. Head
         headSw.Start();
         int kHead = preconditionerShader.FindKernel("PredictHead");
-        preconditionerShader.SetBuffer(kHead, "tokenBuffer", tokenBuffer);
+        preconditionerShader.SetBuffer(kHead, "tokenBufferOut", tokenBuffer); // Note: swapped buffer is now input
         preconditionerShader.SetBuffer(kHead, "matrixGBuffer", matrixGBuffer);
         preconditionerShader.SetInt("numNodes", numNodes);
-        preconditionerShader.SetInt("maxNodes", paddedNodes);
         
         if (weightBuffers.ContainsKey("norm_out.weight"))
             preconditionerShader.SetBuffer(kHead, "w_normOut", weightBuffers["norm_out.weight"]);
@@ -1039,7 +1040,8 @@ public class FluidSimulator : MonoBehaviour
         if (weightBuffers.ContainsKey("head.bias"))
             preconditionerShader.SetBuffer(kHead, "b_head", weightBuffers["head.bias"]);
         
-        preconditionerShader.Dispatch(kHead, groups, 1, 1);
+        // Dispatch Head: 1 Group per Node
+        preconditionerShader.Dispatch(kHead, paddedNodes, 1, 1);
         headSw.Stop();
     }
 

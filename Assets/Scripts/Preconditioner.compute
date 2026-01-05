@@ -15,14 +15,14 @@ struct Node {
 StructuredBuffer<Node> nodesBuffer;
 StructuredBuffer<uint> neighborsBuffer;
 
-// Weights (Loaded from .bytes)
-StructuredBuffer<float> weightsFeatureProj; // [58 * 128]
-StructuredBuffer<float> biasFeatureProj;    // [128]
-StructuredBuffer<float> weightsLayerEmbed;  // [12 * 128]
-StructuredBuffer<float> weightsPosEmbed;    // [512 * 128]
+// Weights
+StructuredBuffer<float> weightsFeatureProj;
+StructuredBuffer<float> biasFeatureProj;
+StructuredBuffer<float> weightsLayerEmbed;
+StructuredBuffer<float> weightsPosEmbed;
 
 // Transformer Layer Weights
-StructuredBuffer<float> w_attn_in;  // [128 * 384] (Combined QKV)
+StructuredBuffer<float> w_attn_in;  // [128 * 384]
 StructuredBuffer<float> b_attn_in;  // [384]
 StructuredBuffer<float> w_attn_out; // [128 * 128]
 StructuredBuffer<float> b_attn_out; // [128]
@@ -42,38 +42,52 @@ StructuredBuffer<float> w_head;     // [128 * 25]
 StructuredBuffer<float> b_head;     // [25]
 
 // Data Buffers
-RWStructuredBuffer<float> tokenBuffer;      // [MaxNodes * 128] (Input/Residual)
-RWStructuredBuffer<float> tokenBufferOut;   // [MaxNodes * 128] (Output of Layer)
+RWStructuredBuffer<float> tokenBuffer;      // [MaxNodes * 128]
+RWStructuredBuffer<float> tokenBufferOut;   // [MaxNodes * 128]
 RWStructuredBuffer<float> bufferQ;          // [MaxNodes * 128]
 RWStructuredBuffer<float> bufferK;          // [MaxNodes * 128]
 RWStructuredBuffer<float> bufferV;          // [MaxNodes * 128]
-RWStructuredBuffer<float> bufferAttn;       // [MaxNodes * 128] (Post-Attention)
-RWStructuredBuffer<float> matrixGBuffer;    // [NumNodes * 25] Output
+RWStructuredBuffer<float> bufferAttn;       // [MaxNodes * 128]
+RWStructuredBuffer<float> matrixGBuffer;    // [NumNodes * 25]
 
 uint numNodes;
-uint maxNodes; // Padded to 512
-
-// --- SHARED MEMORY DECLARATIONS (MUST BE GLOBAL) ---
-// We process the window in tiles of 16 tokens to fit in LDS (16KB)
-// 16 tokens * 128 floats = 2048 floats per buffer
-groupshared float lds_K[2048];
-groupshared float lds_V[2048];
+uint maxNodes;
 
 // --- HELPERS ---
 float GetDx(uint layer) { return pow(2.0, (float)layer); }
 
+float Gelu(float x) {
+    return x * 0.5 * (1.0 + tanh(0.79788 * (x + 0.044715 * x * x * x)));
+}
+
+// --- MACRO FOR REDUCTION ---
+// Replaces the helper function to avoid passing shared memory arrays
+#define REDUCE_SUM_128(tid, val, s_mem) \
+    s_mem[tid] = val; \
+    GroupMemoryBarrierWithGroupSync(); \
+    if (tid < 64) s_mem[tid] += s_mem[tid + 64]; GroupMemoryBarrierWithGroupSync(); \
+    if (tid < 32) s_mem[tid] += s_mem[tid + 32]; GroupMemoryBarrierWithGroupSync(); \
+    if (tid < 16) s_mem[tid] += s_mem[tid + 16]; GroupMemoryBarrierWithGroupSync(); \
+    if (tid < 8)  s_mem[tid] += s_mem[tid + 8];  GroupMemoryBarrierWithGroupSync(); \
+    if (tid < 4)  s_mem[tid] += s_mem[tid + 4];  GroupMemoryBarrierWithGroupSync(); \
+    if (tid < 2)  s_mem[tid] += s_mem[tid + 2];  GroupMemoryBarrierWithGroupSync(); \
+    if (tid < 1)  s_mem[tid] += s_mem[tid + 1];  GroupMemoryBarrierWithGroupSync(); \
+    val = s_mem[0]; \
+    GroupMemoryBarrierWithGroupSync();
+
 // --- KERNEL 1: FEATURES ---
-[numthreads(512, 1, 1)]
+// FIXED: Changed to 512 to match C# windowGroups dispatch (N/512 groups * 512 threads = N)
+[numthreads(512, 1, 1)] 
 void ComputeFeatures(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i >= maxNodes) return;
 
-    float feats[58]; // Zero init
+    // 1. Feature Extraction (You correctly pasted this!)
+    float feats[58]; 
     for(int k=0; k<58; k++) feats[k] = 0.0;
-
-    if (i < numNodes)
-    {
+    
+    if (i < numNodes) {
         Node n = nodesBuffer[i];
         feats[0] = n.position.x / 1024.0;
         feats[1] = n.position.y / 1024.0;
@@ -84,13 +98,10 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
         uint n_base = i * 24;
         int wall_starts[6] = {0, 4, 8, 12, 16, 20};
 
-        // --- NEW LOGIC START ---
         for (int f = 0; f < 6; f++) {
-            // Check Wall Flag (First slot only, as per Python)
             uint w_idx = neighborsBuffer[n_base + wall_starts[f]];
-            if (w_idx == numNodes + 1) feats[3 + f] = 1.0;
-
-            // Check if this face is handled by a single Coarse/Same neighbor (Slot 0)
+            if (w_idx == numNodes + 1) feats[3 + f] = 1.0; // Wall flag
+            
             bool isCoarseOrSame = false;
             uint slot0_idx = neighborsBuffer[n_base + f * 4];
             if (slot0_idx < numNodes) {
@@ -100,12 +111,7 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
 
             for (int s = 0; s < 4; s++) {
                 int local_idx = f * 4 + s;
-                
-                // CRITICAL FIX: If this face is Coarse/Same, ONLY Slot 0 is valid.
-                // Slots 1, 2, 3 must be skipped (weight = 0) to match Python training.
-                if (isCoarseOrSame && s > 0) {
-                    continue; 
-                }
+                if (isCoarseOrSame && s > 0) continue;
 
                 uint n_idx = neighborsBuffer[n_base + local_idx];
                 if (n_idx == numNodes) feats[9 + local_idx] = 1.0; // Air flag
@@ -114,32 +120,22 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
                 if (n_idx < numNodes) {
                     Node nb = nodesBuffer[n_idx];
                     float dist = max(0.5 * (dx + GetDx(nb.layer)), 1e-6);
-                    
-                    // Python Logic:
-                    // If Coarse/Same (s==0 checked above): area = dx*dx
-                    // If Fine (not coarse): area = dx*dx*0.25
                     float area = (isCoarseOrSame) ? (dx*dx) : (dx*dx*0.25);
-                    
                     weight = area / dist;
-                    feats[34 + local_idx] = -weight;
-                } else if (n_idx == numNodes) { // Dirichlet (Air)
-                    // Python Logic: weight_s = (dx^2 / 4.0) / dist_s
-                    // Note: Python computes this for all slots unless blocked by Coarse
+                    feats[34 + local_idx] = -weight; // A_off
+                } else if (n_idx == numNodes) { 
                     weight = (dx*dx*0.25) / max(0.5 * dx, 1e-6);
                 }
-                
-                // Only accumulate diagonal if we calculated a valid weight
                 A_diag += weight;
             }
         }
-        // --- NEW LOGIC END ---
-        
         feats[33] = A_diag;
     }
 
     uint layer = (i < numNodes) ? nodesBuffer[i].layer : 0;
     uint win_pos = i % 512;
     
+    // 2. Linear Projection
     for (int d = 0; d < 128; d++) {
         float val = biasFeatureProj[d];
         for (int f = 0; f < 58; f++) val += feats[f] * weightsFeatureProj[f * 128 + d];
@@ -149,232 +145,243 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
     }
 }
 
-// --- KERNEL 2: NORM + PROJECT QKV ---
-[numthreads(512, 1, 1)]
-void ComputeQKV(uint3 id : SV_DispatchThreadID)
+// --- KERNEL 2: QKV (Node Parallel) ---
+groupshared float sm_x[128]; // Used for broadcast
+groupshared float s_reduce[128]; // Used for reduction
+
+[numthreads(128, 1, 1)]
+void ComputeQKV(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
-    uint i = id.x;
-    if (i >= maxNodes) return;
+    uint nodeIdx = groupID.x;
+    uint dim = groupIndex; // 0..127
+    if (nodeIdx >= maxNodes) return;
 
-    // 1. Read Input & Apply Norm1
-    float x[128];
-    float mean = 0, var = 0;
-    for(int k=0; k<128; k++) { x[k] = tokenBuffer[i*128 + k]; mean += x[k]; }
-    mean /= 128.0;
-    for(int v=0; v<128; v++) var += (x[v]-mean)*(x[v]-mean);
-    float invStd = rsqrt(var/128.0 + 1e-5);
+    // 1. Load & Norm
+    float val = tokenBuffer[nodeIdx * 128 + dim];
     
-    float x_norm[128];
-    for(int n=0; n<128; n++) x_norm[n] = (x[n] - mean) * invStd * w_norm1[n] + b_norm1[n];
+    // Mean Reduction
+    float sum = val;
+    REDUCE_SUM_128(dim, sum, s_reduce);
+    float mean = sum / 128.0;
+    
+    // Var Reduction
+    float diff = val - mean;
+    float sqDiff = diff * diff;
+    REDUCE_SUM_128(dim, sqDiff, s_reduce); // Reuses s_reduce safely
+    
+    float invStd = rsqrt(sqDiff / 128.0 + 1e-5);
+    float normVal = diff * invStd * w_norm1[dim] + b_norm1[dim];
+    
+    // Store for broadcast
+    sm_x[dim] = normVal;
+    GroupMemoryBarrierWithGroupSync();
 
-    // 2. Project to Q, K, V
-    for(int d=0; d<128; d++) {
-        float q = b_attn_in[d];
-        float k_val = b_attn_in[128 + d];
-        float v_val = b_attn_in[256 + d];
-        
-        for(int in_d=0; in_d<128; in_d++) {
-            float val = x_norm[in_d];
-            q += val * w_attn_in[in_d * 384 + d];
-            k_val += val * w_attn_in[in_d * 384 + 128 + d];
-            v_val += val * w_attn_in[in_d * 384 + 256 + d];
-        }
-        
-        bufferQ[i*128 + d] = q;
-        bufferK[i*128 + d] = k_val;
-        bufferV[i*128 + d] = v_val;
+    // 2. Compute Q, K, V
+    float q = b_attn_in[dim];
+    float k_val = b_attn_in[128 + dim];
+    float v_val = b_attn_in[256 + dim];
+
+    for (int k = 0; k < 128; k++) {
+        float x_k = sm_x[k]; 
+        q     += x_k * w_attn_in[k * 384 + dim];
+        k_val += x_k * w_attn_in[k * 384 + 128 + dim];
+        v_val += x_k * w_attn_in[k * 384 + 256 + dim];
     }
+
+    bufferQ[nodeIdx * 128 + dim] = q;
+    bufferK[nodeIdx * 128 + dim] = k_val;
+    bufferV[nodeIdx * 128 + dim] = v_val;
 }
 
-// --- KERNEL 3: OPTIMIZED TILED ATTENTION ---
+// --- KERNEL 3: ATTENTION (Window + Head Parallel) ---
+// Note: No WaveActiveSum needed here, strictly shared memory tiling.
+groupshared float lds_K[512]; // 16 tokens * 32 dims
+groupshared float lds_V[512]; 
+
 [numthreads(512, 1, 1)]
-void ComputeAttention(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
+void ComputeAttention(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
 {
-    uint i = id.x;
-    uint local_id = Gtid.x;       // 0..511
-    uint win_start = Gid.x * 512; // Start of this window in global buffer
+    uint windowIdx = groupID.x;
+    uint headIdx = groupID.y; // 0..3
+    uint localId = groupThreadID.x; // 0..511 (Token inside window)
+    
+    uint globalTokenIdx = windowIdx * 512 + localId;
+    
+    uint headOffset = headIdx * 32; 
+    
+    // Load Q locally (registers)
+    float q_local[32];
+    bool valid = globalTokenIdx < maxNodes;
+    
+    if (valid) {
+        for(int d=0; d<32; d++) {
+            q_local[d] = bufferQ[globalTokenIdx * 128 + headOffset + d];
+        }
+    } else {
+        for(int d=0; d<32; d++) q_local[d] = 0;
+    }
 
-    // Accumulators for Online Softmax
-    float m[4] = {-1e9, -1e9, -1e9, -1e9}; // max score
-    float d[4] = {0, 0, 0, 0};             // denominator
-    float res[128];                        // result
-    for(int z=0; z<128; z++) res[z] = 0;
-
-    float scale = rsqrt(32.0); // 1 / sqrt(head_dim)
-
-    // 3. Tiled Loop
-    // The window size is 512. We process 16 tokens per tile.
-    // 512 / 16 = 32 tiles total.
+    float m = -1e9;
+    float d = 0;
+    float res[32]; 
+    for(int z=0; z<32; z++) res[z] = 0;
+    
+    float scale = 0.17677; // 1/sqrt(32)
+    uint windowStart = windowIdx * 512;
+    
+    // Tiled Processing: 32 tiles * 16 tokens = 512 total
     for(int tile = 0; tile < 32; tile++)
     {
-        // --- A. Cooperative Load into LDS ---
-        // We need to load 2048 floats for K and 2048 for V.
-        // We have 512 threads. Each thread loads 4 floats for K and 4 for V.
-        int tile_base_token = win_start + tile * 16;
-        int vec_start = local_id * 4; // This thread's starting offset in the LDS array
-
-        for(int x=0; x<4; x++) 
-        {
-            int lds_idx = vec_start + x;
+        uint tileStartToken = tile * 16; 
+        
+        // Cooperative Load K/V
+        uint loadIdx = localId; 
+        if (loadIdx < 512) {
+            uint t_token = loadIdx / 32; 
+            uint t_dim = loadIdx % 32;   
+            uint g_node = windowStart + tileStartToken + t_token;
             
-            // Map flat LDS index back to (token, dim) to find Global Address
-            // lds_idx ranges 0..2047. 
-            // row (token inside tile) = lds_idx / 128
-            // col (dimension)         = lds_idx % 128
-            int t_node = lds_idx / 128; 
-            int t_dim  = lds_idx % 128;
-            
-            int global_node = tile_base_token + t_node;
-            int global_addr = global_node * 128 + t_dim;
-
-            if (global_node < maxNodes) {
-                lds_K[lds_idx] = bufferK[global_addr];
-                lds_V[lds_idx] = bufferV[global_addr];
+            if (g_node < maxNodes) {
+                lds_K[loadIdx] = bufferK[g_node * 128 + headOffset + t_dim];
+                lds_V[loadIdx] = bufferV[g_node * 128 + headOffset + t_dim];
             } else {
-                lds_K[lds_idx] = 0.0;
-                lds_V[lds_idx] = 0.0;
+                lds_K[loadIdx] = 0;
+                lds_V[loadIdx] = 0;
             }
         }
-
-        // Wait for all threads to finish loading this tile
         GroupMemoryBarrierWithGroupSync();
 
-        // --- B. Compute Attention for this Tile ---
-        // Iterate over the 16 tokens currently in Shared Memory
-        for(int j=0; j<16; j++)
-        {
-            // Base offset for token 'j' in LDS
-            int lds_offset = j * 128;
-
-            // Compute Scores for 4 Heads
-            float scores[4] = {0, 0, 0, 0};
+        // Compute Attention for this tile
+        for(int j=0; j<16; j++) {
+            float score = 0;
+            uint k_base = j * 32;
+            for(int dim=0; dim<32; dim++) {
+                score += q_local[dim] * lds_K[k_base + dim];
+            }
+            score *= scale;
             
-            for (int h=0; h<4; h++) {
-                int head_offset = h * 32;
-                float s = 0;
-                // Dot product Q[h] . K_tile[j][h]
-                // Read Q directly from global memory (L1/L2 cache is fast enough, prevents register spilling)
-                for (int dim=0; dim<32; dim++) {
-                    float q_val = (i < maxNodes) ? bufferQ[i * 128 + head_offset + dim] : 0.0;
-                    s += q_val * lds_K[lds_offset + head_offset + dim];
-                }
-                scores[h] = s * scale;
-            }
-
-            // Update Softmax Statistics (Online Softmax)
-            for (int h=0; h<4; h++) {
-                float m_prev = m[h];
-                float m_new = max(m_prev, scores[h]);
-                float e_score = exp(scores[h] - m_new);
-                float e_prev = exp(m_prev - m_new);
-                
-                d[h] = d[h] * e_prev + e_score;
-                m[h] = m_new;
-
-                // Update weighted sum
-                int head_offset = h * 32;
-                for(int dim=0; dim<32; dim++) {
-                    float v_val = lds_V[lds_offset + head_offset + dim];
-                    res[head_offset + dim] = res[head_offset + dim] * e_prev + v_val * e_score;
-                }
+            float m_prev = m;
+            m = max(m_prev, score);
+            float e_score = exp(score - m);
+            float e_prev = exp(m_prev - m);
+            
+            d = d * e_prev + e_score;
+            
+            for(int d_v=0; d_v<32; d_v++) {
+                res[d_v] = res[d_v] * e_prev + lds_V[k_base + d_v] * e_score;
             }
         }
-
-        // Wait before overwriting LDS in the next tile iteration
         GroupMemoryBarrierWithGroupSync();
     }
+    
+    if (!valid) return;
 
-    // 4. Final Normalize & Output
-    if (i >= maxNodes) return;
-
-    float attn_out[128];
-    for(int h=0; h<4; h++) {
-        int offset = h * 32;
-        float inv_d = 1.0 / (d[h] + 1e-6);
-        for(int d_v=0; d_v<32; d_v++) {
-            attn_out[offset + d_v] = res[offset + d_v] * inv_d;
-        }
-    }
-
-    // Output Projection (Linear)
-    for(int d=0; d<128; d++) {
-        float val = b_attn_out[d];
-        for(int in_d=0; in_d<128; in_d++) val += attn_out[in_d] * w_attn_out[in_d * 128 + d];
-        bufferAttn[i*128 + d] = val;
+    float inv_d = 1.0 / (d + 1e-6);
+    for(int d_i=0; d_i<32; d_i++) {
+        bufferAttn[globalTokenIdx * 128 + headOffset + d_i] = res[d_i] * inv_d;
     }
 }
 
-// --- KERNEL 4: FFN & RESIDUALS ---
-[numthreads(512, 1, 1)]
-void ComputeFFN(uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    if (i >= maxNodes) return;
+// --- KERNEL 4: FFN (Node Parallel) ---
+groupshared float sm_input[128];
+groupshared float sm_hidden[256];
+groupshared float s_reduce_ffn[128]; // Dedicated reduction buffer
 
-    // 1. Residual 1 (Input + Attn) & Norm2
-    float x[128];
-    float x_skip[128];
+[numthreads(128, 1, 1)]
+void ComputeFFN(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+    uint nodeIdx = groupID.x;
+    uint dim = groupIndex; // 0..127
+    if (nodeIdx >= maxNodes) return;
+
+    // --- STEP A: Linear Projection (Attn Out) ---
+    // Cooperative load Attn Output
+    sm_input[dim] = bufferAttn[nodeIdx * 128 + dim];
+    GroupMemoryBarrierWithGroupSync();
     
-    // Load original input for residual
-    for(int k=0; k<128; k++) x_skip[k] = tokenBuffer[i*128 + k];
-    
-    float mean = 0, var = 0;
-    for(int k=0; k<128; k++) { 
-        x[k] = x_skip[k] + bufferAttn[i*128 + k]; // Add Residual
-        x_skip[k] = x[k]; // Save for next residual
-        mean += x[k]; 
+    // Apply W_attn_out
+    float proj_val = b_attn_out[dim];
+    for(int k=0; k<128; k++) {
+        proj_val += sm_input[k] * w_attn_out[k * 128 + dim];
     }
     
-    mean /= 128.0;
-    for(int v=0; v<128; v++) var += (x[v]-mean)*(x[v]-mean);
-    float invStd = rsqrt(var/128.0 + 1e-5);
+    // Residual 1
+    float x_in = tokenBuffer[nodeIdx * 128 + dim];
+    float x_res1 = x_in + proj_val;
     
-    float x_norm[128];
-    for(int n=0; n<128; n++) x_norm[n] = (x[n] - mean) * invStd * w_norm2[n] + b_norm2[n];
-
-    // 2. FFN (128 -> 256 -> 128)
-    // Layer 1 (Expand + GELU)
-    float hidden[256];
+    // --- Norm 2 ---
+    float sum = x_res1;
+    REDUCE_SUM_128(dim, sum, s_reduce_ffn);
+    float mean = sum / 128.0;
+    
+    float diff = x_res1 - mean;
+    float sqDiff = diff * diff;
+    REDUCE_SUM_128(dim, sqDiff, s_reduce_ffn);
+    float invStd = rsqrt(sqDiff / 128.0 + 1e-5);
+    
+    float x_norm = diff * invStd * w_norm2[dim] + b_norm2[dim];
+    
+    // Store Normalized Input
+    sm_input[dim] = x_norm;
+    GroupMemoryBarrierWithGroupSync();
+    
+    // --- STEP B: FFN Layer 1 (128 -> 256) ---
+    // Thread computes 2 values
+    float h1 = b_ffn1[dim];
+    for(int i=0; i<128; i++) h1 += sm_input[i] * w_ffn1[i * 256 + dim];
+    sm_hidden[dim] = Gelu(h1);
+    
+    float h2 = b_ffn1[dim + 128];
+    for(int j=0; j<128; j++) h2 += sm_input[j] * w_ffn1[j * 256 + (dim + 128)];
+    sm_hidden[dim + 128] = Gelu(h2);
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // --- STEP C: FFN Layer 2 (256 -> 128) + Residual ---
+    float ffn_out = b_ffn2[dim];
     for(int h=0; h<256; h++) {
-        float val = b_ffn1[h];
-        for(int in_d=0; in_d<128; in_d++) val += x_norm[in_d] * w_ffn1[in_d * 256 + h];
-        // GELU Approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        // Simple ReLU or GELU:
-        hidden[h] = val * 0.5 * (1.0 + tanh(0.79788 * (val + 0.044715 * val * val * val)));
+        ffn_out += sm_hidden[h] * w_ffn2[h * 128 + dim];
     }
-
-    // Layer 2 (Contract) + Final Residual
-    for(int out_d=0; out_d<128; out_d++) {
-        float val = b_ffn2[out_d];
-        for(int h=0; h<256; h++) val += hidden[h] * w_ffn2[h * 128 + out_d];
-        tokenBufferOut[i*128 + out_d] = x_skip[out_d] + val; // Add 2nd Residual
-    }
+    
+    float final_val = x_res1 + ffn_out;
+    tokenBufferOut[nodeIdx * 128 + dim] = final_val;
 }
 
-// --- KERNEL 5: HEAD ---
-[numthreads(512, 1, 1)]
-void PredictHead(uint3 id : SV_DispatchThreadID)
+// --- KERNEL 5: PREDICT HEAD ---
+groupshared float s_reduce_head[128];
+
+[numthreads(128, 1, 1)]
+void PredictHead(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
-    uint i = id.x;
-    if (i >= numNodes) return;
+    uint nodeIdx = groupID.x;
+    uint dim = groupIndex;
+    if (nodeIdx >= numNodes) return;
     
-    float x[128];
-    // Read from tokenBufferOut (result of last layer) OR tokenBuffer (if swapped)
-    // NOTE: C# must ensure the final result is in 'tokenBuffer' bound here
-    for(int k=0; k<128; k++) x[k] = tokenBuffer[i*128 + k];
+    float val = tokenBufferOut[nodeIdx * 128 + dim];
     
     // Norm Out
-    float mean = 0, var = 0;
-    for(int m=0; m<128; m++) mean += x[m]; mean /= 128.0;
-    for(int v=0; v<128; v++) var += (x[v]-mean)*(x[v]-mean);
-    float invStd = rsqrt(var/128.0 + 1e-5);
-    for(int n=0; n<128; n++) x[n] = (x[n] - mean) * invStd * w_normOut[n] + b_normOut[n];
+    float sum = val;
+    REDUCE_SUM_128(dim, sum, s_reduce_head);
+    float mean = sum / 128.0;
+    
+    float diff = val - mean;
+    float sqDiff = diff * diff;
+    REDUCE_SUM_128(dim, sqDiff, s_reduce_head);
+    float invStd = rsqrt(sqDiff / 128.0 + 1e-5);
+    
+    float x_norm = diff * invStd * w_normOut[dim] + b_normOut[dim];
+    
+    // Store for projection
+    // We reuse s_reduce_head to broadcast the normalized vector
+    s_reduce_head[dim] = x_norm;
+    GroupMemoryBarrierWithGroupSync();
     
     // Linear 128 -> 25
-    for(int out_d=0; out_d<25; out_d++)
-    {
-        float val = b_head[out_d];
-        for(int in_d=0; in_d<128; in_d++) val += x[in_d] * w_head[in_d * 25 + out_d];
-        matrixGBuffer[i*25 + out_d] = val;
+    if (dim < 25) {
+        float outVal = b_head[dim];
+        for(int k=0; k<128; k++) {
+            outVal += s_reduce_head[k] * w_head[k * 25 + dim];
+        }
+        matrixGBuffer[nodeIdx * 25 + dim] = outVal;
     }
 }
