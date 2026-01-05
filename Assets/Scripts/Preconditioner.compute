@@ -53,6 +53,12 @@ RWStructuredBuffer<float> matrixGBuffer;    // [NumNodes * 25] Output
 uint numNodes;
 uint maxNodes; // Padded to 512
 
+// --- SHARED MEMORY DECLARATIONS (MUST BE GLOBAL) ---
+// We process the window in tiles of 16 tokens to fit in LDS (16KB)
+// 16 tokens * 128 floats = 2048 floats per buffer
+groupshared float lds_K[2048];
+groupshared float lds_V[2048];
+
 // --- HELPERS ---
 float GetDx(uint layer) { return pow(2.0, (float)layer); }
 
@@ -180,69 +186,107 @@ void ComputeQKV(uint3 id : SV_DispatchThreadID)
     }
 }
 
-// --- KERNEL 3: WINDOWED ATTENTION (Online Softmax) ---
+// --- KERNEL 3: OPTIMIZED TILED ATTENTION ---
 [numthreads(512, 1, 1)]
-void ComputeAttention(uint3 id : SV_DispatchThreadID)
+void ComputeAttention(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= maxNodes) return;
+    uint local_id = Gtid.x;       // 0..511
+    uint win_start = Gid.x * 512; // Start of this window in global buffer
 
-    uint win_start = (i / 512) * 512;
-    
-    // 1. Load My Query (We still need this cached)
-    float my_q[128];
-    for(int k=0; k<128; k++) my_q[k] = bufferQ[i*128 + k];
-
-    // Accumulators
+    // Accumulators for Online Softmax
     float m[4] = {-1e9, -1e9, -1e9, -1e9}; // max score
     float d[4] = {0, 0, 0, 0};             // denominator
-    float res[128];                        // numerator
+    float res[128];                        // result
     for(int z=0; z<128; z++) res[z] = 0;
 
-    float scale = rsqrt(32.0);
+    float scale = rsqrt(32.0); // 1 / sqrt(head_dim)
 
-    // Loop over window
-    for(uint j=0; j<512; j++)
+    // 3. Tiled Loop
+    // The window size is 512. We process 16 tokens per tile.
+    // 512 / 16 = 32 tiles total.
+    for(int tile = 0; tile < 32; tile++)
     {
-        uint target_idx = win_start + j;
-        
-        // OPTIMIZATION: Do not load full K/V vectors into registers.
-        // Compute score on the fly to save register spill.
-        
-        // 2. Compute Scores for 4 Heads
-        float scores[4] = {0, 0, 0, 0};
-        
-        for (int h=0; h<4; h++) {
-            int offset = h * 32;
-            float s = 0;
-            // Unroll small loop manually or let compiler handle it
-            for (int dim=0; dim<32; dim++) {
-                s += my_q[offset + dim] * bufferK[target_idx*128 + offset + dim];
-            }
-            scores[h] = s * scale;
-        }
+        // --- A. Cooperative Load into LDS ---
+        // We need to load 2048 floats for K and 2048 for V.
+        // We have 512 threads. Each thread loads 4 floats for K and 4 for V.
+        int tile_base_token = win_start + tile * 16;
+        int vec_start = local_id * 4; // This thread's starting offset in the LDS array
 
-        // 3. Update Softmax Statistics
-        for (int h=0; h<4; h++) {
-            float m_prev = m[h];
-            float m_new = max(m_prev, scores[h]);
-            float e_score = exp(scores[h] - m_new);
-            float e_prev = exp(m_prev - m_new);
+        for(int x=0; x<4; x++) 
+        {
+            int lds_idx = vec_start + x;
             
-            d[h] = d[h] * e_prev + e_score;
-            m[h] = m_new;
+            // Map flat LDS index back to (token, dim) to find Global Address
+            // lds_idx ranges 0..2047. 
+            // row (token inside tile) = lds_idx / 128
+            // col (dimension)         = lds_idx % 128
+            int t_node = lds_idx / 128; 
+            int t_dim  = lds_idx % 128;
+            
+            int global_node = tile_base_token + t_node;
+            int global_addr = global_node * 128 + t_dim;
 
-            // Update weighted sum (res)
-            // We read V directly from global memory here
-            int offset = h * 32;
-            for(int dim=0; dim<32; dim++) {
-                 float v_val = bufferV[target_idx*128 + offset + dim];
-                 res[offset + dim] = res[offset + dim] * e_prev + v_val * e_score;
+            if (global_node < maxNodes) {
+                lds_K[lds_idx] = bufferK[global_addr];
+                lds_V[lds_idx] = bufferV[global_addr];
+            } else {
+                lds_K[lds_idx] = 0.0;
+                lds_V[lds_idx] = 0.0;
             }
         }
+
+        // Wait for all threads to finish loading this tile
+        GroupMemoryBarrierWithGroupSync();
+
+        // --- B. Compute Attention for this Tile ---
+        // Iterate over the 16 tokens currently in Shared Memory
+        for(int j=0; j<16; j++)
+        {
+            // Base offset for token 'j' in LDS
+            int lds_offset = j * 128;
+
+            // Compute Scores for 4 Heads
+            float scores[4] = {0, 0, 0, 0};
+            
+            for (int h=0; h<4; h++) {
+                int head_offset = h * 32;
+                float s = 0;
+                // Dot product Q[h] . K_tile[j][h]
+                // Read Q directly from global memory (L1/L2 cache is fast enough, prevents register spilling)
+                for (int dim=0; dim<32; dim++) {
+                    float q_val = (i < maxNodes) ? bufferQ[i * 128 + head_offset + dim] : 0.0;
+                    s += q_val * lds_K[lds_offset + head_offset + dim];
+                }
+                scores[h] = s * scale;
+            }
+
+            // Update Softmax Statistics (Online Softmax)
+            for (int h=0; h<4; h++) {
+                float m_prev = m[h];
+                float m_new = max(m_prev, scores[h]);
+                float e_score = exp(scores[h] - m_new);
+                float e_prev = exp(m_prev - m_new);
+                
+                d[h] = d[h] * e_prev + e_score;
+                m[h] = m_new;
+
+                // Update weighted sum
+                int head_offset = h * 32;
+                for(int dim=0; dim<32; dim++) {
+                    float v_val = lds_V[lds_offset + head_offset + dim];
+                    res[head_offset + dim] = res[head_offset + dim] * e_prev + v_val * e_score;
+                }
+            }
+        }
+
+        // Wait before overwriting LDS in the next tile iteration
+        GroupMemoryBarrierWithGroupSync();
     }
 
-    // Final Normalize & Project Out
+    // 4. Final Normalize & Output
+    if (i >= maxNodes) return;
+
     float attn_out[128];
     for(int h=0; h<4; h++) {
         int offset = h * 32;
@@ -252,7 +296,7 @@ void ComputeAttention(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    // Output Projection
+    // Output Projection (Linear)
     for(int d=0; d<128; d++) {
         float val = b_attn_out[d];
         for(int in_d=0; in_d<128; in_d++) val += attn_out[in_d] * w_attn_out[in_d * 128 + d];
