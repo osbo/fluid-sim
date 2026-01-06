@@ -431,13 +431,12 @@ void PredictHead(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
     s_reduce_head[dim] = x_norm;
     GroupMemoryBarrierWithGroupSync();
     
-    // Linear d_model -> 7
-    // Ensure only valid threads write output
-    if (dim < 7) { // 7 coeffs
+    // Linear d_model -> 25
+    if (dim < 25) { 
         float outVal = b_head[dim];
         for(int k=0; k<d_model; k++) {
-            outVal += s_reduce_head[k] * w_head[k * 7 + dim];
+            outVal += s_reduce_head[k] * w_head[k * 25 + dim]; 
         }
-        matrixGBuffer[nodeIdx * 7 + dim] = outVal;
+        matrixGBuffer[nodeIdx * 25 + dim] = outVal; 
     }
 }
