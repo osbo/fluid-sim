@@ -214,6 +214,16 @@ public class FluidSimulator : MonoBehaviour
         RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
     }
 
+    private void ResizeBuffer(ref ComputeBuffer buffer, int count, int stride)
+    {
+        if (buffer != null && buffer.count >= count) return; // Capacity is sufficient
+
+        buffer?.Release();
+        // Allocate next power of two to prevent frequent resizing
+        int newSize = Mathf.NextPowerOfTwo(Mathf.Max(count, 512));
+        buffer = new ComputeBuffer(newSize, stride);
+    }
+
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
         DrawParticles(cam);
@@ -1510,17 +1520,14 @@ public class FluidSimulator : MonoBehaviour
 
         if (numNodes == 0) return;
 
+
         // Find kernel
         createLeavesKernel = nodesShader.FindKernel("CreateLeaves");
 
-        // Release and recreate node buffers each frame since numNodes changes
-        nodesBuffer?.Release();
-        tempNodesBuffer?.Release();
-        mortonCodesBuffer?.Release();
-        nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
-        tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
-        // NEW: Allocate tight morton code buffer (SoA)
-        mortonCodesBuffer = new ComputeBuffer(numNodes, sizeof(uint));
+        // Use ResizeBuffer to prevent frequent reallocations
+        ResizeBuffer(ref nodesBuffer, numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        ResizeBuffer(ref tempNodesBuffer, numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        ResizeBuffer(ref mortonCodesBuffer, numNodes, sizeof(uint));
 
         // Set buffer data to compute shader
         nodesShader.SetBuffer(createLeavesKernel, "particlesBuffer", particlesBuffer);
@@ -1753,10 +1760,8 @@ public class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // Release and recreate neighbors buffer each frame since numNodes changes
-        // SoA layout: [24 * N] with stride 4
-        neighborsBuffer?.Release();
-        neighborsBuffer = new ComputeBuffer(numNodes * 24, 4);
+        // Use ResizeBuffer to prevent frequent reallocations
+        ResizeBuffer(ref neighborsBuffer, numNodes * 24, sizeof(uint));
 
         findNeighborsKernel = nodesShader.FindKernel("findNeighbors");
         nodesShader.SetBuffer(findNeighborsKernel, "nodesBuffer", nodesBuffer);
@@ -1768,10 +1773,8 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.Dispatch(findNeighborsKernel, threadGroups, 1, 1);
 
         // Find reverse connections (run once per frame after findNeighbors)
-        // Release and recreate reverseNeighbors buffer each frame since numNodes changes
-        // SoA layout: [24 * N] with stride 4
-        reverseNeighborsBuffer?.Release();
-        reverseNeighborsBuffer = new ComputeBuffer(numNodes * 24, 4);
+        // Use ResizeBuffer to prevent frequent reallocations
+        ResizeBuffer(ref reverseNeighborsBuffer, numNodes * 24, sizeof(uint));
         
         findReverseKernel = nodesShader.FindKernel("FindReverseConnections");
         nodesShader.SetBuffer(findReverseKernel, "reverseNeighborsBuffer", reverseNeighborsBuffer);
