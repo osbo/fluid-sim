@@ -391,51 +391,66 @@ void ApplySparseGT(uint3 id : SV_DispatchThreadID)
 
 // FUSED KERNEL: ApplySparseG + DotProduct
 // Computes z = G * u + eps * r AND r · z in a single pass to reduce memory round-trips
-groupshared float s_precon_dot[512];
+groupshared float s_precon_dot[256];
+groupshared float s_z_values[256]; // Cache for vector 'u' (zBuffer)
 
-[numthreads(512, 1, 1)]
+[numthreads(256, 1, 1)] // Changed from 512 to 256
 void ApplySparseGAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     uint li = Gtid.x;
-    
+    uint group_start_idx = Gid.x * 256;
+
+    // --- 1. Collaborative Load into LDS ---
+    // ALL threads must participate.
+    if (i < numNodes) {
+        s_z_values[li] = zBuffer[i];
+    }
+    GroupMemoryBarrierWithGroupSync(); // Wait for all threads in group to finish loading
+
     float z_val = 0.0;
     float r_val = 0.0;
 
     if (i < numNodes)
     {
-        // --- 1. PERFORM APPLY SPARSE G (Gather) ---
-        // (Copied and adapted from ApplySparseG)
-        
-        float u_val = zBuffer[i]; // Intermediate u
+        // Read own value from fast LDS
+        float u_val = s_z_values[li];
         if (!isfinite(u_val)) u_val = 0.0;
 
-        r_val = xBuffer[i];       // Residual r (needed for epsilon skip and dot product)
+        r_val = xBuffer[i]; // Residual r (needed for epsilon skip and dot product)
         if (!isfinite(r_val)) r_val = 0.0;
         
         float z_sum = 0.0;
         
-        // A. Diagonal (SoA Layout: Index 0)
-        // SoA layout: matrixGBuffer[dim * numNodes + nodeIndex]
-        float g_diag = matrixGBuffer[i]; // matrixGBuffer[0 * numNodes + i]
+        // A. Diagonal
+        float g_diag = matrixGBuffer[i];
         if (!isfinite(g_diag)) g_diag = 0.0;
         z_sum += u_val * g_diag;
 
-        // B. Neighbors (SoA Layout: Indices 1..24)
+        // B. Neighbors (Optimized Gather)
         for(int k=0; k<24; k++)
         {
-            // SoA Neighbor Read
             uint n_idx = neighborsBuffer[k * numNodes + i];
-
             if(n_idx < numNodes)
             {
-                // SoA Coeff Read (Index is k+1)
                 float g_coeff = matrixGBuffer[(k + 1) * numNodes + i];
                 if (!isfinite(g_coeff)) g_coeff = 0.0;
 
-                float u_neighbor = zBuffer[n_idx];
-                if (!isfinite(u_neighbor)) u_neighbor = 0.0;
+                float u_neighbor;
+                
+                // --- LDS CACHE CHECK ---
+                if (n_idx >= group_start_idx && n_idx < group_start_idx + 256)
+                {
+                    // Cache Hit: Read from Shared Memory (Fast)
+                    u_neighbor = s_z_values[n_idx - group_start_idx];
+                }
+                else
+                {
+                    // Cache Miss: Read from Global Memory (Slow)
+                    u_neighbor = zBuffer[n_idx];
+                }
 
+                if (!isfinite(u_neighbor)) u_neighbor = 0.0;
                 z_sum += g_coeff * u_neighbor;
             }
         }
@@ -452,7 +467,6 @@ void ApplySparseGAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, u
     }
 
     // --- 2. FUSED DOT PRODUCT (r . z) ---
-    // We have r_val and z_val in registers right now.
     float product = r_val * z_val;
     if (!isfinite(product)) product = 0.0;
     
@@ -460,7 +474,8 @@ void ApplySparseGAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, u
     s_precon_dot[li] = product;
     GroupMemoryBarrierWithGroupSync();
     
-    for (uint s = 256; s > 0; s >>= 1) {
+    // Reduction loop for 256 threads
+    for (uint s = 128; s > 0; s >>= 1) {
         if (li < s) {
             float sum = s_precon_dot[li] + s_precon_dot[li + s];
             if (!isfinite(sum)) sum = 0.0;
