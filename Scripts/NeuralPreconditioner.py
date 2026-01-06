@@ -98,7 +98,7 @@ def compute_laplacian_stencil(neighbors, layers, num_nodes):
 
 class SPAIGenerator(nn.Module):
     # CHANGE 1: Default d_model=32 (matches paper's ~24k parameters)
-    def __init__(self, input_dim=58, d_model=32, num_layers=4, nhead=4, window_size=512, max_octree_depth=12):
+    def __init__(self, input_dim=58, d_model=32, num_layers=4, nhead=4, window_size=256, max_octree_depth=12):
         super().__init__()
         self.d_model = d_model
         self.window_size = window_size
@@ -327,8 +327,10 @@ class FluidGraphDataset(Dataset):
                         if 'numNodes' in line: max_n = max(max_n, int(line.split(':')[1].strip()))
             except: continue
         
-        # Round up to 512 for window efficiency
-        self.max_nodes = ((max_n + 511) // 512) * 512
+        # Round up to window_size for window efficiency
+        # Note: This assumes window_size=256, update if changed
+        window_size = 256
+        self.max_nodes = ((max_n + window_size - 1) // window_size) * window_size
         print(f"Dataset: {len(self.frame_paths)} frames. Max Nodes padded to: {self.max_nodes}")
         
         self.node_dtype = np.dtype([
@@ -430,7 +432,7 @@ def export_weights(model, path):
         header = struct.pack('<ffiiii', 
                            0.0, 0.0, 
                            model.d_model, 
-                           4,  # num_heads (hardcoded to 4)
+                           model.encoder.layers[0].self_attn.num_heads,  # num_heads from model
                            len(model.encoder.layers), 
                            58) # Input dim is fixed at 58
         f.write(header)
@@ -448,7 +450,7 @@ def export_weights(model, path):
         write_tensor(model.feature_proj.weight) # Will be Transposed [58, d_model]
         write_tensor(model.feature_proj.bias)
         write_tensor(model.layer_embed.weight)    # [12, d_model]
-        write_tensor(model.window_pos_embed)      # [1, 512, d_model]
+        write_tensor(model.window_pos_embed)      # [1, window_size, d_model]
 
         # --- 2. Transformer Layers ---
         for i, layer in enumerate(model.encoder.layers):
