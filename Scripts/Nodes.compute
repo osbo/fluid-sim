@@ -6,8 +6,7 @@
 #pragma kernel interpolateFaceVelocities
 #pragma kernel copyFaceVelocities
 #pragma kernel ApplyPressureGradient
-#pragma kernel ApplyGravity
-#pragma kernel EnforceBoundaryConditions
+#pragma kernel ApplyExternalForces
 #pragma kernel InitializePhi
 #pragma kernel PropagatePhi
 
@@ -1044,44 +1043,31 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(512, 1, 1)]
-void ApplyGravity(uint3 id : SV_DispatchThreadID)
+void ApplyExternalForces(uint3 id : SV_DispatchThreadID)
 {
-    uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
+    uint i = id.x;
+    if (i >= numNodes) return;
 
-    Node node = nodesBuffer[threadIndex];
-    // Apply gravity to all face velocities consistently
+    Node node = nodesBuffer[i];
+    
+    // 1. Gravity
     node.velocities.top -= gravity * deltaTime;
     node.velocities.bottom -= gravity * deltaTime;
-    nodesBuffer[threadIndex] = node;
-}
 
-[numthreads(512, 1, 1)]
-void EnforceBoundaryConditions(uint3 id : SV_DispatchThreadID)
-{
-    uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
-
-    Node node = nodesBuffer[threadIndex];
-    
+    // 2. Boundaries
     uint shift = node.layer * 3;
     uint prefix = node.mortonCode >> shift;
     uint3 coord = deinterleave(prefix);
     uint gridDim = 1u << (10 - node.layer);
 
-    // Check X boundaries
     if (coord.x == 0) node.velocities.left = 0;
     if (coord.x == gridDim - 1) node.velocities.right = 0;
-    
-    // Check Y boundaries
     if (coord.y == 0) node.velocities.bottom = 0;
     if (coord.y == gridDim - 1) node.velocities.top = 0;
-
-    // Check Z boundaries
     if (coord.z == 0) node.velocities.front = 0;
     if (coord.z == gridDim - 1) node.velocities.back = 0;
-    
-    nodesBuffer[threadIndex] = node;
+
+    nodesBuffer[i] = node;
 }
 
 [numthreads(512, 1, 1)]
