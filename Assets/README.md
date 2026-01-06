@@ -1,87 +1,91 @@
-# Neural-Accelerated Fluid Simulation: Sparse Approximate Inverse Preconditioning on GPU
+# Neural-Accelerated Fluid Simulation: Learned SPAI Preconditioning on GPU
 
-**Abstract:** This project implements a high-performance Eulerian-Lagrangian fluid simulation for incompressible flows, targeting massive particle counts ($N > 10^6$) on consumer hardware. The core contribution is a hybrid numerical-neural solver that replaces standard preconditioners (e.g., Incomplete Cholesky, Jacobi) with a learned Sparse Approximate Inverse (SPAI). By training a Transformer-based architecture to predict the inverse topology of the discrete Laplacian on a linearized sparse octree, we achieve a significant reduction in convergence time for the Conjugate Gradient (CG) pressure projection.
+**Abstract:** This project implements a high-performance Eulerian-Lagrangian fluid simulation (PIC/FLIP) on the GPU, featuring a novel **Neural Sparse Approximate Inverse (SPAI)** preconditioner for the Conjugate Gradient pressure solver. By treating the linearized octree as a sequence, a Windowed Transformer predicts the inverse topology of the Laplacian operator, replacing traditional sequential preconditioners (e.g., Incomplete Cholesky) with a fully parallelizable matrix-vector product.
 
-## 1. Performance Analysis
+Based on the methodology presented by **Yang et al. (2025)** in *"Learning Sparse Approximate Inverse Preconditioners for Conjugate Gradient Solvers on GPUs"*.
 
-The following benchmarks were conducted on a stress-test scenario involving **1,048,576 particles**, utilizing a dynamic sparse octree with effective resolutions ranging from **Level 4 ($2^4$)** in the bulk fluid to **Level 10 ($2^{10}$)** at the interface.
+## 1. Performance Statistics
+
+Benchmarks were conducted on a stress-test scenario with **1,048,576 particles**, utilizing a dynamic sparse octree with cell sizes ranging from **Level 4 ($2^4$)** to **Level 10 ($2^{10}$)**.
 
 ### 1.1 Neural SPAI vs. Jacobi (Standard GPU Baseline)
-The Jacobi preconditioner ($M = \text{diag}(A)$) is the industry standard for GPU-based CG solvers due to its trivial parallelization. The Neural SPAI demonstrates superior convergence properties by capturing off-diagonal spectral dependencies while maintaining $O(1)$ parallel inference cost.
+The Jacobi preconditioner is the standard for GPU-based CG due to its $O(1)$ parallel nature. The Neural SPAI outperforms it by capturing non-diagonal spectral dependencies while maintaining similar parallelism.
 
 | Metric | Reduction | Value Change |
 |--------|-----------|--------------|
-| **CG Iterations** | **44.6%** | $56 \to 31$ |
+| **Frame Time** | **11.3%** | $53\text{ms} \to 47\text{ms}$ |
 | **Solve Time** | **17.9%** | $28\text{ms} \to 23\text{ms}$ |
-| **Total Frame Time** | **11.3%** | $53\text{ms} \to 47\text{ms}$ |
+| **CG Iterations** | **44.6%** | $56 \to 31$ |
 
-### 1.2 Neural SPAI vs. Unconditioned CG
-This comparison isolates the efficiency of the learned preconditioner against the raw Krylov subspace method.
+### 1.2 Neural SPAI vs. None (Raw CG)
+This comparison highlights the raw algorithmic efficiency of the learned preconditioner against an unconditioned Krylov subspace solver.
 
 | Metric | Reduction | Value Change |
 |--------|-----------|--------------|
-| **CG Iterations** | **74.6%** | $122 \to 31$ |
+| **Frame Time** | **54.4%** | $103\text{ms} \to 47\text{ms}$ |
 | **Solve Time** | **75.0%** | $92\text{ms} \to 23\text{ms}$ |
-| **Total Frame Time** | **54.4%** | $103\text{ms} \to 47\text{ms}$ |
+| **CG Iterations** | **74.6%** | $122 \to 31$ |
 
 ---
 
-## 2. Algorithmic Methodology
+## 2. Domain Discretization: Linearized Sparse Octree
 
-The simulation employs a standard **PIC/FLIP (Particle-In-Cell / Fluid-Implicit-Particle)** discretization. The governing equations are the incompressible Euler equations, split into advection and projection steps.
+The simulation domain is discretized using a pointer-less, linearized octree structure to maximize GPU memory coalescence.
 
-### 2.1 Adaptive Sparse Octree & Spatial Hashing
-To handle the domain $\Omega$, we avoid pointer-based tree structures which induce cache-thrashing on GPUs. Instead, we utilize a **linearized octree** based on Z-order curves (Morton Codes).
+### 2.1 Adaptive Resolution Levels
+The grid follows a power-of-two scaling where **Level 0** represents maximum detail ($1^3$ voxel) and **Level 10** represents the coarse root bounds ($1024^3$ voxel).
+* **Current Configuration:** The simulation actively utilizes levels 4 through 10.
+* **Refinement Strategy:** A distance-based heuristic allocates high-resolution leaf nodes near the fluid interface (Zero Level Set) and rapidly coarsens into the bulk fluid to reduce the degrees of freedom for the Poisson solve.
 
-* **Initialization:** Particles are hashed into 30-bit Morton codes. A custom **GPU Radix Sort** (`RadixSort.compute`) arranges particles to ensure spatial locality corresponds to memory locality.
-* **Adaptive Resolution (Level Set):** The grid resolution is not uniform. We employ a distance-based refinement strategy:
-    * **Level 10 ($2^{10}$):** Allocated strictly at the fluid interface (Zero Level Set), maximizing detail where surface tension and visual artifacts are most prominent.
-    * **Level 4 ($2^4$):** Allocated for the deep bulk fluid.
-    * **Grading:** Resolution degrades based on the Manhattan distance from the surface.
-* **2:1 Balance Constraint:** To ensure numerical stability in the finite difference stencil, we enforce a strict 2:1 balance. No cell is allowed to be adjacent to a neighbor more than one level coarser or finer. This simplifies the T-junction interpolation during the Laplacian construction.
+### 2.2 The 2:1 Balanced Neighbor Buffer
+To facilitate finite difference stencils on a non-uniform grid, we enforce a **2:1 balance constraint**: adjacent cells may differ by at most one level of resolution.
 
-### 2.2 Staggered Grid & Velocity Interpolation
-The simulation utilizes a MAC (Marker-and-Cell) grid arrangement.
-* **Dual Representation:** Velocity is stored on particles (Lagrangian) and grid faces (Eulerian).
-* **Face Velocity Sharing:** The `Node` struct contains storage for 6 faces. During the `ProcessNodes` kernel, velocity is scattered from particles to leaves. Critically, to enforce continuity, shared faces between adjacent nodes (e.g., Node $i$'s right face and Node $j$'s left face) are averaged.
-* **Divergence:** The divergence $\nabla \cdot \mathbf{u}$ is computed on this staggered grid. The 2:1 constraint ensures that flux computations across resolution changes (fine-to-coarse boundaries) remain conservative.
-
-### 2.3 Boundary Conditions
-* **Solid Walls:** Handled via a discrete epsilon-buffer method in `Particles.compute`. Particles approaching the domain boundary ($x < 0$ or $x > 1024$) are reflected with a restitution coefficient (bounce damping) of 0.3. A spatial buffer of $\epsilon = 0.05$ prevents particles from becoming "stuck" in the zero-velocity wall condition during interpolation.
-* **Pressure Solve:**
-    * **Free Surface:** Dirichlet boundary condition ($p=0$) is applied at the interface (ghost nodes).
-    * **Solid Boundaries:** Neumann boundary condition ($\frac{\partial p}{\partial n} = 0$) is enforced by modifying the matrix diagonal in `CGSolver.compute`.
+Unlike standard uniform grids with 6 neighbors (Von Neumann neighborhood), a balanced octree node requires a significantly more complex neighbor list.
+* **The 24-Slot Problem:** When a node at Level $L$ borders nodes at Level $L-1$ (finer), a single face can be shared by up to 4 smaller neighbors.
+* **Implementation:** `Nodes.compute` utilizes a flat buffer stride of **24 integers per node** (6 faces $\times$ 4 max sub-neighbors).
+* **Topological Search:** The `FindNeighbors` kernel traverses the Morton curve to populate these slots. During the matrix-free Laplacian application, the solver iterates these 24 slots, weighting fluxes by the intersecting surface area to ensure conservation of mass across resolution changes.
 
 ---
 
-## 3. The Neural Preconditioner
+## 3. The Neural Preconditioner Architecture
 
-The bottleneck of incompressible fluid simulation is solving the Poisson equation $A p = \mathbf{d}$, where $A$ is the sparse, symmetric positive-definite Laplacian matrix. We propose a learning-based alternative to incomplete factorizations.
+The core innovation is the replacement of numerical preconditioning heuristics with a learned parametric model. This model approximates $G \approx A^{-1}$ such that the condition number $\kappa(GA) \approx 1$.
 
-### 3.1 Sparse Approximate Inverse (SPAI)
-Instead of solving a linear system for the preconditioner step (e.g., $Mz=r$), we approximate the inverse matrix explicitly: $G \approx A^{-1}$.
-The preconditioner application becomes a simple sparse matrix-vector multiplication (SpMV): $z = G r$.
+### 3.1 SWIN-Like Windowed Attention
 
-### 3.2 Transformer Architecture (`NeuralPreconditioner.py`)
-* **Input:** The local geometric topology of the octree. The network receives a sequence of Morton codes and level information, representing the linearized tree.
-* **Model:** A 1D Windowed Transformer. The attention mechanism effectively captures the non-local pressure propagation characteristics of the fluid.
-* **Loss Function:** We utilize an unsupervised **Scale-Invariant Aligned Identity (SAI) Loss** via Stochastic Trace Estimation. The network minimizes the Frobenius norm $\| I - GA \|_F$ without requiring ground-truth inverses, making training tractable for large systems.
+Standard Transformers have $O(N^2)$ complexity, which is intractable for $N=10^6$ nodes. We employ a **1D Windowed Transformer** architecture similar to Swin Transformer, but applied to the 1D Z-order curve (Morton code sequence) rather than 2D image patches.
 
-### 3.3 GPU Inference (`Preconditioner.compute`)
-The trained weights are exported to compute buffers. The inference is implemented as a **Fused Transformer Layer** in HLSL. This custom kernel performs the Attention and Feed-Forward steps directly on the GPU, avoiding CPU-GPU synchronization latency and allowing the preconditioner to adapt dynamically to the changing grid topology every frame.
+* **Window Size:** 64 nodes.
+* **Stride:** 32 nodes (50% overlap).
+* **Local-Global Approximation:** Due to the locality-preserving properties of the Morton curve, spatially adjacent nodes are highly likely to be adjacent in the index buffer. Statistical analysis of the dataset shows that **~77% of a node's spatial neighbors** fall within this sliding window, allowing the attention mechanism to capture local pressure dependencies effectively.
+
+### 3.2 Model Specifications (`NeuralPreconditioner.py`)
+The architecture is designed to be lightweight enough for real-time inference while deep enough to learn the Laplacian topology:
+* **Embedding Dimension ($d_{model}$):** 32
+* **Attention Heads:** 4
+* **Encoder Layers:** 2
+* **Parameter Count:** ~12k (Extremely compact for GPU L1 cache residency).
+
+### 3.3 Inference: Fused HLSL Kernel
+To avoid the latency of context-switching between Unity and Python/TensorRT, the inference is implemented directly in `Preconditioner.compute` as a **Fused Transformer Layer**.
+* **Operation:** The kernel manually performs the Input Embedding $\to$ LayerNorm $\to$ Multi-Head Self-Attention (MHSA) $\to$ Feed-Forward Network (FFN) sequence.
+* **Parallelism:** Each thread processes one window. The 50% stride ensures that boundary artifacts at window edges are averaged out in the overlapping regions.
 
 ---
 
-## 4. Implementation Details
+## 4. Physics Solver Details
 
-### 4.1 Kernel Memory Access
-The solver is optimized for the SIMT (Single Instruction, Multiple Threads) architecture of modern GPUs.
-* **Coalescing:** By sorting nodes via Morton codes, we ensure that threads with adjacent `dispatchID` access adjacent memory addresses in `nodesBuffer`. This maximizes L2 cache hit rates and memory bandwidth utilization.
-* **Warp Divergence:** The `CGSolver.compute` kernels are structured to minimize branching. Active fluid nodes are packed contiguously, ensuring that warps remain fully occupied during the iterative solve.
+### 4.1 Boundary Conditions
+The simulation handles domain boundaries ($x,y,z \in [0, 1024]$) with a specific compliant collision response:
+* **Reflective Walls:** Particles violating bounds ($x < 0$ or $x > 1024$) are reflected.
+* **Restitution:** A coefficient of $0.3$ is applied to the velocity perpendicular to the wall (bounce damping).
+* **$\epsilon$-Buffer:** To prevent numerical sticking where interpolation kernels sample strictly zero velocity at the exact wall coordinate, particles are clamped to a spatial buffer of $\epsilon = 0.05$ from the boundary.
 
-### 4.2 Code Structure
-* **`FluidSimulator.cs`**: Orchestrator. Manages the lifecycle of Compute Buffers and dispatches kernels based on the current simulation state.
-* **`CGSolver.compute`**: Implements the Preconditioned Conjugate Gradient (PCG) algorithm. Contains the matrix-free Laplacian operator which reconstructs the stencil $A$ on-the-fly using neighbor indices.
-* **`Preconditioner.compute`**: The neural inference engine.
-* **`Nodes.compute`**: Handles the bottom-up construction of the octree, including leaf creation, neighbor finding, and hierarchical coarsening.
-* **`RadixSort.compute`**: A custom implementation of parallel Radix Sort, utilizing a Hillis-Steele scan for prefix sum calculation, essential for the fast rebuilding of the linear octree.
+### 4.2 Matrix-Free PCG Solver (`CGSolver.compute`)
+The system solves $A p = \mathbf{d}$ (Poisson Equation). The matrix $A$ is never explicitly constructed.
+* **Operator $A(\cdot)$:** The Laplacian is evaluated on-the-fly using the `nodesBuffer` and the 24-slot `neighborsBuffer`.
+* **Preconditioner Application:** The PCG step $z = M^{-1}r$ is replaced by $z = G r$, where $G$ is the output of the Neural Transformer. This reduces the preconditioning step to a simple sparse matrix-vector multiplication (SpMV), eliminating the serial dependency of forward-backward substitution found in ICC.
+
+## 5. References
+
+**Zherui Yang, Zhehao Li, Kangbo Lyu, Yixuan Li, Tao Du, Ligang Liu.** *Learning Sparse Approximate Inverse Preconditioners for Conjugate Gradient Solvers on GPUs.* arXiv preprint arXiv:2510.27517, 2025.
