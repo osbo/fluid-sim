@@ -425,45 +425,65 @@ class FluidGraphDataset(Dataset):
 def export_weights(model, path):
     print(f"Exporting weights to {path}...")
     with open(path, 'wb') as f:
-        # Header: magic(f), d_model(i), heads(i), layers(i), input_dim(i)
-        # Note: p_mean/p_std are not needed for this unsupervised method, using 0.0/1.0 placeholders
-        f.write(struct.pack('<ffiiii', 0.0, 1.0, model.d_model, 4, len(model.encoder.layers), 58))
+        # 1. Header: p_mean (float), p_std (float), d_model (int), heads (int), layers (int), input_dim (int)
+        # We don't have p_mean/std here, writing 0.0
+        header = struct.pack('<ffiiii', 
+                           0.0, 0.0, 
+                           model.d_model, 
+                           4,  # num_heads (hardcoded to 4)
+                           len(model.encoder.layers), 
+                           58) # Input dim is fixed at 58
+        f.write(header)
         
-        def write_t(t):
-            f.write(t.detach().cpu().numpy().astype(np.float32).tobytes())
+        # Helper to write tensor
+        def write_tensor(tensor):
+            # TRANSPOSE 2D WEIGHTS for HLSL (Input-Major) compatibility
+            if len(tensor.shape) == 2:
+                t_data = tensor.t().cpu().detach().numpy().astype(np.float32)
+            else:
+                t_data = tensor.cpu().detach().numpy().astype(np.float32)
+            f.write(t_data.tobytes())
+
+        # --- 1. Feature Projection ---
+        write_tensor(model.feature_proj.weight) # Will be Transposed [58, d_model]
+        write_tensor(model.feature_proj.bias)
+        write_tensor(model.layer_embed.weight)    # [12, d_model]
+        write_tensor(model.window_pos_embed)      # [1, 512, d_model]
+
+        # --- 2. Transformer Layers ---
+        for i, layer in enumerate(model.encoder.layers):
+            # Attention In (Q,K,V packed)
+            # PyTorch: [3*d_model, d_model] -> Transpose to [d_model, 3*d_model]
+            # This lines up perfectly with HLSL reading stride of 3*d_model
+            write_tensor(layer.self_attn.in_proj_weight) 
+            write_tensor(layer.self_attn.in_proj_bias)
             
-        # 1. Stem
-        write_t(model.feature_proj.weight.T) # [58, 128]
-        write_t(model.feature_proj.bias)
-        write_t(model.layer_embed.weight)    # [12, 128]
-        write_t(model.window_pos_embed)      # [1, 512, 128]
+            # Attention Out
+            write_tensor(layer.self_attn.out_proj.weight)
+            write_tensor(layer.self_attn.out_proj.bias)
+            
+            # Norm 1
+            write_tensor(layer.norm1.weight)
+            write_tensor(layer.norm1.bias)
+            
+            # FFN 1 (Linear 1)
+            write_tensor(layer.linear1.weight)
+            write_tensor(layer.linear1.bias)
+            
+            # FFN 2 (Linear 2)
+            write_tensor(layer.linear2.weight)
+            write_tensor(layer.linear2.bias)
+            
+            # Norm 2
+            write_tensor(layer.norm2.weight)
+            write_tensor(layer.norm2.bias)
+
+        # --- 3. Output Head ---
+        write_tensor(model.norm_out.weight)
+        write_tensor(model.norm_out.bias)
+        write_tensor(model.head.weight)
+        write_tensor(model.head.bias)
         
-        # 2. Layers
-        for layer in model.encoder.layers:
-            # QKV Packed [3*128, 128] -> Transpose -> [128, 384]
-            # PyTorch InProj is [3*D, D]. Unity implementation might expect unpacked or packed.
-            # Sticking to PyTorch standard order.
-            write_t(layer.self_attn.in_proj_weight.T)
-            write_t(layer.self_attn.in_proj_bias)
-            write_t(layer.self_attn.out_proj.weight.T)
-            write_t(layer.self_attn.out_proj.bias)
-            
-            write_t(layer.norm1.weight)
-            write_t(layer.norm1.bias)
-            
-            write_t(layer.linear1.weight.T)
-            write_t(layer.linear1.bias)
-            write_t(layer.linear2.weight.T)
-            write_t(layer.linear2.bias)
-            
-            write_t(layer.norm2.weight)
-            write_t(layer.norm2.bias)
-            
-        # 3. Head
-        write_t(model.norm_out.weight)
-        write_t(model.norm_out.bias)
-        write_t(model.head.weight.T)
-        write_t(model.head.bias)
     print("Export complete.")
 
 # --- 6. Training Loop ---
