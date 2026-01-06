@@ -340,22 +340,46 @@ void PrecomputeIndices(uint3 id : SV_DispatchThreadID)
 // Computes u = G^T * r
 // Formula: u_i = G_ii * r_i + Sum_{k in neighbors} ( G_ki * r_k )
 // G is now size [N, 7] where 0=Diag, 1-6=Face Neighbors
+// --- OPTIMIZATION START: Define Shared Memory ---
+groupshared float s_x[512]; 
+
 [numthreads(512, 1, 1)]
-void ApplySparseGT(uint3 id : SV_DispatchThreadID)
+void ApplySparseGT(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint li = Gtid.x;
+    uint group_start_idx = Gid.x * 512; // The global index of the first thread in this group
+
+    // --- PHASE 1: Collaborative Load into LDS ---
+    // Every thread loads its own value into shared memory
+    if (i < numNodes)
+    {
+        s_x[li] = xBuffer[i];
+    }
+    else
+    {
+        // Zero out padding threads to avoid reading garbage later
+        s_x[li] = 0.0;
+    }
+
+    // Wait for all threads to finish loading s_x
+    GroupMemoryBarrierWithGroupSync();
+
+    // --- PHASE 2: Main Calculation ---
     if (i >= numNodes) return;
 
-    float r_i = xBuffer[i];
+    // Optimization: Read our own r_i from fast LDS instead of global memory
+    float r_i = s_x[li]; 
     if (!isfinite(r_i)) r_i = 0.0;
 
     // 1. Diagonal
     // SoA layout: matrixGBuffer[dim * numNodes + nodeIndex]
-    float g_diag = matrixGBuffer[i]; // dim=0, so index is just i
+    float g_diag = matrixGBuffer[i]; // dim=0
     if (!isfinite(g_diag)) g_diag = 0.0;
+    
     float sum = g_diag * r_i;
 
-    // 2. Off-Diagonal (Optimized)
+    // 2. Off-Diagonal (Optimized with Caching)
     for (int n = 0; n < 24; n++)
     {
         // SoA layout: scatterIndicesBuffer[slot * numNodes + nodeIndex]
@@ -364,19 +388,31 @@ void ApplySparseGT(uint3 id : SV_DispatchThreadID)
         // 0xFFFFFFFF is uint.MaxValue, check for valid neighbor
         if (k != 0xFFFFFFFF)
         {
-            // Note: reverseNeighborsBuffer can stay AoS for now since it's rarely accessed
             uint revSlot = reverseNeighborsBuffer[i * 24 + n];
+
             if (revSlot < 24) 
             {
-                // SoA layout: matrixGBuffer[dim * numNodes + nodeIndex]
-                // We need coeff at node 'k', slot 'revSlot'.
                 // Formula: (SlotIndex) * numNodes + NodeIndex
                 // SlotIndex = 1 + revSlot (since 0 is diagonal)
-                // NodeIndex = k
                 float g_ki = matrixGBuffer[(1 + revSlot) * numNodes + k];
-                
+
                 if (!isfinite(g_ki)) g_ki = 0.0;
-                float r_k = xBuffer[k];
+
+                float r_k;
+
+                // --- LDS CACHE CHECK ---
+                // Check if neighbor 'k' is within this thread group's range [start, start+512)
+                if (k >= group_start_idx && k < group_start_idx + 512)
+                {
+                    // Cache Hit: Read from fast shared memory
+                    r_k = s_x[k - group_start_idx];
+                }
+                else
+                {
+                    // Cache Miss: Read from slow global memory
+                    r_k = xBuffer[k];
+                }
+
                 if (!isfinite(r_k)) r_k = 0.0;
                 
                 sum += g_ki * r_k;
