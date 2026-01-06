@@ -888,11 +888,11 @@ public class FluidSimulator : MonoBehaviour
         int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
         int requiredPaddedSize = Mathf.CeilToInt(requiredSize / 512.0f) * 512;
         
-        // MatrixG: [N, 7] -> 28 bytes per node
+        // MatrixG: [N, 25] -> 100 bytes per node
         if (matrixGBuffer == null || matrixGBuffer.count < requiredSize)
         {
             matrixGBuffer?.Release();
-            matrixGBuffer = new ComputeBuffer(requiredSize, 4 * 7); // UPDATED stride
+            matrixGBuffer = new ComputeBuffer(requiredSize, 4 * 25); // UPDATED STRIDE
         }
         if (zBuffer == null || zBuffer.count < requiredSize)
         {
