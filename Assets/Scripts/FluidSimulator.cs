@@ -506,6 +506,7 @@ public class FluidSimulator : MonoBehaviour
 
         // need: nodes buffer, nodes buffer old, particles buffer, numNodes, numParticles
         particlesShader.SetBuffer(updateParticlesKernel, "nodesBuffer", nodesBuffer);
+        particlesShader.SetBuffer(updateParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
         particlesShader.SetBuffer(updateParticlesKernel, "nodesBufferOld", nodesBufferOld);
         particlesShader.SetBuffer(updateParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetInt("numNodes", numNodes);

@@ -245,7 +245,7 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     // Binary search to find the first node with a Morton code >= particle's code
     while (left < right) {
         uint mid = left + ((right - left) >> 1);
-        if (nodesBuffer[mid].mortonCode < target) {
+        if (mortonCodesBuffer[mid] < target) {
             left = mid + 1;
         } else {
             right = mid;
