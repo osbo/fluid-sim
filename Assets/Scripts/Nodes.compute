@@ -624,10 +624,10 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[threadIndex];
 
     // Initialize neighbors to invalid index (numNodes) for all 24 slots
-    uint nbBase = threadIndex * 24;
+    // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
     for (uint k = 0; k < 24; k++)
     {
-        neighborsBuffer[nbBase + k] = numNodes;
+        neighborsBuffer[k * numNodes + threadIndex] = numNodes;
     }
 
     // all face neighbors of this node. It's bounded to 2:1 ratio
@@ -647,7 +647,8 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (10 - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
-            neighborsBuffer[threadIndex * 24 + faceOffset(d)] = numNodes + 1;
+            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+            neighborsBuffer[faceOffset(d) * numNodes + threadIndex] = numNodes + 1;
             continue; // Skip this neighbor direction
         }
         
@@ -676,12 +677,14 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
         if (idx_leq_mc_prefix == nPrefix && idx_leq_layer == node.layer)
         {
             // same-layer neighbor
-            neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
+            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+            neighborsBuffer[faceOffset(d) * numNodes + threadIndex] = idx_leq;
         }
         else if ((idx_leq_mc >> (shift + 3)) == (nPrefix >> 3) && idx_leq_layer == node.layer + 1)
         {
             // parent neighbor
-            neighborsBuffer[threadIndex * 24 + faceOffset(d)] = idx_leq;
+            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+            neighborsBuffer[faceOffset(d) * numNodes + threadIndex] = idx_leq;
         }
         else
         {
@@ -740,7 +743,8 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
                             uint idx_sub_layer = cNode.layer;
                             if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
                             {
-                                neighborsBuffer[threadIndex * 24 + faceOffset(d) + i] = idx_sub;
+                                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+                                neighborsBuffer[(faceOffset(d) + i) * numNodes + threadIndex] = idx_sub;
                             }
                         }
                     }
@@ -760,7 +764,8 @@ void FindReverseConnections(uint3 id : SV_DispatchThreadID)
     for (int n = 0; n < 24; n++)
     {
         // 1. Who is my neighbor?
-        uint k = neighborsBuffer[i * 24 + n];
+        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+        uint k = neighborsBuffer[n * numNodes + i];
         
         // Default to "Invalid" if no neighbor exists
         uint reverseSlot = 99; 
@@ -771,8 +776,6 @@ void FindReverseConnections(uint3 id : SV_DispatchThreadID)
             // This loop is expensive, but we only do it ONCE.
             // We can even use the "Geometric Optimization" here to speed it up (check only 4 slots)
             
-            uint k_base = k * 24;
-            
             // Optimization: Only search the opposing face range
             int myFace = n / 4; 
             int oppFace = (myFace % 2 == 0) ? (myFace + 1) : (myFace - 1);
@@ -781,7 +784,8 @@ void FindReverseConnections(uint3 id : SV_DispatchThreadID)
 
             for (int slot = startSlot; slot < endSlot; slot++)
             {
-                if (neighborsBuffer[k_base + slot] == i)
+                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+                if (neighborsBuffer[slot * numNodes + k] == i)
                 {
                     reverseSlot = slot;
                     break;
@@ -790,6 +794,7 @@ void FindReverseConnections(uint3 id : SV_DispatchThreadID)
         }
 
         // 3. Store the result
+        // Note: reverseNeighborsBuffer can stay AoS for now since it's rarely accessed
         reverseNeighborsBuffer[i * 24 + n] = reverseSlot;
     }
 }
@@ -806,10 +811,10 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
     // Cache self mass for performance
     float m_i = node.mass; 
 
-    uint neighborBaseIndex = threadIndex * 24;
     for (int d = 0; d < 6; d++) {
-        uint baseFaceIndex = neighborBaseIndex + d * 4;
-        uint n0_idx = neighborsBuffer[baseFaceIndex]; 
+        uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
+        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+        uint n0_idx = neighborsBuffer[faceSlotBase * numNodes + threadIndex]; 
 
         // --- 1. Wall Boundary (Neumann) ---
         if (n0_idx == numNodes + 1) {
@@ -848,7 +853,7 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
                 else { 
                     // --- Case B: Parent/Coarse Logic (Mass Weighted T-Junction) ---
                     uint neighborD = d ^ 1;
-                    uint n0BaseNeighborFaceIndex = n0_idx * 24 + neighborD * 4;
+                    uint neighborFaceSlotBase = neighborD * 4; // Base slot for neighbor's opposing face
 
                     // We need to compare the Parent's Mass vs The Sum of all Children's Mass on this face
                     float sumChildrenVel = 0.0;
@@ -856,7 +861,8 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
                     int numChildren = 0;
                     
                     for (int k = 0; k < 4; k++) {
-                        uint child_idx = neighborsBuffer[n0BaseNeighborFaceIndex + k];
+                        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+                        uint child_idx = neighborsBuffer[(neighborFaceSlotBase + k) * numNodes + n0_idx];
                         if (child_idx < numNodes) {
                             Node childNode = nodesBuffer[child_idx];
                             float childVal = selectOpposingFace(childNode.velocities, neighborD);
@@ -900,7 +906,8 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
             int validChildCount = 0;
 
             for (int k = 0; k < 4; k++) {
-                uint child_idx = neighborsBuffer[baseFaceIndex + k];
+                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
                 if (child_idx < numNodes) {
                     Node childNode = nodesBuffer[child_idx];
                     
@@ -957,13 +964,12 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
     float p_i = pressureBuffer[threadIndex];
     float dx_i = exp2((float)node.layer);
 
-    uint neighborBaseIndex = threadIndex * 24;
-
     // Loop through all 6 faces, same as findNeighbors and ApplyLaplacian
     for (int d = 0; d < 6; d++)
     {
-        uint faceNeighborBase = neighborBaseIndex + d * 4;
-        uint neighbor_idx = neighborsBuffer[faceNeighborBase];
+        uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
+        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + threadIndex];
         float pressure_gradient = 0.0;
         bool isBoundary = (neighbor_idx == numNodes + 1);
 
@@ -989,7 +995,8 @@ void ApplyPressureGradient(uint3 id : SV_DispatchThreadID)
             int numChildren = 0;
             for (int k = 0; k < 4; k++)
             {
-                uint child_idx = neighborsBuffer[faceNeighborBase + k];
+                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
                 if (child_idx < numNodes)
                 {
                     Node cNode = nodesBuffer[child_idx];
@@ -1064,19 +1071,19 @@ void InitializePhi(uint3 id : SV_DispatchThreadID)
     if (threadIndex >= numNodes) return;
 
     bool isSurfaceNode = false;
-    uint neighborBase = threadIndex * 24;
 
     // Iterate through all 6 faces
     for (int d = 0; d < 6; d++)
     {
-        uint faceNeighborBase = neighborBase + d * 4;
+        uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
         bool hasFluidNeighborOnFace = false;
         bool hasAirNeighborOnFace = false;
 
         // Check all 4 potential neighbors on this face
         for (int k = 0; k < 4; k++)
         {
-            uint neighbor_idx = neighborsBuffer[faceNeighborBase + k];
+            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+            uint neighbor_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
 
             if (neighbor_idx < numNodes || neighbor_idx == numNodes + 1)
             {
@@ -1121,17 +1128,16 @@ void PropagatePhi(uint3 id : SV_DispatchThreadID)
     float oldPhi = phiBuffer_Read[threadIndex];
     float minPropagatedPhi = oldPhi;
 
-    uint neighborBase = threadIndex * 24;
-
     // Iterate through all 6 faces
     for (int d = 0; d < 6; d++)
     {
-        uint faceNeighborBase = neighborBase + d * 4;
+        uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
 
         // Check all 4 potential neighbors on this face (for 2:1 balance)
         for (int k = 0; k < 4; k++)
         {
-            uint neighbor_idx = neighborsBuffer[faceNeighborBase + k];
+            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+            uint neighbor_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
 
             // Only check valid fluid nodes
             if (neighbor_idx < numNodes)

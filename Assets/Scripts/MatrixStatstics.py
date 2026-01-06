@@ -763,13 +763,51 @@ class MatrixAnalyzer:
         print(f"  Mean max distance:           {np.mean(max_dist_per_node):.2f}")
         print(f"  Median max distance:         {np.median(max_dist_per_node):.2f}")
         
+        # Analyze power-of-2 window sizes
+        print(f"\n{'='*60}")
+        print("POWER-OF-2 WINDOW SIZE ANALYSIS")
+        print(f"{'='*60}")
+        max_window_needed = int(np.ceil(sorted_bandwidths[-1]))
+        
+        # Generate power-of-2 window sizes up to max_window_needed
+        power_of_2_windows = []
+        window_size = 1
+        while window_size <= max_window_needed:
+            power_of_2_windows.append(window_size)
+            window_size *= 2
+        
+        # Also include common sizes like 256, 512 if they're relevant
+        if 256 <= max_window_needed and 256 not in power_of_2_windows:
+            power_of_2_windows.append(256)
+        if 512 <= max_window_needed and 512 not in power_of_2_windows:
+            power_of_2_windows.append(512)
+        if 1024 <= max_window_needed and 1024 not in power_of_2_windows:
+            power_of_2_windows.append(1024)
+        
+        power_of_2_windows = sorted(set(power_of_2_windows))
+        
+        print(f"\n{'Window Size':<15} {'Nodes In':<15} {'Nodes Out':<15} {'Percent Captured':<20}")
+        print(f"{'-'*15} {'-'*15} {'-'*15} {'-'*20}")
+        
+        for window_size in power_of_2_windows:
+            nodes_in = np.sum(max_dist_per_node <= window_size)
+            nodes_out = num_nodes - nodes_in
+            percent_captured = (nodes_in / num_nodes) * 100.0
+            print(f"{window_size:<15} {nodes_in:<15} {nodes_out:<15} {percent_captured:<20.2f}%")
+        
         results = {
             'window_sizes': sorted_bandwidths,
             'percentages': y_percentiles,
             'max_distances': max_dist_per_node,
             'p90_window': p90_val,
             'p99_window': p99_val,
-            'max_window': sorted_bandwidths[-1]
+            'max_window': sorted_bandwidths[-1],
+            'power_of_2_analysis': {
+                'window_sizes': power_of_2_windows,
+                'nodes_in': [np.sum(max_dist_per_node <= w) for w in power_of_2_windows],
+                'nodes_out': [num_nodes - np.sum(max_dist_per_node <= w) for w in power_of_2_windows],
+                'percent_captured': [(np.sum(max_dist_per_node <= w) / num_nodes) * 100.0 for w in power_of_2_windows]
+            }
         }
         
         return results
