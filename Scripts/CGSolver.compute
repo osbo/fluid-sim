@@ -6,6 +6,7 @@
 #pragma kernel ApplySparseG
 #pragma kernel ApplySparseGT
 #pragma kernel ClearBufferFloat
+#pragma kernel PrecomputeIndices
 
 // Include common HLSL functions
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
@@ -36,12 +37,14 @@ struct Node
 RWStructuredBuffer<Node> nodesBuffer;
 RWStructuredBuffer<float> divergenceBuffer;
 RWStructuredBuffer<uint> neighborsBuffer;
+StructuredBuffer<uint> reverseNeighborsBuffer; // Reverse neighbor slot indices per node (numNodes * 24)
 RWStructuredBuffer<float> pBuffer; // The input vector 'p'
 RWStructuredBuffer<float> ApBuffer; // The output vector 'Ap'
 RWStructuredBuffer<float> xBuffer;
 RWStructuredBuffer<float> yBuffer;
-RWStructuredBuffer<float> matrixGBuffer; // [N * 25] The Preconditioner Matrix G
+RWStructuredBuffer<float> matrixGBuffer; // [N * 7] The Preconditioner Matrix G (0=Diag, 1-6=Face Neighbors)
 RWStructuredBuffer<float> zBuffer;       // Intermediate buffer "u" and Output "z"
+RWStructuredBuffer<uint> scatterIndicesBuffer; // NEW: [N * 24] Pre-computed scatter indices
 uint numNodes;
 float a; // scalar 'a'
 float deltaTime; // Time step for physics scaling
@@ -269,10 +272,28 @@ void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id 
 // Implements M^-1 * r approx (G * G^T + eps * I) * r
 // --------------------------------------------------------------------------------
 
+// --- ADD THIS KERNEL ---
+// Pre-computes scatter indices to optimize ApplySparseGT
+[numthreads(512, 1, 1)]
+void PrecomputeIndices(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    uint base_idx = i * 24;
+    // Pre-calculate indices for the Scatter (GT) operation
+    for (int n = 0; n < 24; n++)
+    {
+        uint k = neighborsBuffer[base_idx + n];
+        // If neighbor is valid, store index. If not, store Sentinel (0xFFFFFFFF)
+        scatterIndicesBuffer[base_idx + n] = (k < numNodes) ? k : 0xFFFFFFFF;
+    }
+}
+
 // OPTIMIZED GATHER KERNEL (Replaces Scatter)
 // Computes u = G^T * r
 // Formula: u_i = G_ii * r_i + Sum_{k in neighbors} ( G_ki * r_k )
-// Complexity: O(24×24) per node = O(1) relative to N
+// G is now size [N, 7] where 0=Diag, 1-6=Face Neighbors
 [numthreads(512, 1, 1)]
 void ApplySparseGT(uint3 id : SV_DispatchThreadID)
 {
@@ -281,46 +302,34 @@ void ApplySparseGT(uint3 id : SV_DispatchThreadID)
 
     float r_i = xBuffer[i];
     if (!isfinite(r_i)) r_i = 0.0;
-    
-    uint g_base_i = i * 25;
-    
-    // 1. Diagonal Contribution (G_ii * r_i)
+
+    // 1. Diagonal (Unchanged)
+    uint g_base_i = i * 7;
     float g_diag = matrixGBuffer[g_base_i];
     if (!isfinite(g_diag)) g_diag = 0.0;
     float sum = g_diag * r_i;
 
-    // 2. Off-Diagonal Contribution
-    // Iterate my neighbors 'k'. If I am connected to k, k is connected to me.
-    // We need to find G_ki (which is stored at node k).
-    uint n_base_i = i * 24;
-    
+    // 2. Off-Diagonal (Optimized)
+    uint base_idx = i * 24;
     for (int n = 0; n < 24; n++)
     {
-        uint k = neighborsBuffer[n_base_i + n];
-        
-        // Valid neighbor?
-        if (k < numNodes)
+        // DIRECT LOOKUP - No bound checks needed here
+        uint k = scatterIndicesBuffer[base_idx + n];
+
+        // 0xFFFFFFFF is uint.MaxValue, check for valid neighbor
+        if (k != 0xFFFFFFFF)
         {
-            float r_k = xBuffer[k];
-            if (!isfinite(r_k)) r_k = 0.0;
-            
-            // Now we need G_ki. This is stored in matrixGBuffer at index k.
-            // But which neighbor slot of k corresponds to 'i'?
-            // We search k's neighbors to find 'i'.
-            uint n_base_k = k * 24;
-            uint g_base_k = k * 25;
-            
-            // Search k's 24 neighbors (Small constant loop, fast in cache)
-            for (int slot = 0; slot < 24; slot++)
+            uint revSlot = reverseNeighborsBuffer[base_idx + n];
+            if (revSlot < 24) 
             {
-                if (neighborsBuffer[n_base_k + slot] == i)
-                {
-                    // Found it! G_ki is at slot+1 (0 is diagonal)
-                    float g_ki = matrixGBuffer[g_base_k + 1 + slot];
-                    if (!isfinite(g_ki)) g_ki = 0.0;
-                    sum += g_ki * r_k;
-                    break; // Optimization: Stop once found
-                }
+                uint faceIndex = revSlot / 4;
+                float g_ki = matrixGBuffer[k * 7 + 1 + faceIndex];
+                if (!isfinite(g_ki)) g_ki = 0.0;
+                
+                float r_k = xBuffer[k];
+                if (!isfinite(r_k)) r_k = 0.0;
+                
+                sum += g_ki * r_k;
             }
         }
     }
@@ -332,22 +341,18 @@ void ApplySparseGT(uint3 id : SV_DispatchThreadID)
 // KERNEL 2: Gather (z = G * u)
 // Each node 'i' reads 'u' from neighbors 'j' and GATHERS results
 // Also adds epsilon regularization: z += eps * r
+// G is now size [N, 7] where 0=Diag, 1-6=Face Neighbors
 [numthreads(512, 1, 1)]
 void ApplySparseG(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i >= numNodes) return;
 
-    // xBuffer here holds the original 'r' (for epsilon add)
-    // zBuffer holds 'u' (input from GT step)
-    // We write result back to yBuffer (which is 'z' in PCG)
-
     float u_val = zBuffer[i];
     if (!isfinite(u_val)) u_val = 0.0;
     
     float z_sum = 0.0;
-
-    uint g_base = i * 25;
+    uint g_base = i * 7;
     uint n_base = i * 24;
 
     // 1. Diagonal
@@ -361,7 +366,10 @@ void ApplySparseG(uint3 id : SV_DispatchThreadID)
         uint n_idx = neighborsBuffer[n_base + k];
         if(n_idx < numNodes)
         {
-            float g_coeff = matrixGBuffer[g_base + 1 + k];
+            // Map neighbor index k (0-23) to Face Index (0-5)
+            uint faceIndex = k / 4;
+            
+            float g_coeff = matrixGBuffer[g_base + 1 + faceIndex];
             if (!isfinite(g_coeff)) g_coeff = 0.0;
             
             float u_neighbor = zBuffer[n_idx];
@@ -371,12 +379,11 @@ void ApplySparseG(uint3 id : SV_DispatchThreadID)
         }
     }
     
-    // 3. Epsilon Regularization (z += 1e-4 * r)
-    // Note: In PCG, we often reuse buffers. Ensure 'xBuffer' is bound to 'r'.
+    // 3. Epsilon Regularization
     float r_val = xBuffer[i];
     if (!isfinite(r_val)) r_val = 0.0;
-    z_sum += 1e-4 * r_val;
-
+    z_sum += 1e-4 * r_val; // Or 1e-6 depending on training
+    
     if (!isfinite(z_sum)) z_sum = 0.0;
     yBuffer[i] = z_sum;
 }

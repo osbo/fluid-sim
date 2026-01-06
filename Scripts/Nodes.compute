@@ -1,6 +1,7 @@
 #pragma kernel CreateLeaves
 #pragma kernel ProcessNodes
 #pragma kernel findNeighbors
+#pragma kernel FindReverseConnections
 #pragma kernel interpolateFaceVelocities
 #pragma kernel copyFaceVelocities
 #pragma kernel ApplyPressureGradient
@@ -51,6 +52,7 @@ RWStructuredBuffer<float> pressureBuffer;               // input: pressure value
 RWStructuredBuffer<Node> nodesBuffer;                   // output: aggregated nodes
 RWStructuredBuffer<Node> tempNodesBuffer;               // output: per-node gathered face deltas
 RWStructuredBuffer<uint> neighborsBuffer;               // output: neighbor indices per node (numNodes * 24)
+RWStructuredBuffer<uint> reverseNeighborsBuffer;        // output: reverse neighbor slot indices per node (numNodes * 24)
 RWStructuredBuffer<float> phiBuffer;                    // level set distance field (read/write)
 StructuredBuffer<float> phiBuffer_Read;                 // level set distance field (read-only copy for propagation)
 RWStructuredBuffer<uint> dirtyFlagBuffer;               // single-element buffer for convergence flag
@@ -745,6 +747,50 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
                 }
             }
         }
+    }
+}
+
+[numthreads(512, 1, 1)]
+void FindReverseConnections(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    // For every one of my neighbor slots...
+    for (int n = 0; n < 24; n++)
+    {
+        // 1. Who is my neighbor?
+        uint k = neighborsBuffer[i * 24 + n];
+        
+        // Default to "Invalid" if no neighbor exists
+        uint reverseSlot = 99; 
+
+        if (k < numNodes)
+        {
+            // 2. Search K's list to find ME (i)
+            // This loop is expensive, but we only do it ONCE.
+            // We can even use the "Geometric Optimization" here to speed it up (check only 4 slots)
+            
+            uint k_base = k * 24;
+            
+            // Optimization: Only search the opposing face range
+            int myFace = n / 4; 
+            int oppFace = (myFace % 2 == 0) ? (myFace + 1) : (myFace - 1);
+            int startSlot = oppFace * 4;
+            int endSlot = startSlot + 4;
+
+            for (int slot = startSlot; slot < endSlot; slot++)
+            {
+                if (neighborsBuffer[k_base + slot] == i)
+                {
+                    reverseSlot = slot;
+                    break;
+                }
+            }
+        }
+
+        // 3. Store the result
+        reverseNeighborsBuffer[i * 24 + n] = reverseSlot;
     }
 }
 
