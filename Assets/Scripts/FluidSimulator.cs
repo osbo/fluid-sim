@@ -64,8 +64,7 @@ public class FluidSimulator : MonoBehaviour
     private int dotProductKernel;
     private int applyPressureGradientKernel;
     private int updateParticlesKernel;
-    private int applyGravityKernel;
-    private int enforceBoundaryConditionsKernel;
+    private int applyExternalForcesKernel;
     private int solvePressureIterationKernel;
     private int initializePressureBuffersKernel;
     private int initializePhiKernel;
@@ -440,15 +439,10 @@ public class FluidSimulator : MonoBehaviour
         StoreOldVelocities();
         storeOldVelocitiesSw.Stop();
 
-        // Step 7: Apply gravity on the grid
-        var applyGravitySw = System.Diagnostics.Stopwatch.StartNew();
-        ApplyGravity();
-        applyGravitySw.Stop();
-
-        // Step 8: Enforce boundary conditions
-        var enforceBoundarySw = System.Diagnostics.Stopwatch.StartNew();
-        EnforceBoundaryConditions();
-        enforceBoundarySw.Stop();
+        // Step 7: Apply external forces on the grid
+        var applyExternalForcesSw = System.Diagnostics.Stopwatch.StartNew();
+        ApplyExternalForces();
+        applyExternalForcesSw.Stop();
 
         // Step 9: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
@@ -476,8 +470,7 @@ public class FluidSimulator : MonoBehaviour
                  $"• Find Neighbors: {findNeighborsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Compute Level Set: {computeLevelSetSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Apply Gravity: {applyGravitySw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Enforce Boundaries: {enforceBoundarySw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Apply External Forces: {applyExternalForcesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Avg CG Iterations: {averageCgIterationsText}");
@@ -1911,41 +1904,23 @@ public class FluidSimulator : MonoBehaviour
         // Debug.Log(str);
     }
 
-    private void ApplyGravity()
+    private void ApplyExternalForces()
     {
         if (nodesShader == null) return;
 
-        applyGravityKernel = nodesShader.FindKernel("ApplyGravity");
-        if (applyGravityKernel < 0)
+        applyExternalForcesKernel = nodesShader.FindKernel("ApplyExternalForces");
+        if (applyExternalForcesKernel < 0)
         {
-            Debug.LogError("ApplyGravity kernel not found in Nodes.compute shader.");
+            Debug.LogError("ApplyExternalForces kernel not found in Nodes.compute shader.");
             return;
         }
 
-        nodesShader.SetBuffer(applyGravityKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(applyExternalForcesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetFloat("gravity", gravity);
         nodesShader.SetFloat("deltaTime", (1 / frameRate));
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        nodesShader.Dispatch(applyGravityKernel, threadGroups, 1, 1);
-    }
-
-    private void EnforceBoundaryConditions()
-    {
-        if (nodesShader == null) return;
-        
-        enforceBoundaryConditionsKernel = nodesShader.FindKernel("EnforceBoundaryConditions");
-        if (enforceBoundaryConditionsKernel < 0)
-        {
-            Debug.LogError("EnforceBoundaryConditions kernel not found in Nodes.compute shader.");
-            return;
-        }
-        
-        nodesShader.SetBuffer(enforceBoundaryConditionsKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetInt("numNodes", numNodes);
-        
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        nodesShader.Dispatch(enforceBoundaryConditionsKernel, threadGroups, 1, 1);
+        nodesShader.Dispatch(applyExternalForcesKernel, threadGroups, 1, 1);
     }
 
     private void ClearUniqueBuffers()
