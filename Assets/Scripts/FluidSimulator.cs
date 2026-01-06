@@ -985,11 +985,10 @@ public class FluidSimulator : MonoBehaviour
         int threadGroups = Mathf.CeilToInt(numNodes / 256.0f);
         nodesShader.Dispatch(applyPressureGradientKernel, threadGroups, 1, 1);
 
-        copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
-        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
-        nodesShader.SetInt("numNodes", numNodes);
-        nodesShader.Dispatch(copyFaceVelocitiesKernel, threadGroups, 1, 1);
+        // SWAP the C# references
+        ComputeBuffer swap = nodesBuffer;
+        nodesBuffer = tempNodesBuffer;
+        tempNodesBuffer = swap;
     }
 
     // Helper for dispatching kernels
