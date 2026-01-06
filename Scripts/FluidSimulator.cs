@@ -682,7 +682,7 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "divergenceBuffer", divergenceBuffer); // For reduction output
             cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
             cgSolverShader.SetInt("numNodes", numNodes);
-            int groups = Mathf.CeilToInt(numNodes / 512.0f);
+            int groups = Mathf.CeilToInt(numNodes / 256.0f);
             cgSolverShader.Dispatch(applyLaplacianAndDotKernel, groups, 1, 1);
             laplacianSw.Stop();
 
@@ -970,7 +970,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("minLayer", minLayer);
 
         // Dispatch the kernel to update velocities
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+        int threadGroups = Mathf.CeilToInt(numNodes / 256.0f);
         nodesShader.Dispatch(applyPressureGradientKernel, threadGroups, 1, 1);
 
         copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
