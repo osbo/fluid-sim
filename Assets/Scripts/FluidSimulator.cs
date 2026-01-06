@@ -70,6 +70,7 @@ public class FluidSimulator : MonoBehaviour
     private int initializePressureBuffersKernel;
     private int initializePhiKernel;
     private int propagatePhiKernel;
+    private int extractMortonCodesKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -84,6 +85,7 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer nodesBuffer;
     private ComputeBuffer nodesBufferOld;
     private ComputeBuffer tempNodesBuffer;
+    private ComputeBuffer mortonCodesBuffer;
     private ComputeBuffer neighborsBuffer;
     public ComputeBuffer reverseNeighborsBuffer;
     private ComputeBuffer divergenceBuffer;
@@ -408,6 +410,18 @@ public class FluidSimulator : MonoBehaviour
             findUniqueNodes();
             ProcessNodes();
             compactNodes();
+
+            // --- NEW: Refresh SoA Buffer after compaction ---
+            // The nodes have moved/shrunk, so we must extract the codes again 
+            // for the next iteration (and for findNeighbors later)
+            if (mortonCodesBuffer != null && nodesBuffer != null)
+            {
+                nodesShader.SetBuffer(extractMortonCodesKernel, "nodesBuffer", nodesBuffer);
+                nodesShader.SetBuffer(extractMortonCodesKernel, "mortonCodesBuffer", mortonCodesBuffer);
+                nodesShader.SetInt("numNodes", numNodes);
+                int groups = Mathf.CeilToInt(numNodes / 512.0f);
+                nodesShader.Dispatch(extractMortonCodesKernel, groups, 1, 1);
+            }
         }
         layerLoopSw.Stop();
 
@@ -1278,6 +1292,11 @@ public class FluidSimulator : MonoBehaviour
         }
         initializeParticlesKernel = particlesShader.FindKernel("InitializeParticles");
         
+        if (nodesShader != null)
+        {
+            extractMortonCodesKernel = nodesShader.FindKernel("ExtractMortonCodes");
+        }
+        
         // Create buffers
         particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 12 + 12 + 4 + 4 = 32 bytes
         particlesCPU = new Particle[numParticles];
@@ -1524,13 +1543,17 @@ public class FluidSimulator : MonoBehaviour
         // Release and recreate node buffers each frame since numNodes changes
         nodesBuffer?.Release();
         tempNodesBuffer?.Release();
+        mortonCodesBuffer?.Release();
         nodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
         tempNodesBuffer = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        // NEW: Allocate tight morton code buffer (SoA)
+        mortonCodesBuffer = new ComputeBuffer(numNodes, sizeof(uint));
 
         // Set buffer data to compute shader
         nodesShader.SetBuffer(createLeavesKernel, "particlesBuffer", particlesBuffer);
         nodesShader.SetBuffer(createLeavesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(createLeavesKernel, "uniqueIndices", uniqueIndices);
+        nodesShader.SetBuffer(createLeavesKernel, "mortonCodesBuffer", mortonCodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetInt("numParticles", numParticles);
         nodesShader.SetInt("minLayer", minLayer);
@@ -1629,6 +1652,7 @@ public class FluidSimulator : MonoBehaviour
         // Set buffers for the node processing kernel
         nodesShader.SetBuffer(processNodesKernel, "uniqueIndices", uniqueIndices);
         nodesShader.SetBuffer(processNodesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(processNodesKernel, "mortonCodesBuffer", mortonCodesBuffer);
         nodesShader.SetInt("numUniqueNodes", numUniqueNodes);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetInt("layer", layer);
@@ -1765,6 +1789,7 @@ public class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(findNeighborsKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "neighborsBuffer", neighborsBuffer);
+        nodesShader.SetBuffer(findNeighborsKernel, "mortonCodesBuffer", mortonCodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(findNeighborsKernel, threadGroups, 1, 1);
@@ -2177,6 +2202,7 @@ public class FluidSimulator : MonoBehaviour
         phiBuffer?.Release();
         phiBuffer_Read?.Release();
         dirtyFlagBuffer?.Release();
+        mortonCodesBuffer?.Release();
         ReleasePreconditionerBuffers();
         foreach(var b in weightBuffers.Values) b?.Release();
         weightBuffers.Clear();

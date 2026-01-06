@@ -1,6 +1,7 @@
 #pragma kernel CreateLeaves
 #pragma kernel ProcessNodes
 #pragma kernel findNeighbors
+#pragma kernel ExtractMortonCodes
 #pragma kernel FindReverseConnections
 #pragma kernel interpolateFaceVelocities
 #pragma kernel copyFaceVelocities
@@ -51,6 +52,10 @@ RWStructuredBuffer<float> pressureBuffer;               // input: pressure value
 // Output buffers
 RWStructuredBuffer<Node> nodesBuffer;                   // output: aggregated nodes
 RWStructuredBuffer<Node> tempNodesBuffer;               // output: per-node gathered face deltas
+
+// --- NEW: SoA Buffer ---
+RWStructuredBuffer<uint> mortonCodesBuffer; // [Cite: 1]
+
 RWStructuredBuffer<uint> neighborsBuffer;               // output: neighbor indices per node (numNodes * 24)
 RWStructuredBuffer<uint> reverseNeighborsBuffer;        // output: reverse neighbor slot indices per node (numNodes * 24)
 RWStructuredBuffer<float> phiBuffer;                    // level set distance field (read/write)
@@ -157,16 +162,27 @@ float calculateMassWeight(float selfMass, float neighborMass)
     return selfMass / total;
 }
 
+// --- NEW: Extraction Kernel ---
+// Run this after compaction to keep the SoA buffer in sync
+[numthreads(512,1,1)]
+void ExtractMortonCodes(uint3 id : SV_DispatchThreadID) {
+    if(id.x >= numNodes) return;
+    mortonCodesBuffer[id.x] = nodesBuffer[id.x].mortonCode;
+}
+
+// --- OPTIMIZED SEARCH HELPERS ---
+// Reads from the tight mortonCodesBuffer instead of the heavy nodesBuffer
 // Lower-bound search: first index with mortonCode >= target
 // left is inclusive, right is exclusive
 uint lowerBoundMorton(uint target, uint left_bound, uint right_bound)
 {
     uint left = left_bound;
-    uint right = right_bound; // exclusive
+    uint right = right_bound;
     while (left < right)
     {
         uint mid = left + ((right - left) >> 1);
-        uint midCode = nodesBuffer[mid].mortonCode;
+        // OPTIMIZATION: Read 4 bytes instead of 64 bytes
+        uint midCode = mortonCodesBuffer[mid]; 
         if (midCode < target)
         {
             left = mid + 1u;
@@ -188,7 +204,8 @@ uint upperBoundMorton(uint target, uint left_bound, uint right_bound)
     while (left < right)
     {
         uint mid = left + ((right - left) >> 1);
-        uint midCode = nodesBuffer[mid].mortonCode;
+        // OPTIMIZATION: Read 4 bytes instead of 64 bytes
+        uint midCode = mortonCodesBuffer[mid];
         if (midCode > target)
         {
             right = mid;
@@ -198,7 +215,7 @@ uint upperBoundMorton(uint target, uint left_bound, uint right_bound)
             left = mid + 1u;
         }
     }
-    return left - 1u; // return last position where code <= target
+    return left - 1u;
 }
 
 [numthreads(512, 1, 1)]
@@ -314,6 +331,9 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
     node.active = 1u;
     
     nodesBuffer[threadIndex] = node;
+    
+    // --- NEW: Populate SoA buffer directly ---
+    mortonCodesBuffer[threadIndex] = mortonCode;
 }
 
 [numthreads(512, 1, 1)]
