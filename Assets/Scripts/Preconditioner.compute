@@ -22,33 +22,37 @@ StructuredBuffer<float> weightsLayerEmbed;
 StructuredBuffer<float> weightsPosEmbed;
 
 // Transformer Layer Weights
-StructuredBuffer<float> w_attn_in;  // [128 * 384]
-StructuredBuffer<float> b_attn_in;  // [384]
-StructuredBuffer<float> w_attn_out; // [128 * 128]
-StructuredBuffer<float> b_attn_out; // [128]
-StructuredBuffer<float> w_norm1;    // [128]
-StructuredBuffer<float> b_norm1;    // [128]
-StructuredBuffer<float> w_ffn1;     // [128 * 256]
-StructuredBuffer<float> b_ffn1;     // [256]
-StructuredBuffer<float> w_ffn2;     // [256 * 128]
-StructuredBuffer<float> b_ffn2;     // [128]
-StructuredBuffer<float> w_norm2;    // [128]
-StructuredBuffer<float> b_norm2;    // [128]
+StructuredBuffer<float> w_attn_in;  
+StructuredBuffer<float> b_attn_in;
+StructuredBuffer<float> w_attn_out; 
+StructuredBuffer<float> b_attn_out; 
+StructuredBuffer<float> w_norm1;    
+StructuredBuffer<float> b_norm1;    
+StructuredBuffer<float> w_ffn1;     
+StructuredBuffer<float> b_ffn1;     
+StructuredBuffer<float> w_ffn2;     
+StructuredBuffer<float> b_ffn2;     
+StructuredBuffer<float> w_norm2;
+StructuredBuffer<float> b_norm2;    
 
 // Head Weights
 StructuredBuffer<float> w_normOut;
 StructuredBuffer<float> b_normOut;
-StructuredBuffer<float> w_head;     // [128 * 25]
-StructuredBuffer<float> b_head;     // [25]
+StructuredBuffer<float> w_head;     
+StructuredBuffer<float> b_head;
 
 // Data Buffers
-RWStructuredBuffer<float> tokenBuffer;      // [MaxNodes * 128]
-RWStructuredBuffer<float> tokenBufferOut;   // [MaxNodes * 128]
-RWStructuredBuffer<float> bufferQ;          // [MaxNodes * 128]
-RWStructuredBuffer<float> bufferK;          // [MaxNodes * 128]
-RWStructuredBuffer<float> bufferV;          // [MaxNodes * 128]
-RWStructuredBuffer<float> bufferAttn;       // [MaxNodes * 128]
-RWStructuredBuffer<float> matrixGBuffer;    // [NumNodes * 25]
+RWStructuredBuffer<float> tokenBuffer;
+RWStructuredBuffer<float> tokenBufferOut;
+RWStructuredBuffer<float> bufferQ;          
+RWStructuredBuffer<float> bufferK;          
+RWStructuredBuffer<float> bufferV;
+RWStructuredBuffer<float> bufferAttn;       
+RWStructuredBuffer<float> matrixGBuffer;
+
+// Add Global Uniforms
+int d_model;
+int d_ffn; 
 
 uint numNodes;
 uint maxNodes;
@@ -60,13 +64,10 @@ float Gelu(float x) {
     return x * 0.5 * (1.0 + tanh(0.79788 * (x + 0.044715 * x * x * x)));
 }
 
-// --- MACRO FOR REDUCTION ---
-// Replaces the helper function to avoid passing shared memory arrays
-#define REDUCE_SUM_128(tid, val, s_mem) \
+// --- MACRO FOR REDUCTION (32 threads) ---
+#define REDUCE_SUM_32(tid, val, s_mem) \
     s_mem[tid] = val; \
     GroupMemoryBarrierWithGroupSync(); \
-    if (tid < 64) s_mem[tid] += s_mem[tid + 64]; GroupMemoryBarrierWithGroupSync(); \
-    if (tid < 32) s_mem[tid] += s_mem[tid + 32]; GroupMemoryBarrierWithGroupSync(); \
     if (tid < 16) s_mem[tid] += s_mem[tid + 16]; GroupMemoryBarrierWithGroupSync(); \
     if (tid < 8)  s_mem[tid] += s_mem[tid + 8];  GroupMemoryBarrierWithGroupSync(); \
     if (tid < 4)  s_mem[tid] += s_mem[tid + 4];  GroupMemoryBarrierWithGroupSync(); \
@@ -76,15 +77,14 @@ float Gelu(float x) {
     GroupMemoryBarrierWithGroupSync();
 
 // --- KERNEL 1: FEATURES ---
-// FIXED: Changed to 512 to match C# windowGroups dispatch (N/512 groups * 512 threads = N)
 [numthreads(512, 1, 1)] 
 void ComputeFeatures(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i >= maxNodes) return;
 
-    // 1. Feature Extraction (You correctly pasted this!)
-    float feats[58]; 
+    // 1. Feature Extraction
+    float feats[58];
     for(int k=0; k<58; k++) feats[k] = 0.0;
     
     if (i < numNodes) {
@@ -97,10 +97,9 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
         float dx = GetDx(n.layer);
         uint n_base = i * 24;
         int wall_starts[6] = {0, 4, 8, 12, 16, 20};
-
         for (int f = 0; f < 6; f++) {
             uint w_idx = neighborsBuffer[n_base + wall_starts[f]];
-            if (w_idx == numNodes + 1) feats[3 + f] = 1.0; // Wall flag
+            if (w_idx == numNodes + 1) feats[3 + f] = 1.0; 
             
             bool isCoarseOrSame = false;
             uint slot0_idx = neighborsBuffer[n_base + f * 4];
@@ -114,7 +113,7 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
                 if (isCoarseOrSame && s > 0) continue;
 
                 uint n_idx = neighborsBuffer[n_base + local_idx];
-                if (n_idx == numNodes) feats[9 + local_idx] = 1.0; // Air flag
+                if (n_idx == numNodes) feats[9 + local_idx] = 1.0; 
                 
                 float weight = 0.0;
                 if (n_idx < numNodes) {
@@ -122,7 +121,7 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
                     float dist = max(0.5 * (dx + GetDx(nb.layer)), 1e-6);
                     float area = (isCoarseOrSame) ? (dx*dx) : (dx*dx*0.25);
                     weight = area / dist;
-                    feats[34 + local_idx] = -weight; // A_off
+                    feats[34 + local_idx] = -weight;
                 } else if (n_idx == numNodes) { 
                     weight = (dx*dx*0.25) / max(0.5 * dx, 1e-6);
                 }
@@ -134,128 +133,161 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
 
     uint layer = (i < numNodes) ? nodesBuffer[i].layer : 0;
     uint win_pos = i % 512;
-    
     // 2. Linear Projection
-    for (int d = 0; d < 128; d++) {
+    for (int d = 0; d < d_model; d++) {
         float val = biasFeatureProj[d];
-        for (int f = 0; f < 58; f++) val += feats[f] * weightsFeatureProj[f * 128 + d];
-        val += weightsLayerEmbed[layer * 128 + d];
-        val += weightsPosEmbed[win_pos * 128 + d];
-        tokenBuffer[i * 128 + d] = val;
+        for (int f = 0; f < 58; f++) val += feats[f] * weightsFeatureProj[f * d_model + d];
+        val += weightsLayerEmbed[layer * d_model + d];
+        val += weightsPosEmbed[win_pos * d_model + d];
+        tokenBuffer[i * d_model + d] = val;
     }
 }
 
-// --- KERNEL 2: QKV (Node Parallel) ---
-groupshared float sm_x[128]; // Used for broadcast
-groupshared float s_reduce[128]; // Used for reduction
+// --- KERNEL 2: QKV (Node Parallel - 32 Threads) ---
+groupshared float sm_x[32];
+groupshared float s_reduce[32];
 
-[numthreads(128, 1, 1)]
+[numthreads(32, 1, 1)]
 void ComputeQKV(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
     uint nodeIdx = groupID.x;
-    uint dim = groupIndex; // 0..127
+    uint dim = groupIndex; // 0..31
     if (nodeIdx >= maxNodes) return;
+    
+    // REMOVED early return: if (dim >= (uint)d_model) return;
 
     // 1. Load & Norm
-    float val = tokenBuffer[nodeIdx * 128 + dim];
-    
+    // Mask the load so invalid threads read 0
+    float val = 0.0;
+    if (dim < (uint)d_model) {
+        val = tokenBuffer[nodeIdx * d_model + dim];
+    }
+
     // Mean Reduction
     float sum = val;
-    REDUCE_SUM_128(dim, sum, s_reduce);
-    float mean = sum / 128.0;
-    
+    REDUCE_SUM_32(dim, sum, s_reduce);
+    float mean = sum / (float)d_model; // Correct since sum includes 0s from padding
+
     // Var Reduction
-    float diff = val - mean;
+    float diff = 0.0;
+    if (dim < (uint)d_model) {
+        diff = val - mean;
+    }
     float sqDiff = diff * diff;
-    REDUCE_SUM_128(dim, sqDiff, s_reduce); // Reuses s_reduce safely
+    REDUCE_SUM_32(dim, sqDiff, s_reduce);
     
-    float invStd = rsqrt(sqDiff / 128.0 + 1e-5);
-    float normVal = diff * invStd * w_norm1[dim] + b_norm1[dim];
+    float invStd = rsqrt(sqDiff / (float)d_model + 1e-5);
     
-    // Store for broadcast
+    // Mask weight read
+    float w_n = 0.0; float b_n = 0.0;
+    if (dim < (uint)d_model) {
+        w_n = w_norm1[dim];
+        b_n = b_norm1[dim];
+    }
+    float normVal = diff * invStd * w_n + b_n;
+    
+    // Writing to shared mem is safe (slots >= d_model contain junk, but won't be read)
     sm_x[dim] = normVal;
     GroupMemoryBarrierWithGroupSync();
 
     // 2. Compute Q, K, V
-    float q = b_attn_in[dim];
-    float k_val = b_attn_in[128 + dim];
-    float v_val = b_attn_in[256 + dim];
-
-    for (int k = 0; k < 128; k++) {
-        float x_k = sm_x[k]; 
-        q     += x_k * w_attn_in[k * 384 + dim];
-        k_val += x_k * w_attn_in[k * 384 + 128 + dim];
-        v_val += x_k * w_attn_in[k * 384 + 256 + dim];
+    // Mask bias reads
+    float q = 0.0; float k_val = 0.0; float v_val = 0.0;
+    if (dim < (uint)d_model) {
+        q = b_attn_in[dim];
+        k_val = b_attn_in[d_model + dim];
+        v_val = b_attn_in[2 * d_model + dim];
+    }
+    
+    // Loop only up to d_model, so we only read valid sm_x values
+    for (int k = 0; k < d_model; k++) {
+        float x_k = sm_x[k];
+        // We still need to mask writes to q/k/v if this thread is OOB
+        if (dim < (uint)d_model) {
+            q     += x_k * w_attn_in[k * (3 * d_model) + dim];
+            k_val += x_k * w_attn_in[k * (3 * d_model) + d_model + dim];
+            v_val += x_k * w_attn_in[k * (3 * d_model) + 2 * d_model + dim];
+        }
     }
 
-    bufferQ[nodeIdx * 128 + dim] = q;
-    bufferK[nodeIdx * 128 + dim] = k_val;
-    bufferV[nodeIdx * 128 + dim] = v_val;
+    // Mask output write
+    if (dim < (uint)d_model) {
+        bufferQ[nodeIdx * d_model + dim] = q;
+        bufferK[nodeIdx * d_model + dim] = k_val;
+        bufferV[nodeIdx * d_model + dim] = v_val;
+    }
 }
 
 // --- KERNEL 3: ATTENTION (Window + Head Parallel) ---
-// Note: No WaveActiveSum needed here, strictly shared memory tiling.
-groupshared float lds_K[512]; // 16 tokens * 32 dims
-groupshared float lds_V[512]; 
+groupshared float lds_K[128];
+groupshared float lds_V[128];
 
 [numthreads(512, 1, 1)]
 void ComputeAttention(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
 {
     uint windowIdx = groupID.x;
     uint headIdx = groupID.y; // 0..3
-    uint localId = groupThreadID.x; // 0..511 (Token inside window)
+    uint localId = groupThreadID.x; // 0..511
     
     uint globalTokenIdx = windowIdx * 512 + localId;
-    
-    uint headOffset = headIdx * 32; 
+    uint headDim = d_model / 4;
+    uint headOffset = headIdx * headDim; 
     
     // Load Q locally (registers)
     float q_local[32];
     bool valid = globalTokenIdx < maxNodes;
     
     if (valid) {
-        for(int d=0; d<32; d++) {
-            q_local[d] = bufferQ[globalTokenIdx * 128 + headOffset + d];
+        for(int d=0; d<(int)headDim; d++) {
+            q_local[d] = bufferQ[globalTokenIdx * d_model + headOffset + d];
         }
     } else {
-        for(int d=0; d<32; d++) q_local[d] = 0;
+        for(int d=0; d<(int)headDim; d++) q_local[d] = 0;
     }
 
     float m = -1e9;
     float d = 0;
-    float res[32]; 
-    for(int z=0; z<32; z++) res[z] = 0;
+    float res[32];
+    for(int z=0; z<(int)headDim; z++) res[z] = 0;
     
-    float scale = 0.17677; // 1/sqrt(32)
+    float scale = 1.0 / sqrt((float)headDim);
     uint windowStart = windowIdx * 512;
-    
-    // Tiled Processing: 32 tiles * 16 tokens = 512 total
+
     for(int tile = 0; tile < 32; tile++)
     {
-        uint tileStartToken = tile * 16; 
+        uint tileStartToken = tile * 16;
         
-        // Cooperative Load K/V
-        uint loadIdx = localId; 
-        if (loadIdx < 512) {
-            uint t_token = loadIdx / 32; 
-            uint t_dim = loadIdx % 32;   
+        // Collaborative Load K
+        if (localId < 128) {
+            uint t_token = localId / headDim;
+            uint t_dim = localId % headDim;
             uint g_node = windowStart + tileStartToken + t_token;
-            
             if (g_node < maxNodes) {
-                lds_K[loadIdx] = bufferK[g_node * 128 + headOffset + t_dim];
-                lds_V[loadIdx] = bufferV[g_node * 128 + headOffset + t_dim];
+                lds_K[localId] = bufferK[g_node * d_model + headOffset + t_dim];
             } else {
-                lds_K[loadIdx] = 0;
-                lds_V[loadIdx] = 0;
+                lds_K[localId] = 0;
             }
         }
+        
+        // Collaborative Load V
+        if (localId >= 128 && localId < 256) {
+            uint relId = localId - 128;
+            uint t_token = relId / headDim;
+            uint t_dim = relId % headDim;
+            uint g_node = windowStart + tileStartToken + t_token;
+            if (g_node < maxNodes) {
+                lds_V[relId] = bufferV[g_node * d_model + headOffset + t_dim];
+            } else {
+                lds_V[relId] = 0;
+            }
+        }
+
         GroupMemoryBarrierWithGroupSync();
 
-        // Compute Attention for this tile
         for(int j=0; j<16; j++) {
             float score = 0;
-            uint k_base = j * 32;
-            for(int dim=0; dim<32; dim++) {
+            uint k_base = j * headDim;
+            for(int dim=0; dim<(int)headDim; dim++) {
                 score += q_local[dim] * lds_K[k_base + dim];
             }
             score *= scale;
@@ -264,10 +296,9 @@ void ComputeAttention(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_Group
             m = max(m_prev, score);
             float e_score = exp(score - m);
             float e_prev = exp(m_prev - m);
-            
             d = d * e_prev + e_score;
             
-            for(int d_v=0; d_v<32; d_v++) {
+            for(int d_v=0; d_v<(int)headDim; d_v++) {
                 res[d_v] = res[d_v] * e_prev + lds_V[k_base + d_v] * e_score;
             }
         }
@@ -277,111 +308,136 @@ void ComputeAttention(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_Group
     if (!valid) return;
 
     float inv_d = 1.0 / (d + 1e-6);
-    for(int d_i=0; d_i<32; d_i++) {
-        bufferAttn[globalTokenIdx * 128 + headOffset + d_i] = res[d_i] * inv_d;
+    for(int d_i=0; d_i<(int)headDim; d_i++) {
+        bufferAttn[globalTokenIdx * d_model + headOffset + d_i] = res[d_i] * inv_d;
     }
 }
 
-// --- KERNEL 4: FFN (Node Parallel) ---
-groupshared float sm_input[128];
-groupshared float sm_hidden[256];
-groupshared float s_reduce_ffn[128]; // Dedicated reduction buffer
+// --- KERNEL 4: FFN (Node Parallel - 32 Threads) ---
+groupshared float sm_input[32];
+groupshared float sm_hidden[128];
+groupshared float s_reduce_ffn[32];
 
-[numthreads(128, 1, 1)]
+[numthreads(32, 1, 1)]
 void ComputeFFN(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
     uint nodeIdx = groupID.x;
-    uint dim = groupIndex; // 0..127
+    uint dim = groupIndex; // 0..31
     if (nodeIdx >= maxNodes) return;
+    
+    // REMOVED: if (dim >= (uint)d_model) return;
 
     // --- STEP A: Linear Projection (Attn Out) ---
-    // Cooperative load Attn Output
-    sm_input[dim] = bufferAttn[nodeIdx * 128 + dim];
+    // Mask load
+    if (dim < (uint)d_model) {
+        sm_input[dim] = bufferAttn[nodeIdx * d_model + dim];
+    } else {
+        sm_input[dim] = 0.0;
+    }
     GroupMemoryBarrierWithGroupSync();
     
-    // Apply W_attn_out
-    float proj_val = b_attn_out[dim];
-    for(int k=0; k<128; k++) {
-        proj_val += sm_input[k] * w_attn_out[k * 128 + dim];
+    float proj_val = 0.0;
+    if (dim < (uint)d_model) {
+        proj_val = b_attn_out[dim];
+        for(int k=0; k<d_model; k++) {
+            proj_val += sm_input[k] * w_attn_out[k * d_model + dim];
+        }
     }
     
-    // Residual 1
-    float x_in = tokenBuffer[nodeIdx * 128 + dim];
+    float x_in = 0.0;
+    if (dim < (uint)d_model) {
+        x_in = tokenBuffer[nodeIdx * d_model + dim];
+    }
     float x_res1 = x_in + proj_val;
     
     // --- Norm 2 ---
     float sum = x_res1;
-    REDUCE_SUM_128(dim, sum, s_reduce_ffn);
-    float mean = sum / 128.0;
+    REDUCE_SUM_32(dim, sum, s_reduce_ffn);
+    float mean = sum / (float)d_model;
     
-    float diff = x_res1 - mean;
+    float diff = 0.0;
+    if (dim < (uint)d_model) diff = x_res1 - mean;
+    
     float sqDiff = diff * diff;
-    REDUCE_SUM_128(dim, sqDiff, s_reduce_ffn);
-    float invStd = rsqrt(sqDiff / 128.0 + 1e-5);
+    REDUCE_SUM_32(dim, sqDiff, s_reduce_ffn);
+    float invStd = rsqrt(sqDiff / (float)d_model + 1e-5);
     
-    float x_norm = diff * invStd * w_norm2[dim] + b_norm2[dim];
-    
-    // Store Normalized Input
+    float x_norm = 0.0;
+    if (dim < (uint)d_model) {
+        x_norm = diff * invStd * w_norm2[dim] + b_norm2[dim];
+    }
     sm_input[dim] = x_norm;
     GroupMemoryBarrierWithGroupSync();
-    
-    // --- STEP B: FFN Layer 1 (128 -> 256) ---
-    // Thread computes 2 values
-    float h1 = b_ffn1[dim];
-    for(int i=0; i<128; i++) h1 += sm_input[i] * w_ffn1[i * 256 + dim];
-    sm_hidden[dim] = Gelu(h1);
-    
-    float h2 = b_ffn1[dim + 128];
-    for(int j=0; j<128; j++) h2 += sm_input[j] * w_ffn1[j * 256 + (dim + 128)];
-    sm_hidden[dim + 128] = Gelu(h2);
-    
+
+    // --- STEP B: FFN Layer 1 (d_model -> d_ffn) ---
+    int h_per_thread = d_ffn / 32;
+    for(int h=0; h<h_per_thread; h++) {
+        uint h_idx = dim + h * 32; // Use 32 (group size) not d_model
+        
+        if (h_idx < (uint)d_ffn) {
+            float h_val = b_ffn1[h_idx];
+            for(int i=0; i<d_model; i++) {
+                h_val += sm_input[i] * w_ffn1[i * d_ffn + h_idx];
+            }
+            sm_hidden[h_idx] = Gelu(h_val);
+        }
+    }
     GroupMemoryBarrierWithGroupSync();
     
-    // --- STEP C: FFN Layer 2 (256 -> 128) + Residual ---
-    float ffn_out = b_ffn2[dim];
-    for(int h=0; h<256; h++) {
-        ffn_out += sm_hidden[h] * w_ffn2[h * 128 + dim];
+    // --- STEP C: FFN Layer 2 (d_ffn -> d_model) + Residual ---
+    float ffn_out = 0.0;
+    if (dim < (uint)d_model) {
+        ffn_out = b_ffn2[dim];
+        for(int h=0; h<d_ffn; h++) {
+            ffn_out += sm_hidden[h] * w_ffn2[h * d_model + dim];
+        }
+        tokenBufferOut[nodeIdx * d_model + dim] = x_res1 + ffn_out;
     }
-    
-    float final_val = x_res1 + ffn_out;
-    tokenBufferOut[nodeIdx * 128 + dim] = final_val;
 }
 
-// --- KERNEL 5: PREDICT HEAD ---
-groupshared float s_reduce_head[128];
+// --- KERNEL 5: PREDICT HEAD (32 Threads) ---
+groupshared float s_reduce_head[32];
 
-[numthreads(128, 1, 1)]
+[numthreads(32, 1, 1)]
 void PredictHead(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
     uint nodeIdx = groupID.x;
-    uint dim = groupIndex;
+    uint dim = groupIndex; // 0..31
     if (nodeIdx >= numNodes) return;
     
-    float val = tokenBufferOut[nodeIdx * 128 + dim];
+    // REMOVED: if (dim >= (uint)d_model) return;
     
+    float val = 0.0;
+    if (dim < (uint)d_model) {
+        val = tokenBufferOut[nodeIdx * d_model + dim];
+    }
+
     // Norm Out
     float sum = val;
-    REDUCE_SUM_128(dim, sum, s_reduce_head);
-    float mean = sum / 128.0;
+    REDUCE_SUM_32(dim, sum, s_reduce_head);
+    float mean = sum / (float)d_model;
     
-    float diff = val - mean;
+    float diff = 0.0;
+    if (dim < (uint)d_model) diff = val - mean;
     float sqDiff = diff * diff;
-    REDUCE_SUM_128(dim, sqDiff, s_reduce_head);
-    float invStd = rsqrt(sqDiff / 128.0 + 1e-5);
+    REDUCE_SUM_32(dim, sqDiff, s_reduce_head);
     
-    float x_norm = diff * invStd * w_normOut[dim] + b_normOut[dim];
+    float invStd = rsqrt(sqDiff / (float)d_model + 1e-5);
     
-    // Store for projection
-    // We reuse s_reduce_head to broadcast the normalized vector
+    float x_norm = 0.0;
+    if (dim < (uint)d_model) {
+        x_norm = diff * invStd * w_normOut[dim] + b_normOut[dim];
+    }
     s_reduce_head[dim] = x_norm;
     GroupMemoryBarrierWithGroupSync();
     
-    // Linear 128 -> 25
-    if (dim < 25) {
+    // Linear d_model -> 7
+    // Ensure only valid threads write output
+    if (dim < 7) { // 7 coeffs
         float outVal = b_head[dim];
-        for(int k=0; k<128; k++) {
-            outVal += s_reduce_head[k] * w_head[k * 25 + dim];
+        for(int k=0; k<d_model; k++) {
+            outVal += s_reduce_head[k] * w_head[k * 7 + dim];
         }
-        matrixGBuffer[nodeIdx * 25 + dim] = outVal;
+        matrixGBuffer[nodeIdx * 7 + dim] = outVal;
     }
 }
