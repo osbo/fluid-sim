@@ -505,93 +505,110 @@ void ClearBufferFloat(uint3 id : SV_DispatchThreadID)
 // Computes the diagonal entry A_ii for each node i
 // The diagonal is the negative sum of all off-diagonal weights
 RWStructuredBuffer<float> diagonalBuffer; // Output buffer for diagonal values
-[numthreads(512, 1, 1)]
-void ComputeDiagonal(uint3 id : SV_DispatchThreadID)
+
+// --- OPTIMIZED KERNEL WITH LDS ---
+groupshared Node s_nodes_diag[256];
+
+[numthreads(256, 1, 1)]
+void ComputeDiagonal(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint li = Gtid.x;
+    uint group_start_idx = Gid.x * 256;
+
+    // --- Phase 1: Collaborative Load into LDS ---
+    // Guard against out-of-bounds, but ensure barrier is hit by all
+    if (i < numNodes)
+    {
+        s_nodes_diag[li] = nodesBuffer[i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Early exit for invalid threads after sync
     if (i >= numNodes) return;
 
-    Node node = nodesBuffer[i];
+    // Read own data from fast LDS
+    Node node = s_nodes_diag[li];
+    
     float dx_i = exp2((float)node.layer);
     if (!isfinite(dx_i)) dx_i = 1e-6;
-    
     float diagonal_sum = 0.0;
 
     // Loop over all 6 faces of the node
     for (int d = 0; d < 6; d++)
     {
-        uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
-        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i]; // first slot: same/parent layer
+        uint faceSlotBase = d * 4;
+        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i];
 
-        // Case 1: True Boundary (Neumann BC, neighbor_idx == numNodes + 1)
+        // Case 1: True Boundary (Neumann BC)
         if (neighbor_idx == numNodes + 1)
         {
-            // Neumann BC means zero flux (dp/dn = 0).
-            // No contribution to diagonal.
+            // No contribution
         }
-        // Case 2: Same-layer or Parent (coarser) neighbor
+        // Case 2: Same-layer or Parent neighbor
         else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
-            Node nNode = nodesBuffer[neighbor_idx];
+            Node nNode;
+            
+            // --- LDS CACHE CHECK ---
+            if (neighbor_idx >= group_start_idx && neighbor_idx < group_start_idx + 256)
+            {
+                // Cache Hit: Read from Shared Memory
+                nNode = s_nodes_diag[neighbor_idx - group_start_idx];
+            }
+            else
+            {
+                // Cache Miss: Read from Global Memory
+                nNode = nodesBuffer[neighbor_idx];
+            }
+
             float dx_j = exp2((float)nNode.layer);
-            
-            // Distance between cell centers
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
-            
-            // Face area is the area of cell i's face (dx_i^2)
             float a_shared = dx_i * dx_i;
-            
-            // Weight: area divided by distance
             float w = a_shared / distance;
-            
             diagonal_sum += w;
         }
         else
         {
-            // Case 3 or 4: Child (finer) neighbors or Dirichlet boundary
-            // The face of cell i is subdivided into 4 child cells
+            // Case 3 or 4: Child neighbors or Dirichlet
             float faceArea = dx_i * dx_i;
-            float childFaceArea = faceArea / 4.0; // Each child occupies 1/4 of the face
+            float childFaceArea = faceArea / 4.0;
             
             for (int k = 0; k < 4; k++)
             {
-                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
                 uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + i];
-                // Case 3: Child (finer) neighbor
-                if (child_idx < numNodes)
+                
+                if (child_idx < numNodes) // Case 3: Child neighbor
                 {
-                    Node cNode = nodesBuffer[child_idx];
+                    Node cNode;
+
+                    // --- LDS CACHE CHECK (For Children) ---
+                    if (child_idx >= group_start_idx && child_idx < group_start_idx + 256)
+                    {
+                        cNode = s_nodes_diag[child_idx - group_start_idx];
+                    }
+                    else
+                    {
+                        cNode = nodesBuffer[child_idx];
+                    }
+
                     float dx_k = exp2((float)cNode.layer);
-                    
-                    // Distance between cell i center and child cell k center
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    
-                    // Weight: child's portion of face area divided by distance
                     float w = childFaceArea / distance;
-                    
                     diagonal_sum += w;
                 }
-                // Case 4: Dirichlet boundary
-                else if (child_idx == numNodes)
+                else if (child_idx == numNodes) // Case 4: Dirichlet
                 {
                     float dx_k = dx_i * 0.5;
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    
-                    // Weight: child's portion of face area divided by distance
                     float w = childFaceArea / distance;
-                    
                     diagonal_sum += w;
                 }
             }
         }
     }
 
-    // The diagonal is the negative sum (since Laplacian is -L)
-    // For Jacobi preconditioning, we use the absolute value (magnitude)
-    // to match the Python implementation: A_diag = sum(abs(A_off))
-    float outVal = diagonal_sum; // Store positive value (absolute value of diagonal)
-    
+    float outVal = diagonal_sum;
     if (!isfinite(outVal)) outVal = 0.0;
     diagonalBuffer[i] = outVal;
 }

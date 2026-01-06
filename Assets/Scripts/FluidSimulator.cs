@@ -139,6 +139,7 @@ public class FluidSimulator : MonoBehaviour
     private double cumulativeCgIterations = 0.0;
     private int cgSolveFrameCount = 0;
     private float averageCgIterations = 0.0f;
+    private int lastCgIterations = 0;
     
     private System.Diagnostics.Stopwatch totalOctreeSw;
     
@@ -473,6 +474,7 @@ public class FluidSimulator : MonoBehaviour
                  $"• Apply External Forces: {applyExternalForcesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• CG Iterations: {lastCgIterations}\n" +
                  $"• Avg CG Iterations: {averageCgIterationsText}");
     }
 
@@ -526,7 +528,6 @@ public class FluidSimulator : MonoBehaviour
 
     private void SolvePressure()
     {
-        var totalSolveSw = System.Diagnostics.Stopwatch.StartNew();
         
         if (cgSolverShader == null)
         {
@@ -535,7 +536,6 @@ public class FluidSimulator : MonoBehaviour
         }
 
         // --- Kernel Lookups ---
-        var kernelFindSw = System.Diagnostics.Stopwatch.StartNew();
         int calculateDivergenceKernel = cgSolverShader.FindKernel("CalculateDivergence");
         int applyLaplacianAndDotKernel = cgSolverShader.FindKernel("ApplyLaplacianAndDot");
         int axpyKernel = cgSolverShader.FindKernel("Axpy");
@@ -547,7 +547,6 @@ public class FluidSimulator : MonoBehaviour
         int clearBufferFloatKernel = cgSolverShader.FindKernel("ClearBufferFloat");
         int applyJacobiKernel = cgSolverShader.FindKernel("ApplyJacobi");
         int computeDiagonalKernel = cgSolverShader.FindKernel("ComputeDiagonal");
-        kernelFindSw.Stop();
         
         if (calculateDivergenceKernel < 0 || applyLaplacianAndDotKernel < 0 || axpyKernel < 0 || dotProductKernel < 0)
         {
@@ -556,7 +555,6 @@ public class FluidSimulator : MonoBehaviour
         }
 
         // --- Buffer Init (Grow-only) ---
-        var bufferInitSw = System.Diagnostics.Stopwatch.StartNew();
         int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
         
         if (divergenceBuffer == null || divergenceBuffer.count < requiredSize)
@@ -600,16 +598,13 @@ public class FluidSimulator : MonoBehaviour
             diagonalBuffer?.Release();
             diagonalBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
-        bufferInitSw.Stop();
 
         // --- Step 1: Init (r = b) ---
-        var divergenceSw = System.Diagnostics.Stopwatch.StartNew();
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(calculateDivergenceKernel, numNodes);
-        divergenceSw.Stop();
 
         // Compute Diagonal EARLY (Before Neural Inference or Jacobi)
         // This is needed for both Neural (as input feature) and Jacobi (as preconditioner)
@@ -619,7 +614,10 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(computeDiagonalKernel, "neighborsBuffer", neighborsBuffer);
             cgSolverShader.SetBuffer(computeDiagonalKernel, "diagonalBuffer", diagonalBuffer);
             cgSolverShader.SetInt("numNodes", numNodes);
-            Dispatch(computeDiagonalKernel, numNodes);
+
+            // CHANGED: Use 256.0f divisor to match [numthreads(256, 1, 1)]
+            int groups = Mathf.CeilToInt(numNodes / 256.0f); 
+            cgSolverShader.Dispatch(computeDiagonalKernel, groups, 1, 1);
         }
 
         // Generate Matrix G (Neural Inference) or Use Diagonal (Jacobi)
@@ -636,7 +634,6 @@ public class FluidSimulator : MonoBehaviour
         // Note: Jacobi preconditioner uses the diagonalBuffer computed above, no additional dispatch needed
 
         // Init Pressure x=0
-        var initSw = System.Diagnostics.Stopwatch.StartNew();
         float[] zeros = new float[numNodes];
         pressureBuffer.SetData(zeros);
 
@@ -657,11 +654,9 @@ public class FluidSimulator : MonoBehaviour
         float initialResidual = GpuDotProduct(residualBuffer, residualBuffer); // For convergence check only
         if (initialResidual < convergenceThreshold)
         {
-            initSw.Stop();
-            totalSolveSw.Stop();
+            //totalSolveSw.Stop(); // This is no longer needed after removing totalSolveSw
             return;
         }
-        initSw.Stop();
 
         // Reset CG loop timers
         laplacianSw.Reset();
@@ -669,7 +664,6 @@ public class FluidSimulator : MonoBehaviour
         updateVectorSw.Reset();
 
         // --- Step 3: PCG Loop ---
-        var cgLoopSw = System.Diagnostics.Stopwatch.StartNew();
         int totalIterations = 0;
         
         for (int k = 0; k < maxCgIterations; k++)
@@ -726,20 +720,24 @@ public class FluidSimulator : MonoBehaviour
             updateVectorSw.Stop();
 
             // Check Convergence (using true residual r.r)
-            dotProductSw.Start();
-            float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
-            dotProductSw.Stop();
-            
-            if (r_dot_r > 10.0f * initialResidual)
+            // Only check every 5 iterations to reduce CPU-GPU transfer
+            if (k % 5 == 0)
             {
-                totalIterations = k + 1;
-                break;
-            }
-            
-            if (r_dot_r < convergenceThreshold)
-            {
-                totalIterations = k + 1;
-                break;
+                dotProductSw.Start();
+                float r_dot_r = GpuDotProduct(residualBuffer, residualBuffer);
+                dotProductSw.Stop();
+                
+                if (r_dot_r > 10.0f * initialResidual)
+                {
+                    totalIterations = k + 1;
+                    break;
+                }
+                
+                if (r_dot_r < convergenceThreshold)
+                {
+                    totalIterations = k + 1;
+                    break;
+                }
             }
 
             // --- PRECONDITIONER STEP ---
@@ -763,25 +761,14 @@ public class FluidSimulator : MonoBehaviour
             rho = rho_new;
             totalIterations = k + 1;
         }
-        cgLoopSw.Stop();
         
         // Update running statistics
         cgSolveFrameCount++;
         cumulativeCgIterations += totalIterations;
         averageCgIterations = (float)(cumulativeCgIterations / Math.Max(1, cgSolveFrameCount));
+        lastCgIterations = totalIterations;
         
         // Summary report
-        float finalResidual = GpuDotProduct(residualBuffer, residualBuffer);
-        float totalImprovement = ((initialResidual - finalResidual) / initialResidual) * 100.0f;
-        float residualRatio = finalResidual / initialResidual;
-        
-        string summary = $"PCG Solver Summary: Iterations {totalIterations}/{maxCgIterations}, Residual {initialResidual:E6} -> {finalResidual:E6}\n";
-        summary += $"• Iterations: {totalIterations}/{maxCgIterations}\n";
-        summary += $"• Initial residual: {initialResidual:E6}\n";
-        summary += $"• Final residual: {finalResidual:E6}\n";
-        summary += $"• Total improvement: {totalImprovement:F2}%\n";
-        summary += $"• Residual ratio: {residualRatio:E3}x initial\n";
-        Debug.Log(summary);
 
         // Save training data
         if (recorder != null && recorder.isRecording)
@@ -797,27 +784,9 @@ public class FluidSimulator : MonoBehaviour
         }
 
         // --- Step 4: Apply pressure to velocities ---
-        var pressureGradientSw = System.Diagnostics.Stopwatch.StartNew();
         ApplyPressureGradient();
-        pressureGradientSw.Stop();
         
         // Final timing summary
-        totalSolveSw.Stop();
-        Debug.Log($"SolvePressure Timing Summary:\n" +
-                 $"• Total: {totalSolveSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Kernel Find: {kernelFindSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Buffer Init: {bufferInitSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Divergence: {divergenceSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Preconditioner:\n" +
-                 $"  - ComputeFeatures: {featSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - FusedTransformerLayer (per-layer): {qkvSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - PredictHead: {headSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• PCG Loop ({totalIterations} iterations): {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - ApplyLaplacianAndDot (Fused): {laplacianSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - DotProduct Reduction: {dotProductSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - UpdateVector: {updateVectorSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     // --- Helper to Run the Preconditioner Pipeline ---
