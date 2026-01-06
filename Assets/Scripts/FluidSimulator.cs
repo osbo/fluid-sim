@@ -14,6 +14,13 @@ public enum RenderingMode
     Thickness
 }
 
+public enum PreconditionerType
+{
+    None,
+    Neural,
+    Jacobi
+}
+
 public class FluidSimulator : MonoBehaviour
 {
     public BoxCollider simulationBounds;
@@ -94,6 +101,7 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer zBuffer; // Intermediate buffer for PCG preconditioner application (used as 'u' in shader)
     private ComputeBuffer zVectorBuffer; // Preconditioned residual vector 'z' for PCG
     private ComputeBuffer scatterIndicesBuffer; // NEW: Pre-computed scatter indices for optimization
+    private ComputeBuffer diagonalBuffer; // Diagonal of Laplacian matrix A for Jacobi preconditioning
     private ComputeBuffer bufferQ; // Q buffer for attention
     private ComputeBuffer bufferK; // K buffer for attention
     private ComputeBuffer bufferV; // V buffer for attention
@@ -103,6 +111,10 @@ public class FluidSimulator : MonoBehaviour
     private float p_mean;
     private float p_std;
     private int d_model, num_heads, num_layers, input_dim;
+    
+    // Model architecture constants
+    private const int WINDOW_SIZE = 256;  // Window size for attention (down from 512)
+    private const int NUM_HEADS = 4;     // Number of attention heads
     
     // add previous active node count, but that can be a cpu variable 
     
@@ -119,7 +131,7 @@ public class FluidSimulator : MonoBehaviour
     public float frameRate;
     public int minLayer;
     public int maxLayer;
-    public bool useNeuralPreconditioner = true;
+    public PreconditionerType preconditioner = PreconditionerType.Neural;
 
     private bool hasShownWaitMessage = false;
     private int frameNumber = 0;
@@ -309,7 +321,7 @@ public class FluidSimulator : MonoBehaviour
                 weightBuffers["feature_proj.weight"] = ReadBuffer(input_dim * d_model); // [58, 128] -> transposed
                 weightBuffers["feature_proj.bias"] = ReadBuffer(d_model);
                 weightBuffers["layer_embed"] = ReadBuffer(12 * d_model); // [12, 128]
-                weightBuffers["window_pos_embed"] = ReadBuffer(512 * d_model); // [1, 512, 128] flattened
+                weightBuffers["window_pos_embed"] = ReadBuffer(WINDOW_SIZE * d_model); // [1, WINDOW_SIZE, d_model] flattened
 
                 // Transformer layers
                 for (int i = 0; i < num_layers; i++)
@@ -519,16 +531,20 @@ public class FluidSimulator : MonoBehaviour
         var kernelFindSw = System.Diagnostics.Stopwatch.StartNew();
         int calculateDivergenceKernel = cgSolverShader.FindKernel("CalculateDivergence");
         int applyLaplacianKernel = cgSolverShader.FindKernel("ApplyLaplacian");
+        int applyLaplacianAndDotKernel = cgSolverShader.FindKernel("ApplyLaplacianAndDot");
         int axpyKernel = cgSolverShader.FindKernel("Axpy");
         int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
         // Preconditioner Kernels from CGSolver.compute
         int precomputeIndicesKernel = cgSolverShader.FindKernel("PrecomputeIndices");
         int applySparseGTKernel = cgSolverShader.FindKernel("ApplySparseGT"); 
         int applySparseGKernel = cgSolverShader.FindKernel("ApplySparseG");
+        int applySparseGAndDotKernel = cgSolverShader.FindKernel("ApplySparseGAndDot");
         int clearBufferFloatKernel = cgSolverShader.FindKernel("ClearBufferFloat");
+        int applyJacobiKernel = cgSolverShader.FindKernel("ApplyJacobi");
+        int computeDiagonalKernel = cgSolverShader.FindKernel("ComputeDiagonal");
         kernelFindSw.Stop();
         
-        if (calculateDivergenceKernel < 0 || applyLaplacianKernel < 0 || axpyKernel < 0 || dotProductKernel < 0)
+        if (calculateDivergenceKernel < 0 || applyLaplacianKernel < 0 || applyLaplacianAndDotKernel < 0 || axpyKernel < 0 || dotProductKernel < 0)
         {
             Debug.LogError("One or more CG solver kernels not found. Check CGSolver.compute shader compilation.");
             return;
@@ -571,7 +587,13 @@ public class FluidSimulator : MonoBehaviour
         if (scatterIndicesBuffer == null || scatterIndicesBuffer.count < requiredSize * 24)
         {
             scatterIndicesBuffer?.Release();
-            scatterIndicesBuffer = new ComputeBuffer(requiredSize * 24, sizeof(uint));
+            scatterIndicesBuffer = new ComputeBuffer(requiredSize * 24, 4); // SoA: stride is 4 bytes (uint)
+        }
+        // Always allocate diagonalBuffer (needed for Neural input OR Jacobi)
+        if (diagonalBuffer == null || diagonalBuffer.count < requiredSize)
+        {
+            diagonalBuffer?.Release();
+            diagonalBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
         bufferInitSw.Stop();
 
@@ -584,10 +606,21 @@ public class FluidSimulator : MonoBehaviour
         Dispatch(calculateDivergenceKernel, numNodes);
         divergenceSw.Stop();
 
-        // Generate Matrix G (Neural Inference)
-        if (useNeuralPreconditioner && preconditionerShader != null)
+        // Compute Diagonal EARLY (Before Neural Inference or Jacobi)
+        // This is needed for both Neural (as input feature) and Jacobi (as preconditioner)
+        if (computeDiagonalKernel >= 0)
         {
-            RunNeuralPreconditioner(); // Fills matrixGBuffer
+            cgSolverShader.SetBuffer(computeDiagonalKernel, "nodesBuffer", nodesBuffer);
+            cgSolverShader.SetBuffer(computeDiagonalKernel, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(computeDiagonalKernel, "diagonalBuffer", diagonalBuffer);
+            cgSolverShader.SetInt("numNodes", numNodes);
+            Dispatch(computeDiagonalKernel, numNodes);
+        }
+
+        // Generate Matrix G (Neural Inference) or Use Diagonal (Jacobi)
+        if (preconditioner == PreconditionerType.Neural && preconditionerShader != null)
+        {
+            RunNeuralPreconditioner(); // Fills matrixGBuffer (now has access to ready-made diagonalBuffer)
             
             // --- Precompute Optimization ---
             cgSolverShader.SetBuffer(precomputeIndicesKernel, "neighborsBuffer", neighborsBuffer);
@@ -595,6 +628,7 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetInt("numNodes", numNodes);
             Dispatch(precomputeIndicesKernel, numNodes);
         }
+        // Note: Jacobi preconditioner uses the diagonalBuffer computed above, no additional dispatch needed
 
         // Init Pressure x=0
         var initSw = System.Diagnostics.Stopwatch.StartNew();
@@ -605,14 +639,15 @@ public class FluidSimulator : MonoBehaviour
         CopyBuffer(divergenceBuffer, residualBuffer);
 
         // --- Step 2: Preconditioned Initialization ---
-        // z = M^-1 * r
-        ApplyPreconditioner(residualBuffer, zVectorBuffer, applySparseGTKernel, applySparseGKernel, clearBufferFloatKernel);
+        // z = M^-1 * r AND rho = r . z (Fused)
+        float rho = ApplyPreconditionerAndDot(
+            residualBuffer, zVectorBuffer, 
+            applySparseGTKernel, applySparseGKernel, applySparseGAndDotKernel, 
+            clearBufferFloatKernel, applyJacobiKernel
+        );
 
         // p = z
         CopyBuffer(zVectorBuffer, pBuffer);
-
-        // rho = r . z (PCG uses r.z instead of r.r)
-        float rho = GpuDotProduct(residualBuffer, zVectorBuffer);
 
         float initialResidual = GpuDotProduct(residualBuffer, residualBuffer); // For convergence check only
         if (initialResidual < convergenceThreshold)
@@ -634,20 +669,25 @@ public class FluidSimulator : MonoBehaviour
         
         for (int k = 0; k < maxCgIterations; k++)
         {
-            // 1. Ap = A * p
+            // 1. FUSED: Ap = A * p AND p · Ap (in single kernel)
             laplacianSw.Start();
-            cgSolverShader.SetBuffer(applyLaplacianKernel, "nodesBuffer", nodesBuffer);
-            cgSolverShader.SetBuffer(applyLaplacianKernel, "neighborsBuffer", neighborsBuffer);
-            cgSolverShader.SetBuffer(applyLaplacianKernel, "pBuffer", pBuffer);
-            cgSolverShader.SetBuffer(applyLaplacianKernel, "ApBuffer", ApBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "nodesBuffer", nodesBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "pBuffer", pBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "ApBuffer", ApBuffer);
+            cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "divergenceBuffer", divergenceBuffer); // For reduction output
             cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
             cgSolverShader.SetInt("numNodes", numNodes);
-            Dispatch(applyLaplacianKernel, numNodes);
+            int groups = Mathf.CeilToInt(numNodes / 512.0f);
+            cgSolverShader.Dispatch(applyLaplacianAndDotKernel, groups, 1, 1);
             laplacianSw.Stop();
 
-            // 2. alpha = rho / (p . Ap)
+            // 2. CPU Side Reduction (same as GpuDotProduct helper)
             dotProductSw.Start();
-            float p_dot_Ap = GpuDotProduct(pBuffer, ApBuffer);
+            float[] result = new float[groups];
+            divergenceBuffer.GetData(result); // Only read back small buffer
+            float p_dot_Ap = 0.0f;
+            for (int i = 0; i < groups; i++) p_dot_Ap += result[i];
             dotProductSw.Stop();
             
             if (Mathf.Abs(p_dot_Ap) < 1e-12f)
@@ -698,12 +738,13 @@ public class FluidSimulator : MonoBehaviour
             }
 
             // --- PRECONDITIONER STEP ---
-            // 5. z_new = M^-1 * r_new
-            ApplyPreconditioner(residualBuffer, zVectorBuffer, applySparseGTKernel, applySparseGKernel, clearBufferFloatKernel);
-
-            // 6. rho_new = r_new . z_new
+            // 5. z_new = M^-1 * r_new AND rho_new = r_new . z_new (Fused)
             dotProductSw.Start();
-            float rho_new = GpuDotProduct(residualBuffer, zVectorBuffer);
+            float rho_new = ApplyPreconditionerAndDot(
+                residualBuffer, zVectorBuffer, 
+                applySparseGTKernel, applySparseGKernel, applySparseGAndDotKernel, 
+                clearBufferFloatKernel, applyJacobiKernel
+            );
             dotProductSw.Stop();
 
             // 7. beta = rho_new / rho
@@ -770,55 +811,139 @@ public class FluidSimulator : MonoBehaviour
                  $"  - ComputeFFN (4x): {ffnSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - PredictHead: {headSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• PCG Loop ({totalIterations} iterations): {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - ApplyLaplacian: {laplacianSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - DotProduct: {dotProductSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - ApplyLaplacianAndDot (Fused): {laplacianSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - DotProduct Reduction: {dotProductSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - UpdateVector: {updateVectorSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Pressure Gradient: {pressureGradientSw.Elapsed.TotalMilliseconds:F2} ms");
     }
 
     // --- Helper to Run the Preconditioner Pipeline ---
-    private void ApplyPreconditioner(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kClear)
+    private void ApplyPreconditioner(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kClear, int kJacobi)
     {
-        if (!useNeuralPreconditioner || matrixGBuffer == null)
+        if (preconditioner == PreconditionerType.None)
         {
             // Identity fallback: z = r
             CopyBuffer(r, z_out);
             return;
         }
-
-        // Ensure zBuffer is allocated (used as intermediate 'u' in shader)
-        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
-        if (zBuffer == null || zBuffer.count < requiredSize)
+        else if (preconditioner == PreconditionerType.Jacobi)
         {
-            zBuffer?.Release();
-            zBuffer = new ComputeBuffer(requiredSize, 4);
+            // Jacobi preconditioning: z = D^-1 * r
+            // where D is the diagonal of the Laplacian matrix A
+            if (kJacobi >= 0 && diagonalBuffer != null)
+            {
+                cgSolverShader.SetBuffer(kJacobi, "xBuffer", r);
+                cgSolverShader.SetBuffer(kJacobi, "yBuffer", z_out);
+                cgSolverShader.SetBuffer(kJacobi, "diagonalBuffer", diagonalBuffer);
+                cgSolverShader.SetInt("numNodes", numNodes);
+                Dispatch(kJacobi, numNodes);
+            }
+            else
+            {
+                // Fallback to identity if kernel not found
+                CopyBuffer(r, z_out);
+            }
+            return;
+        }
+        else if (preconditioner == PreconditionerType.Neural)
+        {
+            if (matrixGBuffer == null)
+            {
+                // Identity fallback: z = r
+                CopyBuffer(r, z_out);
+                return;
+            }
+
+            // Ensure zBuffer is allocated (used as intermediate 'u' in shader)
+            int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
+            if (zBuffer == null || zBuffer.count < requiredSize)
+            {
+                zBuffer?.Release();
+                zBuffer = new ComputeBuffer(requiredSize, 4);
+            }
+
+            // 1. Clear Intermediate 'zBuffer' (used as 'u' in Shader)
+            cgSolverShader.SetBuffer(kClear, "zBuffer", zBuffer); 
+            cgSolverShader.SetInt("numNodes", numNodes);
+            Dispatch(kClear, numNodes);
+
+            // 2. u = G^T * r  (Scatter)
+            // CGSolver.compute: ApplySparseGT reads 'xBuffer' (r), writes 'zBuffer' (u)
+            cgSolverShader.SetBuffer(kGT, "xBuffer", r);
+            cgSolverShader.SetBuffer(kGT, "zBuffer", zBuffer); // Intermediate
+            cgSolverShader.SetBuffer(kGT, "matrixGBuffer", matrixGBuffer);
+            cgSolverShader.SetBuffer(kGT, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(kGT, "reverseNeighborsBuffer", reverseNeighborsBuffer);
+            cgSolverShader.SetBuffer(kGT, "scatterIndicesBuffer", scatterIndicesBuffer); // Bind precomputed indices
+            cgSolverShader.SetInt("numNodes", numNodes);
+            Dispatch(kGT, numNodes);
+
+            // 3. z = G * u + eps * r (Gather)
+            // CGSolver.compute: ApplySparseG reads 'zBuffer'(u), 'xBuffer'(r), writes 'yBuffer'(z_out)
+            cgSolverShader.SetBuffer(kG, "zBuffer", zBuffer); // Intermediate input
+            cgSolverShader.SetBuffer(kG, "xBuffer", r);       // For epsilon skip connection
+            cgSolverShader.SetBuffer(kG, "yBuffer", z_out);   // Final Output
+            cgSolverShader.SetBuffer(kG, "matrixGBuffer", matrixGBuffer);
+            cgSolverShader.SetBuffer(kG, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetInt("numNodes", numNodes);
+            Dispatch(kG, numNodes);
+        }
+        else
+        {
+            // Unknown preconditioner type, fallback to identity
+            CopyBuffer(r, z_out);
+        }
+    }
+
+    // --- Fused Preconditioner + Dot Product ---
+    // Performs M^-1 * r AND computes r · z in a single pass to reduce memory round-trips
+    private float ApplyPreconditionerAndDot(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kG_Dot, int kClear, int kJacobi)
+    {
+        float dotResult = 0.0f;
+
+        if (preconditioner == PreconditionerType.Neural && matrixGBuffer != null)
+        {
+            // 1. Clear Intermediate
+            cgSolverShader.SetBuffer(kClear, "zBuffer", zBuffer);
+            cgSolverShader.SetInt("numNodes", numNodes);
+            Dispatch(kClear, numNodes);
+
+            // 2. Step 1: u = G^T * r (Standard Scatter)
+            cgSolverShader.SetBuffer(kGT, "xBuffer", r);
+            cgSolverShader.SetBuffer(kGT, "zBuffer", zBuffer);
+            cgSolverShader.SetBuffer(kGT, "matrixGBuffer", matrixGBuffer);
+            cgSolverShader.SetBuffer(kGT, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(kGT, "reverseNeighborsBuffer", reverseNeighborsBuffer);
+            cgSolverShader.SetBuffer(kGT, "scatterIndicesBuffer", scatterIndicesBuffer);
+            cgSolverShader.SetInt("numNodes", numNodes);
+            Dispatch(kGT, numNodes);
+
+            // 3. Step 2 + Dot: z = G * u + eps * r AND rho = dot(r, z)
+            cgSolverShader.SetBuffer(kG_Dot, "zBuffer", zBuffer);       // u (Input)
+            cgSolverShader.SetBuffer(kG_Dot, "xBuffer", r);             // r (Input for eps & dot)
+            cgSolverShader.SetBuffer(kG_Dot, "yBuffer", z_out);         // z (Output)
+            cgSolverShader.SetBuffer(kG_Dot, "matrixGBuffer", matrixGBuffer);
+            cgSolverShader.SetBuffer(kG_Dot, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(kG_Dot, "divergenceBuffer", divergenceBuffer); // Scratch for reduction
+            cgSolverShader.SetInt("numNodes", numNodes);
+            
+            int groups = Mathf.CeilToInt(numNodes / 512.0f);
+            cgSolverShader.Dispatch(kG_Dot, groups, 1, 1);
+
+            // 4. CPU Reduction
+            // Only read back the partial sums (tiny read)
+            float[] partials = new float[groups];
+            divergenceBuffer.GetData(partials);
+            for(int i=0; i<groups; i++) dotResult += partials[i];
+        }
+        else
+        {
+            // Fallback for Jacobi / None: Run standard logic + separate dot product
+            ApplyPreconditioner(r, z_out, kGT, kG, kClear, kJacobi);
+            dotResult = GpuDotProduct(r, z_out);
         }
 
-        // 1. Clear Intermediate 'zBuffer' (used as 'u' in Shader)
-        cgSolverShader.SetBuffer(kClear, "zBuffer", zBuffer); 
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(kClear, numNodes);
-
-        // 2. u = G^T * r  (Scatter)
-        // CGSolver.compute: ApplySparseGT reads 'xBuffer' (r), writes 'zBuffer' (u)
-        cgSolverShader.SetBuffer(kGT, "xBuffer", r);
-        cgSolverShader.SetBuffer(kGT, "zBuffer", zBuffer); // Intermediate
-        cgSolverShader.SetBuffer(kGT, "matrixGBuffer", matrixGBuffer);
-        cgSolverShader.SetBuffer(kGT, "neighborsBuffer", neighborsBuffer);
-        cgSolverShader.SetBuffer(kGT, "reverseNeighborsBuffer", reverseNeighborsBuffer);
-        cgSolverShader.SetBuffer(kGT, "scatterIndicesBuffer", scatterIndicesBuffer); // Bind precomputed indices
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(kGT, numNodes);
-
-        // 3. z = G * u + eps * r (Gather)
-        // CGSolver.compute: ApplySparseG reads 'zBuffer'(u), 'xBuffer'(r), writes 'yBuffer'(z_out)
-        cgSolverShader.SetBuffer(kG, "zBuffer", zBuffer); // Intermediate input
-        cgSolverShader.SetBuffer(kG, "xBuffer", r);       // For epsilon skip connection
-        cgSolverShader.SetBuffer(kG, "yBuffer", z_out);   // Final Output
-        cgSolverShader.SetBuffer(kG, "matrixGBuffer", matrixGBuffer);
-        cgSolverShader.SetBuffer(kG, "neighborsBuffer", neighborsBuffer);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(kG, numNodes);
+        return dotResult;
     }
 
     private void ApplyPressureGradient()
@@ -881,18 +1006,18 @@ public class FluidSimulator : MonoBehaviour
 
         // --- NEURAL PRECONDITIONER INFERENCE ---
         // Align to window size for attention
-        int paddedNodes = Mathf.CeilToInt(numNodes / 512.0f) * 512;
-        int windowGroups = paddedNodes / 512;
+        int paddedNodes = Mathf.CeilToInt(numNodes / (float)WINDOW_SIZE) * WINDOW_SIZE;
+        int windowGroups = paddedNodes / WINDOW_SIZE;
 
         // 1. Resize Buffers (UPDATED SIZES)
-        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
-        int requiredPaddedSize = Mathf.CeilToInt(requiredSize / 512.0f) * 512;
+        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, WINDOW_SIZE));
+        int requiredPaddedSize = Mathf.CeilToInt(requiredSize / (float)WINDOW_SIZE) * WINDOW_SIZE;
         
-        // MatrixG: [N, 25] -> 100 bytes per node
-        if (matrixGBuffer == null || matrixGBuffer.count < requiredSize)
+        // MatrixG: [N, 25] -> SoA layout: [25 * N] with stride 4
+        if (matrixGBuffer == null || matrixGBuffer.count < requiredSize * 25)
         {
             matrixGBuffer?.Release();
-            matrixGBuffer = new ComputeBuffer(requiredSize, 4 * 25); // UPDATED STRIDE
+            matrixGBuffer = new ComputeBuffer(requiredSize * 25, 4); // SoA: stride is 4 bytes (float)
         }
         if (zBuffer == null || zBuffer.count < requiredSize)
         {
@@ -942,18 +1067,21 @@ public class FluidSimulator : MonoBehaviour
         ffnSw.Reset();
         headSw.Reset();
 
-        // 1. Compute Features (Keep existing dispatch: 512 threads per window)
+        // 1. Compute Features
         featSw.Start();
         int kFeat = preconditionerShader.FindKernel("ComputeFeatures");
         preconditionerShader.SetBuffer(kFeat, "nodesBuffer", nodesBuffer);
         preconditionerShader.SetBuffer(kFeat, "neighborsBuffer", neighborsBuffer);
         preconditionerShader.SetBuffer(kFeat, "tokenBuffer", tokenBuffer);
+        preconditionerShader.SetBuffer(kFeat, "diagonalBuffer", diagonalBuffer); // Bind pre-computed diagonal buffer
         preconditionerShader.SetInt("numNodes", numNodes);
         preconditionerShader.SetInt("maxNodes", paddedNodes);
+        preconditionerShader.SetInt("windowSize", WINDOW_SIZE); // Pass window size to shader
         
         // Set Shader Constants
         preconditionerShader.SetInt("d_model", current_d_model);
         preconditionerShader.SetInt("d_ffn", current_d_model * 2);
+        preconditionerShader.SetInt("numHeads", NUM_HEADS); // Pass num heads to shader
         
         // Set Feature/Embed weights
         if (weightBuffers.ContainsKey("feature_proj.weight"))
@@ -965,91 +1093,60 @@ public class FluidSimulator : MonoBehaviour
         if (weightBuffers.ContainsKey("window_pos_embed"))
             preconditionerShader.SetBuffer(kFeat, "weightsPosEmbed", weightBuffers["window_pos_embed"]);
         
-        // Dispatch features using Window Groups (512 threads)
+        // Dispatch features using Window Groups
         preconditionerShader.Dispatch(kFeat, windowGroups, 1, 1);
         featSw.Stop();
 
         // Loop Layers (num_layers should be 2 from metadata)
-        int kQKV = preconditionerShader.FindKernel("ComputeQKV");
-        int kAttn = preconditionerShader.FindKernel("ComputeAttention");
-        int kFFN = preconditionerShader.FindKernel("ComputeFFN");
+        int kFused = preconditionerShader.FindKernel("FusedTransformerLayer");
 
         for (int i = 0; i < num_layers; i++)
         {
             string p = $"layer_{i}.";
 
-            // Step A: QKV
-            // CHANGED: Node Parallel Dispatch
-            qkvSw.Start();
-            preconditionerShader.SetBuffer(kQKV, "tokenBuffer", tokenBuffer);
-            preconditionerShader.SetBuffer(kQKV, "bufferQ", bufferQ);
-            preconditionerShader.SetBuffer(kQKV, "bufferK", bufferK);
-            preconditionerShader.SetBuffer(kQKV, "bufferV", bufferV);
+            qkvSw.Start(); // reuse qkvSw to time the fused layer
+
+            // Input / Output buffers (ping-pong)
+            preconditionerShader.SetBuffer(kFused, "tokenBuffer", tokenBuffer);
+            preconditionerShader.SetBuffer(kFused, "tokenBufferOut", tokenBufferOut);
+
+            // Global uniforms
             preconditionerShader.SetInt("numNodes", numNodes);
             preconditionerShader.SetInt("maxNodes", paddedNodes);
-            preconditionerShader.SetInt("d_model", current_d_model);
-            preconditionerShader.SetInt("d_ffn", current_d_model * 2);
-            
+
+            // Transformer weights for this layer
             if (weightBuffers.ContainsKey(p + "norm1_w"))
-                preconditionerShader.SetBuffer(kQKV, "w_norm1", weightBuffers[p + "norm1_w"]);
+                preconditionerShader.SetBuffer(kFused, "w_norm1", weightBuffers[p + "norm1_w"]);
             if (weightBuffers.ContainsKey(p + "norm1_b"))
-                preconditionerShader.SetBuffer(kQKV, "b_norm1", weightBuffers[p + "norm1_b"]);
+                preconditionerShader.SetBuffer(kFused, "b_norm1", weightBuffers[p + "norm1_b"]);
+
             if (weightBuffers.ContainsKey(p + "in_proj_w"))
-                preconditionerShader.SetBuffer(kQKV, "w_attn_in", weightBuffers[p + "in_proj_w"]);
+                preconditionerShader.SetBuffer(kFused, "w_attn_in", weightBuffers[p + "in_proj_w"]);
             if (weightBuffers.ContainsKey(p + "in_proj_b"))
-                preconditionerShader.SetBuffer(kQKV, "b_attn_in", weightBuffers[p + "in_proj_b"]);
-            
-            // Dispatch QKV: 1 Group per Node (32 threads)
-            preconditionerShader.Dispatch(kQKV, paddedNodes, 1, 1);
-            qkvSw.Stop();
+                preconditionerShader.SetBuffer(kFused, "b_attn_in", weightBuffers[p + "in_proj_b"]);
 
-            // Step B: Attention
-            // CHANGED: Head Parallel Dispatch (4 heads on Y axis)
-            attnSw.Start();
-            preconditionerShader.SetBuffer(kAttn, "bufferQ", bufferQ);
-            preconditionerShader.SetBuffer(kAttn, "bufferK", bufferK);
-            preconditionerShader.SetBuffer(kAttn, "bufferV", bufferV);
-            preconditionerShader.SetBuffer(kAttn, "bufferAttn", bufferAttn); // Intermediate write
-            preconditionerShader.SetInt("numNodes", numNodes);
-            preconditionerShader.SetInt("maxNodes", paddedNodes);
-            preconditionerShader.SetInt("d_model", current_d_model);
-            preconditionerShader.SetInt("d_ffn", current_d_model * 2);
-            
-            // Dispatch Attention: Window Groups X, 4 Heads Y
-            preconditionerShader.Dispatch(kAttn, windowGroups, 4, 1);
-            attnSw.Stop();
-
-            // Step C: FFN (Includes Attn Projection, Norm2, FFN, Residual)
-            // CHANGED: Node Parallel Dispatch
-            ffnSw.Start();
-            preconditionerShader.SetBuffer(kFFN, "tokenBuffer", tokenBuffer); // Input (for residual)
-            preconditionerShader.SetBuffer(kFFN, "bufferAttn", bufferAttn);   // Attn Head Output
-            preconditionerShader.SetBuffer(kFFN, "tokenBufferOut", tokenBufferOut); // Result
-            preconditionerShader.SetInt("numNodes", numNodes);
-            preconditionerShader.SetInt("maxNodes", paddedNodes);
-            preconditionerShader.SetInt("d_model", current_d_model);
-            preconditionerShader.SetInt("d_ffn", current_d_model * 2);
-            
             if (weightBuffers.ContainsKey(p + "out_proj_w"))
-                preconditionerShader.SetBuffer(kFFN, "w_attn_out", weightBuffers[p + "out_proj_w"]);
+                preconditionerShader.SetBuffer(kFused, "w_attn_out", weightBuffers[p + "out_proj_w"]);
             if (weightBuffers.ContainsKey(p + "out_proj_b"))
-                preconditionerShader.SetBuffer(kFFN, "b_attn_out", weightBuffers[p + "out_proj_b"]);
+                preconditionerShader.SetBuffer(kFused, "b_attn_out", weightBuffers[p + "out_proj_b"]);
+
             if (weightBuffers.ContainsKey(p + "norm2_w"))
-                preconditionerShader.SetBuffer(kFFN, "w_norm2", weightBuffers[p + "norm2_w"]);
+                preconditionerShader.SetBuffer(kFused, "w_norm2", weightBuffers[p + "norm2_w"]);
             if (weightBuffers.ContainsKey(p + "norm2_b"))
-                preconditionerShader.SetBuffer(kFFN, "b_norm2", weightBuffers[p + "norm2_b"]);
+                preconditionerShader.SetBuffer(kFused, "b_norm2", weightBuffers[p + "norm2_b"]);
+
             if (weightBuffers.ContainsKey(p + "linear1_w"))
-                preconditionerShader.SetBuffer(kFFN, "w_ffn1", weightBuffers[p + "linear1_w"]);
+                preconditionerShader.SetBuffer(kFused, "w_ffn1", weightBuffers[p + "linear1_w"]);
             if (weightBuffers.ContainsKey(p + "linear1_b"))
-                preconditionerShader.SetBuffer(kFFN, "b_ffn1", weightBuffers[p + "linear1_b"]);
+                preconditionerShader.SetBuffer(kFused, "b_ffn1", weightBuffers[p + "linear1_b"]);
             if (weightBuffers.ContainsKey(p + "linear2_w"))
-                preconditionerShader.SetBuffer(kFFN, "w_ffn2", weightBuffers[p + "linear2_w"]);
+                preconditionerShader.SetBuffer(kFused, "w_ffn2", weightBuffers[p + "linear2_w"]);
             if (weightBuffers.ContainsKey(p + "linear2_b"))
-                preconditionerShader.SetBuffer(kFFN, "b_ffn2", weightBuffers[p + "linear2_b"]);
-            
-            // Dispatch FFN: 1 Group per Node (32 threads)
-            preconditionerShader.Dispatch(kFFN, paddedNodes, 1, 1);
-            ffnSw.Stop();
+                preconditionerShader.SetBuffer(kFused, "b_ffn2", weightBuffers[p + "linear2_b"]);
+
+            // Dispatch fused kernel: 1 group per window, WINDOW_SIZE threads per group
+            preconditionerShader.Dispatch(kFused, windowGroups, 1, 1);
+            qkvSw.Stop();
 
             // Swap Buffers
             var temp = tokenBuffer;
@@ -1092,6 +1189,7 @@ public class FluidSimulator : MonoBehaviour
         zBuffer?.Release();
         zVectorBuffer?.Release();
         scatterIndicesBuffer?.Release();
+        diagonalBuffer?.Release();
     }
 
     // Helper for copying buffer data
@@ -1664,8 +1762,9 @@ public class FluidSimulator : MonoBehaviour
         }
 
         // Release and recreate neighbors buffer each frame since numNodes changes
+        // SoA layout: [24 * N] with stride 4
         neighborsBuffer?.Release();
-        neighborsBuffer = new ComputeBuffer(numNodes, sizeof(uint) * 24);
+        neighborsBuffer = new ComputeBuffer(numNodes * 24, 4);
 
         findNeighborsKernel = nodesShader.FindKernel("findNeighbors");
         nodesShader.SetBuffer(findNeighborsKernel, "nodesBuffer", nodesBuffer);
@@ -1677,8 +1776,9 @@ public class FluidSimulator : MonoBehaviour
 
         // Find reverse connections (run once per frame after findNeighbors)
         // Release and recreate reverseNeighbors buffer each frame since numNodes changes
+        // SoA layout: [24 * N] with stride 4
         reverseNeighborsBuffer?.Release();
-        reverseNeighborsBuffer = new ComputeBuffer(numNodes * 24, sizeof(uint));
+        reverseNeighborsBuffer = new ComputeBuffer(numNodes * 24, 4);
         
         findReverseKernel = nodesShader.FindKernel("FindReverseConnections");
         nodesShader.SetBuffer(findReverseKernel, "reverseNeighborsBuffer", reverseNeighborsBuffer);

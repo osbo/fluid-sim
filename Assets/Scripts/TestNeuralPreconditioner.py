@@ -21,7 +21,7 @@ import os
 
 class SPAIGenerator(nn.Module):
     # CHANGE 1: Default d_model=32 (matches paper's ~24k parameters)
-    def __init__(self, input_dim=58, d_model=32, num_layers=4, nhead=4, window_size=512, max_octree_depth=12):
+    def __init__(self, input_dim=58, d_model=32, num_layers=4, nhead=4, window_size=256, max_octree_depth=12):
         super().__init__()
         self.d_model = d_model
         self.window_size = window_size
@@ -93,6 +93,12 @@ def load_model_from_bytes(model, bytes_path, device):
         
         if file_d_model != model.d_model:
             raise ValueError(f"Model mismatch! File d_model={file_d_model}, Code d_model={model.d_model}")
+        
+        # Verify num_heads matches
+        model_num_heads = model.encoder.layers[0].self_attn.num_heads
+        if heads != model_num_heads:
+            raise ValueError(f"Model mismatch! File heads={heads}, Model num_heads={model_num_heads}. "
+                           f"Please recreate model with nhead={heads}")
             
         def read_tensor(shape, target_tensor, tensor_name="tensor"):
             size = int(np.prod(shape))
@@ -117,7 +123,7 @@ def load_model_from_bytes(model, bytes_path, device):
         read_tensor([file_d_model], model.feature_proj.bias, "feature_proj.bias")
         
         read_tensor([12, file_d_model], model.layer_embed.weight, "layer_embed")
-        read_tensor([1, 512, file_d_model], model.window_pos_embed, "window_pos_embed")
+        read_tensor([1, model.window_size, file_d_model], model.window_pos_embed, "window_pos_embed")
         
         # 2. Layers
         for i, layer in enumerate(model.encoder.layers):
@@ -509,7 +515,8 @@ if __name__ == "__main__":
     print(f"Device: {device}")
     
     # CHANGE 5: Set d_model=32 (matches paper's ~24k parameters)
-    model = SPAIGenerator(input_dim=58, d_model=32, num_layers=4).to(device)
+    # Note: nhead=4 and window_size=256
+    model = SPAIGenerator(input_dim=58, d_model=32, num_layers=4, nhead=4, window_size=256).to(device)
     
     # Load Weights
     try:
