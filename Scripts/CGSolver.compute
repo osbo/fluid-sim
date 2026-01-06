@@ -1,10 +1,8 @@
-#pragma kernel ApplyLaplacian
 #pragma kernel ApplyLaplacianAndDot
 #pragma kernel Axpy // y = a*x + y
 #pragma kernel Scale // y = a*y
 #pragma kernel CalculateDivergence
 #pragma kernel DotProduct
-#pragma kernel ApplySparseG
 #pragma kernel ApplySparseGAndDot
 #pragma kernel ApplySparseGT
 #pragma kernel ClearBufferFloat
@@ -80,137 +78,6 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
     divergenceBuffer[i] = outVal;
 }
 
-[numthreads(512, 1, 1)]
-void ApplyLaplacian(uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    if (i >= numNodes) return;
-
-    Node node = nodesBuffer[i];
-    float p_i = pBuffer[i];
-    float laplacian_p = 0.0;
-
-    // Guard against NaN values in input
-    if (!isfinite(p_i)) p_i = 0.0;
-
-    float dx_i = exp2((float)node.layer);
-    if (!isfinite(dx_i)) dx_i = 1e-6;
-
-    // Loop over all 6 faces of the node
-    for (int d = 0; d < 6; d++)
-    {
-        uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
-        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i]; // first slot: same/parent layer
-
-        // Check the three distinct neighbor cases
-
-        // Case 1: True Boundary (Neumann BC, neighbor_idx == numNodes + 1 )
-        if (neighbor_idx == numNodes + 1)
-        {
-            // Neumann BC means zero flux (dp/dn = 0).
-            // The flux contribution is 0.
-            laplacian_p += 0.0;
-        }
-        // Case 2: Same-layer or Parent (coarser) neighbor
-        else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
-        {
-            Node nNode = nodesBuffer[neighbor_idx];
-            float p_j = pBuffer[neighbor_idx];
-            
-            float dx_j = exp2((float)nNode.layer);
-            
-            // Distance between cell centers
-            float distance = max(0.5 * (dx_i + dx_j), 1e-6);
-            
-            // Face area is the area of cell i's face (dx_i^2)
-            float a_shared = dx_i * dx_i;
-            
-            // Weight: area divided by distance
-            float w = a_shared / distance;
-            
-            float contribution = w * (p_j - p_i);
-            
-            laplacian_p += contribution;
-        }
-        else
-        {
-            // Case 3 or 4: Child (finer) neighbors or Dirichlet boundary
-            // The face of cell i is subdivided into 4 child cells
-            // Each child occupies 1/4 of the face area
-            float faceArea = dx_i * dx_i;
-            float childFaceArea = faceArea / 4.0; // Each child occupies 1/4 of the face
-            
-            for (int k = 0; k < 4; k++)
-            {
-                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + i];
-                // Case 3: Child (finer) neighbor
-                if (child_idx < numNodes)
-                {
-                    Node cNode = nodesBuffer[child_idx];
-                    float p_k = pBuffer[child_idx];
-                    float dx_k = exp2((float)cNode.layer);
-                    
-                    // Distance between cell i center and child cell k center
-                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    
-                    // Weight: child's portion of face area divided by distance
-                    float w = childFaceArea / distance;
-                    
-                    float contribution = w * (p_k - p_i);
-                    laplacian_p += contribution;
-                }
-                // Case 4: Dirichlet boundary
-                else if (child_idx == numNodes)
-                {
-                    float dx_k = dx_i * 0.5;
-                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    
-                    // Weight: child's portion of face area divided by distance
-                    float w = childFaceArea / distance;
-                    
-                    float contribution = w * (-p_i); // No pressure over the boundary
-                    laplacian_p += contribution;
-                }
-            }
-
-            // float sumChildren = 0.0;
-            // int numChildren = 0;
-            // for (int k = 0; k < 4; k++) {
-            //     uint child_idx = neighborsBuffer[faceNeighborBase + k];
-            //     if (child_idx < numNodes) {
-            //         Node cNode = nodesBuffer[child_idx];
-            //         float p_k = pBuffer[child_idx];
-            //         sumChildren += p_k;
-            //         numChildren += 1;
-            //     }
-            // }
-
-            // // float childrenAverage = numChildren > 0 ? sumChildren / numChildren : 0.0;
-            // float childrenAverage = sumChildren / 4.0;
-            // float dx_j = exp2((float)node.layer - 1);
-            // float distance = max(0.5 * (dx_i + dx_j), 1e-6);
-            // float w = childFaceArea / distance;
-            // float contribution = w * (childrenAverage - p_i);
-            // laplacian_p += contribution;
-        }
-    }
-
-    // --- Return Net Flux (not volume-normalized) ---
-    // REMOVE division by volume_i
-    // float volume_i = dx_i * dx_i * dx_i; <-- Delete or comment out
-    // float outVal = laplacian_p / max(volume_i, 1e-9); <-- Delete this
-    
-    // KEEP this (assuming negative sign is desired for the operator)
-    float outVal = -laplacian_p; 
-    
-    // Apply time step if needed, though typically handled in the update step
-    outVal *= deltaTime; 
-
-    if (!isfinite(outVal)) outVal = 0.0;
-    ApBuffer[i] = outVal;
-}
 
 // FUSED KERNEL: ApplyLaplacian + DotProduct
 // Computes Ap = A * p AND p · Ap in a single pass to reduce memory round-trips
@@ -496,55 +363,6 @@ void ApplySparseGT(uint3 id : SV_DispatchThreadID)
     zBuffer[i] = sum;
 }
 
-// KERNEL 2: Gather (z = G * u)
-// Each node 'i' reads 'u' from neighbors 'j' and GATHERS results
-// Also adds epsilon regularization: z += eps * r
-// G is now size [N, 25] where 0=Diag, 1-24=Neighbor Slots
-[numthreads(512, 1, 1)]
-void ApplySparseG(uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    if (i >= numNodes) return;
-
-    float u_val = zBuffer[i];
-    if (!isfinite(u_val)) u_val = 0.0;
-    
-    float z_sum = 0.0;
-
-    // 1. Diagonal (Index 0)
-    // SoA layout: matrixGBuffer[dim * numNodes + nodeIndex]
-    float g_diag = matrixGBuffer[i]; // dim=0, so index is just i
-    if (!isfinite(g_diag)) g_diag = 0.0;
-    z_sum += u_val * g_diag;
-
-    // 2. Neighbors (Gather)
-    for(int k=0; k<24; k++)
-    {
-        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-        uint n_idx = neighborsBuffer[k * numNodes + i];
-        if(n_idx < numNodes)
-        {
-            // SoA layout: matrixGBuffer[dim * numNodes + nodeIndex]
-            // Index is k+1 (since 0 is diagonal), so we access (k+1) * numNodes + i
-            float g_coeff = matrixGBuffer[(k + 1) * numNodes + i];
-
-            if (!isfinite(g_coeff)) g_coeff = 0.0;
-            
-            float u_neighbor = zBuffer[n_idx];
-            if (!isfinite(u_neighbor)) u_neighbor = 0.0;
-            
-            z_sum += g_coeff * u_neighbor;
-        }
-    }
-    
-    // 3. Epsilon Regularization
-    float r_val = xBuffer[i];
-    if (!isfinite(r_val)) r_val = 0.0;
-    z_sum += 1e-4 * r_val; // Or 1e-6 depending on training
-    
-    if (!isfinite(z_sum)) z_sum = 0.0;
-    yBuffer[i] = z_sum;
-}
 
 // FUSED KERNEL: ApplySparseG + DotProduct
 // Computes z = G * u + eps * r AND r · z in a single pass to reduce memory round-trips

@@ -60,7 +60,6 @@ public class FluidSimulator : MonoBehaviour
     private int interpolateFaceVelocitiesKernel;
     private int copyFaceVelocitiesKernel;
     private int calculateDivergenceKernel;
-    private int applyLaplacianKernel;
     private int axpyKernel;
     private int dotProductKernel;
     private int applyPressureGradientKernel;
@@ -530,21 +529,19 @@ public class FluidSimulator : MonoBehaviour
         // --- Kernel Lookups ---
         var kernelFindSw = System.Diagnostics.Stopwatch.StartNew();
         int calculateDivergenceKernel = cgSolverShader.FindKernel("CalculateDivergence");
-        int applyLaplacianKernel = cgSolverShader.FindKernel("ApplyLaplacian");
         int applyLaplacianAndDotKernel = cgSolverShader.FindKernel("ApplyLaplacianAndDot");
         int axpyKernel = cgSolverShader.FindKernel("Axpy");
         int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
         // Preconditioner Kernels from CGSolver.compute
         int precomputeIndicesKernel = cgSolverShader.FindKernel("PrecomputeIndices");
         int applySparseGTKernel = cgSolverShader.FindKernel("ApplySparseGT"); 
-        int applySparseGKernel = cgSolverShader.FindKernel("ApplySparseG");
         int applySparseGAndDotKernel = cgSolverShader.FindKernel("ApplySparseGAndDot");
         int clearBufferFloatKernel = cgSolverShader.FindKernel("ClearBufferFloat");
         int applyJacobiKernel = cgSolverShader.FindKernel("ApplyJacobi");
         int computeDiagonalKernel = cgSolverShader.FindKernel("ComputeDiagonal");
         kernelFindSw.Stop();
         
-        if (calculateDivergenceKernel < 0 || applyLaplacianKernel < 0 || applyLaplacianAndDotKernel < 0 || axpyKernel < 0 || dotProductKernel < 0)
+        if (calculateDivergenceKernel < 0 || applyLaplacianAndDotKernel < 0 || axpyKernel < 0 || dotProductKernel < 0)
         {
             Debug.LogError("One or more CG solver kernels not found. Check CGSolver.compute shader compilation.");
             return;
@@ -642,7 +639,7 @@ public class FluidSimulator : MonoBehaviour
         // z = M^-1 * r AND rho = r . z (Fused)
         float rho = ApplyPreconditionerAndDot(
             residualBuffer, zVectorBuffer, 
-            applySparseGTKernel, applySparseGKernel, applySparseGAndDotKernel, 
+            applySparseGTKernel, applySparseGAndDotKernel, applySparseGAndDotKernel, 
             clearBufferFloatKernel, applyJacobiKernel
         );
 
@@ -742,7 +739,7 @@ public class FluidSimulator : MonoBehaviour
             dotProductSw.Start();
             float rho_new = ApplyPreconditionerAndDot(
                 residualBuffer, zVectorBuffer, 
-                applySparseGTKernel, applySparseGKernel, applySparseGAndDotKernel, 
+                applySparseGTKernel, applySparseGAndDotKernel, applySparseGAndDotKernel, 
                 clearBufferFloatKernel, applyJacobiKernel
             );
             dotProductSw.Stop();
@@ -806,9 +803,7 @@ public class FluidSimulator : MonoBehaviour
                  $"• Initialization: {initSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Preconditioner:\n" +
                  $"  - ComputeFeatures: {featSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - ComputeQKV (4x): {qkvSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - ComputeAttention (4x): {attnSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"  - ComputeFFN (4x): {ffnSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"  - FusedTransformerLayer (per-layer): {qkvSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - PredictHead: {headSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• PCG Loop ({totalIterations} iterations): {cgLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"  - ApplyLaplacianAndDot (Fused): {laplacianSw.Elapsed.TotalMilliseconds:F2} ms\n" +
@@ -879,7 +874,7 @@ public class FluidSimulator : MonoBehaviour
             Dispatch(kGT, numNodes);
 
             // 3. z = G * u + eps * r (Gather)
-            // CGSolver.compute: ApplySparseG reads 'zBuffer'(u), 'xBuffer'(r), writes 'yBuffer'(z_out)
+            // CGSolver.compute: fused ApplySparseGAndDot is used elsewhere; here we use the non-dot variant if desired.
             cgSolverShader.SetBuffer(kG, "zBuffer", zBuffer); // Intermediate input
             cgSolverShader.SetBuffer(kG, "xBuffer", r);       // For epsilon skip connection
             cgSolverShader.SetBuffer(kG, "yBuffer", z_out);   // Final Output
