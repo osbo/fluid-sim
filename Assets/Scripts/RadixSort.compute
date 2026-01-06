@@ -6,17 +6,19 @@
 #pragma kernel clearBuffer32
 #pragma kernel clearBuffer64
 
-#define SCAN_BLOCKSIZE 512
+#define THREADS 512
 
-// Particle struct definition (must match Particles.compute)
+// --- STRUCTS ---
+// Must match C# Particle struct exactly (32 bytes)
 struct Particle
 {
-    float3 position;    // 3-component position vector
-    float3 velocity;    // float face velocities
-    uint layer;         // Layer units
-    uint mortonCode;    // Morton code for spatial indexing
+    float3 position;    // 12 bytes
+    float3 velocity;    // 12 bytes
+    uint layer;         // 4 bytes
+    uint mortonCode;    // 4 bytes
 };
 
+// --- BUFFERS ---
 RWStructuredBuffer<uint> input;
 RWStructuredBuffer<uint> output;
 RWStructuredBuffer<uint> aux;
@@ -27,97 +29,245 @@ RWStructuredBuffer<Particle> inputParticles;
 RWStructuredBuffer<Particle> outputParticles;
 uint count;
 uint bit;
+
+// e: 1 if bit is 0 (false), 0 if bit is 1 (true)
+// f: Exclusive prefix sum of e
 RWStructuredBuffer<uint> e;
 RWStructuredBuffer<uint> f;
 
-[numthreads(SCAN_BLOCKSIZE, 1, 1)]
+// --- GROUPSHARED MEMORY ---
+groupshared uint scan_array[THREADS * 2];
+groupshared Particle gs_particles[THREADS]; // 32 bytes * 512 = 16KB (Fits in 32KB LDS)
+groupshared uint gs_e[THREADS];
+groupshared uint gs_scan[THREADS];
+groupshared uint gs_totalZeros;
+groupshared uint gs_groupStartF;
+
+// --- KERNELS ---
+
+// 1. Prefix Fixup (Standard)
+[numthreads(THREADS, 1, 1)]
 void prefixFixup(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
 {
     uint threadIdx = Gtid.x;
     uint blockIdx = Gid.x;
-    uint start = threadIdx + 2 * blockIdx * SCAN_BLOCKSIZE;
+    uint start = threadIdx + 2 * blockIdx * THREADS;
     uint block_sum = aux[blockIdx];
 
     if (start < len)                    input[start] += block_sum;
-    if (start + SCAN_BLOCKSIZE < len)   input[start + SCAN_BLOCKSIZE] += block_sum;
+    if (start + THREADS < len)   input[start + THREADS] += block_sum;
 }
 
-groupshared uint scan_array[SCAN_BLOCKSIZE * 2];
-
-[numthreads(SCAN_BLOCKSIZE, 1, 1)]
+// 2. Prefix Sum (Standard Hillis-Steele / Blelloch hybrid)
+[numthreads(THREADS, 1, 1)]
 void prefixSum(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
 {
     uint threadIdx = Gtid.x;
     uint blockIdx = Gid.x;
-    uint t1 = threadIdx + 2 * blockIdx * SCAN_BLOCKSIZE;
-    uint t2 = t1 + SCAN_BLOCKSIZE;
+    uint t1 = threadIdx + 2 * blockIdx * THREADS;
+    uint t2 = t1 + THREADS;
 
+    // Load inputs
     scan_array[threadIdx] = (t1 < len) ? input[t1] : 0;
-    scan_array[threadIdx + SCAN_BLOCKSIZE] = (t2 < len) ? input[t2] : 0;
+    scan_array[threadIdx + THREADS] = (t2 < len) ? input[t2] : 0;
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint s1 = 1; s1 <= SCAN_BLOCKSIZE; s1 <<= 1)
+    // Up-sweep
+    [unroll]
+    for (uint s1 = 1; s1 <= THREADS; s1 <<= 1)
     {
         uint index = (threadIdx + 1) * s1 * 2 - 1;
-        if (index < 2 * SCAN_BLOCKSIZE)
+        if (index < 2 * THREADS)
             scan_array[index] += scan_array[index - s1];
         GroupMemoryBarrierWithGroupSync();
     }
 
-    for (uint s2 = SCAN_BLOCKSIZE >> 1; s2 > 0; s2 >>= 1)
+    // Down-sweep
+    [unroll]
+    for (uint s2 = THREADS >> 1; s2 > 0; s2 >>= 1)
     {
         uint index = (threadIdx + 1) * s2 * 2 - 1;
-        if (index + s2 < 2 * SCAN_BLOCKSIZE)
+        if (index + s2 < 2 * THREADS)
             scan_array[index + s2] += scan_array[index];
         GroupMemoryBarrierWithGroupSync();
     }
     GroupMemoryBarrierWithGroupSync();
 
+    // Write output
     if (t1 + zeroff < len)    output[t1 + zeroff] = scan_array[threadIdx];
-    if (t2 + zeroff < len)    output[t2 + zeroff] = (threadIdx == SCAN_BLOCKSIZE - 1 && zeroff) ? 0 : scan_array[threadIdx + SCAN_BLOCKSIZE];
+    if (t2 + zeroff < len)    output[t2 + zeroff] = (threadIdx == THREADS - 1 && zeroff) ? 0 : scan_array[threadIdx + THREADS];
+    
+    // Write aux for next pass
     if (threadIdx == 0)
     {
         if (zeroff) output[0] = 0;
-        aux[blockIdx] = scan_array[2 * SCAN_BLOCKSIZE - 1];
+        aux[blockIdx] = scan_array[2 * THREADS - 1];
     }
 }
 
-[numthreads(512, 1, 1)]
+// 3. Split Prep (Calculates 'e' buffer)
+// e[i] = 1 if the bit is 0 (False), else 0
+[numthreads(THREADS, 1, 1)]
 void split_prep(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
-    if (tid >= count) {
-        return;
-    }
-
-    e[tid] = (inputParticles[tid].mortonCode & (1U << bit)) == 0;
+    if (tid >= count) return;
+    
+    // Check if the specific bit is 0
+    e[tid] = (inputParticles[tid].mortonCode & (1U << bit)) == 0 ? 1 : 0;
 }
 
-[numthreads(512, 1, 1)]
-void split_scatter(uint3 id : SV_DispatchThreadID)
+// 4. OPTIMIZED Split Scatter
+// Uses LDS to coalesce writes to global memory
+[numthreads(THREADS, 1, 1)]
+void split_scatter(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     uint tid = id.x;
-    if (tid >= count) {
-        return;
+    uint localId = gtid.x;
+    uint groupId = gid.x;
+    
+    // -- Step A: Load to Shared Memory --
+    Particle p;
+    uint isZero = 0;
+
+    if (tid < count) 
+    {
+        p = inputParticles[tid];
+        // 'e' logic: 1 if bit is 0, 0 if bit is 1
+        isZero = (p.mortonCode & (1U << bit)) == 0 ? 1 : 0;
+    }
+    else 
+    {
+        // Padding for out of bounds threads
+        p.position = float3(0,0,0);
+        p.velocity = float3(0,0,0);
+        p.layer = 0;
+        p.mortonCode = 0xFFFFFFFF; 
+        isZero = 0; // Padding counts as a '1' so it goes to end
     }
 
-    uint totalFalses = f[count - 1] + e[count - 1];
-
-    bool isBitSet = (inputParticles[tid].mortonCode & (1U << bit)) != 0;
-
-    uint destinationIndex;
-    if (isBitSet) {
-        destinationIndex = totalFalses + (tid - f[tid]);
+    gs_particles[localId] = p;
+    gs_e[localId] = isZero;
+    gs_scan[localId] = isZero; // Seed scan
+    
+    // Optimization: Load global offsets once per group
+    if (localId == 0)
+    {
+        // f contains exclusive sum of 0s up to this group
+        // If we are group 0, offset is 0
+        gs_groupStartF = f[groupId * THREADS];
     }
-    else {
-        destinationIndex = f[tid];
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // -- Step B: Local Parallel Prefix Scan (Exclusive) --
+    // Computes offset for '0's within this group
+    // Standard Hillis-Steele scan in LDS
+    [unroll]
+    for (uint s = 1; s < THREADS; s <<= 1)
+    {
+        uint val = 0;
+        if (localId >= s) val = gs_scan[localId - s];
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (localId >= s) gs_scan[localId] += val;
+        GroupMemoryBarrierWithGroupSync();
     }
 
+    // Convert inclusive scan to exclusive scan
+    // The value gs_scan[localId] currently includes gs_e[localId]
+    uint localRank = gs_scan[localId] - gs_e[localId]; 
 
-    outputParticles[destinationIndex] = inputParticles[tid];
+    // Store total zeros in group to shared memory
+    if (localId == THREADS - 1)
+    {
+        gs_totalZeros = gs_scan[localId];
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // -- Step C: Calculate LDS Rank (Reorder Index) --
+    // If isZero (bit is 0): Place at localRank
+    // If !isZero (bit is 1): Place after all zeros. 
+    // Rank of 1s = TotalZeros + (IndexInGroup - RankOfZeros)
+    uint ldsDest = 0;
+    if (isZero)
+    {
+        ldsDest = localRank;
+    }
+    else
+    {
+        uint onesBeforeMe = localId - localRank;
+        ldsDest = gs_totalZeros + onesBeforeMe;
+    }
+
+    // Move particle to correct place in LDS
+    // We need a barrier to ensure reads don't conflict with writes? 
+    // Actually we can't write to gs_particles in place easily without double buffering or a temp reg.
+    // However, since we write to `ldsDest` and `ldsDest` is a permutation of 0..511,
+    // we must ensure everyone has READ `p` (which they have at start) before we overwrite.
+    // But `p` is in register now. So we can overwrite `gs_particles`.
+    GroupMemoryBarrierWithGroupSync(); // Ensure all `gs_scan` reads are done before writing particles
+    
+    gs_particles[ldsDest] = p;
+
+    GroupMemoryBarrierWithGroupSync(); // Wait for all writes to finish
+
+    // -- Step D: Write to Global Memory --
+    // Now threads read LINEARLY from LDS (gs_particles[localId]) 
+    // and write LINEARLY to Global Memory.
+    
+    uint totalFalses = f[count - 1] + e[count - 1]; // Total zeros in array
+    
+    // We are now processing the particle at `gs_particles[localId]`.
+    // Does this particle belong to the '0' bucket or the '1' bucket?
+    // Because we sorted locally, we know:
+    // Indices 0 to gs_totalZeros-1 are '0's.
+    // Indices gs_totalZeros to 511 are '1's.
+    
+    uint globalDest = 0;
+    
+    if (localId < gs_totalZeros)
+    {
+        // It's a 0.
+        // Global destination = GlobalStartOfZerosForGroup + LocalIndex
+        globalDest = gs_groupStartF + localId;
+    }
+    else
+    {
+        // It's a 1.
+        // Global destination = GlobalStartOfOnesForGroup + LocalIndexOffset
+        
+        // 1. Calculate how many 1s were before this group globally
+        // Total items before group = groupId * THREADS
+        // Total 0s before group = gs_groupStartF
+        uint totalOnesBeforeGroup = (groupId * THREADS) - gs_groupStartF;
+        
+        // 2. Global Start for 1s = TotalZerosInArray + OnesBeforeThisGroup
+        uint globalStartOnes = totalFalses + totalOnesBeforeGroup;
+        
+        // 3. Offset within the 1s block of this group
+        uint offsetInOnes = localId - gs_totalZeros;
+        
+        globalDest = globalStartOnes + offsetInOnes;
+    }
+
+    // Safety check and Write
+    // Note: 'count' might not align with 512 boundary, so we must check
+    // if the resulting global destination is valid, or if the particle was real.
+    // We check if the *original* particle loaded into this slot was valid?
+    // No, we check if `globalDest` is valid.
+    // Actually, `split_scatter` only moves valid particles. Padding particles (which we treated as 1s)
+    // will end up at the very end of the array. If globalDest >= count, we just don't write.
+    
+    if (globalDest < count)
+    {
+        outputParticles[globalDest] = gs_particles[localId];
+    }
 }
 
-[numthreads(512, 1, 1)]
+// 5. Utility Kernels
+[numthreads(THREADS, 1, 1)]
 void copyParticles(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
@@ -125,16 +275,14 @@ void copyParticles(uint3 id : SV_DispatchThreadID)
     outputParticles[tid] = inputParticles[tid];
 }
 
-[numthreads(512, 1, 1)]
+[numthreads(THREADS, 1, 1)]
 void clearBuffer32(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
-    if (tid < count) {
-        output[tid] = 0;
-    }
+    if (tid < count) output[tid] = 0;
 }
 
-[numthreads(512, 1, 1)]
+[numthreads(THREADS, 1, 1)]
 void clearBuffer64(uint3 id : SV_DispatchThreadID)
 {
     uint tid = id.x;
