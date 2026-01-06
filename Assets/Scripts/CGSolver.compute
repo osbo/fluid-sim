@@ -81,104 +81,130 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
 
 // FUSED KERNEL: ApplyLaplacian + DotProduct
 // Computes Ap = A * p AND p · Ap in a single pass to reduce memory round-trips
-groupshared float s_dot_reduction[512];
+groupshared float s_dot_reduction[256];
 
-[numthreads(512, 1, 1)]
+// --- OPTIMIZED LDS KERNEL ---
+// Shared memory to cache node data for the entire thread group
+groupshared Node s_nodes[256];
+groupshared float s_p_values[256];
+
+[numthreads(256, 1, 1)]
 void ApplyLaplacianAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    uint li = Gtid.x; // Local index for reduction
-    
+    uint li = Gtid.x; // Local index [0..255]
+    uint group_start_idx = Gid.x * 256;
+
+    // --- Phase 1: Collaborative Load into LDS ---
+    // ALL threads must participate in the sync, so perform load within a bounds check
+    if (i < numNodes)
+    {
+        s_nodes[li] = nodesBuffer[i];
+        s_p_values[li] = pBuffer[i];
+    }
+    // Sync to ensure all data is loaded before proceeding. ALL threads hit this.
+    GroupMemoryBarrierWithGroupSync();
+
     float p_i = 0.0;
     float Ap_val = 0.0;
     
+    // --- Phase 2: Main Calculation (for valid threads) ---
+    // NO early return. Inactive threads will contribute 0 to the reduction.
     if (i < numNodes)
     {
-        Node node = nodesBuffer[i];
-        p_i = pBuffer[i];
+        // Read own data from fast LDS
+        Node node = s_nodes[li];
+        p_i = s_p_values[li];
         float laplacian_p = 0.0;
 
-        // Guard against NaN values in input
         if (!isfinite(p_i)) p_i = 0.0;
 
         float dx_i = exp2((float)node.layer);
         if (!isfinite(dx_i)) dx_i = 1e-6;
 
-        // Loop over all 6 faces of the node (INLINE Laplacian computation)
+        // Loop over all 6 faces of the node
         for (int d = 0; d < 6; d++)
         {
-            uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
-            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-            uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i]; // first slot: same/parent layer
+            uint faceSlotBase = d * 4;
+            uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i];
 
-            // Check the three distinct neighbor cases
-
-            // Case 1: True Boundary (Neumann BC, neighbor_idx == numNodes + 1 )
+            // Case 1: True Boundary (Neumann BC)
             if (neighbor_idx == numNodes + 1)
             {
-                // Neumann BC means zero flux (dp/dn = 0).
-                // The flux contribution is 0.
                 laplacian_p += 0.0;
             }
-            // Case 2: Same-layer or Parent (coarser) neighbor
+            // This global read is required to decide the logic path
             else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
             {
-                Node nNode = nodesBuffer[neighbor_idx];
-                float p_j = pBuffer[neighbor_idx];
-                
+                // Case 2: Same-layer or Parent neighbor
+                Node nNode;
+                float p_j;
+
+                // --- CACHE CHECK ---
+                if (neighbor_idx >= group_start_idx && neighbor_idx < group_start_idx + 256)
+                {
+                    // Cache Hit: Read from LDS
+                    uint local_neighbor_idx = neighbor_idx - group_start_idx;
+                    nNode = s_nodes[local_neighbor_idx];
+                    p_j = s_p_values[local_neighbor_idx];
+                }
+                else
+                {
+                    // Cache Miss: Read from Global Memory
+                    nNode = nodesBuffer[neighbor_idx];
+                    p_j = pBuffer[neighbor_idx];
+                }
+
                 float dx_j = exp2((float)nNode.layer);
-                
-                // Distance between cell centers
                 float distance = max(0.5 * (dx_i + dx_j), 1e-6);
-                
-                // Face area is the area of cell i's face (dx_i^2)
                 float a_shared = dx_i * dx_i;
-                
-                // Weight: area divided by distance
                 float w = a_shared / distance;
-                
                 float contribution = w * (p_j - p_i);
                 
                 laplacian_p += contribution;
             }
             else
             {
-                // Case 3 or 4: Child (finer) neighbors or Dirichlet boundary
-                // The face of cell i is subdivided into 4 child cells
-                // Each child occupies 1/4 of the face area
+                // Case 3/4: Child neighbors or Dirichlet boundary
                 float faceArea = dx_i * dx_i;
-                float childFaceArea = faceArea / 4.0; // Each child occupies 1/4 of the face
+                float childFaceArea = faceArea / 4.0;
                 
                 for (int k = 0; k < 4; k++)
                 {
-                    // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
                     uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + i];
-                    // Case 3: Child (finer) neighbor
-                    if (child_idx < numNodes)
+                    
+                    if (child_idx < numNodes) // Case 3: Child neighbor
                     {
-                        Node cNode = nodesBuffer[child_idx];
-                        float p_k = pBuffer[child_idx];
+                        Node cNode;
+                        float p_k;
+
+                        // --- CACHE CHECK ---
+                        if (child_idx >= group_start_idx && child_idx < group_start_idx + 256)
+                        {
+                            // Cache Hit
+                            uint local_child_idx = child_idx - group_start_idx;
+                            cNode = s_nodes[local_child_idx];
+                            p_k = s_p_values[local_child_idx];
+                        }
+                        else
+                        {
+                            // Cache Miss
+                            cNode = nodesBuffer[child_idx];
+                            p_k = pBuffer[child_idx];
+                        }
+                        
                         float dx_k = exp2((float)cNode.layer);
-                        
-                        // Distance between cell i center and child cell k center
                         float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                        
-                        // Weight: child's portion of face area divided by distance
                         float w = childFaceArea / distance;
-                        
                         float contribution = w * (p_k - p_i);
                         laplacian_p += contribution;
                     }
-                    // Case 4: Dirichlet boundary
-                    else if (child_idx == numNodes)
+                    else if (child_idx == numNodes) // Case 4: Dirichlet boundary
                     {
                         float dx_k = dx_i * 0.5;
                         float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                        
-                        // Weight: child's portion of face area divided by distance
                         float w = childFaceArea / distance;
-                        
-                        float contribution = w * (-p_i); // No pressure over the boundary
+                        float contribution = w * (-p_i);
                         laplacian_p += contribution;
                     }
                 }
@@ -197,10 +223,9 @@ void ApplyLaplacianAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID,
         
         // Write Ap to memory (still needed for next steps)
         ApBuffer[i] = Ap_val;
-    }
+    } // End of "if (i < numNodes)"
 
-    // 3. FUSED DOT PRODUCT (p . Ap)
-    // We already have p_i and Ap_val in registers! No VRAM read needed.
+    // 3. FUSED DOT PRODUCT (p . Ap) -- ALL threads participate
     float product = p_i * Ap_val;
     if (!isfinite(product)) product = 0.0;
     
@@ -208,7 +233,7 @@ void ApplyLaplacianAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID,
     s_dot_reduction[li] = product;
     GroupMemoryBarrierWithGroupSync();
     
-    for (uint s = 256; s > 0; s >>= 1) {
+    for (uint s = 128; s > 0; s >>= 1) {
         if (li < s) {
             float sum = s_dot_reduction[li] + s_dot_reduction[li + s];
             if (!isfinite(sum)) sum = 0.0;
