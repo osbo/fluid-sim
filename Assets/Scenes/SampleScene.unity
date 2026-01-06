@@ -554,7 +554,7 @@ MonoBehaviour:
   frameRate: 30
   minLayer: 5
   maxLayer: 10
-  preconditioner: 2
+  preconditioner: 1
   renderingMode: 0
   particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
   particleDepthMaterial: {fileID: 2100000, guid: 02cdf3bcc869241a49f58b5e8d42a8ea, type: 2}
