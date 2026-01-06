@@ -930,12 +930,23 @@ public class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(kG_Dot, "divergenceBuffer", divergenceBuffer); // Scratch for reduction
             cgSolverShader.SetInt("numNodes", numNodes);
             
-            int groups = Mathf.CeilToInt(numNodes / 512.0f);
-            cgSolverShader.Dispatch(kG_Dot, groups, 1, 1);
-
-            // 4. CPU Reduction
-            // Only read back the partial sums (tiny read)
-            float[] partials = new float[groups];
+                        int groups = Mathf.CeilToInt(numNodes / 256.0f);
+            
+            
+            
+                        // --- [FIX START] ADD THIS LINE ---
+            
+                        cgSolverShader.Dispatch(kG_Dot, groups, 1, 1);
+            
+                        // --- [FIX END] ---
+            
+            
+            
+                        // 4. CPU Reduction
+            
+                        // Only read back the partial sums (tiny read)
+            
+                        float[] partials = new float[groups];
             divergenceBuffer.GetData(partials);
             for(int i=0; i<groups; i++) dotResult += partials[i];
         }
