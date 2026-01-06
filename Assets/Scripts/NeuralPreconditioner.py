@@ -97,7 +97,8 @@ def compute_laplacian_stencil(neighbors, layers, num_nodes):
 # --- 2. Architecture: SPAI Generator ---
 
 class SPAIGenerator(nn.Module):
-    def __init__(self, input_dim=58, d_model=128, num_layers=4, nhead=4, window_size=512, max_octree_depth=12):
+    # CHANGE 1: Default d_model=32 (matches paper's ~24k parameters)
+    def __init__(self, input_dim=58, d_model=32, num_layers=4, nhead=4, window_size=512, max_octree_depth=12):
         super().__init__()
         self.d_model = d_model
         self.window_size = window_size
@@ -545,7 +546,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--d_model', type=int, default=128)
+    parser.add_argument('--d_model', type=int, default=32)
     parser.add_argument('--layers', type=int, default=4)
     args = parser.parse_args()
     

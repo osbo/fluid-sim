@@ -49,6 +49,7 @@ public class FluidSimulator : MonoBehaviour
     private int radixPrefixSumKernelId;
     private int radixPrefixFixupKernelId;
     private int findNeighborsKernel;
+    private int findReverseKernel;
     private int interpolateFaceVelocitiesKernel;
     private int copyFaceVelocitiesKernel;
     private int calculateDivergenceKernel;
@@ -78,6 +79,7 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer nodesBufferOld;
     private ComputeBuffer tempNodesBuffer;
     private ComputeBuffer neighborsBuffer;
+    public ComputeBuffer reverseNeighborsBuffer;
     private ComputeBuffer divergenceBuffer;
     private ComputeBuffer pBuffer;
     private ComputeBuffer ApBuffer;
@@ -91,6 +93,7 @@ public class FluidSimulator : MonoBehaviour
     private ComputeBuffer matrixGBuffer; // Output buffer for preconditioner matrix G
     private ComputeBuffer zBuffer; // Intermediate buffer for PCG preconditioner application (used as 'u' in shader)
     private ComputeBuffer zVectorBuffer; // Preconditioned residual vector 'z' for PCG
+    private ComputeBuffer scatterIndicesBuffer; // NEW: Pre-computed scatter indices for optimization
     private ComputeBuffer bufferQ; // Q buffer for attention
     private ComputeBuffer bufferK; // K buffer for attention
     private ComputeBuffer bufferV; // V buffer for attention
@@ -519,6 +522,7 @@ public class FluidSimulator : MonoBehaviour
         int axpyKernel = cgSolverShader.FindKernel("Axpy");
         int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
         // Preconditioner Kernels from CGSolver.compute
+        int precomputeIndicesKernel = cgSolverShader.FindKernel("PrecomputeIndices");
         int applySparseGTKernel = cgSolverShader.FindKernel("ApplySparseGT"); 
         int applySparseGKernel = cgSolverShader.FindKernel("ApplySparseG");
         int clearBufferFloatKernel = cgSolverShader.FindKernel("ClearBufferFloat");
@@ -564,6 +568,11 @@ public class FluidSimulator : MonoBehaviour
             zVectorBuffer?.Release(); 
             zVectorBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
+        if (scatterIndicesBuffer == null || scatterIndicesBuffer.count < requiredSize * 24)
+        {
+            scatterIndicesBuffer?.Release();
+            scatterIndicesBuffer = new ComputeBuffer(requiredSize * 24, sizeof(uint));
+        }
         bufferInitSw.Stop();
 
         // --- Step 1: Init (r = b) ---
@@ -579,6 +588,12 @@ public class FluidSimulator : MonoBehaviour
         if (useNeuralPreconditioner && preconditionerShader != null)
         {
             RunNeuralPreconditioner(); // Fills matrixGBuffer
+            
+            // --- Precompute Optimization ---
+            cgSolverShader.SetBuffer(precomputeIndicesKernel, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(precomputeIndicesKernel, "scatterIndicesBuffer", scatterIndicesBuffer);
+            cgSolverShader.SetInt("numNodes", numNodes);
+            Dispatch(precomputeIndicesKernel, numNodes);
         }
 
         // Init Pressure x=0
@@ -790,6 +805,8 @@ public class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(kGT, "zBuffer", zBuffer); // Intermediate
         cgSolverShader.SetBuffer(kGT, "matrixGBuffer", matrixGBuffer);
         cgSolverShader.SetBuffer(kGT, "neighborsBuffer", neighborsBuffer);
+        cgSolverShader.SetBuffer(kGT, "reverseNeighborsBuffer", reverseNeighborsBuffer);
+        cgSolverShader.SetBuffer(kGT, "scatterIndicesBuffer", scatterIndicesBuffer); // Bind precomputed indices
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(kGT, numNodes);
 
@@ -867,49 +884,55 @@ public class FluidSimulator : MonoBehaviour
         int paddedNodes = Mathf.CeilToInt(numNodes / 512.0f) * 512;
         int windowGroups = paddedNodes / 512;
 
-        // 1. Resize Buffers (grow-only to avoid constant reallocation)
+        // 1. Resize Buffers (UPDATED SIZES)
         int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
         int requiredPaddedSize = Mathf.CeilToInt(requiredSize / 512.0f) * 512;
         
+        // MatrixG: [N, 7] -> 28 bytes per node
         if (matrixGBuffer == null || matrixGBuffer.count < requiredSize)
         {
             matrixGBuffer?.Release();
-            matrixGBuffer = new ComputeBuffer(requiredSize, 4 * 25);
+            matrixGBuffer = new ComputeBuffer(requiredSize, 4 * 7); // UPDATED stride
         }
         if (zBuffer == null || zBuffer.count < requiredSize)
         {
             zBuffer?.Release();
             zBuffer = new ComputeBuffer(requiredSize, 4);
         }
-        if (tokenBuffer == null || tokenBuffer.count < requiredPaddedSize * 128)
+        
+        // Internal buffers: Use d_model loaded from the .bytes file
+        int current_d_model = this.d_model; 
+        int stride = current_d_model * 4; 
+        
+        if (tokenBuffer == null || tokenBuffer.count < requiredPaddedSize * current_d_model)
         {
             tokenBuffer?.Release();
-            tokenBuffer = new ComputeBuffer(requiredPaddedSize * 128, 4);
+            tokenBuffer = new ComputeBuffer(requiredPaddedSize * current_d_model, 4);
         }
-        if (tokenBufferOut == null || tokenBufferOut.count < requiredPaddedSize * 128)
+        if (tokenBufferOut == null || tokenBufferOut.count < requiredPaddedSize * current_d_model)
         {
             tokenBufferOut?.Release();
-            tokenBufferOut = new ComputeBuffer(requiredPaddedSize * 128, 4);
+            tokenBufferOut = new ComputeBuffer(requiredPaddedSize * current_d_model, 4);
         }
-        if (bufferQ == null || bufferQ.count < requiredPaddedSize * 128)
+        if (bufferQ == null || bufferQ.count < requiredPaddedSize * current_d_model)
         {
             bufferQ?.Release();
-            bufferQ = new ComputeBuffer(requiredPaddedSize * 128, 4);
+            bufferQ = new ComputeBuffer(requiredPaddedSize * current_d_model, 4);
         }
-        if (bufferK == null || bufferK.count < requiredPaddedSize * 128)
+        if (bufferK == null || bufferK.count < requiredPaddedSize * current_d_model)
         {
             bufferK?.Release();
-            bufferK = new ComputeBuffer(requiredPaddedSize * 128, 4);
+            bufferK = new ComputeBuffer(requiredPaddedSize * current_d_model, 4);
         }
-        if (bufferV == null || bufferV.count < requiredPaddedSize * 128)
+        if (bufferV == null || bufferV.count < requiredPaddedSize * current_d_model)
         {
             bufferV?.Release();
-            bufferV = new ComputeBuffer(requiredPaddedSize * 128, 4);
+            bufferV = new ComputeBuffer(requiredPaddedSize * current_d_model, 4);
         }
-        if (bufferAttn == null || bufferAttn.count < requiredPaddedSize * 128)
+        if (bufferAttn == null || bufferAttn.count < requiredPaddedSize * current_d_model)
         {
             bufferAttn?.Release();
-            bufferAttn = new ComputeBuffer(requiredPaddedSize * 128, 4);
+            bufferAttn = new ComputeBuffer(requiredPaddedSize * current_d_model, 4);
         }
 
         // Reset timers
@@ -928,6 +951,10 @@ public class FluidSimulator : MonoBehaviour
         preconditionerShader.SetInt("numNodes", numNodes);
         preconditionerShader.SetInt("maxNodes", paddedNodes);
         
+        // Set Shader Constants
+        preconditionerShader.SetInt("d_model", current_d_model);
+        preconditionerShader.SetInt("d_ffn", current_d_model * 2);
+        
         // Set Feature/Embed weights
         if (weightBuffers.ContainsKey("feature_proj.weight"))
             preconditionerShader.SetBuffer(kFeat, "weightsFeatureProj", weightBuffers["feature_proj.weight"]);
@@ -942,12 +969,12 @@ public class FluidSimulator : MonoBehaviour
         preconditionerShader.Dispatch(kFeat, windowGroups, 1, 1);
         featSw.Stop();
 
-        // Loop Layers
+        // Loop Layers (num_layers should be 2 from metadata)
         int kQKV = preconditionerShader.FindKernel("ComputeQKV");
         int kAttn = preconditionerShader.FindKernel("ComputeAttention");
         int kFFN = preconditionerShader.FindKernel("ComputeFFN");
 
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < num_layers; i++)
         {
             string p = $"layer_{i}.";
 
@@ -960,6 +987,8 @@ public class FluidSimulator : MonoBehaviour
             preconditionerShader.SetBuffer(kQKV, "bufferV", bufferV);
             preconditionerShader.SetInt("numNodes", numNodes);
             preconditionerShader.SetInt("maxNodes", paddedNodes);
+            preconditionerShader.SetInt("d_model", current_d_model);
+            preconditionerShader.SetInt("d_ffn", current_d_model * 2);
             
             if (weightBuffers.ContainsKey(p + "norm1_w"))
                 preconditionerShader.SetBuffer(kQKV, "w_norm1", weightBuffers[p + "norm1_w"]);
@@ -970,7 +999,7 @@ public class FluidSimulator : MonoBehaviour
             if (weightBuffers.ContainsKey(p + "in_proj_b"))
                 preconditionerShader.SetBuffer(kQKV, "b_attn_in", weightBuffers[p + "in_proj_b"]);
             
-            // Dispatch QKV: 1 Group per Node (128 threads)
+            // Dispatch QKV: 1 Group per Node (32 threads)
             preconditionerShader.Dispatch(kQKV, paddedNodes, 1, 1);
             qkvSw.Stop();
 
@@ -983,6 +1012,8 @@ public class FluidSimulator : MonoBehaviour
             preconditionerShader.SetBuffer(kAttn, "bufferAttn", bufferAttn); // Intermediate write
             preconditionerShader.SetInt("numNodes", numNodes);
             preconditionerShader.SetInt("maxNodes", paddedNodes);
+            preconditionerShader.SetInt("d_model", current_d_model);
+            preconditionerShader.SetInt("d_ffn", current_d_model * 2);
             
             // Dispatch Attention: Window Groups X, 4 Heads Y
             preconditionerShader.Dispatch(kAttn, windowGroups, 4, 1);
@@ -996,6 +1027,8 @@ public class FluidSimulator : MonoBehaviour
             preconditionerShader.SetBuffer(kFFN, "tokenBufferOut", tokenBufferOut); // Result
             preconditionerShader.SetInt("numNodes", numNodes);
             preconditionerShader.SetInt("maxNodes", paddedNodes);
+            preconditionerShader.SetInt("d_model", current_d_model);
+            preconditionerShader.SetInt("d_ffn", current_d_model * 2);
             
             if (weightBuffers.ContainsKey(p + "out_proj_w"))
                 preconditionerShader.SetBuffer(kFFN, "w_attn_out", weightBuffers[p + "out_proj_w"]);
@@ -1014,7 +1047,7 @@ public class FluidSimulator : MonoBehaviour
             if (weightBuffers.ContainsKey(p + "linear2_b"))
                 preconditionerShader.SetBuffer(kFFN, "b_ffn2", weightBuffers[p + "linear2_b"]);
             
-            // Dispatch FFN: 1 Group per Node
+            // Dispatch FFN: 1 Group per Node (32 threads)
             preconditionerShader.Dispatch(kFFN, paddedNodes, 1, 1);
             ffnSw.Stop();
 
@@ -1030,6 +1063,8 @@ public class FluidSimulator : MonoBehaviour
         preconditionerShader.SetBuffer(kHead, "tokenBufferOut", tokenBuffer); // Note: swapped buffer is now input
         preconditionerShader.SetBuffer(kHead, "matrixGBuffer", matrixGBuffer);
         preconditionerShader.SetInt("numNodes", numNodes);
+        preconditionerShader.SetInt("d_model", current_d_model);
+        preconditionerShader.SetInt("d_ffn", current_d_model * 2);
         
         if (weightBuffers.ContainsKey("norm_out.weight"))
             preconditionerShader.SetBuffer(kHead, "w_normOut", weightBuffers["norm_out.weight"]);
@@ -1040,7 +1075,7 @@ public class FluidSimulator : MonoBehaviour
         if (weightBuffers.ContainsKey("head.bias"))
             preconditionerShader.SetBuffer(kHead, "b_head", weightBuffers["head.bias"]);
         
-        // Dispatch Head: 1 Group per Node
+        // Dispatch Head: 1 Group per Node (32 threads)
         preconditionerShader.Dispatch(kHead, paddedNodes, 1, 1);
         headSw.Stop();
     }
@@ -1056,6 +1091,7 @@ public class FluidSimulator : MonoBehaviour
         matrixGBuffer?.Release();
         zBuffer?.Release();
         zVectorBuffer?.Release();
+        scatterIndicesBuffer?.Release();
     }
 
     // Helper for copying buffer data
@@ -1639,6 +1675,17 @@ public class FluidSimulator : MonoBehaviour
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(findNeighborsKernel, threadGroups, 1, 1);
 
+        // Find reverse connections (run once per frame after findNeighbors)
+        // Release and recreate reverseNeighbors buffer each frame since numNodes changes
+        reverseNeighborsBuffer?.Release();
+        reverseNeighborsBuffer = new ComputeBuffer(numNodes * 24, sizeof(uint));
+        
+        findReverseKernel = nodesShader.FindKernel("FindReverseConnections");
+        nodesShader.SetBuffer(findReverseKernel, "reverseNeighborsBuffer", reverseNeighborsBuffer);
+        nodesShader.SetBuffer(findReverseKernel, "neighborsBuffer", neighborsBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.Dispatch(findReverseKernel, threadGroups, 1, 1);
+
         interpolateFaceVelocitiesKernel = nodesShader.FindKernel("interpolateFaceVelocities");
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
@@ -2026,6 +2073,7 @@ public class FluidSimulator : MonoBehaviour
         nodesBufferOld?.Release();
         tempNodesBuffer?.Release();
         neighborsBuffer?.Release();
+        reverseNeighborsBuffer?.Release();
         divergenceBuffer?.Release();
         residualBuffer?.Release();
         pBuffer?.Release();
