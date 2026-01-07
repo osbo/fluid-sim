@@ -79,7 +79,7 @@ Shader "Custom/ParticlesPoints"
 
             VSOut VS(uint id : SV_VertexID)
             {
-                VSOut o;
+                VSOut o = (VSOut)0; // Initialize all members to zero
                 Particle p = _Particles[id];
                 
                 // Convert normalized position (0-1024 range) back to world coordinates
@@ -89,6 +89,9 @@ Shader "Custom/ParticlesPoints"
                 o.pos = TransformWorldToHClip(positionWS);
                 o.col = LayerToColor(p.layer);
                 o.col = float4(0.0, 0.5, 1.0, 1.0);
+                
+                // Ensure PSIZE is always positive and valid for Metal/iOS
+                // PSIZE must be set for point rendering on Metal
                 o.psize = max(_PointSize, 1.0);
                 
                 // Calculate distance from camera to particle

@@ -43,7 +43,7 @@ Shader "Custom/ParticleThickness"
 
             VSOut VS(uint id : SV_VertexID)
             {
-                VSOut o;
+                VSOut o = (VSOut)0; // Initialize all members to zero
                 Particle p = _Particles[id];
                 
                 float3 simulationSize = _SimulationBoundsMax - _SimulationBoundsMin;
@@ -51,8 +51,10 @@ Shader "Custom/ParticleThickness"
 
                 o.pos = TransformWorldToHClip(positionWS);
 
-                // 3. FIXED SIZE: Force 4 pixel screen size
-                o.psize = 4.0;
+                // Ensure PSIZE is always positive and valid for Metal/iOS
+                // PSIZE must be set for point rendering on Metal
+                // Fixed size: Force 4 pixel screen size
+                o.psize = max(4.0, 1.0);
 
                 return o;
             }

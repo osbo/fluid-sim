@@ -1976,22 +1976,22 @@ public class FluidSimulator : MonoBehaviour
 
         // for (int i = 0; i < numNodes; i++) {
         //     Node node = nodesCPU[i];
-        //     // Gizmos.color = layerColors[(int)node.layer];
-        //     // Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        //     Gizmos.color = new Color(0.0f, 0.5f, 1.0f, 1.0f);
-        //     bool isBoundary = false;
-        //     uint neighborBaseIndex = (uint)i * 24;
-        //     for (int d = 0; d < 6; d++) {
-        //         uint baseFaceIndex = neighborBaseIndex + (uint)d * 4;
-        //         uint n0_idx = neighborsCPU[baseFaceIndex];
-        //         if (n0_idx == numNodes + 1) {
-        //             isBoundary = true;
-        //             break;
-        //         }
-        //     }
-        //     if (node.layer == minLayer || isBoundary) {
-        //         Gizmos.DrawCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        //     }
+        //     Gizmos.color = layerColors[(int)node.layer];
+        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        //     // Gizmos.color = new Color(0.0f, 0.5f, 1.0f, 1.0f);
+        //     // bool isBoundary = false;
+        //     // uint neighborBaseIndex = (uint)i * 24;
+        //     // for (int d = 0; d < 6; d++) {
+        //     //     uint baseFaceIndex = neighborBaseIndex + (uint)d * 4;
+        //     //     uint n0_idx = neighborsCPU[baseFaceIndex];
+        //     //     if (n0_idx == numNodes + 1) {
+        //     //         isBoundary = true;
+        //     //         break;
+        //     //     }
+        //     // }
+        //     // if (node.layer == minLayer || isBoundary) {
+        //     //     Gizmos.DrawCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
+        //     // }
         // }
     }
 
