@@ -51,6 +51,20 @@ uint numNodes;
 float a; // scalar 'a'
 float deltaTime; // Time step for physics scaling
 
+// Helper: Calculate density ensuring a safe minimum to prevent explosion
+float GetDensity(float mass, uint layer)
+{
+    float cellSide = exp2((float)layer);
+    float volume = cellSide * cellSide * cellSide;
+    
+    // Density = Mass / Volume
+    float rho = mass / volume;
+    
+    // Stability: Clamp density to a minimum (e.g. 1.0) 
+    // This prevents low-mass "spray" particles from getting infinite acceleration.
+    return max(rho, 1.0); 
+}
+
 // Shared memory for dot product reduction
 groupshared float s_data[512];
 
@@ -121,6 +135,9 @@ void ApplyLaplacianAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID,
 
         float dx_i = exp2((float)node.layer);
         if (!isfinite(dx_i)) dx_i = 1e-6;
+        
+        // [NEW] Calculate Density for self
+        float rho_i = GetDensity(node.mass, node.layer);
 
         // Loop over all 6 faces of the node
         for (int d = 0; d < 6; d++)
@@ -158,7 +175,14 @@ void ApplyLaplacianAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID,
                 float dx_j = exp2((float)nNode.layer);
                 float distance = max(0.5 * (dx_i + dx_j), 1e-6);
                 float a_shared = dx_i * dx_i;
-                float w = a_shared / distance;
+                
+                // [NEW] Calculate Density for neighbor and average interface density
+                float rho_j = GetDensity(nNode.mass, nNode.layer);
+                float rho_face = (rho_i + rho_j) * 0.5f;
+
+                // [MODIFIED] Weight w includes Inverse Density
+                // Old: float w = a_shared / distance;
+                float w = (a_shared / distance) * (1.0f / rho_face);
                 float contribution = w * (p_j - p_i);
                 
                 laplacian_p += contribution;
@@ -195,15 +219,26 @@ void ApplyLaplacianAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID,
                         
                         float dx_k = exp2((float)cNode.layer);
                         float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                        float w = childFaceArea / distance;
+                        
+                        // [NEW] Child Density
+                        float rho_k = GetDensity(cNode.mass, cNode.layer);
+                        float rho_face = (rho_i + rho_k) * 0.5f;
+
+                        // [MODIFIED]
+                        float w = (childFaceArea / distance) * (1.0f / rho_face);
                         float contribution = w * (p_k - p_i);
                         laplacian_p += contribution;
                     }
                     else if (child_idx == numNodes) // Case 4: Dirichlet boundary
                     {
+                        // Treat boundary as having same density as self to allow free surface movement
+                        float rho_face = rho_i; 
+
                         float dx_k = dx_i * 0.5;
                         float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                        float w = childFaceArea / distance;
+                        
+                        // [MODIFIED]
+                        float w = (childFaceArea / distance) * (1.0f / rho_face);
                         float contribution = w * (-p_i);
                         laplacian_p += contribution;
                     }
@@ -568,6 +603,10 @@ void ComputeDiagonal(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint
     
     float dx_i = exp2((float)node.layer);
     if (!isfinite(dx_i)) dx_i = 1e-6;
+    
+    // [NEW] Self Density
+    float rho_i = GetDensity(node.mass, node.layer);
+    
     float diagonal_sum = 0.0;
 
     // Loop over all 6 faces of the node
@@ -598,10 +637,16 @@ void ComputeDiagonal(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint
                 nNode = nodesBuffer[neighbor_idx];
             }
 
+            // [NEW] Neighbor Density
+            float rho_j = GetDensity(nNode.mass, nNode.layer);
+            float rho_face = (rho_i + rho_j) * 0.5f;
+
             float dx_j = exp2((float)nNode.layer);
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
             float a_shared = dx_i * dx_i;
-            float w = a_shared / distance;
+
+            // [MODIFIED]
+            float w = (a_shared / distance) * (1.0f / rho_face);
             diagonal_sum += w;
         }
         else
@@ -628,16 +673,27 @@ void ComputeDiagonal(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint
                         cNode = nodesBuffer[child_idx];
                     }
 
+                    // [NEW] Child Density
+                    float rho_k = GetDensity(cNode.mass, cNode.layer);
+                    float rho_face = (rho_i + rho_k) * 0.5f;
+
                     float dx_k = exp2((float)cNode.layer);
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    float w = childFaceArea / distance;
+
+                    // [MODIFIED]
+                    float w = (childFaceArea / distance) * (1.0f / rho_face);
                     diagonal_sum += w;
                 }
                 else if (child_idx == numNodes) // Case 4: Dirichlet
                 {
+                    // Dirichlet
+                    float rho_face = rho_i;
+
                     float dx_k = dx_i * 0.5;
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    float w = childFaceArea / distance;
+
+                    // [MODIFIED]
+                    float w = (childFaceArea / distance) * (1.0f / rho_face);
                     diagonal_sum += w;
                 }
             }
