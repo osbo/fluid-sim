@@ -161,20 +161,6 @@ float calculateMassWeight(float selfMass, float neighborMass)
     return selfMass / total;
 }
 
-// Helper: Calculate density ensuring a safe minimum to prevent explosion
-float GetDensity(float mass, uint layer)
-{
-    float cellSide = exp2((float)layer);
-    float volume = cellSide * cellSide * cellSide;
-    
-    // Density = Mass / Volume
-    float rho = mass / volume;
-    
-    // Stability: Clamp density to a minimum (e.g. 1.0) 
-    // This prevents low-mass "spray" particles from getting infinite acceleration.
-    return max(rho, 1.0); 
-}
-
 // --- NEW: Extraction Kernel ---
 // Run this after compaction to keep the SoA buffer in sync
 [numthreads(512,1,1)]
@@ -1015,9 +1001,6 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
     Node outNode = node; // Start with a copy
     float p_i = s_grad_pressure[li];
     float dx_i = exp2((float)node.layer);
-    
-    // [NEW] Calculate Density for this node
-    float rho_i = GetDensity(node.mass, node.layer);
 
     // Loop through all 6 faces, same as findNeighbors and ApplyLaplacian
     for (int d = 0; d < 6; d++)
@@ -1113,7 +1096,7 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
         // [MODIFICATION START]
         // Convert Pressure Gradient (Force/Volume) to Acceleration (Force/Mass)
         // a = F/m = (F/V) / (m/V) = GradP / Density
-        float acceleration = pressure_gradient / rho_i;
+        float acceleration = pressure_gradient;
 
         float velocity_correction = deltaTime * acceleration;
         // [MODIFICATION END]
