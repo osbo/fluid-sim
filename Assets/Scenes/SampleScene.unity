@@ -552,7 +552,7 @@ MonoBehaviour:
   modelWeightsAsset: {fileID: 4900000, guid: c8c83e26cc03d4114b9402603b15f56f, type: 3}
   gravity: 100
   frameRate: 30
-  minLayer: 4
+  minLayer: 5
   maxLayer: 10
   preconditioner: 1
   renderingMode: 0
