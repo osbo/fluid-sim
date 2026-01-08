@@ -11,7 +11,8 @@ public enum RenderingMode
 {
     Particles,
     Depth,
-    Thickness
+    Thickness,
+    BlurredDepth
 }
 
 public enum PreconditionerType
@@ -186,6 +187,11 @@ public class FluidSimulator : MonoBehaviour
     private Particle[] particlesCPU;
     private string str;
 
+    // Training data recorder
+    public TrainingDataRecorder recorder;
+    
+    [Header("Rendering")]
+
     // Rendering mode enum
     public RenderingMode renderingMode = RenderingMode.Particles;
     
@@ -201,8 +207,11 @@ public class FluidSimulator : MonoBehaviour
     // Thickness contribution per particle (controls how much each particle adds to the thickness map)
     public float thicknessContribution = 1.0f / 1024.0f;
     
-    // Training data recorder
-    public TrainingDataRecorder recorder;
+    public ComputeShader blurCompute; // Assign BilateralBlur.compute here
+    [Range(0, 100)] public int blurRadius = 5;
+    [Range(0.0001f, 0.1f)] public float blurDepthFalloff = 0.01f;
+    [Range(0.1f, 50.0f)] public float pointSize = 2.0f;
+    
 
     void OnEnable()
     {
@@ -2011,8 +2020,9 @@ public class FluidSimulator : MonoBehaviour
         if (particlesBuffer == null || numParticles <= 0) return;
         if (cam == null) return;
 
-        // Select material based on rendering mode
         Material currentMaterial = null;
+        bool useBlur = false;
+
         switch (renderingMode)
         {
             case RenderingMode.Particles:
@@ -2021,6 +2031,10 @@ public class FluidSimulator : MonoBehaviour
             case RenderingMode.Depth:
                 currentMaterial = particleDepthMaterial;
                 break;
+            case RenderingMode.BlurredDepth:
+                currentMaterial = particleDepthMaterial; // Use depth shader as base
+                useBlur = true;
+                break;
             case RenderingMode.Thickness:
                 currentMaterial = particleThicknessMaterial;
                 break;
@@ -2028,12 +2042,11 @@ public class FluidSimulator : MonoBehaviour
 
         if (currentMaterial == null) return;
 
+        // --- Common Material Setup ---
         currentMaterial.SetBuffer("_Particles", particlesBuffer);
-        currentMaterial.SetFloat("_PointSize", 2.0f);
+        currentMaterial.SetFloat("_PointSize", pointSize);
         currentMaterial.SetInt("_MinLayer", minLayer);
         currentMaterial.SetInt("_MaxLayer", maxLayer);
-        
-        // Add simulation bounds for denormalizing particle positions
         currentMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
         currentMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
         
@@ -2074,8 +2087,8 @@ public class FluidSimulator : MonoBehaviour
         currentMaterial.SetFloat("_DepthFadeStart", fadeStart);
         currentMaterial.SetFloat("_DepthFadeEnd", fadeEnd);
         
-        // Calculate depth min/max for depth visualization (only for depth material)
-        if (renderingMode == RenderingMode.Depth)
+        // Calculate depth min/max for depth visualization (for depth and blurred depth materials)
+        if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth)
         {
             // Calculate the 8 corners of the bounding box
             Vector3[] corners = new Vector3[]
@@ -2120,8 +2133,75 @@ public class FluidSimulator : MonoBehaviour
             currentMaterial.SetFloat("_ThicknessContribution", thicknessContribution);
         }
 
-        currentMaterial.SetPass(0);
+        if (useBlur && blurCompute != null)
+        {
+            RenderBlurredDepth(cam, currentMaterial);
+        }
+        else
+        {
+            currentMaterial.SetPass(0);
+            Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
+        }
+    }
+
+    private void RenderBlurredDepth(Camera cam, Material mat)
+    {
+        int width = cam.pixelWidth;
+        int height = cam.pixelHeight;
+
+        // 1. Get Temporary RenderTextures
+        RenderTexture rawDepth = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.RFloat);
+        RenderTexture tempBlur = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.RFloat);
+        RenderTexture finalBlur = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.RFloat);
+        
+        rawDepth.enableRandomWrite = true;
+        tempBlur.enableRandomWrite = true;
+        finalBlur.enableRandomWrite = true;
+
+        // 2. Render Particles to rawDepth texture
+        // We must manually set the render target to our texture, clear it, and draw
+        Graphics.SetRenderTarget(rawDepth);
+        GL.Clear(true, true, Color.black); // Clear depth and color (0 = far/background in our normalized setup)
+        
+        mat.SetPass(0);
         Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
+
+        // 3. Dispatch Horizontal Blur (rawDepth -> tempBlur)
+        int kernelHandleH = blurCompute.FindKernel("HorizontalBlur");
+        blurCompute.SetTexture(kernelHandleH, "_SourceTexture", rawDepth);
+        blurCompute.SetTexture(kernelHandleH, "_DestinationTexture", tempBlur);
+        blurCompute.SetFloat("_BlurRadius", blurRadius);
+        blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
+        blurCompute.SetVector("_Resolution", new Vector2(width, height));
+        
+        int groupsX = Mathf.CeilToInt(width / 8.0f);
+        int groupsY = Mathf.CeilToInt(height / 8.0f);
+        blurCompute.Dispatch(kernelHandleH, groupsX, groupsY, 1);
+
+        // 4. Dispatch Vertical Blur (tempBlur -> finalBlur)
+        int kernelHandleV = blurCompute.FindKernel("VerticalBlur");
+        blurCompute.SetTexture(kernelHandleV, "_SourceTexture", tempBlur);
+        blurCompute.SetTexture(kernelHandleV, "_DestinationTexture", finalBlur);
+        blurCompute.SetFloat("_BlurRadius", blurRadius);
+        blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
+        blurCompute.SetVector("_Resolution", new Vector2(width, height));
+        
+        blurCompute.Dispatch(kernelHandleV, groupsX, groupsY, 1);
+
+        // 5. Blit Final Result to Screen
+        // We need to restore the camera's target. 
+        // Since we are in OnEndCameraRendering, 'null' usually targets the screen/camera buffer.
+        Graphics.SetRenderTarget(null); 
+        
+        // Simple blit to visualize the blurred depth map (Grayscale)
+        // Note: For actual fluid rendering later, you won't Blit this to screen;
+        // you will pass 'finalBlur' to your fluid composition shader.
+        Graphics.Blit(finalBlur, (RenderTexture)null);
+
+        // 6. Cleanup
+        RenderTexture.ReleaseTemporary(rawDepth);
+        RenderTexture.ReleaseTemporary(tempBlur);
+        RenderTexture.ReleaseTemporary(finalBlur);
     }
 
     private Vector3 DecodeMorton3D(Node node)

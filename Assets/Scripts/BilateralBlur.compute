@@ -1,0 +1,99 @@
+#pragma kernel HorizontalBlur
+#pragma kernel VerticalBlur
+
+// Inputs
+Texture2D<float4> _SourceTexture;
+RWTexture2D<float4> _DestinationTexture;
+
+// Params
+float _BlurRadius;
+float _BlurDepthFalloff;
+float2 _Resolution;
+
+// Gaussian weight helper
+float Gaussian(float x, float sigma)
+{
+    return exp(-(x * x) / (2.0 * sigma * sigma));
+}
+
+[numthreads(8, 8, 1)]
+void HorizontalBlur(uint3 id : SV_DispatchThreadID)
+{
+    uint width = (uint)_Resolution.x;
+    uint height = (uint)_Resolution.y;
+    if (id.x >= width || id.y >= height) return;
+
+    int radius = (int)_BlurRadius;
+    float4 centerVal = _SourceTexture[id.xy];
+    float centerDepth = centerVal.r;
+    
+    float totalWeight = 0.0;
+    float result = 0.0;
+    
+    // Sigma for spatial gaussian (usually radius / 2 is a good heuristic)
+    float sigma = max(1.0, _BlurRadius / 2.0);
+
+    for (int x = -radius; x <= radius; x++)
+    {
+        int sampleX = (int)id.x + x;
+        int sampleY = (int)id.y;
+        // Clamp to screen
+        sampleX = clamp(sampleX, 0, (int)width - 1);
+        uint2 sampleUV = uint2((uint)sampleX, (uint)sampleY);
+        
+        float sampleDepth = _SourceTexture[sampleUV].r;
+        
+        // 1. Spatial Weight (Gaussian)
+        float spatialWeight = Gaussian((float)x, sigma);
+        
+        // 2. Range Weight (Depth Difference)
+        // If the neighbor is too far away in depth, weight drops to 0
+        float depthDiff = abs(centerDepth - sampleDepth);
+        float rangeWeight = exp(-(depthDiff * depthDiff) / (2.0 * _BlurDepthFalloff * _BlurDepthFalloff));
+        
+        float weight = spatialWeight * rangeWeight;
+        
+        result += sampleDepth * weight;
+        totalWeight += weight;
+    }
+    
+    _DestinationTexture[id.xy] = float4(result / totalWeight, 0, 0, 1);
+}
+
+[numthreads(8, 8, 1)]
+void VerticalBlur(uint3 id : SV_DispatchThreadID)
+{
+    uint width = (uint)_Resolution.x;
+    uint height = (uint)_Resolution.y;
+    if (id.x >= width || id.y >= height) return;
+
+    int radius = (int)_BlurRadius;
+    float4 centerVal = _SourceTexture[id.xy];
+    float centerDepth = centerVal.r;
+    
+    float totalWeight = 0.0;
+    float result = 0.0;
+    float sigma = max(1.0, _BlurRadius / 2.0);
+
+    for (int y = -radius; y <= radius; y++)
+    {
+        int sampleX = (int)id.x;
+        int sampleY = (int)id.y + y;
+        // Clamp to screen
+        sampleY = clamp(sampleY, 0, (int)height - 1);
+        uint2 sampleUV = uint2((uint)sampleX, (uint)sampleY);
+        
+        float sampleDepth = _SourceTexture[sampleUV].r;
+        
+        float spatialWeight = Gaussian((float)y, sigma);
+        float depthDiff = abs(centerDepth - sampleDepth);
+        float rangeWeight = exp(-(depthDiff * depthDiff) / (2.0 * _BlurDepthFalloff * _BlurDepthFalloff));
+        
+        float weight = spatialWeight * rangeWeight;
+        
+        result += sampleDepth * weight;
+        totalWeight += weight;
+    }
+    
+    _DestinationTexture[id.xy] = float4(result / totalWeight, 0, 0, 1);
+}
