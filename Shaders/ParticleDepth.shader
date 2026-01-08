@@ -77,12 +77,10 @@ Shader "Fluid/ParticleDepth"
                 // Convert to Unity depth buffer format
                 Depth = LinearDepthToUnityDepth(linearDepth);
                 
-                // Normalize depth to 0-1 range using min/max
                 float depthRange = _DepthMax - _DepthMin;
+                // Output raw linear depth to Red channel for the blur shader to use
                 float normalizedDepth = depthRange > 0.0001 ? saturate((linearDepth - _DepthMin) / depthRange) : 0.0;
-                
-                // Return normalized depth as grayscale color
-                return float4(normalizedDepth, normalizedDepth, normalizedDepth, 1.0);
+                return float4(normalizedDepth, 0, 0, 1.0);
             }
             ENDHLSL
 
