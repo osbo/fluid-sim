@@ -1165,7 +1165,18 @@ public class FluidSimulator : MonoBehaviour
             preconditionerShader.SetBuffer(kHead, "b_head", weightBuffers["head.bias"]);
         
         // Dispatch Head: 1 Group per Node (32 threads)
-        preconditionerShader.Dispatch(kHead, paddedNodes, 1, 1);
+        // Handle large node counts by dispatching in batches (max 65535 thread groups per dimension)
+        const int MAX_THREAD_GROUPS = 65535;
+        int remainingNodes = paddedNodes;
+        int offset = 0;
+        while (remainingNodes > 0)
+        {
+            int batchSize = Mathf.Min(remainingNodes, MAX_THREAD_GROUPS);
+            preconditionerShader.SetInt("headOffset", offset);
+            preconditionerShader.Dispatch(kHead, batchSize, 1, 1);
+            offset += batchSize;
+            remainingNodes -= batchSize;
+        }
         headSw.Stop();
     }
 

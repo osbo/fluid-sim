@@ -57,6 +57,7 @@ uint numNodes;
 uint maxNodes;
 int windowSize;  // Window size for attention (default: 256)
 int numHeads;    // Number of attention heads (default: 4)
+int headOffset;  // Offset for batched head processing
 
 // --- HELPERS ---
 float GetDx(uint layer) { return pow(2.0, (float)layer); }
@@ -158,7 +159,7 @@ groupshared float s_reduce_head[32];
 [numthreads(32, 1, 1)]
 void PredictHead(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
-    uint nodeIdx = groupID.x;
+    uint nodeIdx = groupID.x + (uint)headOffset;
     uint dim = groupIndex; // 0..31
     if (nodeIdx >= numNodes) return;
     
