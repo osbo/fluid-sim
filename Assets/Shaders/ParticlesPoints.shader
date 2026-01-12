@@ -2,7 +2,7 @@ Shader "Custom/ParticlesPoints"
 {
     Properties
     {
-        _PointSize ("Point Size", Float) = 2.0
+        _Radius ("Particle Radius", Float) = 0.01
         _MinLayer ("Min Layer", Int) = 0
         _MaxLayer ("Max Layer", Int) = 10
         _DepthFadeStart ("Depth Fade Start", Float) = 0.0
@@ -32,13 +32,15 @@ Shader "Custom/ParticlesPoints"
             };
 
             StructuredBuffer<Particle> _Particles;
-            float _PointSize;
+            float _Radius;
             int _MinLayer;
             int _MaxLayer;
             float3 _SimulationBoundsMin;
             float3 _SimulationBoundsMax;
             float _DepthFadeStart;
             float _DepthFadeEnd;
+            float _Scale;
+            float _MinValue;
 
             float4 LayerToColor(uint layer)
             {
@@ -69,49 +71,81 @@ Shader "Custom/ParticlesPoints"
                 return float4(c, 1);
             }
 
+            struct Attributes
+            {
+                float4 positionOS : POSITION; // Standard Quad Vertex (-0.5 to 0.5)
+                float2 uv : TEXCOORD0;
+                uint instanceID : SV_InstanceID;
+            };
+
             struct VSOut
             {
                 float4 pos : SV_POSITION;
                 float4 col : COLOR0;
-                float  psize : PSIZE;
-                float  depth : TEXCOORD0;
+                float2 uv : TEXCOORD0;
+                float depth : TEXCOORD1;
             };
 
-            VSOut VS(uint id : SV_VertexID)
+            // Helper to decode position (Same as your other shaders)
+            float3 GetParticlePos(Particle p)
             {
-                VSOut o = (VSOut)0; // Initialize all members to zero
-                Particle p = _Particles[id];
+                 float3 simulationSize = _SimulationBoundsMax - _SimulationBoundsMin;
+                 return _SimulationBoundsMin + (p.position * simulationSize / 1024.0);
+            }
+
+            VSOut VS(Attributes input)
+            {
+                VSOut o;
+                Particle p = _Particles[input.instanceID];
                 
-                // Convert normalized position (0-1024 range) back to world coordinates
-                float3 simulationSize = _SimulationBoundsMax - _SimulationBoundsMin;
-                float3 positionWS = _SimulationBoundsMin + (p.position * simulationSize / 1024.0);
+                float3 centerWorld = GetParticlePos(p);
+                
+                // Billboard Math: Always face camera
+                float3 cameraRight = unity_CameraToWorld._m00_m10_m20;
+                float3 cameraUp = unity_CameraToWorld._m01_m11_m21;
+                
+                // Scale up by 2*radius to get full diameter
+                float3 positionWS = centerWorld 
+                                  + (cameraRight * input.positionOS.x * _Radius * 2.0) 
+                                  + (cameraUp * input.positionOS.y * _Radius * 2.0);
                 
                 o.pos = TransformWorldToHClip(positionWS);
                 o.col = LayerToColor(p.layer);
                 o.col = float4(0.0, 0.5, 1.0, 1.0);
-                
-                // Ensure PSIZE is always positive and valid for Metal/iOS
-                // PSIZE must be set for point rendering on Metal
-                o.psize = max(_PointSize, 1.0);
+                o.uv = input.uv;
                 
                 // Calculate distance from camera to particle
-                // _WorldSpaceCameraPos is a built-in Unity variable available in all shaders
-                o.depth = distance(positionWS, _WorldSpaceCameraPos.xyz);
+                o.depth = distance(centerWorld, _WorldSpaceCameraPos.xyz);
                 
                 return o;
             }
 
             float4 PS(VSOut i) : SV_Target
             {
-                // Calculate depth-based shading factor
-                // Particles transition: black (far) -> color (near)
-                float depthNormalized = saturate((i.depth - _DepthFadeStart) / max(0.0001, _DepthFadeEnd - _DepthFadeStart));
+                // Circle trick: discard pixels outside the circle
+                float2 uv = (i.uv - 0.5) * 2.0;
+                float distSq = dot(uv, uv);
+                if (distSq > 1.0) discard;
                 
-                // Invert depth so near particles (low depth) have high value and far particles (high depth) have low value
-                float invertedDepth = 1.0 - depthNormalized;
+                // Use the same depth scaling as DebugTextureDisplay
+                float val = i.depth;
                 
-                // Simple lerp from black (far) to color (near)
-                float4 finalColor = lerp(float4(0.0, 0.0, 0.0, 1.0), i.col, invertedDepth);
+                // Early return: if depth is truly 0 or very large, output black
+                if (val == 0.0 || val >= 10000.0) return float4(0, 0, 0, 1);
+                
+                // Subtract min value before scaling (same as DebugTextureDisplay)
+                float adjustedVal = val - _MinValue;
+                
+                // Scale the adjusted value (same as DebugTextureDisplay)
+                float displayVal = adjustedVal * _Scale;
+                
+                // Clamp to 0-1 range for color intensity
+                displayVal = saturate(displayVal);
+                
+                // Use the scaled depth value to modulate the particle color
+                // Near particles (low depth, high displayVal) are brighter
+                // Far particles (high depth, low displayVal) are darker
+                float4 finalColor = i.col * displayVal;
                 
                 return finalColor;
             }
