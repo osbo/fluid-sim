@@ -204,15 +204,16 @@ public class FluidSimulator : MonoBehaviour
     // Material to render nodes with thickness shader (assign a shader like Custom/NodeThickness)
     public Material nodeThicknessMaterial;
     
-    // Thickness contribution per node (controls how much each node adds to the thickness map)
-    public float thicknessContribution = 1.0f / 1024.0f;
+    public ComputeShader blurCompute; // Assign BilateralBlur.compute here
     
     // Mesh for instanced node rendering (quad for billboard-style rendering)
     private Mesh quadMesh;
     private ComputeBuffer argsBuffer;
     private CommandBuffer thicknessCmd;
     
-    public ComputeShader blurCompute; // Assign BilateralBlur.compute here
+    // Absorption (exponent slider: -20 to +20, shader value = 2^absorption)
+    [Range(-20.0f, 20.0f)] public float absorption = 0.0f;
+
     [Range(0, 100)] public int blurRadius = 5;
     [Range(0.0001f, 0.1f)] public float blurDepthFalloff = 0.01f;
     [Range(0.1f, 50.0f)] public float pointSize = 2.0f;
@@ -2207,8 +2208,11 @@ public class FluidSimulator : MonoBehaviour
         nodeThicknessMaterial.SetBuffer("_Nodes", nodesBuffer);
         nodeThicknessMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
         nodeThicknessMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
-        nodeThicknessMaterial.SetFloat("_PointSize", 5.0f);
-        nodeThicknessMaterial.SetColor("_Color", Color.red);
+        nodeThicknessMaterial.SetFloat("_PointSize", maxDetailCellSize); // Use maxDetailCellSize as base size
+        nodeThicknessMaterial.SetColor("_Color", new Color(0.0f, 0.5f, 1.0f, 1.0f)); // Blue color
+        // Convert absorption exponent to actual value: 2^absorption
+        float absorptionValue = Mathf.Pow(2.0f, absorption);
+        nodeThicknessMaterial.SetFloat("_Absorption", absorptionValue);
 
         // Use CommandBuffer like working project (this may fix Metal binding issues)
         // CommandBuffer.DrawMeshInstancedIndirect signature matches working project: (Mesh, int submeshIndex, Material, int shaderPass, ComputeBuffer argsBuffer)
@@ -2227,34 +2231,11 @@ public class FluidSimulator : MonoBehaviour
 
     private void CreateQuadMesh()
     {
-        // Create a simple quad mesh (billboard)
-        Vector3[] vertices = new Vector3[4]
-        {
-            new Vector3(-0.5f, -0.5f, 0),
-            new Vector3(0.5f, -0.5f, 0),
-            new Vector3(-0.5f, 0.5f, 0),
-            new Vector3(0.5f, 0.5f, 0)
-        };
-        
-        int[] triangles = new int[6]
-        {
-            0, 2, 1,
-            2, 3, 1
-        };
-        
-        Vector2[] uv = new Vector2[4]
-        {
-            new Vector2(0, 0),
-            new Vector2(1, 0),
-            new Vector2(0, 1),
-            new Vector2(1, 1)
-        };
-        
-        quadMesh = new Mesh();
-        quadMesh.vertices = vertices;
-        quadMesh.triangles = triangles;
-        quadMesh.uv = uv;
-        quadMesh.RecalculateNormals();
+        // Create a simple cube mesh (axis-aligned, no rotation)
+        // Use Unity's built-in cube primitive
+        GameObject temp = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        quadMesh = temp.GetComponent<MeshFilter>().sharedMesh;
+        DestroyImmediate(temp);
     }
     
     private void CreateArgsBuffer()
