@@ -201,11 +201,16 @@ public class FluidSimulator : MonoBehaviour
     // Material to render particles with depth shader (assign a shader like Fluid/ParticleDepth)
     public Material particleDepthMaterial;
     
-    // Material to render particles with thickness shader (assign a shader like Custom/ParticleThickness)
-    public Material particleThicknessMaterial;
+    // Material to render nodes with thickness shader (assign a shader like Custom/NodeThickness)
+    public Material nodeThicknessMaterial;
     
-    // Thickness contribution per particle (controls how much each particle adds to the thickness map)
+    // Thickness contribution per node (controls how much each node adds to the thickness map)
     public float thicknessContribution = 1.0f / 1024.0f;
+    
+    // Mesh for instanced node rendering (quad for billboard-style rendering)
+    private Mesh quadMesh;
+    private ComputeBuffer argsBuffer;
+    private CommandBuffer thicknessCmd;
     
     public ComputeShader blurCompute; // Assign BilateralBlur.compute here
     [Range(0, 100)] public int blurRadius = 5;
@@ -216,11 +221,32 @@ public class FluidSimulator : MonoBehaviour
     void OnEnable()
     {
         RenderPipelineManager.endCameraRendering += OnEndCameraRendering;
+        
+        // Create command buffer for thickness rendering (like working project)
+        if (thicknessCmd == null)
+        {
+            thicknessCmd = new CommandBuffer();
+            thicknessCmd.name = "Node Thickness Render";
+        }
     }
 
     void OnDisable()
     {
         RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
+        
+        // Release args buffer
+        if (argsBuffer != null)
+        {
+            argsBuffer.Release();
+            argsBuffer = null;
+        }
+        
+        // Release command buffer
+        if (thicknessCmd != null)
+        {
+            thicknessCmd.Release();
+            thicknessCmd = null;
+        }
     }
 
     private void ResizeBuffer(ref ComputeBuffer buffer, int count, int stride)
@@ -235,7 +261,14 @@ public class FluidSimulator : MonoBehaviour
 
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
-        DrawParticles(cam);
+        if (renderingMode == RenderingMode.Thickness)
+        {
+            RenderThickness(cam);
+        }
+        else
+        {
+            DrawParticles(cam);
+        }
     }
 
     void Start()
@@ -245,6 +278,10 @@ public class FluidSimulator : MonoBehaviour
         
         // Load neural preconditioner model metadata
         LoadModelMetadata();
+        
+        // Create quad mesh and args buffer for node rendering
+        CreateQuadMesh();
+        CreateArgsBuffer();
         
         // Auto-find recorder if not assigned
         if (recorder == null)
@@ -1991,8 +2028,8 @@ public class FluidSimulator : MonoBehaviour
         // nodesCPU = new Node[numNodes];
         // nodesBuffer.GetData(nodesCPU);
 
-        // uint[] neighborsCPU = new uint[numNodes * 24];
-        // neighborsBuffer.GetData(neighborsCPU);
+        // // uint[] neighborsCPU = new uint[numNodes * 24];
+        // // neighborsBuffer.GetData(neighborsCPU);
 
         // for (int i = 0; i < numNodes; i++) {
         //     Node node = nodesCPU[i];
@@ -2035,16 +2072,15 @@ public class FluidSimulator : MonoBehaviour
                 currentMaterial = particleDepthMaterial; // Use depth shader as base
                 useBlur = true;
                 break;
-            case RenderingMode.Thickness:
-                currentMaterial = particleThicknessMaterial;
-                break;
         }
 
         if (currentMaterial == null) return;
 
         // --- Common Material Setup ---
         currentMaterial.SetBuffer("_Particles", particlesBuffer);
-        currentMaterial.SetFloat("_PointSize", pointSize);
+        // Use fixed point size of 2 for Particles mode, otherwise use the public pointSize variable
+        float pointSizeToUse = (renderingMode == RenderingMode.Particles) ? 2.0f : pointSize;
+        currentMaterial.SetFloat("_PointSize", pointSizeToUse);
         currentMaterial.SetInt("_MinLayer", minLayer);
         currentMaterial.SetInt("_MaxLayer", maxLayer);
         currentMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
@@ -2065,7 +2101,7 @@ public class FluidSimulator : MonoBehaviour
             Mathf.Clamp(cameraPos.z, bounds.min.z, bounds.max.z)
         );
         
-        // Calculate distances
+        // Calculate distancesx
         float distanceToNearest = Vector3.Distance(cameraPos, nearestPoint);
         float distanceToCenter = Vector3.Distance(cameraPos, boundsCenter);
         float boundsDiagonal = boundsSize.magnitude; // Diagonal length of the bounds
@@ -2127,11 +2163,6 @@ public class FluidSimulator : MonoBehaviour
             currentMaterial.SetFloat("_DepthMin", minDepth);
             currentMaterial.SetFloat("_DepthMax", maxDepth);
         }
-        else if (renderingMode == RenderingMode.Thickness)
-        {
-            // Set thickness-specific properties
-            currentMaterial.SetFloat("_ThicknessContribution", thicknessContribution);
-        }
 
         if (useBlur && blurCompute != null)
         {
@@ -2139,9 +2170,114 @@ public class FluidSimulator : MonoBehaviour
         }
         else
         {
+            // Ensure buffer is set right before draw call (required for Metal)
+            currentMaterial.SetBuffer("_Particles", particlesBuffer);
             currentMaterial.SetPass(0);
             Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
         }
+    }
+
+    private void RenderThickness(Camera cam)
+    {
+        if (nodesBuffer == null || numNodes <= 0) return;
+        if (cam == null) return;
+        if (nodeThicknessMaterial == null) return;
+
+        // Create quad mesh and args buffer if they don't exist
+        if (quadMesh == null)
+        {
+            CreateQuadMesh();
+        }
+        
+        // Update args buffer with current node count
+        if (argsBuffer == null || argsBuffer.count != 5)
+        {
+            CreateArgsBuffer();
+        }
+        else
+        {
+            // Update instance count in args buffer
+            uint[] args = new uint[5];
+            argsBuffer.GetData(args);
+            args[1] = (uint)numNodes; // Update instance count
+            argsBuffer.SetData(args);
+        }
+
+        // Set up material properties for NodeThickness shader (like working project's UpdateSettings)
+        nodeThicknessMaterial.SetBuffer("_Nodes", nodesBuffer);
+        nodeThicknessMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
+        nodeThicknessMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
+        nodeThicknessMaterial.SetFloat("_PointSize", 5.0f);
+        nodeThicknessMaterial.SetColor("_Color", Color.red);
+
+        // Use CommandBuffer like working project (this may fix Metal binding issues)
+        // CommandBuffer.DrawMeshInstancedIndirect signature matches working project: (Mesh, int submeshIndex, Material, int shaderPass, ComputeBuffer argsBuffer)
+        thicknessCmd.Clear();
+        thicknessCmd.DrawMeshInstancedIndirect(
+            quadMesh,
+            0,
+            nodeThicknessMaterial,
+            0,  // shader pass index
+            argsBuffer
+        );
+        
+        // Execute command buffer
+        Graphics.ExecuteCommandBuffer(thicknessCmd);
+    }
+
+    private void CreateQuadMesh()
+    {
+        // Create a simple quad mesh (billboard)
+        Vector3[] vertices = new Vector3[4]
+        {
+            new Vector3(-0.5f, -0.5f, 0),
+            new Vector3(0.5f, -0.5f, 0),
+            new Vector3(-0.5f, 0.5f, 0),
+            new Vector3(0.5f, 0.5f, 0)
+        };
+        
+        int[] triangles = new int[6]
+        {
+            0, 2, 1,
+            2, 3, 1
+        };
+        
+        Vector2[] uv = new Vector2[4]
+        {
+            new Vector2(0, 0),
+            new Vector2(1, 0),
+            new Vector2(0, 1),
+            new Vector2(1, 1)
+        };
+        
+        quadMesh = new Mesh();
+        quadMesh.vertices = vertices;
+        quadMesh.triangles = triangles;
+        quadMesh.uv = uv;
+        quadMesh.RecalculateNormals();
+    }
+    
+    private void CreateArgsBuffer()
+    {
+        if (quadMesh == null) CreateQuadMesh();
+        
+        const int stride = sizeof(uint);
+        const int numArgs = 5;
+        const int subMeshIndex = 0;
+        
+        uint[] args = new uint[numArgs];
+        args[0] = (uint)quadMesh.GetIndexCount(subMeshIndex);
+        args[1] = (uint)numNodes;
+        args[2] = (uint)quadMesh.GetIndexStart(subMeshIndex);
+        args[3] = (uint)quadMesh.GetBaseVertex(subMeshIndex);
+        args[4] = 0; // start instance location
+        
+        if (argsBuffer != null)
+        {
+            argsBuffer.Release();
+        }
+        argsBuffer = new ComputeBuffer(numArgs, stride, ComputeBufferType.IndirectArguments);
+        argsBuffer.SetData(args);
     }
 
     private void RenderBlurredDepth(Camera cam, Material mat)
@@ -2163,6 +2299,8 @@ public class FluidSimulator : MonoBehaviour
         Graphics.SetRenderTarget(rawDepth);
         GL.Clear(true, true, Color.black); // Clear depth and color (0 = far/background in our normalized setup)
         
+        // Ensure buffer is set right before draw call (required for Metal)
+        mat.SetBuffer("_Particles", particlesBuffer);
         mat.SetPass(0);
         Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
 

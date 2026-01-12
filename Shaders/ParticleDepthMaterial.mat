@@ -110,7 +110,7 @@ Material:
     - _MinLayer: 4
     - _OcclusionStrength: 1
     - _Parallax: 0.005
-    - _PointSize: 2
+    - _PointSize: 3.6
     - _QueueOffset: 0
     - _ReceiveShadows: 1
     - _Smoothness: 0.5
