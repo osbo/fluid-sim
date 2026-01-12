@@ -93,10 +93,10 @@ Material:
     - _ClearCoatSmoothness: 0
     - _Cull: 2
     - _Cutoff: 0.5
-    - _DepthFadeEnd: 136.75491
-    - _DepthFadeStart: 34.147495
-    - _DepthMax: 118.66183
-    - _DepthMin: 49.14764
+    - _DepthFadeEnd: 126.70778
+    - _DepthFadeStart: 29.951641
+    - _DepthMax: 104.42221
+    - _DepthMin: 48.36384
     - _DetailAlbedoMapScale: 1
     - _DetailNormalMapScale: 1
     - _DstBlend: 0
@@ -107,7 +107,7 @@ Material:
     - _GlossyReflections: 0
     - _MaxLayer: 10
     - _Metallic: 0
-    - _MinLayer: 4
+    - _MinLayer: 5
     - _OcclusionStrength: 1
     - _Parallax: 0.005
     - _PointSize: 3.6
