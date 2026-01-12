@@ -1,4 +1,4 @@
-Shader "Fluid/NormalsFromDepth"
+Shader "Custom/NormalsFromDepth"
 {
     Properties
     {

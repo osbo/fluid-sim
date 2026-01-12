@@ -13,7 +13,8 @@ public enum RenderingMode
     Depth,
     Thickness,
     BlurredDepth,
-    Normal
+    Normal,
+    Composite
 }
 
 public enum PreconditionerType
@@ -195,6 +196,8 @@ public class FluidSimulator : MonoBehaviour
 
     // Rendering mode enum
     public RenderingMode renderingMode = RenderingMode.Particles;
+
+    public Light mainLight; // Assign your Directional Light
     
     public ComputeShader blurCompute; // Assign BilateralBlur.compute here
     
@@ -209,13 +212,23 @@ public class FluidSimulator : MonoBehaviour
     
     // Material to generate normals from depth (assign a shader like Fluid/NormalsFromDepth)
     public Material normalMaterial; // Assign "Fluid/NormalsFromDepth" in Inspector
+
+    public Material compositeMaterial; // Assign "Fluid/FluidRender" here
     
     
     // Debug display material for visualizing textures
     public Material debugDisplayMaterial; // Assign "Custom/DebugTextureDisplay" in Inspector
+
+    public Color fluidColor = new Color(0.2f, 0.6f, 1.0f); // Input for extinction
     [Range(-5.0f, 0.0f)] public float depthDisplayScale = 0.0f;   // Exponent: actual scale = exp(value)
     [Range(0.0f, 10.0f)] public float depthMinValue = 0.0f;        // Exponent: actual min = exp(value), subtracts from depth before scaling
     [Range(-20.0f, 20.0f)] public float thicknessDisplayScale = 0.0f; // Exponent: actual scale = exp(value)
+
+    [Range(0, 100)] public int blurRadius = 5;
+    [Range(0.0001f, 10.0f)] public float blurDepthFalloff = 1.0f;
+    [Range(0.0001f, 1.0f)] public float depthRadius = 0.01f; // Radius for depth quads (world space)
+    [Range(0, 20)] public float absorptionStrength = 1.0f;
+    [Range(0, 10)] public float refractionScale = 1.0f;
     
     // Mesh for instanced node rendering (quad for billboard-style rendering)
     private Mesh quadMesh;
@@ -227,10 +240,7 @@ public class FluidSimulator : MonoBehaviour
     private RenderTexture fluidDepthTexture; // Stores the final smooth depth for normals
     private RenderTexture rawDepthTexture; // Stores unblurred depth for visualization
     private RenderTexture fluidNormalTexture; // Stores the surface normals (RGB = slope vectors)
-
-    [Range(0, 100)] public int blurRadius = 5;
-    [Range(0.0001f, 10.0f)] public float blurDepthFalloff = 1.0f;
-    [Range(0.0001f, 1.0f)] public float depthRadius = 0.01f; // Radius for depth quads (world space)
+    private RenderTexture fluidThicknessTexture; // Smoothed thickness
     
 
     void OnEnable()
@@ -307,29 +317,64 @@ public class FluidSimulator : MonoBehaviour
 
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
-        // 1. Always render Thickness (needed for volume)
-        if (renderingMode == RenderingMode.Thickness)
+        // --- 1. Render Thickness (Raw) ---
+        // Needed for: Thickness, Composite
+        if (renderingMode == RenderingMode.Thickness || renderingMode == RenderingMode.Composite)
         {
             RenderThickness(cam);
+            
+            // If Composite, we also need to BLUR the thickness
+            if (renderingMode == RenderingMode.Composite)
+            {
+                 // Create smooth thickness texture if needed
+                 if (fluidThicknessTexture == null || fluidThicknessTexture.width != cam.pixelWidth)
+                 {
+                     if (fluidThicknessTexture != null) fluidThicknessTexture.Release();
+                     RenderTextureDescriptor desc = new RenderTextureDescriptor(cam.pixelWidth, cam.pixelHeight, RenderTextureFormat.RFloat, 0);
+                     desc.enableRandomWrite = true;
+                     fluidThicknessTexture = new RenderTexture(desc);
+                     fluidThicknessTexture.Create();
+                 }
+                 
+                 // Reuse your existing blur function on the thickness texture
+                 // Note: We use the thickness texture as both source and depth for the blur weights 
+                 // (Self-guided blur preserves thickness edges)
+                 RunBilateralBlur(cam, thicknessTexture, fluidThicknessTexture);
+            }
         }
         
-        // 2. Render particles (for Depth/BlurredDepth modes)
-        if (renderingMode != RenderingMode.Thickness)
+        // --- 2. Render Depth (Raw) ---
+        // Needed for: Depth, BlurredDepth, Normal, Composite
+        if (renderingMode != RenderingMode.Thickness) 
         {
-            DrawParticles(cam);
+            DrawParticles(cam); // Renders to rawDepthTexture
         }
         
-        // 3. Generate Normals from blurred depth (needed for composite rendering)
-        // Only if we have blurred depth available
-        if (renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal)
+        // --- 3. Blur Depth & Gen Normals ---
+        // Needed for: BlurredDepth, Normal, Composite
+        if (renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
         {
+            // Initialize fluidDepthTexture if needed
+            if (fluidDepthTexture == null || fluidDepthTexture.width != cam.pixelWidth || fluidDepthTexture.height != cam.pixelHeight)
+            {
+                if (fluidDepthTexture != null) fluidDepthTexture.Release();
+                RenderTextureDescriptor desc = new RenderTextureDescriptor(cam.pixelWidth, cam.pixelHeight, RenderTextureFormat.RFloat, 0);
+                desc.enableRandomWrite = true;
+                fluidDepthTexture = new RenderTexture(desc);
+                fluidDepthTexture.Create();
+            }
+            
+            // 1. Blur Depth (Raw -> FluidDepth)
+            RunBilateralBlur(cam, rawDepthTexture, fluidDepthTexture);
+            
+            // 2. Generate Normals (FluidDepth -> FluidNormal)
             RenderNormals(cam);
         }
         
-        // 4. Final Display Choice
+        // --- 4. Final Display / Composite ---
         if (renderingMode == RenderingMode.Thickness)
         {
-            DebugBlit(thicknessTexture, thicknessDisplayScale, 0.0f, false); // Thickness min is fixed at 0 (not exp)
+            DebugBlit(thicknessTexture, thicknessDisplayScale, 0.0f, false);
         }
         else if (renderingMode == RenderingMode.Depth)
         {
@@ -341,11 +386,11 @@ public class FluidSimulator : MonoBehaviour
         }
         else if (renderingMode == RenderingMode.Normal)
         {
-            // Visualize the normals (Colorful Blue/Pink map)
-            if (fluidNormalTexture != null)
-            {
-                Graphics.Blit(fluidNormalTexture, (RenderTexture)null);
-            }
+            Graphics.Blit(fluidNormalTexture, (RenderTexture)null);
+        }
+        else if (renderingMode == RenderingMode.Composite)
+        {
+            RenderComposite(cam);
         }
     }
 
@@ -2158,6 +2203,7 @@ public class FluidSimulator : MonoBehaviour
             // FIX: Handle Normal mode here so it generates the depth texture required!
             case RenderingMode.BlurredDepth:
             case RenderingMode.Normal: 
+            case RenderingMode.Composite: // [FIX] Add this
                 currentMaterial = particleDepthMaterial; // Use depth shader as base
                 useBlur = true;
                 break;
@@ -2193,7 +2239,7 @@ public class FluidSimulator : MonoBehaviour
         {
             currentMaterial.SetFloat("_PointSize", 2.0f);
         }
-        else if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth)
+        else if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
         {
             currentMaterial.SetFloat("_Radius", depthRadius);
         }
@@ -2240,7 +2286,7 @@ public class FluidSimulator : MonoBehaviour
         currentMaterial.SetFloat("_DepthFadeEnd", fadeEnd);
         
         // Calculate depth min/max for depth visualization (for depth and blurred depth materials)
-        if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth)
+        if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
         {
             // Calculate the 8 corners of the bounding box
             Vector3[] corners = new Vector3[]
@@ -2280,14 +2326,19 @@ public class FluidSimulator : MonoBehaviour
             currentMaterial.SetFloat("_DepthMax", maxDepth);
         }
 
-        if (useBlur && blurCompute != null)
+        // For Composite mode, we render to rawDepthTexture directly (blur happens in OnEndCameraRendering)
+        // For BlurredDepth mode, we use RenderBlurredDepth which handles its own blur
+        if (useBlur && blurCompute != null && renderingMode != RenderingMode.Composite)
         {
             RenderBlurredDepth(cam, currentMaterial);
         }
         else
         {
-            // Use CommandBuffer with indirect instancing for Depth mode (like NodeThickness)
-            if (renderingMode == RenderingMode.Depth)
+            // [FIX] Update condition to include all modes that need the depth texture
+            if (renderingMode == RenderingMode.Depth || 
+                renderingMode == RenderingMode.BlurredDepth || 
+                renderingMode == RenderingMode.Normal || 
+                renderingMode == RenderingMode.Composite)
             {
                 // Ensure raw depth texture exists and matches screen size
                 if (rawDepthTexture == null || rawDepthTexture.width != cam.pixelWidth || rawDepthTexture.height != cam.pixelHeight)
@@ -2303,19 +2354,16 @@ public class FluidSimulator : MonoBehaviour
                 
                 depthCmd.Clear();
                 depthCmd.SetRenderTarget(rawDepthTexture);
-                // FIX: Clear to a large float value (e.g., 10,000) instead of 0 (Black)
+                // Clear to 'Far' (10,000)
                 depthCmd.ClearRenderTarget(true, true, new Color(10000.0f, 10000.0f, 10000.0f, 1.0f));
-                depthCmd.DrawMeshInstancedIndirect(
-                    quadMesh,
-                    0,
-                    currentMaterial,
-                    0,  // shader pass index
-                    particleArgsBuffer
-                );
+                depthCmd.DrawMeshInstancedIndirect(quadMesh, 0, currentMaterial, 0, particleArgsBuffer);
                 Graphics.ExecuteCommandBuffer(depthCmd);
                 
-                // Visualize unblurred depth
-                DebugBlit(rawDepthTexture, depthDisplayScale, depthMinValue);
+                // Only debug blit if we are strictly in Depth mode
+                if (renderingMode == RenderingMode.Depth)
+                {
+                    DebugBlit(rawDepthTexture, depthDisplayScale, depthMinValue);
+                }
             }
             else
             {
@@ -2614,6 +2662,82 @@ public class FluidSimulator : MonoBehaviour
         // E. Cleanup
         RenderTexture.ReleaseTemporary(rawDepth);
         RenderTexture.ReleaseTemporary(tempBlur);
+    }
+
+    // Extracted from your previous RenderBlurredDepth to allow reuse
+    private void RunBilateralBlur(Camera cam, RenderTexture source, RenderTexture dest)
+    {
+        if (blurCompute == null || source == null || dest == null) return;
+        
+        int width = cam.pixelWidth;
+        int height = cam.pixelHeight;
+        
+        // Temp buffer
+        RenderTextureDescriptor blurDesc = new RenderTextureDescriptor(width, height, RenderTextureFormat.RFloat, 0);
+        blurDesc.enableRandomWrite = true; 
+        RenderTexture tempBlur = RenderTexture.GetTemporary(blurDesc);
+
+        // H Blur
+        int kH = blurCompute.FindKernel("HorizontalBlur");
+        blurCompute.SetTexture(kH, "_SourceTexture", source);
+        blurCompute.SetTexture(kH, "_DestinationTexture", tempBlur);
+        blurCompute.SetFloat("_BlurRadius", blurRadius);
+        blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
+        blurCompute.SetVector("_Resolution", new Vector2(width, height));
+        blurCompute.Dispatch(kH, Mathf.CeilToInt(width/8.0f), Mathf.CeilToInt(height/8.0f), 1);
+        
+        // V Blur
+        int kV = blurCompute.FindKernel("VerticalBlur");
+        blurCompute.SetTexture(kV, "_SourceTexture", tempBlur);
+        blurCompute.SetTexture(kV, "_DestinationTexture", dest);
+        blurCompute.SetFloat("_BlurRadius", blurRadius);
+        blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
+        blurCompute.SetVector("_Resolution", new Vector2(width, height));
+        blurCompute.Dispatch(kV, Mathf.CeilToInt(width/8.0f), Mathf.CeilToInt(height/8.0f), 1);
+        
+        RenderTexture.ReleaseTemporary(tempBlur);
+    }
+
+    private void RenderComposite(Camera cam)
+    {
+        if (compositeMaterial == null) return;
+
+        // 1. Bind Textures
+        compositeMaterial.SetTexture("_MainTex", null); // Or camera target if you grab it
+        compositeMaterial.SetTexture("_NormalTex", fluidNormalTexture);
+        compositeMaterial.SetTexture("_DepthTex", fluidDepthTexture); // Smooth
+        compositeMaterial.SetTexture("_DepthRawTex", rawDepthTexture); // Raw
+        compositeMaterial.SetTexture("_ThicknessTex", fluidThicknessTexture); // Smooth
+
+        // 2. Bind Parameters
+        Vector3 sunDir = mainLight != null ? -mainLight.transform.forward : Vector3.up;
+        float sunInt = mainLight != null ? mainLight.intensity : 1.0f;
+        
+        // Calculate extinction from color (Logarithm of inverse color)
+        Vector3 extinction = new Vector3(
+            -Mathf.Log(fluidColor.r), 
+            -Mathf.Log(fluidColor.g), 
+            -Mathf.Log(fluidColor.b)
+        ) * absorptionStrength;
+
+        compositeMaterial.SetVector("extinctionCoefficients", extinction);
+        compositeMaterial.SetVector("dirToSun", sunDir);
+        compositeMaterial.SetVector("boundsSize", simulationBounds.bounds.size);
+        compositeMaterial.SetFloat("refractionMultiplier", refractionScale);
+        compositeMaterial.SetFloat("sunIntensity", sunInt);
+
+        compositeMaterial.SetFloat("depthDisplayScale", depthDisplayScale);
+        compositeMaterial.SetFloat("depthMinValue", depthMinValue);
+        compositeMaterial.SetFloat("thicknessDisplayScale", thicknessDisplayScale);
+        
+        // Environment (Simple checkerboard settings)
+        compositeMaterial.SetVector("floorPos", new Vector3(0, -5, 0)); // Adjust as needed
+        compositeMaterial.SetVector("floorSize", new Vector3(20, 0.1f, 20));
+        compositeMaterial.SetColor("tileCol1", new Color(0.8f, 0.8f, 0.8f));
+        compositeMaterial.SetColor("tileCol2", new Color(0.4f, 0.4f, 0.4f));
+
+        // 3. Blit to Screen
+        Graphics.Blit(null, (RenderTexture)null, compositeMaterial);
     }
 
     private Vector3 DecodeMorton3D(Node node)

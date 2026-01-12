@@ -458,8 +458,8 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 410087039}
   serializedVersion: 2
-  m_LocalRotation: {x: 0.40821788, y: -0.23456968, z: 0.10938163, w: 0.8754261}
-  m_LocalPosition: {x: 0, y: 3, z: 0}
+  m_LocalRotation: {x: 0.074025884, y: 0.9259597, z: -0.25926054, w: 0.26439136}
+  m_LocalPosition: {x: -51.70117, y: 73.48047, z: 74.47656}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -556,19 +556,24 @@ MonoBehaviour:
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
-  renderingMode: 4
+  renderingMode: 5
+  mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
   particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
   particleDepthMaterial: {fileID: 2100000, guid: 02cdf3bcc869241a49f58b5e8d42a8ea, type: 2}
   nodeThicknessMaterial: {fileID: 2100000, guid: 555cc73f225be420190af8e738526deb, type: 2}
   normalMaterial: {fileID: 2100000, guid: 2c9b4b14204124ea793fcbf0a077e303, type: 2}
+  compositeMaterial: {fileID: 2100000, guid: 300258d4d41fa4015af599080020c3b9, type: 2}
   debugDisplayMaterial: {fileID: 2100000, guid: aac2fbb1f33ff4daba70d3fbf6629df0, type: 2}
+  fluidColor: {r: 0.2, g: 0.6, b: 1, a: 1}
   depthDisplayScale: -4.06
   depthMinValue: 3.93
   thicknessDisplayScale: -8.8
   blurRadius: 10
   blurDepthFalloff: 2.14
   depthRadius: 0.143
+  absorptionStrength: 3.7
+  refractionScale: 1
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
