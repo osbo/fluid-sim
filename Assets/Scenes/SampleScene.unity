@@ -556,15 +556,19 @@ MonoBehaviour:
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
-  renderingMode: 2
+  renderingMode: 3
   particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
   particleDepthMaterial: {fileID: 2100000, guid: 02cdf3bcc869241a49f58b5e8d42a8ea, type: 2}
   nodeThicknessMaterial: {fileID: 2100000, guid: 555cc73f225be420190af8e738526deb, type: 2}
+  debugDisplayMaterial: {fileID: 2100000, guid: aac2fbb1f33ff4daba70d3fbf6629df0, type: 2}
+  depthDisplayScale: -4.06
+  depthMinValue: 3.93
+  thicknessDisplayScale: 1
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
-  absorption: -10
   blurRadius: 9
   blurDepthFalloff: 0.0251
   pointSize: 3.6
+  depthRadius: 0.143
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
