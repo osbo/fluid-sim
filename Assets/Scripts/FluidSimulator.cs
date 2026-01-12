@@ -232,7 +232,9 @@ public class FluidSimulator : MonoBehaviour
     public Material debugDisplayMaterial; // Assign "Custom/DebugTextureDisplay" in Inspector
 
     public Color fluidColor = new Color(0.2f, 0.6f, 1.0f); // Input for extinction
-    [Range(-5.0f, 5.0f)] public float sunIntensity = 0.0f; // Exponent: actual intensity = exp(value)
+    public Color skyHorizonColor = new Color(0.1f, 0.1f, 0.15f); // Dark color at horizon (looking down)
+    public Color skyTopColor = new Color(0.4f, 0.6f, 0.9f); // Light color at top (looking up)
+    [Range(-20.0f, 20.0f)] public float sunIntensity = 0.0f; // Exponent: actual intensity = exp(value)
     [Range(-5.0f, 0.0f)] public float depthDisplayScale = 0.0f;   // Exponent: actual scale = exp(value)
     [Range(0.0f, 10.0f)] public float depthMinValue = 0.0f;        // Exponent: actual min = exp(value), subtracts from depth before scaling
     [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = 0.0f; // Exponent: actual scale = exp(value) for nodes
@@ -243,7 +245,7 @@ public class FluidSimulator : MonoBehaviour
     [Range(0.0001f, 1.0f)] public float depthRadius = 0.01f; // Radius for depth quads (world space)
     [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.01f; // Radius for particle thickness quads (world space)
     [Range(0, 20)] public float absorptionStrength = 1.0f;
-    [Range(0, 10)] public float refractionScale = 1.0f;
+    [Range(0, 2)] public float refractionScale = 1.0f;
     
     // Mesh for instanced node rendering (quad for billboard-style rendering)
     private Mesh quadMesh;
@@ -2783,6 +2785,8 @@ public class FluidSimulator : MonoBehaviour
         compositeMaterial.SetVector("boundsSize", simulationBounds.bounds.size);
         compositeMaterial.SetFloat("refractionMultiplier", refractionScale);
         compositeMaterial.SetFloat("sunIntensity", sunInt);
+        compositeMaterial.SetVector("skyHorizonColor", skyHorizonColor);
+        compositeMaterial.SetVector("skyTopColor", skyTopColor);
 
         compositeMaterial.SetFloat("depthDisplayScale", depthDisplayScale);
         compositeMaterial.SetFloat("depthMinValue", depthMinValue);
@@ -2793,7 +2797,7 @@ public class FluidSimulator : MonoBehaviour
         
         // Environment (Simple checkerboard settings)
         compositeMaterial.SetVector("floorPos", new Vector3(0, -5, 0)); // Adjust as needed
-        compositeMaterial.SetVector("floorSize", new Vector3(20, 0.1f, 20));
+        compositeMaterial.SetVector("floorSize", new Vector3(75, 0.1f, 75));
         compositeMaterial.SetColor("tileCol1", new Color(0.8f, 0.8f, 0.8f));
         compositeMaterial.SetColor("tileCol2", new Color(0.4f, 0.4f, 0.4f));
 

@@ -568,15 +568,17 @@ MonoBehaviour:
   compositeMaterial: {fileID: 2100000, guid: 300258d4d41fa4015af599080020c3b9, type: 2}
   debugDisplayMaterial: {fileID: 2100000, guid: aac2fbb1f33ff4daba70d3fbf6629df0, type: 2}
   fluidColor: {r: 0.2, g: 0.6, b: 1, a: 1}
+  skyHorizonColor: {r: 0.043137256, g: 0.043137256, b: 0.13333334, a: 1}
+  skyTopColor: {r: 1, g: 1, b: 1, a: 1}
   sunIntensity: -1.58
   depthDisplayScale: -4.06
   depthMinValue: 3.93
   thicknessScaleNodes: -8.6
-  thicknessScaleParticles: -9.2
-  blurRadius: 10
-  blurDepthFalloff: 2.14
+  thicknessScaleParticles: -6.5
+  blurRadius: 6
+  blurDepthFalloff: 1.99
   depthRadius: 0.143
-  thicknessRadius: 0.781
+  thicknessRadius: 0.296
   absorptionStrength: 11.8
   refractionScale: 1
 --- !u!1 &832575517
