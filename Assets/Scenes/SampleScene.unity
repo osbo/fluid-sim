@@ -557,22 +557,27 @@ MonoBehaviour:
   preconditioner: 1
   recorder: {fileID: 944897176}
   renderingMode: 5
+  thicknessSource: 1
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
   particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
   particleDepthMaterial: {fileID: 2100000, guid: 02cdf3bcc869241a49f58b5e8d42a8ea, type: 2}
   nodeThicknessMaterial: {fileID: 2100000, guid: 555cc73f225be420190af8e738526deb, type: 2}
+  particleThicknessMaterial: {fileID: 2100000, guid: 9df3c40a709154c7a8fcb0766b252408, type: 2}
   normalMaterial: {fileID: 2100000, guid: 2c9b4b14204124ea793fcbf0a077e303, type: 2}
   compositeMaterial: {fileID: 2100000, guid: 300258d4d41fa4015af599080020c3b9, type: 2}
   debugDisplayMaterial: {fileID: 2100000, guid: aac2fbb1f33ff4daba70d3fbf6629df0, type: 2}
   fluidColor: {r: 0.2, g: 0.6, b: 1, a: 1}
+  sunIntensity: -1.58
   depthDisplayScale: -4.06
   depthMinValue: 3.93
-  thicknessDisplayScale: -8.8
+  thicknessScaleNodes: -8.6
+  thicknessScaleParticles: -9.2
   blurRadius: 10
   blurDepthFalloff: 2.14
   depthRadius: 0.143
-  absorptionStrength: 3.7
+  thicknessRadius: 0.781
+  absorptionStrength: 11.8
   refractionScale: 1
 --- !u!1 &832575517
 GameObject:
