@@ -103,7 +103,7 @@ Shader "Custom/FluidRender"
             float3 SampleEnvironment(float3 pos, float3 dir) {
                 HitInfo floorHit = RayBox(pos, dir, floorPos, floorSize);
                 if (floorHit.didHit) {
-                    float2 tile = floor(floorHit.hitPoint.xz * 2.0);
+                    float2 tile = floor(floorHit.hitPoint.xz * 0.5);
                     bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
                     return isDark ? tileCol1.rgb : tileCol2.rgb;
                 }
