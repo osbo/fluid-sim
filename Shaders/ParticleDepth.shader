@@ -1,4 +1,4 @@
-Shader "Fluid/ParticleDepth"
+Shader "Custom/ParticleDepth"
 {
     Properties
     {

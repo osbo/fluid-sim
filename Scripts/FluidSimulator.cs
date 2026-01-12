@@ -12,7 +12,8 @@ public enum RenderingMode
     Particles,
     Depth,
     Thickness,
-    BlurredDepth
+    BlurredDepth,
+    Normal
 }
 
 public enum PreconditionerType
@@ -195,6 +196,8 @@ public class FluidSimulator : MonoBehaviour
     // Rendering mode enum
     public RenderingMode renderingMode = RenderingMode.Particles;
     
+    public ComputeShader blurCompute; // Assign BilateralBlur.compute here
+    
     // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
     public Material particlesMaterial;
     
@@ -204,13 +207,15 @@ public class FluidSimulator : MonoBehaviour
     // Material to render nodes with thickness shader (assign a shader like Custom/NodeThickness)
     public Material nodeThicknessMaterial;
     
+    // Material to generate normals from depth (assign a shader like Fluid/NormalsFromDepth)
+    public Material normalMaterial; // Assign "Fluid/NormalsFromDepth" in Inspector
+    
+    
     // Debug display material for visualizing textures
     public Material debugDisplayMaterial; // Assign "Custom/DebugTextureDisplay" in Inspector
     [Range(-5.0f, 0.0f)] public float depthDisplayScale = 0.0f;   // Exponent: actual scale = exp(value)
     [Range(0.0f, 10.0f)] public float depthMinValue = 0.0f;        // Exponent: actual min = exp(value), subtracts from depth before scaling
     [Range(-20.0f, 20.0f)] public float thicknessDisplayScale = 0.0f; // Exponent: actual scale = exp(value)
-    
-    public ComputeShader blurCompute; // Assign BilateralBlur.compute here
     
     // Mesh for instanced node rendering (quad for billboard-style rendering)
     private Mesh quadMesh;
@@ -221,10 +226,10 @@ public class FluidSimulator : MonoBehaviour
     private RenderTexture thicknessTexture;
     private RenderTexture fluidDepthTexture; // Stores the final smooth depth for normals
     private RenderTexture rawDepthTexture; // Stores unblurred depth for visualization
+    private RenderTexture fluidNormalTexture; // Stores the surface normals (RGB = slope vectors)
 
     [Range(0, 100)] public int blurRadius = 5;
-    [Range(0.0001f, 0.1f)] public float blurDepthFalloff = 0.01f;
-    [Range(0.1f, 50.0f)] public float pointSize = 2.0f;
+    [Range(0.0001f, 10.0f)] public float blurDepthFalloff = 1.0f;
     [Range(0.0001f, 1.0f)] public float depthRadius = 0.01f; // Radius for depth quads (world space)
     
 
@@ -302,13 +307,45 @@ public class FluidSimulator : MonoBehaviour
 
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
+        // 1. Always render Thickness (needed for volume)
         if (renderingMode == RenderingMode.Thickness)
         {
             RenderThickness(cam);
         }
-        else
+        
+        // 2. Render particles (for Depth/BlurredDepth modes)
+        if (renderingMode != RenderingMode.Thickness)
         {
             DrawParticles(cam);
+        }
+        
+        // 3. Generate Normals from blurred depth (needed for composite rendering)
+        // Only if we have blurred depth available
+        if (renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal)
+        {
+            RenderNormals(cam);
+        }
+        
+        // 4. Final Display Choice
+        if (renderingMode == RenderingMode.Thickness)
+        {
+            DebugBlit(thicknessTexture, thicknessDisplayScale, 0.0f, false); // Thickness min is fixed at 0 (not exp)
+        }
+        else if (renderingMode == RenderingMode.Depth)
+        {
+            DebugBlit(rawDepthTexture, depthDisplayScale, depthMinValue);
+        }
+        else if (renderingMode == RenderingMode.BlurredDepth)
+        {
+            DebugBlit(fluidDepthTexture, depthDisplayScale, depthMinValue);
+        }
+        else if (renderingMode == RenderingMode.Normal)
+        {
+            // Visualize the normals (Colorful Blue/Pink map)
+            if (fluidNormalTexture != null)
+            {
+                Graphics.Blit(fluidNormalTexture, (RenderTexture)null);
+            }
         }
     }
 
@@ -2118,7 +2155,9 @@ public class FluidSimulator : MonoBehaviour
             case RenderingMode.Depth:
                 currentMaterial = particleDepthMaterial;
                 break;
+            // FIX: Handle Normal mode here so it generates the depth texture required!
             case RenderingMode.BlurredDepth:
+            case RenderingMode.Normal: 
                 currentMaterial = particleDepthMaterial; // Use depth shader as base
                 useBlur = true;
                 break;
@@ -2264,7 +2303,8 @@ public class FluidSimulator : MonoBehaviour
                 
                 depthCmd.Clear();
                 depthCmd.SetRenderTarget(rawDepthTexture);
-                depthCmd.ClearRenderTarget(true, true, Color.black); // Clear to "far away"
+                // FIX: Clear to a large float value (e.g., 10,000) instead of 0 (Black)
+                depthCmd.ClearRenderTarget(true, true, new Color(10000.0f, 10000.0f, 10000.0f, 1.0f));
                 depthCmd.DrawMeshInstancedIndirect(
                     quadMesh,
                     0,
@@ -2353,14 +2393,47 @@ public class FluidSimulator : MonoBehaviour
         // Execute command buffer
         Graphics.ExecuteCommandBuffer(thicknessCmd);
 
-        // Visualize it if we are in Thickness mode
-        if (renderingMode == RenderingMode.Thickness)
+        // Visualization is handled in OnEndCameraRendering
+    }
+    
+    private void RenderNormals(Camera cam)
+    {
+        int width = cam.pixelWidth;
+        int height = cam.pixelHeight;
+
+        // 1. Ensure Texture Exists (Same as before)
+        if (fluidNormalTexture == null || fluidNormalTexture.width != width || fluidNormalTexture.height != height)
         {
-            DebugBlit(thicknessTexture, thicknessDisplayScale, 0.0f); // Min value is 0 for thickness
+            if (fluidNormalTexture != null) fluidNormalTexture.Release();
+            RenderTextureDescriptor desc = new RenderTextureDescriptor(width, height, RenderTextureFormat.ARGBHalf, 0);
+            fluidNormalTexture = new RenderTexture(desc);
+            fluidNormalTexture.Create();
+        }
+
+        // 2. Setup Material
+        if (normalMaterial != null && fluidDepthTexture != null)
+        {
+            // Keep this: View -> World
+            normalMaterial.SetMatrix("_CameraInvViewMatrix", cam.cameraToWorldMatrix);
+            
+            // FIX: Remove _CameraInvProjMatrix. 
+            // Instead, pass the intrinsic camera parameters needed to unproject linear depth.
+            // Unity's built-in projection params (zBufferParams, etc) handle part of this, 
+            // but for manual linear depth, we just need FOV and Aspect.
+            
+            float fovY = Mathf.Deg2Rad * cam.fieldOfView;
+            float aspect = cam.aspect;
+            float tanHalfFovY = Mathf.Tan(fovY * 0.5f);
+            
+            // Pass these to the shader
+            normalMaterial.SetVector("_CameraParams", new Vector4(aspect * tanHalfFovY, tanHalfFovY, 0, 0));
+            normalMaterial.SetTexture("_MainTex", fluidDepthTexture);
+            
+            Graphics.Blit(fluidDepthTexture, fluidNormalTexture, normalMaterial);
         }
     }
     
-    private void DebugBlit(RenderTexture source, float scaleExponent, float minValueExponent = float.MinValue)
+    private void DebugBlit(RenderTexture source, float scaleExponent, float minValueExponent = float.MinValue, bool useExpForMin = true)
     {
         if (debugDisplayMaterial == null || source == null) return;
 
@@ -2371,8 +2444,20 @@ public class FluidSimulator : MonoBehaviour
         float scale = Mathf.Exp(scaleExponent);
         debugDisplayMaterial.SetFloat("_Scale", scale);
         
-        // Set min value (if provided, otherwise 0 for thickness)
-        float minValue = (minValueExponent != float.MinValue) ? Mathf.Exp(minValueExponent) : 0.0f;
+        // Set min value
+        float minValue;
+        if (minValueExponent == float.MinValue)
+        {
+            minValue = 0.0f; // Default to 0 if not provided
+        }
+        else if (useExpForMin)
+        {
+            minValue = Mathf.Exp(minValueExponent); // Use exp for depth
+        }
+        else
+        {
+            minValue = minValueExponent; // Use directly for thickness (should be 0.0f)
+        }
         debugDisplayMaterial.SetFloat("_MinValue", minValue);
         
         // Draw to screen
@@ -2585,6 +2670,7 @@ public class FluidSimulator : MonoBehaviour
         
         // Clean up render textures
         if (fluidDepthTexture != null) fluidDepthTexture.Release();
+        if (fluidNormalTexture != null) fluidNormalTexture.Release();
     }
 }
 
