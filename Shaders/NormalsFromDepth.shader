@@ -62,7 +62,7 @@ Shader "Custom/NormalsFromDepth"
                 float depth = tex2D(_MainTex, i.uv).r;
                 
                 // Ignore background (the large clear value we set earlier)
-                if (depth > 9000.0) return float4(0, 0, 0, 0); 
+                if (depth == 10000.0) return float4(0, 0, 0, 0); 
 
                 // 2. Reconstruct Position
                 float3 viewPos = ReconstructViewPos(i.uv, depth);
