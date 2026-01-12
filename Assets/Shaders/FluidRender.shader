@@ -58,6 +58,8 @@ Shader "Custom/FluidRender"
             float3 floorPos;
             float3 floorSize;
             float sunIntensity;
+            float3 skyHorizonColor; // Dark color at horizon (looking down)
+            float3 skyTopColor;    // Light color at top (looking up)
 
             // ... (Keep Helper Functions: HitInfo, RayBox, SampleEnvironment, Refract, etc.) ...
             
@@ -98,14 +100,14 @@ Shader "Custom/FluidRender"
             }
 
             float3 SampleEnvironment(float3 pos, float3 dir) {
-                // HitInfo floorHit = RayBox(pos, dir, floorPos, floorSize);
-                // if (floorHit.didHit) {
-                //     float2 tile = floor(floorHit.hitPoint.xz * 2.0);
-                //     bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
-                //     return isDark ? tileCol1.rgb : tileCol2.rgb;
-                // }
+                HitInfo floorHit = RayBox(pos, dir, floorPos, floorSize);
+                if (floorHit.didHit) {
+                    float2 tile = floor(floorHit.hitPoint.xz * 2.0);
+                    bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
+                    return isDark ? tileCol1.rgb : tileCol2.rgb;
+                }
                 float sun = pow(max(0, dot(dir, dirToSun)), 500.0) * sunIntensity;
-                return lerp(float3(0.1, 0.1, 0.15), float3(0.4, 0.6, 0.9), dir.y * 0.5 + 0.5) + sun;
+                return lerp(skyHorizonColor, skyTopColor, dir.y * 0.5 + 0.5) + sun;
             }
 
             float CalculateReflectance(float3 inDir, float3 normal, float iorA, float iorB) {
@@ -140,13 +142,20 @@ Shader "Custom/FluidRender"
 
             float4 frag(v2f i) : SV_Target {
                 // 1. Sample Raw Values
-                float3 normal = tex2D(_NormalTex, i.uv).xyz * 2.0 - 1.0; // Unpack Normal (0..1 -> -1..1)
                 float rawDepth = tex2D(_DepthTex, i.uv).r;
                 float rawThickness = tex2D(_ThicknessTex, i.uv).r;
-                float3 bgCol = tex2D(_MainTex, i.uv).rgb;
-
-                // 2. Early Exit (No Fluid)
-                if (rawDepth > 9000.0) return float4(bgCol, 1);
+                
+                // 2. Always compute environment (floor + sky) as base
+                float3 viewDir = WorldViewDir(i.uv);
+                float3 cameraPos = _WorldSpaceCameraPos;
+                float3 envCol = SampleEnvironment(cameraPos, viewDir);
+                
+                // 3. Early Exit (No Fluid) - return environment
+                // Use threshold check since blurred depth might not be exactly 10000.0
+                if (rawDepth >= 9999.0) return float4(envCol, 1);
+                
+                // 4. Sample normal only when we have fluid
+                float3 normal = tex2D(_NormalTex, i.uv).xyz * 2.0 - 1.0; // Unpack Normal (0..1 -> -1..1)
 
                 // --- APPLY SCALING (Using your tuned params) ---
                 // Convert stored exponents to actual multipliers
@@ -168,27 +177,27 @@ Shader "Custom/FluidRender"
                 // float depthSmooth = (rawDepth - dMin) * dScale;
                 // float displayVal = depthSmooth;
 
-                // 3. View Ray
-                float3 viewDir = WorldViewDir(i.uv);
-                float3 hitPos = _WorldSpaceCameraPos + viewDir * depthSmooth;
+                // 4. View Ray (viewDir already computed above)
+                float3 hitPos = cameraPos + viewDir * depthSmooth;
 
-                // 4. Lighting & Shading
+                // 5. Lighting & Shading
                 LightResponse lr = CalculateReflectionAndRefraction(viewDir, normal, 1.0, 1.33);
                 
-                // Refraction (Beer's Law)
+                // Refraction (Beer's Law) - sample environment behind fluid
                 float3 refractPos = hitPos + lr.refractDir * thickness * refractionMultiplier;
-                float3 refractCol = SampleEnvironment(refractPos, viewDir); 
+                float3 refractCol = SampleEnvironment(refractPos, lr.refractDir); 
                 
                 float3 transmission = exp(-thickness * extinctionCoefficients);
                 refractCol *= transmission;
 
-                // Reflection
+                // Reflection - sample environment in reflection direction
                 float3 reflectCol = SampleEnvironment(hitPos, lr.reflectDir);
                 float specular = pow(max(0, dot(lr.reflectDir, dirToSun)), 100.0) * sunIntensity;
                 reflectCol += specular;
 
-                // 5. Composite
-                float3 finalCol = lerp(refractCol, reflectCol, lr.reflectWeight);
+                // 6. Composite fluid on top of environment
+                float3 fluidCol = lerp(refractCol, reflectCol, lr.reflectWeight);
+                float3 finalCol = fluidCol; // Fluid already samples environment, so this is correct
 
                 // return float4(displayVal, displayVal, displayVal, 1);
                 return float4(finalCol, 1);
