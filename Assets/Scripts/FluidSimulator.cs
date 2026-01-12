@@ -24,6 +24,12 @@ public enum PreconditionerType
     Jacobi
 }
 
+public enum ThicknessSource
+{
+    Nodes,
+    Particles
+}
+
 public class FluidSimulator : MonoBehaviour
 {
     public BoxCollider simulationBounds;
@@ -196,6 +202,9 @@ public class FluidSimulator : MonoBehaviour
 
     // Rendering mode enum
     public RenderingMode renderingMode = RenderingMode.Particles;
+    
+    // Thickness source selection
+    public ThicknessSource thicknessSource = ThicknessSource.Nodes;
 
     public Light mainLight; // Assign your Directional Light
     
@@ -210,6 +219,9 @@ public class FluidSimulator : MonoBehaviour
     // Material to render nodes with thickness shader (assign a shader like Custom/NodeThickness)
     public Material nodeThicknessMaterial;
     
+    // Material to render particles with thickness shader (assign a shader like Custom/ParticleThickness)
+    public Material particleThicknessMaterial;
+    
     // Material to generate normals from depth (assign a shader like Fluid/NormalsFromDepth)
     public Material normalMaterial; // Assign "Fluid/NormalsFromDepth" in Inspector
 
@@ -220,13 +232,16 @@ public class FluidSimulator : MonoBehaviour
     public Material debugDisplayMaterial; // Assign "Custom/DebugTextureDisplay" in Inspector
 
     public Color fluidColor = new Color(0.2f, 0.6f, 1.0f); // Input for extinction
+    [Range(-5.0f, 5.0f)] public float sunIntensity = 0.0f; // Exponent: actual intensity = exp(value)
     [Range(-5.0f, 0.0f)] public float depthDisplayScale = 0.0f;   // Exponent: actual scale = exp(value)
     [Range(0.0f, 10.0f)] public float depthMinValue = 0.0f;        // Exponent: actual min = exp(value), subtracts from depth before scaling
-    [Range(-20.0f, 20.0f)] public float thicknessDisplayScale = 0.0f; // Exponent: actual scale = exp(value)
+    [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = 0.0f; // Exponent: actual scale = exp(value) for nodes
+    [Range(-20.0f, 20.0f)] public float thicknessScaleParticles = 0.0f; // Exponent: actual scale = exp(value) for particles
 
     [Range(0, 100)] public int blurRadius = 5;
     [Range(0.0001f, 10.0f)] public float blurDepthFalloff = 1.0f;
     [Range(0.0001f, 1.0f)] public float depthRadius = 0.01f; // Radius for depth quads (world space)
+    [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.01f; // Radius for particle thickness quads (world space)
     [Range(0, 20)] public float absorptionStrength = 1.0f;
     [Range(0, 10)] public float refractionScale = 1.0f;
     
@@ -374,7 +389,10 @@ public class FluidSimulator : MonoBehaviour
         // --- 4. Final Display / Composite ---
         if (renderingMode == RenderingMode.Thickness)
         {
-            DebugBlit(thicknessTexture, thicknessDisplayScale, 0.0f, false);
+            float thicknessScale = thicknessSource == ThicknessSource.Nodes 
+                ? thicknessScaleNodes 
+                : thicknessScaleParticles;
+            DebugBlit(thicknessTexture, thicknessScale, 0.0f, false);
         }
         else if (renderingMode == RenderingMode.Depth)
         {
@@ -2378,28 +2396,12 @@ public class FluidSimulator : MonoBehaviour
 
     private void RenderThickness(Camera cam)
     {
-        if (nodesBuffer == null || numNodes <= 0) return;
         if (cam == null) return;
-        if (nodeThicknessMaterial == null) return;
 
-        // Create quad mesh and args buffer if they don't exist
+        // Create quad mesh if it doesn't exist
         if (quadMesh == null)
         {
             CreateQuadMesh();
-        }
-        
-        // Update args buffer with current node count
-        if (argsBuffer == null || argsBuffer.count != 5)
-        {
-            CreateArgsBuffer();
-        }
-        else
-        {
-            // Update instance count in args buffer
-            uint[] args = new uint[5];
-            argsBuffer.GetData(args);
-            args[1] = (uint)numNodes; // Update instance count
-            argsBuffer.SetData(args);
         }
 
         // Ensure thickness texture exists and matches screen size
@@ -2414,29 +2416,85 @@ public class FluidSimulator : MonoBehaviour
             thicknessTexture.Create();
         }
 
-        // Set up material properties for NodeThickness shader (like working project's UpdateSettings)
-        nodeThicknessMaterial.SetBuffer("_Nodes", nodesBuffer);
-        nodeThicknessMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
-        nodeThicknessMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
-        nodeThicknessMaterial.SetFloat("_PointSize", maxDetailCellSize); // Use maxDetailCellSize as base size
-        nodeThicknessMaterial.SetColor("_Color", new Color(0.0f, 0.5f, 1.0f, 1.0f)); // Blue color
-
         // Use CommandBuffer like working project (this may fix Metal binding issues)
-        // CommandBuffer.DrawMeshInstancedIndirect signature matches working project: (Mesh, int submeshIndex, Material, int shaderPass, ComputeBuffer argsBuffer)
         thicknessCmd.Clear();
         
         // Set render target to thickness texture and clear to black (0 thickness)
         thicknessCmd.SetRenderTarget(thicknessTexture);
         thicknessCmd.ClearRenderTarget(true, true, Color.black);
-        
-        // Draw nodes to thickness texture
-        thicknessCmd.DrawMeshInstancedIndirect(
-            quadMesh,
-            0,
-            nodeThicknessMaterial,
-            0,  // shader pass index
-            argsBuffer
-        );
+
+        // Switch between nodes and particles based on thicknessSource enum
+        if (thicknessSource == ThicknessSource.Nodes)
+        {
+            // Render using nodes
+            if (nodesBuffer == null || numNodes <= 0) return;
+            if (nodeThicknessMaterial == null) return;
+
+            // Update args buffer with current node count
+            if (argsBuffer == null || argsBuffer.count != 5)
+            {
+                CreateArgsBuffer();
+            }
+            else
+            {
+                // Update instance count in args buffer
+                uint[] args = new uint[5];
+                argsBuffer.GetData(args);
+                args[1] = (uint)numNodes; // Update instance count
+                argsBuffer.SetData(args);
+            }
+
+            // Set up material properties for NodeThickness shader
+            nodeThicknessMaterial.SetBuffer("_Nodes", nodesBuffer);
+            nodeThicknessMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
+            nodeThicknessMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
+            nodeThicknessMaterial.SetFloat("_PointSize", maxDetailCellSize); // Use maxDetailCellSize as base size
+            nodeThicknessMaterial.SetColor("_Color", new Color(0.0f, 0.5f, 1.0f, 1.0f)); // Blue color
+
+            // Draw nodes to thickness texture
+            thicknessCmd.DrawMeshInstancedIndirect(
+                quadMesh,
+                0,
+                nodeThicknessMaterial,
+                0,  // shader pass index
+                argsBuffer
+            );
+        }
+        else // ThicknessSource.Particles
+        {
+            // Render using particles
+            if (particlesBuffer == null || numParticles <= 0) return;
+            if (particleThicknessMaterial == null) return;
+
+            // Update particle args buffer with current particle count
+            if (particleArgsBuffer == null || particleArgsBuffer.count != 5)
+            {
+                CreateParticleArgsBuffer();
+            }
+            else
+            {
+                // Update instance count in args buffer
+                uint[] args = new uint[5];
+                particleArgsBuffer.GetData(args);
+                args[1] = (uint)numParticles; // Update instance count
+                particleArgsBuffer.SetData(args);
+            }
+
+            // Set up material properties for ParticleThickness shader
+            particleThicknessMaterial.SetBuffer("_Particles", particlesBuffer);
+            particleThicknessMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
+            particleThicknessMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
+            particleThicknessMaterial.SetFloat("_Radius", thicknessRadius);
+
+            // Draw particles to thickness texture
+            thicknessCmd.DrawMeshInstancedIndirect(
+                quadMesh,
+                0,
+                particleThicknessMaterial,
+                0,  // shader pass index
+                particleArgsBuffer
+            );
+        }
         
         // Execute command buffer
         Graphics.ExecuteCommandBuffer(thicknessCmd);
@@ -2711,7 +2769,7 @@ public class FluidSimulator : MonoBehaviour
 
         // 2. Bind Parameters
         Vector3 sunDir = mainLight != null ? -mainLight.transform.forward : Vector3.up;
-        float sunInt = mainLight != null ? mainLight.intensity : 1.0f;
+        float sunInt = Mathf.Exp(sunIntensity);
         
         // Calculate extinction from color (Logarithm of inverse color)
         Vector3 extinction = new Vector3(
@@ -2728,7 +2786,10 @@ public class FluidSimulator : MonoBehaviour
 
         compositeMaterial.SetFloat("depthDisplayScale", depthDisplayScale);
         compositeMaterial.SetFloat("depthMinValue", depthMinValue);
-        compositeMaterial.SetFloat("thicknessDisplayScale", thicknessDisplayScale);
+        float thicknessScale = thicknessSource == ThicknessSource.Nodes 
+            ? thicknessScaleNodes 
+            : thicknessScaleParticles;
+        compositeMaterial.SetFloat("thicknessDisplayScale", thicknessScale);
         
         // Environment (Simple checkerboard settings)
         compositeMaterial.SetVector("floorPos", new Vector3(0, -5, 0)); // Adjust as needed
