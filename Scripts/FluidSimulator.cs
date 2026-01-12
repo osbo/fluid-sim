@@ -204,30 +204,45 @@ public class FluidSimulator : MonoBehaviour
     // Material to render nodes with thickness shader (assign a shader like Custom/NodeThickness)
     public Material nodeThicknessMaterial;
     
+    // Debug display material for visualizing textures
+    public Material debugDisplayMaterial; // Assign "Custom/DebugTextureDisplay" in Inspector
+    [Range(-5.0f, 0.0f)] public float depthDisplayScale = 0.0f;   // Exponent: actual scale = exp(value)
+    [Range(0.0f, 10.0f)] public float depthMinValue = 0.0f;        // Exponent: actual min = exp(value), subtracts from depth before scaling
+    [Range(-20.0f, 20.0f)] public float thicknessDisplayScale = 0.0f; // Exponent: actual scale = exp(value)
+    
     public ComputeShader blurCompute; // Assign BilateralBlur.compute here
     
     // Mesh for instanced node rendering (quad for billboard-style rendering)
     private Mesh quadMesh;
     private ComputeBuffer argsBuffer;
+    private ComputeBuffer particleArgsBuffer;
     private CommandBuffer thicknessCmd;
-    
-    // Absorption (exponent slider: -20 to +20, shader value = 2^absorption)
-    [Range(-20.0f, 20.0f)] public float absorption = 0.0f;
+    private CommandBuffer depthCmd;
+    private RenderTexture thicknessTexture;
+    private RenderTexture fluidDepthTexture; // Stores the final smooth depth for normals
+    private RenderTexture rawDepthTexture; // Stores unblurred depth for visualization
 
     [Range(0, 100)] public int blurRadius = 5;
     [Range(0.0001f, 0.1f)] public float blurDepthFalloff = 0.01f;
     [Range(0.1f, 50.0f)] public float pointSize = 2.0f;
+    [Range(0.0001f, 1.0f)] public float depthRadius = 0.01f; // Radius for depth quads (world space)
     
 
     void OnEnable()
     {
         RenderPipelineManager.endCameraRendering += OnEndCameraRendering;
         
-        // Create command buffer for thickness rendering (like working project)
+        // Create command buffers for thickness and depth rendering (like working project)
         if (thicknessCmd == null)
         {
             thicknessCmd = new CommandBuffer();
             thicknessCmd.name = "Node Thickness Render";
+        }
+        
+        if (depthCmd == null)
+        {
+            depthCmd = new CommandBuffer();
+            depthCmd.name = "Particle Depth Render";
         }
     }
 
@@ -235,18 +250,43 @@ public class FluidSimulator : MonoBehaviour
     {
         RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
         
-        // Release args buffer
+        // Release args buffers
         if (argsBuffer != null)
         {
             argsBuffer.Release();
             argsBuffer = null;
         }
         
-        // Release command buffer
+        if (particleArgsBuffer != null)
+        {
+            particleArgsBuffer.Release();
+            particleArgsBuffer = null;
+        }
+        
+        // Release command buffers
         if (thicknessCmd != null)
         {
             thicknessCmd.Release();
             thicknessCmd = null;
+        }
+        
+        if (depthCmd != null)
+        {
+            depthCmd.Release();
+            depthCmd = null;
+        }
+        
+        // Release render textures
+        if (thicknessTexture != null)
+        {
+            thicknessTexture.Release();
+            thicknessTexture = null;
+        }
+        
+        if (rawDepthTexture != null)
+        {
+            rawDepthTexture.Release();
+            rawDepthTexture = null;
         }
     }
 
@@ -280,9 +320,18 @@ public class FluidSimulator : MonoBehaviour
         // Load neural preconditioner model metadata
         LoadModelMetadata();
         
-        // Create quad mesh and args buffer for node rendering
+        // Create quad mesh and args buffers for node and particle rendering
         CreateQuadMesh();
         CreateArgsBuffer();
+        CreateParticleArgsBuffer();
+        
+        // Create thickness render texture
+        if (thicknessTexture == null)
+        {
+            thicknessTexture = new RenderTexture(Screen.width, Screen.height, 0, RenderTextureFormat.RFloat);
+            thicknessTexture.enableRandomWrite = true;
+            thicknessTexture.Create();
+        }
         
         // Auto-find recorder if not assigned
         if (recorder == null)
@@ -2077,11 +2126,38 @@ public class FluidSimulator : MonoBehaviour
 
         if (currentMaterial == null) return;
 
+        // Create quad mesh and args buffer if they don't exist (needed for Depth mode)
+        if (quadMesh == null)
+        {
+            CreateQuadMesh();
+        }
+        
+        // Update particle args buffer with current particle count (needed for Depth mode)
+        if (particleArgsBuffer == null || particleArgsBuffer.count != 5)
+        {
+            CreateParticleArgsBuffer();
+        }
+        else
+        {
+            // Update instance count in args buffer
+            uint[] args = new uint[5];
+            particleArgsBuffer.GetData(args);
+            args[1] = (uint)numParticles; // Update instance count
+            particleArgsBuffer.SetData(args);
+        }
+
         // --- Common Material Setup ---
         currentMaterial.SetBuffer("_Particles", particlesBuffer);
-        // Use fixed point size of 2 for Particles mode, otherwise use the public pointSize variable
-        float pointSizeToUse = (renderingMode == RenderingMode.Particles) ? 2.0f : pointSize;
-        currentMaterial.SetFloat("_PointSize", pointSizeToUse);
+        
+        // Set point size for Particles mode, or radius for Depth modes
+        if (renderingMode == RenderingMode.Particles)
+        {
+            currentMaterial.SetFloat("_PointSize", 2.0f);
+        }
+        else if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth)
+        {
+            currentMaterial.SetFloat("_Radius", depthRadius);
+        }
         currentMaterial.SetInt("_MinLayer", minLayer);
         currentMaterial.SetInt("_MaxLayer", maxLayer);
         currentMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
@@ -2171,10 +2247,44 @@ public class FluidSimulator : MonoBehaviour
         }
         else
         {
-            // Ensure buffer is set right before draw call (required for Metal)
-            currentMaterial.SetBuffer("_Particles", particlesBuffer);
-            currentMaterial.SetPass(0);
-            Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
+            // Use CommandBuffer with indirect instancing for Depth mode (like NodeThickness)
+            if (renderingMode == RenderingMode.Depth)
+            {
+                // Ensure raw depth texture exists and matches screen size
+                if (rawDepthTexture == null || rawDepthTexture.width != cam.pixelWidth || rawDepthTexture.height != cam.pixelHeight)
+                {
+                    if (rawDepthTexture != null)
+                    {
+                        rawDepthTexture.Release();
+                    }
+                    rawDepthTexture = new RenderTexture(cam.pixelWidth, cam.pixelHeight, 24, RenderTextureFormat.RFloat);
+                    rawDepthTexture.enableRandomWrite = true;
+                    rawDepthTexture.Create();
+                }
+                
+                depthCmd.Clear();
+                depthCmd.SetRenderTarget(rawDepthTexture);
+                depthCmd.ClearRenderTarget(true, true, Color.black); // Clear to "far away"
+                depthCmd.DrawMeshInstancedIndirect(
+                    quadMesh,
+                    0,
+                    currentMaterial,
+                    0,  // shader pass index
+                    particleArgsBuffer
+                );
+                Graphics.ExecuteCommandBuffer(depthCmd);
+                
+                // Visualize unblurred depth
+                DebugBlit(rawDepthTexture, depthDisplayScale, depthMinValue);
+            }
+            else
+            {
+                // For Particles mode, use the old procedural approach
+                // Ensure buffer is set right before draw call (required for Metal)
+                currentMaterial.SetBuffer("_Particles", particlesBuffer);
+                currentMaterial.SetPass(0);
+                Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
+            }
         }
     }
 
@@ -2204,19 +2314,34 @@ public class FluidSimulator : MonoBehaviour
             argsBuffer.SetData(args);
         }
 
+        // Ensure thickness texture exists and matches screen size
+        if (thicknessTexture == null || thicknessTexture.width != cam.pixelWidth || thicknessTexture.height != cam.pixelHeight)
+        {
+            if (thicknessTexture != null)
+            {
+                thicknessTexture.Release();
+            }
+            thicknessTexture = new RenderTexture(cam.pixelWidth, cam.pixelHeight, 0, RenderTextureFormat.RFloat);
+            thicknessTexture.enableRandomWrite = true;
+            thicknessTexture.Create();
+        }
+
         // Set up material properties for NodeThickness shader (like working project's UpdateSettings)
         nodeThicknessMaterial.SetBuffer("_Nodes", nodesBuffer);
         nodeThicknessMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
         nodeThicknessMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
         nodeThicknessMaterial.SetFloat("_PointSize", maxDetailCellSize); // Use maxDetailCellSize as base size
         nodeThicknessMaterial.SetColor("_Color", new Color(0.0f, 0.5f, 1.0f, 1.0f)); // Blue color
-        // Convert absorption exponent to actual value: 2^absorption
-        float absorptionValue = Mathf.Pow(2.0f, absorption);
-        nodeThicknessMaterial.SetFloat("_Absorption", absorptionValue);
 
         // Use CommandBuffer like working project (this may fix Metal binding issues)
         // CommandBuffer.DrawMeshInstancedIndirect signature matches working project: (Mesh, int submeshIndex, Material, int shaderPass, ComputeBuffer argsBuffer)
         thicknessCmd.Clear();
+        
+        // Set render target to thickness texture and clear to black (0 thickness)
+        thicknessCmd.SetRenderTarget(thicknessTexture);
+        thicknessCmd.ClearRenderTarget(true, true, Color.black);
+        
+        // Draw nodes to thickness texture
         thicknessCmd.DrawMeshInstancedIndirect(
             quadMesh,
             0,
@@ -2227,15 +2352,63 @@ public class FluidSimulator : MonoBehaviour
         
         // Execute command buffer
         Graphics.ExecuteCommandBuffer(thicknessCmd);
+
+        // Visualize it if we are in Thickness mode
+        if (renderingMode == RenderingMode.Thickness)
+        {
+            DebugBlit(thicknessTexture, thicknessDisplayScale, 0.0f); // Min value is 0 for thickness
+        }
+    }
+    
+    private void DebugBlit(RenderTexture source, float scaleExponent, float minValueExponent = float.MinValue)
+    {
+        if (debugDisplayMaterial == null || source == null) return;
+
+        // Restore the screen as the render target
+        Graphics.SetRenderTarget(null);
+        
+        // Convert exponent to actual scale: exp(scaleExponent)
+        float scale = Mathf.Exp(scaleExponent);
+        debugDisplayMaterial.SetFloat("_Scale", scale);
+        
+        // Set min value (if provided, otherwise 0 for thickness)
+        float minValue = (minValueExponent != float.MinValue) ? Mathf.Exp(minValueExponent) : 0.0f;
+        debugDisplayMaterial.SetFloat("_MinValue", minValue);
+        
+        // Draw to screen
+        Graphics.Blit(source, (RenderTexture)null, debugDisplayMaterial);
     }
 
     private void CreateQuadMesh()
     {
-        // Create a simple cube mesh (axis-aligned, no rotation)
-        // Use Unity's built-in cube primitive
-        GameObject temp = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        quadMesh = temp.GetComponent<MeshFilter>().sharedMesh;
-        DestroyImmediate(temp);
+        // Create a simple quad mesh for billboard rendering
+        Vector3[] vertices = new Vector3[4]
+        {
+            new Vector3(-0.5f, -0.5f, 0),
+            new Vector3(0.5f, -0.5f, 0),
+            new Vector3(-0.5f, 0.5f, 0),
+            new Vector3(0.5f, 0.5f, 0)
+        };
+        
+        int[] triangles = new int[6]
+        {
+            0, 2, 1,
+            2, 3, 1
+        };
+        
+        Vector2[] uv = new Vector2[4]
+        {
+            new Vector2(0, 0),
+            new Vector2(1, 0),
+            new Vector2(0, 1),
+            new Vector2(1, 1)
+        };
+        
+        quadMesh = new Mesh();
+        quadMesh.vertices = vertices;
+        quadMesh.triangles = triangles;
+        quadMesh.uv = uv;
+        quadMesh.RecalculateNormals();
     }
     
     private void CreateArgsBuffer()
@@ -2260,32 +2433,72 @@ public class FluidSimulator : MonoBehaviour
         argsBuffer = new ComputeBuffer(numArgs, stride, ComputeBufferType.IndirectArguments);
         argsBuffer.SetData(args);
     }
+    
+    private void CreateParticleArgsBuffer()
+    {
+        if (quadMesh == null) CreateQuadMesh();
+        
+        const int stride = sizeof(uint);
+        const int numArgs = 5;
+        const int subMeshIndex = 0;
+        
+        uint[] args = new uint[numArgs];
+        args[0] = (uint)quadMesh.GetIndexCount(subMeshIndex);
+        args[1] = (uint)numParticles;
+        args[2] = (uint)quadMesh.GetIndexStart(subMeshIndex);
+        args[3] = (uint)quadMesh.GetBaseVertex(subMeshIndex);
+        args[4] = 0; // start instance location
+        
+        if (particleArgsBuffer != null)
+        {
+            particleArgsBuffer.Release();
+        }
+        particleArgsBuffer = new ComputeBuffer(numArgs, stride, ComputeBufferType.IndirectArguments);
+        particleArgsBuffer.SetData(args);
+    }
 
     private void RenderBlurredDepth(Camera cam, Material mat)
     {
         int width = cam.pixelWidth;
         int height = cam.pixelHeight;
 
-        // 1. Get Temporary RenderTextures
-        RenderTexture rawDepth = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.RFloat);
-        RenderTexture tempBlur = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.RFloat);
-        RenderTexture finalBlur = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.RFloat);
-        
-        rawDepth.enableRandomWrite = true;
-        tempBlur.enableRandomWrite = true;
-        finalBlur.enableRandomWrite = true;
+        // 1. Initialize persistent texture (fluidDepthTexture)
+        // Check if null or size changed
+        if (fluidDepthTexture == null || fluidDepthTexture.width != width || fluidDepthTexture.height != height)
+        {
+            if (fluidDepthTexture != null) fluidDepthTexture.Release();
+            
+            // Use descriptor to properly ensure UAV flag is set BEFORE creation
+            RenderTextureDescriptor desc = new RenderTextureDescriptor(width, height, RenderTextureFormat.RFloat, 0);
+            desc.enableRandomWrite = true; // REQUIRED for Compute Shader output
+            
+            fluidDepthTexture = new RenderTexture(desc);
+            fluidDepthTexture.Create();
+        }
 
-        // 2. Render Particles to rawDepth texture
-        // We must manually set the render target to our texture, clear it, and draw
-        Graphics.SetRenderTarget(rawDepth);
-        GL.Clear(true, true, Color.black); // Clear depth and color (0 = far/background in our normalized setup)
-        
-        // Ensure buffer is set right before draw call (required for Metal)
-        mat.SetBuffer("_Particles", particlesBuffer);
-        mat.SetPass(0);
-        Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
+        // 2. Create rawDepth (Input for blur)
+        // IMPORTANT: enableRandomWrite MUST be FALSE here because this texture has a Depth Buffer (24).
+        // It is only read by the Compute Shader (as _SourceTexture), so it doesn't need UAV.
+        RenderTextureDescriptor rawDesc = new RenderTextureDescriptor(width, height, RenderTextureFormat.RFloat, 24);
+        rawDesc.enableRandomWrite = false; 
+        RenderTexture rawDepth = RenderTexture.GetTemporary(rawDesc);
 
-        // 3. Dispatch Horizontal Blur (rawDepth -> tempBlur)
+        // 3. Create tempBlur (Intermediate Ping-Pong buffer)
+        // This needs UAV because the Compute Shader writes to it. No Depth Buffer needed (0).
+        RenderTextureDescriptor blurDesc = new RenderTextureDescriptor(width, height, RenderTextureFormat.RFloat, 0);
+        blurDesc.enableRandomWrite = true; 
+        RenderTexture tempBlur = RenderTexture.GetTemporary(blurDesc);
+        
+        // --- RENDERING ---
+        
+        // A. Render Particles to rawDepth
+        depthCmd.Clear();
+        depthCmd.SetRenderTarget(rawDepth);
+        depthCmd.ClearRenderTarget(true, true, Color.black); // Clear to "far away"
+        depthCmd.DrawMeshInstancedIndirect(quadMesh, 0, mat, 0, particleArgsBuffer);
+        Graphics.ExecuteCommandBuffer(depthCmd);
+
+        // B. Horizontal Blur (rawDepth -> tempBlur)
         int kernelHandleH = blurCompute.FindKernel("HorizontalBlur");
         blurCompute.SetTexture(kernelHandleH, "_SourceTexture", rawDepth);
         blurCompute.SetTexture(kernelHandleH, "_DestinationTexture", tempBlur);
@@ -2297,30 +2510,25 @@ public class FluidSimulator : MonoBehaviour
         int groupsY = Mathf.CeilToInt(height / 8.0f);
         blurCompute.Dispatch(kernelHandleH, groupsX, groupsY, 1);
 
-        // 4. Dispatch Vertical Blur (tempBlur -> finalBlur)
+        // C. Vertical Blur (tempBlur -> fluidDepthTexture)
         int kernelHandleV = blurCompute.FindKernel("VerticalBlur");
         blurCompute.SetTexture(kernelHandleV, "_SourceTexture", tempBlur);
-        blurCompute.SetTexture(kernelHandleV, "_DestinationTexture", finalBlur);
+        blurCompute.SetTexture(kernelHandleV, "_DestinationTexture", fluidDepthTexture);
         blurCompute.SetFloat("_BlurRadius", blurRadius);
         blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
         blurCompute.SetVector("_Resolution", new Vector2(width, height));
         
         blurCompute.Dispatch(kernelHandleV, groupsX, groupsY, 1);
 
-        // 5. Blit Final Result to Screen
-        // We need to restore the camera's target. 
-        // Since we are in OnEndCameraRendering, 'null' usually targets the screen/camera buffer.
-        Graphics.SetRenderTarget(null); 
-        
-        // Simple blit to visualize the blurred depth map (Grayscale)
-        // Note: For actual fluid rendering later, you won't Blit this to screen;
-        // you will pass 'finalBlur' to your fluid composition shader.
-        Graphics.Blit(finalBlur, (RenderTexture)null);
+        // D. Visualize
+        if (renderingMode == RenderingMode.BlurredDepth)
+        {
+            DebugBlit(fluidDepthTexture, depthDisplayScale, depthMinValue);
+        }
 
-        // 6. Cleanup
+        // E. Cleanup
         RenderTexture.ReleaseTemporary(rawDepth);
         RenderTexture.ReleaseTemporary(tempBlur);
-        RenderTexture.ReleaseTemporary(finalBlur);
     }
 
     private Vector3 DecodeMorton3D(Node node)
@@ -2374,6 +2582,9 @@ public class FluidSimulator : MonoBehaviour
         ReleasePreconditionerBuffers();
         foreach(var b in weightBuffers.Values) b?.Release();
         weightBuffers.Clear();
+        
+        // Clean up render textures
+        if (fluidDepthTexture != null) fluidDepthTexture.Release();
     }
 }
 
