@@ -576,11 +576,11 @@ MonoBehaviour:
   modelWeightsAsset: {fileID: 4900000, guid: c8c83e26cc03d4114b9402603b15f56f, type: 3}
   gravity: 100
   frameRate: 30
-  minLayer: 5
+  minLayer: 4
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
-  renderingMode: 5
+  renderingMode: 0
   thicknessSource: 1
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
@@ -592,17 +592,15 @@ MonoBehaviour:
   compositeMaterial: {fileID: 2100000, guid: 300258d4d41fa4015af599080020c3b9, type: 2}
   debugDisplayMaterial: {fileID: 2100000, guid: aac2fbb1f33ff4daba70d3fbf6629df0, type: 2}
   fluidColor: {r: 0.2, g: 0.6, b: 1, a: 1}
-  skyHorizonColor: {r: 0.043137256, g: 0.043137256, b: 0.13333334, a: 1}
+  skyHorizonColor: {r: 0, g: 0, b: 0, a: 1}
   skyTopColor: {r: 1, g: 1, b: 1, a: 1}
   sunIntensity: -1.58
   sunSharpness: 41
-  depthDisplayScale: -4.06
-  depthMinValue: 3.93
   thicknessScaleNodes: -8.6
   thicknessScaleParticles: -6.5
   blurRadius: 6
   blurDepthFalloff: 1.99
-  particleRadius: 0.107
+  particleRadius: 0.085
   depthRadius: 0.143
   thicknessRadius: 0.296
   absorptionStrength: 8.6

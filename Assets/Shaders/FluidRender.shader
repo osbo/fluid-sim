@@ -104,8 +104,9 @@ Shader "Custom/FluidRender"
                 HitInfo floorHit = RayBox(pos, dir, floorPos, floorSize);
                 if (floorHit.didHit) {
                     float2 tile = floor(floorHit.hitPoint.xz * 0.5);
-                    bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
-                    return isDark ? tileCol1.rgb : tileCol2.rgb;
+                    // bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
+                    bool isDark = true;
+                    return isDark ? tileCol2.rgb : tileCol1.rgb;
                 }
                 float sun = pow(max(0, dot(dir, dirToSun)), sunSharpness) * sunIntensity;
                 return lerp(skyHorizonColor, skyTopColor, dir.y * 0.5 + 0.5) + sun;
