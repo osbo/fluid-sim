@@ -151,6 +151,8 @@ public class FluidSimulator : MonoBehaviour
     private int lastCgIterations = 0;
     
     private System.Diagnostics.Stopwatch totalOctreeSw;
+    private System.Diagnostics.Stopwatch renderSw = new System.Diagnostics.Stopwatch();
+    private double lastRenderTimeMs = 0.0;
     
     // Simulation parameters (calculated in InitializeParticleSystem)
     private Vector3 mortonNormalizationFactor;
@@ -235,6 +237,7 @@ public class FluidSimulator : MonoBehaviour
     public Color skyHorizonColor = new Color(0.1f, 0.1f, 0.15f); // Dark color at horizon (looking down)
     public Color skyTopColor = new Color(0.4f, 0.6f, 0.9f); // Light color at top (looking up)
     [Range(-20.0f, 20.0f)] public float sunIntensity = 0.0f; // Exponent: actual intensity = exp(value)
+    [Range(0.0f, 500.0f)] public float sunSharpness = 500.0f; // Sun highlight sharpness (power exponent)
     [Range(-5.0f, 0.0f)] public float depthDisplayScale = 0.0f;   // Exponent: actual scale = exp(value)
     [Range(0.0f, 10.0f)] public float depthMinValue = 0.0f;        // Exponent: actual min = exp(value), subtracts from depth before scaling
     [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = 0.0f; // Exponent: actual scale = exp(value) for nodes
@@ -242,6 +245,7 @@ public class FluidSimulator : MonoBehaviour
 
     [Range(0, 100)] public int blurRadius = 5;
     [Range(0.0001f, 10.0f)] public float blurDepthFalloff = 1.0f;
+    [Range(0.0001f, 1.0f)] public float particleRadius = 0.01f; // Radius for particle points (world space)
     [Range(0.0001f, 1.0f)] public float depthRadius = 0.01f; // Radius for depth quads (world space)
     [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.01f; // Radius for particle thickness quads (world space)
     [Range(0, 20)] public float absorptionStrength = 1.0f;
@@ -334,6 +338,9 @@ public class FluidSimulator : MonoBehaviour
 
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
+        // Start rendering timing
+        renderSw.Restart();
+        
         // --- 1. Render Thickness (Raw) ---
         // Needed for: Thickness, Composite
         if (renderingMode == RenderingMode.Thickness || renderingMode == RenderingMode.Composite)
@@ -364,7 +371,7 @@ public class FluidSimulator : MonoBehaviour
         // Needed for: Depth, BlurredDepth, Normal, Composite
         if (renderingMode != RenderingMode.Thickness) 
         {
-            DrawParticles(cam); // Renders to rawDepthTexture
+            DrawParticles(cam, ctx); // Renders to rawDepthTexture or screen
         }
         
         // --- 3. Blur Depth & Gen Normals ---
@@ -412,6 +419,10 @@ public class FluidSimulator : MonoBehaviour
         {
             RenderComposite(cam);
         }
+        
+        // Stop rendering timing and store the result
+        renderSw.Stop();
+        lastRenderTimeMs = renderSw.Elapsed.TotalMilliseconds;
     }
 
     void Start()
@@ -682,6 +693,7 @@ public class FluidSimulator : MonoBehaviour
                  $"• Apply External Forces: {applyExternalForcesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Rendering: {lastRenderTimeMs:F2} ms\n" +
                  $"• CG Iterations: {lastCgIterations}\n" +
                  $"• Avg CG Iterations: {averageCgIterationsText}");
     }
@@ -2204,7 +2216,7 @@ public class FluidSimulator : MonoBehaviour
         // }
     }
 
-    private void DrawParticles(Camera cam)
+    private void DrawParticles(Camera cam, ScriptableRenderContext ctx = default)
     {
         if (particlesBuffer == null || numParticles <= 0) return;
         if (cam == null) return;
@@ -2254,10 +2266,15 @@ public class FluidSimulator : MonoBehaviour
         // --- Common Material Setup ---
         currentMaterial.SetBuffer("_Particles", particlesBuffer);
         
-        // Set point size for Particles mode, or radius for Depth modes
+        // Set radius for Particles mode or Depth modes
         if (renderingMode == RenderingMode.Particles)
         {
-            currentMaterial.SetFloat("_PointSize", 2.0f);
+            currentMaterial.SetFloat("_Radius", particleRadius);
+            // Set depth scale and min value for Particles mode (same as depth visualization)
+            float scale = Mathf.Exp(depthDisplayScale);
+            float minValue = Mathf.Exp(depthMinValue);
+            currentMaterial.SetFloat("_Scale", scale);
+            currentMaterial.SetFloat("_MinValue", minValue);
         }
         else if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
         {
@@ -2387,11 +2404,33 @@ public class FluidSimulator : MonoBehaviour
             }
             else
             {
-                // For Particles mode, use the old procedural approach
-                // Ensure buffer is set right before draw call (required for Metal)
-                currentMaterial.SetBuffer("_Particles", particlesBuffer);
-                currentMaterial.SetPass(0);
-                Graphics.DrawProceduralNow(MeshTopology.Points, numParticles, 1);
+                // For Particles mode, use instanced rendering with quad mesh
+                if (particlesBuffer == null || numParticles <= 0) return;
+                
+                // Update particle args buffer with current particle count
+                if (particleArgsBuffer == null || particleArgsBuffer.count != 5)
+                {
+                    CreateParticleArgsBuffer();
+                }
+                else
+                {
+                    // Update instance count in args buffer
+                    uint[] args = new uint[5];
+                    particleArgsBuffer.GetData(args);
+                    args[1] = (uint)numParticles; // Update instance count
+                    particleArgsBuffer.SetData(args);
+                }
+                
+                // Use CommandBuffer to ensure correct RenderTarget and avoid strict bounds culling
+                depthCmd.Clear();
+                
+                // Target the Camera's active buffer (Screen)
+                depthCmd.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                
+                // Draw mesh without strict bounds checks
+                depthCmd.DrawMeshInstancedIndirect(quadMesh, 0, currentMaterial, 0, particleArgsBuffer);
+                
+                Graphics.ExecuteCommandBuffer(depthCmd);
             }
         }
     }
@@ -2785,6 +2824,7 @@ public class FluidSimulator : MonoBehaviour
         compositeMaterial.SetVector("boundsSize", simulationBounds.bounds.size);
         compositeMaterial.SetFloat("refractionMultiplier", refractionScale);
         compositeMaterial.SetFloat("sunIntensity", sunInt);
+        compositeMaterial.SetFloat("sunSharpness", sunSharpness);
         compositeMaterial.SetVector("skyHorizonColor", skyHorizonColor);
         compositeMaterial.SetVector("skyTopColor", skyTopColor);
 

@@ -58,6 +58,7 @@ Shader "Custom/FluidRender"
             float3 floorPos;
             float3 floorSize;
             float sunIntensity;
+            float sunSharpness;
             float3 skyHorizonColor; // Dark color at horizon (looking down)
             float3 skyTopColor;    // Light color at top (looking up)
 
@@ -106,7 +107,7 @@ Shader "Custom/FluidRender"
                     bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
                     return isDark ? tileCol1.rgb : tileCol2.rgb;
                 }
-                float sun = pow(max(0, dot(dir, dirToSun)), 500.0) * sunIntensity;
+                float sun = pow(max(0, dot(dir, dirToSun)), sunSharpness) * sunIntensity;
                 return lerp(skyHorizonColor, skyTopColor, dir.y * 0.5 + 0.5) + sun;
             }
 
@@ -190,10 +191,11 @@ Shader "Custom/FluidRender"
                 float3 transmission = exp(-thickness * extinctionCoefficients);
                 refractCol *= transmission;
 
-                // Reflection - sample environment in reflection direction
-                float3 reflectCol = SampleEnvironment(hitPos, lr.reflectDir);
-                float specular = pow(max(0, dot(lr.reflectDir, dirToSun)), 100.0) * sunIntensity;
-                reflectCol += specular;
+                // // Reflection - sample environment in reflection direction
+                // float3 reflectCol = SampleEnvironment(hitPos, lr.reflectDir);
+                // float specular = pow(max(0, dot(lr.reflectDir, dirToSun)), sunSharpness) * sunIntensity;
+                // reflectCol += specular;
+                float3 reflectCol = refractCol;
 
                 // 6. Composite fluid on top of environment
                 float3 fluidCol = lerp(refractCol, reflectCol, lr.reflectWeight);
