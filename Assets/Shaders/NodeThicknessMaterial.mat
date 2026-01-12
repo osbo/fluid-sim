@@ -108,6 +108,7 @@ Material:
     - _Cull: 2
     - _Cutoff: 0.5
     - _DebugMode: 0
+    - _DensityMultiplier: 0.016572677
     - _DensityScale: 1
     - _DetailAlbedoMapScale: 1
     - _DetailNormalMapScale: 1
