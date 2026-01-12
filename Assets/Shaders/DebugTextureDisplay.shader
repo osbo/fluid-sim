@@ -42,8 +42,8 @@ Shader "Custom/DebugTextureDisplay"
             float4 frag (v2f i) : SV_Target {
                 float val = tex2D(_MainTex, i.uv).r;
                 
-                // Early return: if depth is truly 0 (before anything), output black
-                if (val == 0.0) return float4(0, 0, 0, 1);
+                // Early return: if depth is truly 0 (before anything) or very large (cleared value), output black
+                if (val == 0.0 || val >= 10000.0) return float4(0, 0, 0, 1);
                 
                 // Subtract min value before scaling
                 float adjustedVal = val - _MinValue;

@@ -3,7 +3,6 @@ Shader "Custom/NodeThickness"
     Properties
     {
         _PointSize ("Point Size", Float) = 5.0
-        // No Color or Absorption here. This shader only outputs raw depth data.
     }
     SubShader
     {
@@ -16,8 +15,7 @@ Shader "Custom/NodeThickness"
             ZTest LEqual
             Cull Off
             
-            // CRITICAL CHANGE: Additive Blending
-            // We want to SUM the thickness of all cubes overlapping this pixel.
+            // Additive Blending: Adds up the total "optical depth" of all nodes
             Blend One One 
 
             HLSLINCLUDE
@@ -25,7 +23,6 @@ Shader "Custom/NodeThickness"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/SpaceTransforms.hlsl"
  
-            // --- Structs (Same as before) ---
             struct faceVelocities { float left, right, bottom, top, front, back; };
             struct Node {
                 float3 position; float3 velocity; faceVelocities v;
@@ -46,12 +43,12 @@ Shader "Custom/NodeThickness"
             struct VSOut
             {
                 float4 pos : SV_POSITION;
-                float3 centerWS : TEXCOORD3;
-                float nodeSize : TEXCOORD4;
-                float3 worldPos : TEXCOORD5; 
+                float3 centerWS : TEXCOORD0;
+                float nodeSize : TEXCOORD1;
+                float3 worldPos : TEXCOORD2;
+                float density : TEXCOORD3; // Passing density to Pixel Shader
             };
 
-            // (Helper: DecodeMorton3D same as previous)
             float3 DecodeMorton3D(Node node)
             {
                 int gridResolution = (int)exp2(10.0 - (float)node.layer);
@@ -76,20 +73,38 @@ Shader "Custom/NodeThickness"
                 
                 float3 centerWS = DecodeMorton3D(node);
                 float nodeSize = max(_PointSize * exp2((float)node.layer), 0.01);
-                float3 positionWS = centerWS + (input.positionOS.xyz * nodeSize);
+                
+                // --- 1. Calculate Density ---
+                // Volume of a cube = size^3
+                float volume = nodeSize * nodeSize * nodeSize;
+                // Density = Mass / Volume
+                // We assume 'active' nodes have mass. 
+                float density = (node.mass / max(volume, 0.0001));
+
+                // --- 2. Billboard Calculation ---
+                float3 cameraRight = unity_CameraToWorld._m00_m10_m20;
+                float3 cameraUp = unity_CameraToWorld._m01_m11_m21;
+
+                // Scale up canvas by 2.0 to fit the rotated cube inside
+                float drawSize = nodeSize * 2.0;
+
+                float3 positionWS = centerWS 
+                                  + (cameraRight * input.positionOS.x * drawSize) 
+                                  + (cameraUp * input.positionOS.y * drawSize);
 
                 o.pos = TransformWorldToHClip(positionWS);
                 
-                // Pass bounds info
                 o.centerWS = centerWS;
-                o.nodeSize = nodeSize;
+                o.nodeSize = nodeSize; 
                 o.worldPos = positionWS;
+                o.density = density; // Pass calculated density
+
                 return o;
             }
 
             float4 PS(VSOut i) : SV_Target
             {
-                // --- Ray-Box Intersection (Slab Method) ---
+                // Ray-Box Intersection (Slab Method)
                 float3 rayOrigin = _WorldSpaceCameraPos;
                 float3 rayDir = normalize(i.worldPos - _WorldSpaceCameraPos);
                 
@@ -105,13 +120,14 @@ Shader "Custom/NodeThickness"
                 float tEnter = max(max(tMin.x, tMin.y), tMin.z);
                 float tExit = min(min(tMax.x, tMax.y), tMax.z);
 
-                // Calculate distance through volume
+                // Distance traveled through THIS specific cube
                 float dist = max(0.0, tExit - max(0.0, tEnter));
 
-                // RETURN THE THICKNESS
-                // We return 'dist' in the Red channel.
-                // Since blend is One One, this adds 'dist' to the existing pixel value.
-                return float4(dist, 0, 0, 1);
+                // --- 3. Return Optical Depth ---
+                // Instead of just returning distance, we multiply by density.
+                // High Density Node = Large value added to texture
+                // Low Density Node = Small value added to texture
+                return float4(dist * i.density, 0, 0, 1);
             }
             ENDHLSL
 
