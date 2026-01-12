@@ -238,8 +238,11 @@ public class FluidSimulator : MonoBehaviour
     public Color skyTopColor = new Color(0.4f, 0.6f, 0.9f); // Light color at top (looking up)
     [Range(-20.0f, 20.0f)] public float sunIntensity = 0.0f; // Exponent: actual intensity = exp(value)
     [Range(0.0f, 500.0f)] public float sunSharpness = 500.0f; // Sun highlight sharpness (power exponent)
-    [Range(-5.0f, 0.0f)] public float depthDisplayScale = 0.0f;   // Exponent: actual scale = exp(value)
-    [Range(0.0f, 10.0f)] public float depthMinValue = 0.0f;        // Exponent: actual min = exp(value), subtracts from depth before scaling
+    // Calculated depth values (updated each frame based on camera position)
+    private float calculatedDepthDisplayScale = 0.0f;  // Exponent for depth scale
+    private float calculatedDepthMinValue = 0.0f;     // Exponent for depth min
+    private float calculatedMinDepth = 0.0f;          // Actual min depth value
+    private float calculatedMaxDepth = 0.0f;          // Actual max depth value
     [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = 0.0f; // Exponent: actual scale = exp(value) for nodes
     [Range(-20.0f, 20.0f)] public float thicknessScaleParticles = 0.0f; // Exponent: actual scale = exp(value) for particles
 
@@ -405,11 +408,27 @@ public class FluidSimulator : MonoBehaviour
         }
         else if (renderingMode == RenderingMode.Depth)
         {
-            DebugBlit(rawDepthTexture, depthDisplayScale, depthMinValue);
+            // Calculate depth parameters for debug visualization
+            if (cam != null && simulationBounds != null)
+            {
+                Vector3 cameraPos = cam.transform.position;
+                Bounds bounds = simulationBounds.bounds;
+                float boundsDiagonal = bounds.size.magnitude;
+                CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
+            }
+            DebugBlit(rawDepthTexture, calculatedDepthDisplayScale, calculatedDepthMinValue);
         }
         else if (renderingMode == RenderingMode.BlurredDepth)
         {
-            DebugBlit(fluidDepthTexture, depthDisplayScale, depthMinValue);
+            // Calculate depth parameters for debug visualization
+            if (cam != null && simulationBounds != null)
+            {
+                Vector3 cameraPos = cam.transform.position;
+                Bounds bounds = simulationBounds.bounds;
+                float boundsDiagonal = bounds.size.magnitude;
+                CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
+            }
+            DebugBlit(fluidDepthTexture, calculatedDepthDisplayScale, calculatedDepthMinValue);
         }
         else if (renderingMode == RenderingMode.Normal)
         {
@@ -2270,11 +2289,6 @@ public class FluidSimulator : MonoBehaviour
         if (renderingMode == RenderingMode.Particles)
         {
             currentMaterial.SetFloat("_Radius", particleRadius);
-            // Set depth scale and min value for Particles mode (same as depth visualization)
-            float scale = Mathf.Exp(depthDisplayScale);
-            float minValue = Mathf.Exp(depthMinValue);
-            currentMaterial.SetFloat("_Scale", scale);
-            currentMaterial.SetFloat("_MinValue", minValue);
         }
         else if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
         {
@@ -2305,6 +2319,19 @@ public class FluidSimulator : MonoBehaviour
         float distanceToCenter = Vector3.Distance(cameraPos, boundsCenter);
         float boundsDiagonal = boundsSize.magnitude; // Diagonal length of the bounds
         
+        // Calculate depth min/max for normalizing particles inside the simulation bounds to 0-1 range
+        CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
+        
+        // Set depth scale and min value for Particles mode (calculated dynamically)
+        if (renderingMode == RenderingMode.Particles)
+        {
+            // Get the calculated values (convert from exponents to actual values)
+            float calculatedMinValue = Mathf.Exp(calculatedDepthMinValue);
+            float calculatedScale = Mathf.Exp(calculatedDepthDisplayScale);
+            currentMaterial.SetFloat("_Scale", calculatedScale);
+            currentMaterial.SetFloat("_MinValue", calculatedMinValue);
+        }
+        
         // Calculate fade start: start fading slightly before the nearest point
         // Subtract half the diagonal to account for particles that might be at the edge
         float fadeStart = Mathf.Max(0.0f, distanceToNearest - boundsDiagonal * 0.3f);
@@ -2323,44 +2350,11 @@ public class FluidSimulator : MonoBehaviour
         currentMaterial.SetFloat("_DepthFadeEnd", fadeEnd);
         
         // Calculate depth min/max for depth visualization (for depth and blurred depth materials)
+        // Reuse the already calculated minDepth and maxDepth values
         if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
         {
-            // Calculate the 8 corners of the bounding box
-            Vector3[] corners = new Vector3[]
-            {
-                bounds.min,
-                new Vector3(bounds.max.x, bounds.min.y, bounds.min.z),
-                new Vector3(bounds.min.x, bounds.max.y, bounds.min.z),
-                new Vector3(bounds.max.x, bounds.max.y, bounds.min.z),
-                new Vector3(bounds.min.x, bounds.min.y, bounds.max.z),
-                new Vector3(bounds.max.x, bounds.min.y, bounds.max.z),
-                new Vector3(bounds.min.x, bounds.max.y, bounds.max.z),
-                bounds.max
-            };
-            
-            // Find min and max distances from camera to all corners
-            float minDepth = float.MaxValue;
-            float maxDepth = float.MinValue;
-            
-            foreach (Vector3 corner in corners)
-            {
-                float distance = Vector3.Distance(cameraPos, corner);
-                minDepth = Mathf.Min(minDepth, distance);
-                maxDepth = Mathf.Max(maxDepth, distance);
-            }
-            
-            // Add some margin to ensure we capture all particles
-            minDepth = Mathf.Max(0.0f, minDepth - boundsDiagonal * 0.1f);
-            maxDepth = maxDepth + boundsDiagonal * 0.1f;
-            
-            // Ensure max is greater than min
-            if (maxDepth <= minDepth)
-            {
-                maxDepth = minDepth + boundsDiagonal * 0.5f;
-            }
-            
-            currentMaterial.SetFloat("_DepthMin", minDepth);
-            currentMaterial.SetFloat("_DepthMax", maxDepth);
+            currentMaterial.SetFloat("_DepthMin", calculatedMinDepth);
+            currentMaterial.SetFloat("_DepthMax", calculatedMaxDepth);
         }
 
         // For Composite mode, we render to rawDepthTexture directly (blur happens in OnEndCameraRendering)
@@ -2399,7 +2393,7 @@ public class FluidSimulator : MonoBehaviour
                 // Only debug blit if we are strictly in Depth mode
                 if (renderingMode == RenderingMode.Depth)
                 {
-                    DebugBlit(rawDepthTexture, depthDisplayScale, depthMinValue);
+                    DebugBlit(rawDepthTexture, calculatedDepthDisplayScale, calculatedDepthMinValue);
                 }
             }
             else
@@ -2611,6 +2605,60 @@ public class FluidSimulator : MonoBehaviour
         Graphics.Blit(source, (RenderTexture)null, debugDisplayMaterial);
     }
 
+    private void CalculateDepthParameters(Vector3 cameraPos, Bounds bounds, float boundsDiagonal)
+    {
+        // Calculate depth min/max for normalizing particles inside the simulation bounds to 0-1 range
+        // Min depth: distance to nearest point on bounds (particles can't be closer)
+        Vector3 nearestPoint = new Vector3(
+            Mathf.Clamp(cameraPos.x, bounds.min.x, bounds.max.x),
+            Mathf.Clamp(cameraPos.y, bounds.min.y, bounds.max.y),
+            Mathf.Clamp(cameraPos.z, bounds.min.z, bounds.max.z)
+        );
+        float minDepth = Vector3.Distance(cameraPos, nearestPoint);
+        
+        // Max depth: find the farthest corner of the bounds (farthest point where particles can be)
+        Vector3[] corners = new Vector3[]
+        {
+            bounds.min,
+            new Vector3(bounds.max.x, bounds.min.y, bounds.min.z),
+            new Vector3(bounds.min.x, bounds.max.y, bounds.min.z),
+            new Vector3(bounds.max.x, bounds.max.y, bounds.min.z),
+            new Vector3(bounds.min.x, bounds.min.y, bounds.max.z),
+            new Vector3(bounds.max.x, bounds.min.y, bounds.max.z),
+            new Vector3(bounds.min.x, bounds.max.y, bounds.max.z),
+            bounds.max
+        };
+        
+        float maxDepth = 0.0f;
+        foreach (Vector3 corner in corners)
+        {
+            float distance = Vector3.Distance(cameraPos, corner);
+            maxDepth = Mathf.Max(maxDepth, distance);
+        }
+        
+        // Ensure max is greater than min
+        if (maxDepth <= minDepth)
+        {
+            maxDepth = minDepth + boundsDiagonal * 0.5f;
+        }
+        
+        // Store the actual depth values for use in depth visualization
+        calculatedMinDepth = minDepth;
+        calculatedMaxDepth = maxDepth;
+        
+        // Calculate depth scale and min value dynamically to map depth to 0-1 range
+        // Formula: displayVal = (depth - minDepth) * (1.0 / (maxDepth - minDepth))
+        // So: _MinValue = minDepth, _Scale = 1.0 / (maxDepth - minDepth)
+        // Store as exponents: depthMinValue = ln(minDepth), depthDisplayScale = ln(1.0 / (maxDepth - minDepth))
+        float calculatedMinValue = Mathf.Max(0.001f, minDepth); // Ensure > 0 for log
+        float depthRange = maxDepth - minDepth;
+        float calculatedScale = depthRange > 0.001f ? (1.0f / depthRange) : 1.0f; // Avoid division by zero
+        
+        // Store as exponents (for compatibility with shaders that use exp())
+        calculatedDepthMinValue = Mathf.Log(calculatedMinValue);
+        calculatedDepthDisplayScale = Mathf.Log(calculatedScale);
+    }
+
     private void CreateQuadMesh()
     {
         // Create a simple quad mesh for billboard rendering
@@ -2755,7 +2803,15 @@ public class FluidSimulator : MonoBehaviour
         // D. Visualize
         if (renderingMode == RenderingMode.BlurredDepth)
         {
-            DebugBlit(fluidDepthTexture, depthDisplayScale, depthMinValue);
+            // Calculate depth parameters for debug visualization
+            if (cam != null && simulationBounds != null)
+            {
+                Vector3 cameraPos = cam.transform.position;
+                Bounds bounds = simulationBounds.bounds;
+                float boundsDiagonal = bounds.size.magnitude;
+                CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
+            }
+            DebugBlit(fluidDepthTexture, calculatedDepthDisplayScale, calculatedDepthMinValue);
         }
 
         // E. Cleanup
@@ -2828,8 +2884,15 @@ public class FluidSimulator : MonoBehaviour
         compositeMaterial.SetVector("skyHorizonColor", skyHorizonColor);
         compositeMaterial.SetVector("skyTopColor", skyTopColor);
 
-        compositeMaterial.SetFloat("depthDisplayScale", depthDisplayScale);
-        compositeMaterial.SetFloat("depthMinValue", depthMinValue);
+        // Calculate depth parameters for composite rendering
+        Vector3 cameraPos = cam.transform.position;
+        Bounds bounds = simulationBounds.bounds;
+        float boundsDiagonal = bounds.size.magnitude;
+        CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
+        
+        // Use the calculated values (already stored as exponents)
+        compositeMaterial.SetFloat("depthDisplayScale", calculatedDepthDisplayScale);
+        compositeMaterial.SetFloat("depthMinValue", calculatedDepthMinValue);
         float thicknessScale = thicknessSource == ThicknessSource.Nodes 
             ? thicknessScaleNodes 
             : thicknessScaleParticles;
