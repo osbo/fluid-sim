@@ -22,11 +22,11 @@ public partial class FluidSimulator : MonoBehaviour
     public ComputeShader nodesShader;
     public ComputeShader cgSolverShader;
     public ComputeShader preconditionerShader; // Assign Preconditioner.compute in Inspector
-    public int numParticles;
+    public int numParticles = 1048576;
     
     // CG Solver parameters
-    public int maxCgIterations;
-    public float convergenceThreshold;
+    public int maxCgIterations = 400;
+    public float convergenceThreshold = 1e-05f;
     
     // Simulation parameters
     private float maxDetailCellSize;
@@ -120,10 +120,10 @@ public partial class FluidSimulator : MonoBehaviour
     public int NumNodes => numNodes;
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
-    public float gravity;
-    public float frameRate;
-    public int minLayer;
-    public int maxLayer;
+    public float gravity = 100.0f;
+    public float frameRate = 30.0f;
+    public int minLayer = 4;
+    public int maxLayer = 10;
     public PreconditionerType preconditioner = PreconditionerType.Neural;
 
     private bool hasShownWaitMessage = false;
@@ -186,7 +186,7 @@ public partial class FluidSimulator : MonoBehaviour
     [Header("Rendering")]
 
     // Rendering mode enum
-    public RenderingMode renderingMode = RenderingMode.Particles;
+    public RenderingMode renderingMode = RenderingMode.Thickness;
     
     // Thickness source selection
     public ThicknessSource thicknessSource = ThicknessSource.Nodes;
@@ -217,24 +217,24 @@ public partial class FluidSimulator : MonoBehaviour
     public Material debugDisplayMaterial; // Assign "Custom/DebugTextureDisplay" in Inspector
 
     public Color fluidColor = new Color(0.2f, 0.6f, 1.0f); // Input for extinction
-    public Color skyHorizonColor = new Color(0.1f, 0.1f, 0.15f); // Dark color at horizon (looking down)
-    public Color skyTopColor = new Color(0.4f, 0.6f, 0.9f); // Light color at top (looking up)
-    [Range(-20.0f, 20.0f)] public float sunIntensity = 0.0f; // Exponent: actual intensity = exp(value)
-    [Range(0.0f, 500.0f)] public float sunSharpness = 500.0f; // Sun highlight sharpness (power exponent)
+    public Color skyHorizonColor = new Color(0.0f, 0.0f, 0.0f); // Dark color at horizon (looking down)
+    public Color skyTopColor = new Color(1.0f, 1.0f, 1.0f); // Light color at top (looking up)
+    [Range(-20.0f, 20.0f)] public float sunIntensity = -2.3f; // Exponent: actual intensity = exp(value)
+    [Range(0.0f, 500.0f)] public float sunSharpness = 53.0f; // Sun highlight sharpness (power exponent)
     // Calculated depth values (updated each frame based on camera position)
     private float calculatedDepthDisplayScale = 0.0f;  // Exponent for depth scale
     private float calculatedDepthMinValue = 0.0f;     // Exponent for depth min
     private float calculatedMinDepth = 0.0f;          // Actual min depth value
     private float calculatedMaxDepth = 0.0f;          // Actual max depth value
-    [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = 0.0f; // Exponent: actual scale = exp(value) for nodes
-    [Range(-20.0f, 20.0f)] public float thicknessScaleParticles = 0.0f; // Exponent: actual scale = exp(value) for particles
+    [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = -8.8f; // Exponent: actual scale = exp(value) for nodes
+    [Range(-20.0f, 20.0f)] public float thicknessScaleParticles = -9.6f; // Exponent: actual scale = exp(value) for particles
 
-    [Range(0, 100)] public int blurRadius = 5;
-    [Range(0.0001f, 10.0f)] public float blurDepthFalloff = 1.0f;
-    [Range(0.0001f, 1.0f)] public float particleRadius = 0.01f; // Radius for particle points (world space)
-    [Range(0.0001f, 1.0f)] public float depthRadius = 0.01f; // Radius for depth quads (world space)
-    [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.01f; // Radius for particle thickness quads (world space)
-    [Range(0, 20)] public float absorptionStrength = 1.0f;
+    [Range(0, 100)] public int blurRadius = 11;
+    [Range(0.0001f, 10.0f)] public float blurDepthFalloff = 2.0f;
+    [Range(0.0001f, 1.0f)] public float particleRadius = 0.066f; // Radius for particle points (world space)
+    [Range(0.0001f, 1.0f)] public float depthRadius = 0.082f; // Radius for depth quads (world space)
+    [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.776f; // Radius for particle thickness quads (world space)
+    [Range(0, 20)] public float absorptionStrength = 4.1f;
     [Range(0, 2)] public float refractionScale = 1.0f;
     
     // Helper method for resizing buffers

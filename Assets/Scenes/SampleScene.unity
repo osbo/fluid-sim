@@ -580,7 +580,7 @@ MonoBehaviour:
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
-  renderingMode: 0
+  renderingMode: 5
   thicknessSource: 1
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
@@ -596,14 +596,14 @@ MonoBehaviour:
   skyTopColor: {r: 1, g: 1, b: 1, a: 1}
   sunIntensity: -2.3
   sunSharpness: 53
-  thicknessScaleNodes: -3.4
-  thicknessScaleParticles: 0
-  blurRadius: 5
-  blurDepthFalloff: 1
+  thicknessScaleNodes: -8.8
+  thicknessScaleParticles: -9.6
+  blurRadius: 11
+  blurDepthFalloff: 2
   particleRadius: 0.066
-  depthRadius: 0.01
-  thicknessRadius: 0.01
-  absorptionStrength: 1
+  depthRadius: 0.082
+  thicknessRadius: 0.776
+  absorptionStrength: 4.1
   refractionScale: 1
 --- !u!1 &832575517
 GameObject:
