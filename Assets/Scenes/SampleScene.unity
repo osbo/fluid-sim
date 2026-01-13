@@ -576,7 +576,7 @@ MonoBehaviour:
   modelWeightsAsset: {fileID: 4900000, guid: c8c83e26cc03d4114b9402603b15f56f, type: 3}
   gravity: 100
   frameRate: 30
-  minLayer: 4
+  minLayer: 5
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
@@ -594,16 +594,16 @@ MonoBehaviour:
   fluidColor: {r: 0.2, g: 0.6, b: 1, a: 1}
   skyHorizonColor: {r: 0, g: 0, b: 0, a: 1}
   skyTopColor: {r: 1, g: 1, b: 1, a: 1}
-  sunIntensity: -1.58
-  sunSharpness: 41
-  thicknessScaleNodes: -8.6
-  thicknessScaleParticles: -6.5
-  blurRadius: 6
-  blurDepthFalloff: 1.99
-  particleRadius: 0.085
-  depthRadius: 0.143
-  thicknessRadius: 0.296
-  absorptionStrength: 8.6
+  sunIntensity: -2.3
+  sunSharpness: 53
+  thicknessScaleNodes: -3.4
+  thicknessScaleParticles: 0
+  blurRadius: 5
+  blurDepthFalloff: 1
+  particleRadius: 0.066
+  depthRadius: 0.01
+  thicknessRadius: 0.01
+  absorptionStrength: 1
   refractionScale: 1
 --- !u!1 &832575517
 GameObject:
