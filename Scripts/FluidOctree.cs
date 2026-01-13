@@ -356,6 +356,7 @@ public partial class FluidSimulator : MonoBehaviour
 
         // Use ResizeBuffer to prevent frequent reallocations
         ResizeBuffer(ref neighborsBuffer, numNodes * 24, sizeof(uint));
+        ResizeBuffer(ref diffusionGradientBuffer, numNodes, sizeof(float) * 3);
 
         findNeighborsKernel = nodesShader.FindKernel("findNeighbors");
         nodesShader.SetBuffer(findNeighborsKernel, "nodesBuffer", nodesBuffer);
