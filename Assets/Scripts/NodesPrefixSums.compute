@@ -18,7 +18,6 @@ struct Particle
 {
     float3 position;    // 3-component position vector
     float3 velocity;    // float face velocities
-    uint layer;         // Layer units
     uint mortonCode;    // Morton code for spatial indexing
 };
 

@@ -318,29 +318,27 @@ public partial class FluidSimulator : MonoBehaviour
         if (cgSolverShader == null) return 0.0f;
 
         int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
+        int reduceKernel = cgSolverShader.FindKernel("GlobalReduceSum");
         
-        // Set up buffers for dot product
+        // 1. Run Standard Dot Product (Partial Sums)
         cgSolverShader.SetBuffer(dotProductKernel, "xBuffer", bufferA);
         cgSolverShader.SetBuffer(dotProductKernel, "yBuffer", bufferB);
-        cgSolverShader.SetBuffer(dotProductKernel, "divergenceBuffer", divergenceBuffer); // Required for output
+        cgSolverShader.SetBuffer(dotProductKernel, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
         
-        // Dispatch dot product kernel
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         cgSolverShader.Dispatch(dotProductKernel, threadGroups, 1, 1);
         
-        // Read back the result from divergenceBuffer (reused as temporary output)
-        float[] result = new float[threadGroups];
-        divergenceBuffer.GetData(result);
+        // 2. Run Final Reduction on GPU (Sum partials to index 0)
+        cgSolverShader.SetBuffer(reduceKernel, "divergenceBuffer", divergenceBuffer);
+        cgSolverShader.SetInt("reductionCount", threadGroups);
+        cgSolverShader.Dispatch(reduceKernel, 1, 1, 1);
+
+        // 3. Read back ONLY the single float result
+        // This is still blocking, but minimal data transfer
+        divergenceBuffer.GetData(reductionResult, 0, 0, 1);
         
-        // Sum up all partial results
-        float total = 0.0f;
-        for (int i = 0; i < threadGroups; i++)
-        {
-            total += result[i];
-        }
-        
-        return total;
+        return reductionResult[0];
     }
     private void UpdateVector(ComputeBuffer yBuffer, ComputeBuffer xBuffer, float a)
     {

@@ -9,6 +9,7 @@
 #pragma kernel PrecomputeIndices
 #pragma kernel ComputeDiagonal
 #pragma kernel ApplyJacobi
+#pragma kernel GlobalReduceSum
 
 // Include common HLSL functions
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
@@ -50,6 +51,7 @@ RWStructuredBuffer<uint> scatterIndicesBuffer; // NEW: [N * 24] Pre-computed sca
 uint numNodes;
 float a; // scalar 'a'
 float deltaTime; // Time step for physics scaling
+uint reductionCount; // Number of partial sums to reduce
 
 // Shared memory for dot product reduction
 groupshared float s_data[512];
@@ -678,4 +680,24 @@ void ApplyJacobi(uint3 id : SV_DispatchThreadID)
 
     if (!isfinite(z_val)) z_val = 0.0;
     yBuffer[i] = z_val;
+}
+
+// Global reduction kernel: Sums partial results from workgroups into a single value at index 0
+[numthreads(64, 1, 1)]
+void GlobalReduceSum(uint3 id : SV_DispatchThreadID)
+{
+    // Only thread 0 runs this linear sum (fast enough for <1024 groups)
+    if (id.x != 0) return;
+    
+    // Safety clamp (reductionCount set from C#)
+    uint count = min(reductionCount, 2048); 
+    float total = 0.0;
+    
+    for(uint i = 0; i < count; i++) 
+    {
+        total += divergenceBuffer[i];
+    }
+    
+    // Write result to index 0
+    divergenceBuffer[0] = total; 
 }

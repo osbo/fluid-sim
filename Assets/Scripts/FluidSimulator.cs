@@ -102,6 +102,9 @@ public partial class FluidSimulator : MonoBehaviour
     private float p_std;
     private int d_model, num_heads, num_layers, input_dim;
     
+    // Helper array to avoid allocating every frame for GPU reduction
+    private float[] reductionResult = new float[1];
+    
     // Model architecture constants
     private const int WINDOW_SIZE = 256;  // Window size for attention (down from 512)
     private const int NUM_HEADS = 4;     // Number of attention heads
@@ -158,7 +161,6 @@ public partial class FluidSimulator : MonoBehaviour
     {
         public Vector3 position;    // 12 bytes
         public Vector3 velocity;    // 12 bytes
-        public uint layer;          // 4 bytes
         public uint mortonCode;     // 4 bytes
     }
 
@@ -318,7 +320,6 @@ public partial class FluidSimulator : MonoBehaviour
 
         // for (int i = 0; i < numParticles/1024 && i < numParticles; i++) {
         for (int i = 0; (uint)i < 1000 && i < numParticles; i++) {
-            particlesCPU[indices[i]].layer = (uint)minLayer;
             particlesCPU[indices[i]].velocity = new Vector3(100.0f, 0.0f, 0.0f);
         }
 
@@ -491,7 +492,7 @@ public partial class FluidSimulator : MonoBehaviour
         }
         
         // Create buffers
-        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(uint)); // 12 + 12 + 4 + 4 = 32 bytes
+        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint)); // 12 + 12 + 4 = 28 bytes
         particlesCPU = new Particle[numParticles];
 
         // Set buffer data to compute shader

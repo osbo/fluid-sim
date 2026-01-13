@@ -24,7 +24,6 @@ Shader "Custom/ParticleDepth"
             {
                 float3 position;
                 float3 velocity;
-                uint layer;
                 uint mortonCode;
             };
 

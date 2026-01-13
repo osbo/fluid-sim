@@ -8,7 +8,6 @@ struct Particle
 {
     float3 position;   // 3-component position vector
     float3 velocity;   // float face velocities
-    uint layer;        // Layer units
     uint mortonCode;   // Morton code for spatial indexing
 };
 
@@ -203,23 +202,8 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     float distanceFromCenter = length(centerOffset);
     float centerRadius = 3;// Small radius around center for layer 0 particles
     
-    // Assign layer: center particles get layer 0, boundary particles get layer 0, others get layer 11
-    bool nearCenter = (distanceFromCenter <= centerRadius);
-    bool onBoundary = (u > (1.0 - max(0.0, boundaryThreshold)));
-    // particle.layer = (nearCenter || onBoundary) ? minLayer : 11;
-    // particle.layer = onBoundary ? minLayer : 11;
-    particle.layer = (nearCenter) ? minLayer : maxLayer;
-    // particle.layer = 11;
-    // particle.layer = 4;
-
-    // if (nearCenter) {
-    //     particle.velocity = float3(0.0, 100.0, 0.0);
-    // }
-
     // Generate morton code from normalized position
     particle.mortonCode = EncodeMorton3D((uint3)particle.position);
-
-    // particle.layer = particle.mortonCode % 10;
     
     // Write particle to buffer
     particlesBuffer[index] = particle;
@@ -343,8 +327,6 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     // FIX END
 
     particle.position = newPosition;
-
-    particle.layer = node.layer;
 
     // newVelocity.y -= gravity * deltaTime; 
 

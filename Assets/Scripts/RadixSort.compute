@@ -9,12 +9,11 @@
 #define THREADS 512
 
 // --- STRUCTS ---
-// Must match C# Particle struct exactly (32 bytes)
+// Must match C# Particle struct exactly (28 bytes)
 struct Particle
 {
     float3 position;    // 12 bytes
     float3 velocity;    // 12 bytes
-    uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
 };
 
@@ -37,7 +36,7 @@ RWStructuredBuffer<uint> f;
 
 // --- GROUPSHARED MEMORY ---
 groupshared uint scan_array[THREADS * 2];
-groupshared Particle gs_particles[THREADS]; // 32 bytes * 512 = 16KB (Fits in 32KB LDS)
+groupshared Particle gs_particles[THREADS]; // 28 bytes * 512 = 14KB (Fits in 32KB LDS)
 groupshared uint gs_e[THREADS];
 groupshared uint gs_scan[THREADS];
 groupshared uint gs_totalZeros;
@@ -141,7 +140,6 @@ void split_scatter(uint3 id : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID
         // Padding for out of bounds threads
         p.position = float3(0,0,0);
         p.velocity = float3(0,0,0);
-        p.layer = 0;
         p.mortonCode = 0xFFFFFFFF; 
         isZero = 0; // Padding counts as a '1' so it goes to end
     }
@@ -290,7 +288,6 @@ void clearBuffer64(uint3 id : SV_DispatchThreadID)
         Particle emptyParticle;
         emptyParticle.position = float3(0, 0, 0);
         emptyParticle.velocity = float3(0, 0, 0);
-        emptyParticle.layer = 0;
         emptyParticle.mortonCode = 0;
         outputParticles[tid] = emptyParticle;
     }
