@@ -60,6 +60,7 @@ public partial class FluidSimulator : MonoBehaviour
     private int initializePhiKernel;
     private int propagatePhiKernel;
     private int extractMortonCodesKernel;
+    private int calculateDensityGradientKernel;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -96,6 +97,7 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer bufferK; // K buffer for attention
     private ComputeBuffer bufferV; // V buffer for attention
     private ComputeBuffer bufferAttn; // Attention output buffer
+    private ComputeBuffer diffusionGradientBuffer; // Precomputed normalized density gradient per node
     public TextAsset modelWeightsAsset; // Assign model_weights.bytes from Assets/Scripts/ in Inspector
     private Dictionary<string, ComputeBuffer> weightBuffers = new Dictionary<string, ComputeBuffer>();
     private float p_mean;
@@ -379,6 +381,11 @@ public partial class FluidSimulator : MonoBehaviour
         findNeighbors();
         findNeighborsSw.Stop();
 
+        // Step 4.5: Calculate density gradients
+        var calculateGradientsSw = System.Diagnostics.Stopwatch.StartNew();
+        CalculateDensityGradients();
+        calculateGradientsSw.Stop();
+
         // Step 5: Compute level set (distance field)
         var computeLevelSetSw = System.Diagnostics.Stopwatch.StartNew();
         // ComputeLevelSet();
@@ -418,6 +425,7 @@ public partial class FluidSimulator : MonoBehaviour
                  $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Find Neighbors: {findNeighborsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                 $"• Calculate Gradients: {calculateGradientsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Compute Level Set: {computeLevelSetSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Apply External Forces: {applyExternalForcesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
@@ -426,6 +434,24 @@ public partial class FluidSimulator : MonoBehaviour
                  $"• Rendering: {lastRenderTimeMs:F2} ms\n" +
                  $"• CG Iterations: {lastCgIterations}\n" +
                  $"• Avg CG Iterations: {averageCgIterationsText}");
+    }
+
+    private void CalculateDensityGradients()
+    {
+        if (nodesShader == null)
+        {
+            Debug.LogError("Nodes compute shader is not assigned.");
+            return;
+        }
+
+        calculateDensityGradientKernel = nodesShader.FindKernel("CalculateDensityGradient");
+        nodesShader.SetBuffer(calculateDensityGradientKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(calculateDensityGradientKernel, "neighborsBuffer", neighborsBuffer);
+        nodesShader.SetBuffer(calculateDensityGradientKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
+        nodesShader.SetInt("numNodes", numNodes);
+        
+        int groups = Mathf.CeilToInt(numNodes / 512.0f);
+        nodesShader.Dispatch(calculateDensityGradientKernel, groups, 1, 1);
     }
 
     private void StoreOldVelocities()
@@ -461,6 +487,7 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetBuffer(updateParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
         particlesShader.SetBuffer(updateParticlesKernel, "nodesBufferOld", nodesBufferOld);
         particlesShader.SetBuffer(updateParticlesKernel, "particlesBuffer", particlesBuffer);
+        particlesShader.SetBuffer(updateParticlesKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
         particlesShader.SetInt("numNodes", numNodes);
         particlesShader.SetInt("numParticles", numParticles);
         particlesShader.SetFloat("deltaTime", (1 / frameRate));
@@ -634,6 +661,7 @@ public partial class FluidSimulator : MonoBehaviour
         tempNodesBuffer?.Release();
         neighborsBuffer?.Release();
         reverseNeighborsBuffer?.Release();
+        diffusionGradientBuffer?.Release();
         divergenceBuffer?.Release();
         residualBuffer?.Release();
         pBuffer?.Release();
