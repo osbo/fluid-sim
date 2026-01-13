@@ -9,6 +9,7 @@
 #pragma kernel ApplyExternalForces
 #pragma kernel InitializePhi
 #pragma kernel PropagatePhi
+#pragma kernel CalculateDensityGradient
 
 struct faceVelocities
 {
@@ -58,6 +59,7 @@ RWStructuredBuffer<uint> neighborsBuffer;               // output: neighbor indi
 RWStructuredBuffer<uint> reverseNeighborsBuffer;        // output: reverse neighbor slot indices per node (numNodes * 24)
 RWStructuredBuffer<float> phiBuffer;                    // level set distance field (read/write)
 StructuredBuffer<float> phiBuffer_Read;                 // level set distance field (read-only copy for propagation)
+RWStructuredBuffer<float3> diffusionGradientBuffer;     // output: precomputed normalized density gradient per node
 RWStructuredBuffer<uint> dirtyFlagBuffer;               // single-element buffer for convergence flag
 
 uint numUniqueNodes;                              // number of unique morton codes
@@ -1251,4 +1253,89 @@ void PropagatePhi(uint3 id : SV_DispatchThreadID)
         // We only care if *any* thread writes 1, not which one.
         dirtyFlagBuffer[0] = 1;
     }
+}
+
+[numthreads(512, 1, 1)]
+void CalculateDensityGradient(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    Node node = nodesBuffer[i];
+    float dx = exp2((float)node.layer);
+    float vol = dx * dx * dx;
+    float selfDensity = node.mass / max(1e-6, vol);
+    
+    // Check if empty (optimization)
+    if (node.mass <= 1e-6) {
+        diffusionGradientBuffer[i] = float3(0,0,0);
+        return;
+    }
+
+    float3 gradient = float3(0,0,0);
+
+    // --- X Axis ---
+    {
+        uint idxLeft = neighborsBuffer[0 * numNodes + i];
+        uint idxRight = neighborsBuffer[4 * numNodes + i];
+        
+        float rhoLeft = selfDensity;
+        if (idxLeft < numNodes) {
+            float ndx = exp2((float)nodesBuffer[idxLeft].layer);
+            rhoLeft = nodesBuffer[idxLeft].mass / max(1e-6, ndx*ndx*ndx);
+        }
+        
+        float rhoRight = selfDensity;
+        if (idxRight < numNodes) {
+            float ndx = exp2((float)nodesBuffer[idxRight].layer);
+            rhoRight = nodesBuffer[idxRight].mass / max(1e-6, ndx*ndx*ndx);
+        }
+        
+        float sum = rhoLeft + rhoRight;
+        if (sum > 1e-9) gradient.x = (rhoLeft - rhoRight) / sum;
+    }
+
+    // --- Y Axis ---
+    {
+        uint idxBottom = neighborsBuffer[8 * numNodes + i];
+        uint idxTop = neighborsBuffer[12 * numNodes + i];
+        
+        float rhoBottom = selfDensity;
+        if (idxBottom < numNodes) {
+            float ndx = exp2((float)nodesBuffer[idxBottom].layer);
+            rhoBottom = nodesBuffer[idxBottom].mass / max(1e-6, ndx*ndx*ndx);
+        }
+        
+        float rhoTop = selfDensity;
+        if (idxTop < numNodes) {
+            float ndx = exp2((float)nodesBuffer[idxTop].layer);
+            rhoTop = nodesBuffer[idxTop].mass / max(1e-6, ndx*ndx*ndx);
+        }
+        
+        float sum = rhoBottom + rhoTop;
+        if (sum > 1e-9) gradient.y = (rhoBottom - rhoTop) / sum;
+    }
+
+    // --- Z Axis ---
+    {
+        uint idxFront = neighborsBuffer[16 * numNodes + i];
+        uint idxBack = neighborsBuffer[20 * numNodes + i];
+        
+        float rhoFront = selfDensity;
+        if (idxFront < numNodes) {
+            float ndx = exp2((float)nodesBuffer[idxFront].layer);
+            rhoFront = nodesBuffer[idxFront].mass / max(1e-6, ndx*ndx*ndx);
+        }
+        
+        float rhoBack = selfDensity;
+        if (idxBack < numNodes) {
+            float ndx = exp2((float)nodesBuffer[idxBack].layer);
+            rhoBack = nodesBuffer[idxBack].mass / max(1e-6, ndx*ndx*ndx);
+        }
+        
+        float sum = rhoFront + rhoBack;
+        if (sum > 1e-9) gradient.z = (rhoFront - rhoBack) / sum;
+    }
+
+    diffusionGradientBuffer[i] = gradient;
 }

@@ -122,6 +122,7 @@ RWStructuredBuffer<Node> nodesBuffer;
 RWStructuredBuffer<Node> nodesBufferOld; // Old velocities for FLIP method
 RWStructuredBuffer<uint> mortonCodesBuffer; // Separate morton codes buffer
 RWStructuredBuffer<uint> particleIndicesBuffer; // Separate indices buffer
+StructuredBuffer<float3> diffusionGradientBuffer; // Precomputed normalized density gradient per node
 // nodeFlagsBuffer moved to Nodes.compute
 
 // Parameters for particle initialization (pre-calculated on CPU)
@@ -282,8 +283,30 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     // float3 newVelocity = newGridVelocity;
 
-    // Advect the particle
-    float3 newPosition = particle.position + newVelocity * deltaTime;
+    // --- FICKIAN DIFFUSION (ANTI-CLUMPING) ---
+    // Read the precomputed normalized gradient
+    float3 diffusionOffset = diffusionGradientBuffer[nodeIndex];
+
+    // Apply the Offset
+    // A good starting point is related to cell size. 
+    float diffusionStrength = 0.2;
+    
+    float selfDx = exp2((float)node.layer);
+    
+    // Scale by cell size and time
+    float3 shift = diffusionOffset * diffusionStrength * selfDx * deltaTime;
+
+    // Clamp shift to avoid explosions (e.g., max 50% of cell size)
+    float maxShift = selfDx * 0.5;
+    shift = clamp(shift, -maxShift, maxShift);
+
+    // Apply to position
+    float3 newPosition = particle.position + shift;
+
+    // Existing Advection Logic
+    newPosition = newPosition + newVelocity * deltaTime;
+
+    // float3 newPosition = particle.position + newVelocity * deltaTime;
 
     // FIX START: Add Epsilon and Bounce
     // 1. Give particles a tiny bounce so they don't lose all momentum
