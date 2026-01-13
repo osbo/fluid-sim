@@ -38,7 +38,6 @@ public struct Particle
 {
     public Vector3 position;    // 12 bytes
     public Vector3 velocity;    // 12 bytes
-    public uint layer;          // 4 bytes
     public uint mortonCode;     // 4 bytes
 }
 

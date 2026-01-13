@@ -228,8 +228,6 @@ public partial class FluidSimulator : MonoBehaviour
         {
             currentMaterial.SetFloat("_Radius", depthRadius);
         }
-        currentMaterial.SetInt("_MinLayer", minLayer);
-        currentMaterial.SetInt("_MaxLayer", maxLayer);
         currentMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
         currentMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
         
