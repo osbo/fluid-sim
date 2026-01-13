@@ -25,7 +25,6 @@ struct Particle
 {
     float3 position;    // 12 bytes
     float3 velocity;    // 12 bytes
-    uint layer;         // 4 bytes
     uint mortonCode;    // 4 bytes
 };
 

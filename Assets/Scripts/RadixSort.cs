@@ -32,8 +32,8 @@ public class RadixSort
         copyParticlesKernel = sortShader.FindKernel("copyParticles");
         clearBuffer32Kernel = sortShader.FindKernel("clearBuffer32");
 
-        // Calculate particle struct size (3*4 + 3*4 + 4 + 4 = 32 bytes)
-        int particleSize = 3 * 4 + 3 * 4 + 4 + 4; // position(12) + velocity(12) + layer(4) + mortonCode(4)
+        // Calculate particle struct size (3*4 + 3*4 + 4 = 28 bytes)
+        int particleSize = 3 * 4 + 3 * 4 + 4; // position(12) + velocity(12) + mortonCode(4)
         tempParticles = new ComputeBuffer((int)maxLength, particleSize, ComputeBufferType.Default);
         tempParticlesB = new ComputeBuffer((int)maxLength, particleSize, ComputeBufferType.Default);
         eBuffer = new ComputeBuffer((int)maxLength, sizeof(uint), ComputeBufferType.Default);
@@ -153,9 +153,9 @@ public class RadixSort
 
     private void ClearBuffer(ComputeBuffer buffer, uint count)
     {
-        // Use clearBuffer64 for particle buffers (32-byte structures)
+        // Use clearBuffer64 for particle buffers (28-byte structures)
         // and clearBuffer32 for uint buffers
-        if (buffer.stride == 32) // Particle buffer
+        if (buffer.stride == 28) // Particle buffer
         {
             int clearBuffer64Kernel = sortShader.FindKernel("clearBuffer64");
             sortShader.SetBuffer(clearBuffer64Kernel, "outputParticles", buffer);
