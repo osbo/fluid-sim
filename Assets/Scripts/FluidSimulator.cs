@@ -219,6 +219,8 @@ public partial class FluidSimulator : MonoBehaviour
     public Material debugDisplayMaterial; // Assign "Custom/DebugTextureDisplay" in Inspector
 
     public Color fluidColor = new Color(0.2f, 0.6f, 1.0f); // Input for extinction
+    public bool useSkybox = true; // Toggle between cubemap and gradient sky
+    public Cubemap skyboxTexture; // Skybox cubemap for environment sampling
     public Color skyHorizonColor = new Color(0.0f, 0.0f, 0.0f); // Dark color at horizon (looking down)
     public Color skyTopColor = new Color(1.0f, 1.0f, 1.0f); // Light color at top (looking up)
     [Range(-20.0f, 20.0f)] public float sunIntensity = -2.3f; // Exponent: actual intensity = exp(value)
