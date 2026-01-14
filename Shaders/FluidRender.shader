@@ -51,7 +51,7 @@ Shader "Custom/FluidRender"
             float depthDisplayScale;     // Exponent for Depth Scale
             float depthMinValue;         // Exponent for Depth Min
             float thicknessDisplayScale; // Exponent for Thickness Scale
-            float depthOfFieldStrength; // Strength of depth-based darkening (0-1)
+            float depthOfFieldStrength; // Strength of fog (0-1)
             
             // Environment / Tile settings
             float4 tileCol1;
@@ -105,8 +105,8 @@ Shader "Custom/FluidRender"
                 HitInfo floorHit = RayBox(pos, dir, floorPos, floorSize);
                 if (floorHit.didHit) {
                     float2 tile = floor(floorHit.hitPoint.xz * 0.5);
-                    // bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
-                    bool isDark = true;
+                    bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
+                    // bool isDark = true;
                     return isDark ? tileCol2.rgb : tileCol1.rgb;
                 }
                 float sun = pow(max(0, dot(dir, dirToSun)), sunSharpness) * sunIntensity;
@@ -143,14 +143,14 @@ Shader "Custom/FluidRender"
                 return r;
             }
 
-            float ApplyDepthOfField(float depth) {
+            // Calculate a 0-1 factor representing distance (0 = near, 1 = far)
+            float GetDistanceFactor(float depth) {
                 float dMin = exp(depthMinValue);
                 float dScale = exp(depthDisplayScale);
                 float adjustedDepth = depth - dMin;
-                float displayVal = adjustedDepth * dScale;
-                displayVal = saturate(displayVal); // Clamp to 0-1
-                // Lerp between darkened (displayVal) and original (1.0) based on strength
-                return lerp(1.0, displayVal, depthOfFieldStrength);
+                // Calculates normalized distance within the simulation bounds
+                float factor = adjustedDepth * dScale;
+                return saturate(factor); 
             }
 
             float4 frag(v2f i) : SV_Target {
@@ -163,65 +163,49 @@ Shader "Custom/FluidRender"
                 float3 cameraPos = _WorldSpaceCameraPos;
                 float3 envCol = SampleEnvironment(cameraPos, viewDir);
                 
-                // 3. Early Exit (No Fluid) - return environment with depth of field
-                // Use threshold check since blurred depth might not be exactly 10000.0
+                // --- FIX 1: Early Exit without Dimming ---
+                // If there is no fluid (depth is far), return the clean environment.
+                // Do NOT apply darkening here.
                 if (rawDepth >= 9999.0) {
-                    // For environment, use a default far depth or skip darkening
-                    // Option: darken environment based on a reasonable default depth
-                    float envDepth = 50.0; // Default depth for environment (adjust as needed)
-                    float darkenFactor = ApplyDepthOfField(envDepth);
-                    return float4(envCol * darkenFactor, 1);
+                    return float4(envCol, 1);
                 }
                 
-                // 4. Sample normal only when we have fluid
-                float3 normal = tex2D(_NormalTex, i.uv).xyz * 2.0 - 1.0; // Unpack Normal (0..1 -> -1..1)
+                // 3. Fluid Lighting
+                float3 normal = tex2D(_NormalTex, i.uv).xyz * 2.0 - 1.0;
 
-                // --- APPLY SCALING (Using your tuned params) ---
-                // Convert stored exponents to actual multipliers
                 float tScale = exp(thicknessDisplayScale);
-
-                // Apply logic: (Val - Min) * Scale
-                // Note: For physics, we usually want real world units. 
-                // If your 'tuned' look is 0-1, we might need to be careful here.
-                // Assuming your debug view showed "Correct Physics" when mapped to 0-1:
-                
-                // Thickness needs to be positive and non-zero for absorption
                 float thickness = max(0, rawThickness * tScale);
-                // float displayVal = thickness;
-                
-                // Depth is distance from camera.
                 float depthSmooth = rawDepth;
-                // float depthSmooth = (rawDepth - dMin) * dScale;
-                // float displayVal = depthSmooth;
-
-                // 4. View Ray (viewDir already computed above)
                 float3 hitPos = cameraPos + viewDir * depthSmooth;
 
-                // 5. Lighting & Shading
                 LightResponse lr = CalculateReflectionAndRefraction(viewDir, normal, 1.0, 1.33);
                 
-                // Refraction (Beer's Law) - sample environment behind fluid
+                // Refraction
                 float3 refractPos = hitPos + lr.refractDir * thickness * refractionMultiplier;
                 float3 refractCol = SampleEnvironment(refractPos, lr.refractDir); 
-                
                 float3 transmission = exp(-thickness * extinctionCoefficients);
                 refractCol *= transmission;
+                
+                // Reflection (using refraction color as base per your original code)
+                float3 reflectCol = refractCol; 
 
-                // // Reflection - sample environment in reflection direction
-                // float3 reflectCol = SampleEnvironment(hitPos, lr.reflectDir);
-                // float specular = pow(max(0, dot(lr.reflectDir, dirToSun)), sunSharpness) * sunIntensity;
-                // reflectCol += specular;
-                float3 reflectCol = refractCol;
-
-                // 6. Composite fluid on top of environment
+                // Composite fluid
                 float3 fluidCol = lerp(refractCol, reflectCol, lr.reflectWeight);
-                float3 finalCol = fluidCol; // Fluid already samples environment, so this is correct
+                
+                // --- FIX 2: Atmospheric Fog (Aerial Perspective) ---
+                // Instead of darkening the color (multiplying by < 1), we blend it towards the sky color.
+                // This keeps near fluid bright/reflective, and pushes far fluid into the "atmosphere".
+                
+                float distFactor = GetDistanceFactor(depthSmooth);
+                
+                // Scale the effect by user strength parameter
+                float fogFactor = distFactor * depthOfFieldStrength;
+                
+                // Lerp from Fluid Color -> Sky Top Color
+                // Near (fogFactor 0) = Fluid Color
+                // Far (fogFactor 1) = Sky Top Color
+                float3 finalCol = lerp(fluidCol, skyTopColor, fogFactor);
 
-                // 7. Apply depth of field darkening (similar to ParticlesPoints.shader)
-                float darkenFactor = ApplyDepthOfField(depthSmooth);
-                finalCol *= darkenFactor;
-
-                // return float4(displayVal, displayVal, displayVal, 1);
                 return float4(finalCol, 1);
             }
             ENDCG

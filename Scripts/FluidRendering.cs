@@ -856,10 +856,10 @@ public partial class FluidSimulator : MonoBehaviour
         compositeMaterial.SetFloat("depthOfFieldStrength", depthOfFieldStrength);
         
         // Environment (Simple checkerboard settings)
-        compositeMaterial.SetVector("floorPos", new Vector3(0, -5, 0)); // Adjust as needed
-        compositeMaterial.SetVector("floorSize", new Vector3(75, 0.1f, 75));
+        compositeMaterial.SetVector("floorPos", new Vector3(0, -2.5f, 0)); // Adjust as needed
+        compositeMaterial.SetVector("floorSize", new Vector3(45.0f, 0.1f, 45.0f));
         compositeMaterial.SetColor("tileCol1", new Color(0.8f, 0.8f, 0.8f));
-        compositeMaterial.SetColor("tileCol2", new Color(0.4f, 0.4f, 0.4f));
+        compositeMaterial.SetColor("tileCol2", new Color(0.6f, 0.6f, 0.6f));
 
         // 3. Blit to Screen
         Graphics.Blit(null, (RenderTexture)null, compositeMaterial);
