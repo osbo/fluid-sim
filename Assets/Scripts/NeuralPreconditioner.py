@@ -529,6 +529,18 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = SAILoss(num_probe_vectors=args.num_probe_vectors)
     
+    # Initialize Mixed Precision Training (AMP)
+    # GradScaler is only needed for CUDA to handle potential underflows
+    use_amp = device.type in ['cuda', 'mps']
+    scaler = None
+    if device.type == 'cuda':
+        scaler = torch.cuda.amp.GradScaler()
+        print("AMP enabled with GradScaler (CUDA)")
+    elif device.type == 'mps':
+        print("AMP enabled (MPS - no GradScaler needed)")
+    else:
+        print("AMP disabled (CPU)")
+    
     # Compile the model and the loss function for kernel fusion
     # This works best on Linux/Windows NVIDIA GPUs. On Mac MPS, support is experimental.
     try:
@@ -578,16 +590,28 @@ def train(args):
             else:
                 fwd_start = time.time()
             
-            # 1. Forward Pass (Model Inference)
-            G_coeffs = model(x, layers)
+            # 1. Forward Pass with AMP
+            if use_amp:
+                # Use new torch.amp.autocast() API with device type
+                device_type = 'cuda' if device.type == 'cuda' else 'mps'
+                with torch.amp.autocast(device_type=device_type):
+                    G_coeffs = model(x, layers)
+            else:
+                G_coeffs = model(x, layers)
             
             if use_cuda_events:
                 fwd_end_event.record()
             else:
                 fwd_end = time.time()
             
-            # 2. Loss Calculation (Physics / Sparse Matrix Ops)
-            loss = criterion(G_coeffs, A_diag, A_off, nbrs, mask)
+            # 2. Loss Calculation with AMP
+            if use_amp:
+                # Use new torch.amp.autocast() API with device type
+                device_type = 'cuda' if device.type == 'cuda' else 'mps'
+                with torch.amp.autocast(device_type=device_type):
+                    loss = criterion(G_coeffs, A_diag, A_off, nbrs, mask)
+            else:
+                loss = criterion(G_coeffs, A_diag, A_off, nbrs, mask)
             
             if use_cuda_events:
                 loss_end_event.record()
@@ -595,9 +619,17 @@ def train(args):
                 loss_end = time.time()
             # --------------------
             
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            # 3. Backward Pass with AMP Scaler (CUDA only)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             
             total_loss += loss.item()
             
@@ -635,7 +667,7 @@ if __name__ == "__main__":
     # Script is in Assets/Scripts/, so parent.parent = Assets/
     default_data_path = Path(__file__).parent.parent / "StreamingAssets" / "TestData"
     parser.add_argument('--data_folder', type=str, default=str(default_data_path))
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=15)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--d_model', type=int, default=32)
