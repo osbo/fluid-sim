@@ -71,13 +71,13 @@ public partial class FluidSimulator : MonoBehaviour
         renderSw.Restart();
         
         // --- 1. Render Thickness (Raw) ---
-        // Needed for: Thickness, Composite
-        if (renderingMode == RenderingMode.Thickness || renderingMode == RenderingMode.Composite)
+        // Needed for: Thickness, BlurredThickness, Composite
+        if (renderingMode == RenderingMode.Thickness || renderingMode == RenderingMode.BlurredThickness || renderingMode == RenderingMode.Composite)
         {
             RenderThickness(cam);
             
-            // If Composite, we also need to BLUR the thickness
-            if (renderingMode == RenderingMode.Composite)
+            // If Composite or BlurredThickness, we also need to BLUR the thickness
+            if (renderingMode == RenderingMode.Composite || renderingMode == RenderingMode.BlurredThickness)
             {
                  // Create smooth thickness texture if needed
                  if (fluidThicknessTexture == null || fluidThicknessTexture.width != cam.pixelWidth)
@@ -89,16 +89,14 @@ public partial class FluidSimulator : MonoBehaviour
                      fluidThicknessTexture.Create();
                  }
                  
-                 // Reuse your existing blur function on the thickness texture
-                 // Note: We use the thickness texture as both source and depth for the blur weights 
-                 // (Self-guided blur preserves thickness edges)
-                 RunBilateralBlur(cam, thicknessTexture, fluidThicknessTexture);
+                 // Use thickness blur (doesn't blur with 0 thickness)
+                 RunThicknessBlur(cam, thicknessTexture, fluidThicknessTexture);
             }
         }
         
         // --- 2. Render Depth (Raw) ---
         // Needed for: Depth, BlurredDepth, Normal, Composite
-        if (renderingMode != RenderingMode.Thickness) 
+        if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness) 
         {
             DrawParticles(cam, ctx); // Renders to rawDepthTexture or screen
         }
@@ -131,6 +129,13 @@ public partial class FluidSimulator : MonoBehaviour
                 ? thicknessScaleNodes 
                 : thicknessScaleParticles;
             DebugBlit(thicknessTexture, thicknessScale, 0.0f, false);
+        }
+        else if (renderingMode == RenderingMode.BlurredThickness)
+        {
+            float thicknessScale = thicknessSource == ThicknessSource.Nodes 
+                ? thicknessScaleNodes 
+                : thicknessScaleParticles;
+            DebugBlit(fluidThicknessTexture, thicknessScale, 0.0f, false);
         }
         else if (renderingMode == RenderingMode.Depth)
         {
@@ -703,11 +708,11 @@ public partial class FluidSimulator : MonoBehaviour
         Graphics.ExecuteCommandBuffer(depthCmd);
 
         // B. Horizontal Blur (rawDepth -> tempBlur)
-        int kernelHandleH = blurCompute.FindKernel("HorizontalBlur");
+        int kernelHandleH = blurCompute.FindKernel("DepthBlurHorizontal");
         blurCompute.SetTexture(kernelHandleH, "_SourceTexture", rawDepth);
         blurCompute.SetTexture(kernelHandleH, "_DestinationTexture", tempBlur);
-        blurCompute.SetFloat("_BlurRadius", blurRadius);
-        blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
+        blurCompute.SetFloat("_BlurRadius", depthBlurRadius);
+        blurCompute.SetFloat("_BlurDepthFalloff", depthBlurThreshold);
         blurCompute.SetVector("_Resolution", new Vector2(width, height));
         
         int groupsX = Mathf.CeilToInt(width / 8.0f);
@@ -715,11 +720,11 @@ public partial class FluidSimulator : MonoBehaviour
         blurCompute.Dispatch(kernelHandleH, groupsX, groupsY, 1);
 
         // C. Vertical Blur (tempBlur -> fluidDepthTexture)
-        int kernelHandleV = blurCompute.FindKernel("VerticalBlur");
+        int kernelHandleV = blurCompute.FindKernel("DepthBlurVertical");
         blurCompute.SetTexture(kernelHandleV, "_SourceTexture", tempBlur);
         blurCompute.SetTexture(kernelHandleV, "_DestinationTexture", fluidDepthTexture);
-        blurCompute.SetFloat("_BlurRadius", blurRadius);
-        blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
+        blurCompute.SetFloat("_BlurRadius", depthBlurRadius);
+        blurCompute.SetFloat("_BlurDepthFalloff", depthBlurThreshold);
         blurCompute.SetVector("_Resolution", new Vector2(width, height));
         
         blurCompute.Dispatch(kernelHandleV, groupsX, groupsY, 1);
@@ -755,20 +760,50 @@ public partial class FluidSimulator : MonoBehaviour
         RenderTexture tempBlur = RenderTexture.GetTemporary(blurDesc);
 
         // H Blur
-        int kH = blurCompute.FindKernel("HorizontalBlur");
+        int kH = blurCompute.FindKernel("DepthBlurHorizontal");
         blurCompute.SetTexture(kH, "_SourceTexture", source);
         blurCompute.SetTexture(kH, "_DestinationTexture", tempBlur);
-        blurCompute.SetFloat("_BlurRadius", blurRadius);
-        blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
+        blurCompute.SetFloat("_BlurRadius", depthBlurRadius);
+        blurCompute.SetFloat("_BlurDepthFalloff", depthBlurThreshold);
         blurCompute.SetVector("_Resolution", new Vector2(width, height));
         blurCompute.Dispatch(kH, Mathf.CeilToInt(width/8.0f), Mathf.CeilToInt(height/8.0f), 1);
         
         // V Blur
-        int kV = blurCompute.FindKernel("VerticalBlur");
+        int kV = blurCompute.FindKernel("DepthBlurVertical");
         blurCompute.SetTexture(kV, "_SourceTexture", tempBlur);
         blurCompute.SetTexture(kV, "_DestinationTexture", dest);
-        blurCompute.SetFloat("_BlurRadius", blurRadius);
-        blurCompute.SetFloat("_BlurDepthFalloff", blurDepthFalloff);
+        blurCompute.SetFloat("_BlurRadius", depthBlurRadius);
+        blurCompute.SetFloat("_BlurDepthFalloff", depthBlurThreshold);
+        blurCompute.SetVector("_Resolution", new Vector2(width, height));
+        blurCompute.Dispatch(kV, Mathf.CeilToInt(width/8.0f), Mathf.CeilToInt(height/8.0f), 1);
+        
+        RenderTexture.ReleaseTemporary(tempBlur);
+    }
+    private void RunThicknessBlur(Camera cam, RenderTexture source, RenderTexture dest)
+    {
+        if (blurCompute == null || source == null || dest == null) return;
+        
+        int width = cam.pixelWidth;
+        int height = cam.pixelHeight;
+        
+        // Temp buffer
+        RenderTextureDescriptor blurDesc = new RenderTextureDescriptor(width, height, RenderTextureFormat.RFloat, 0);
+        blurDesc.enableRandomWrite = true; 
+        RenderTexture tempBlur = RenderTexture.GetTemporary(blurDesc);
+
+        // H Blur
+        int kH = blurCompute.FindKernel("ThicknessBlurHorizontal");
+        blurCompute.SetTexture(kH, "_SourceTexture", source);
+        blurCompute.SetTexture(kH, "_DestinationTexture", tempBlur);
+        blurCompute.SetFloat("_BlurRadius", thicknessBlurRadius);
+        blurCompute.SetVector("_Resolution", new Vector2(width, height));
+        blurCompute.Dispatch(kH, Mathf.CeilToInt(width/8.0f), Mathf.CeilToInt(height/8.0f), 1);
+        
+        // V Blur
+        int kV = blurCompute.FindKernel("ThicknessBlurVertical");
+        blurCompute.SetTexture(kV, "_SourceTexture", tempBlur);
+        blurCompute.SetTexture(kV, "_DestinationTexture", dest);
+        blurCompute.SetFloat("_BlurRadius", thicknessBlurRadius);
         blurCompute.SetVector("_Resolution", new Vector2(width, height));
         blurCompute.Dispatch(kV, Mathf.CeilToInt(width/8.0f), Mathf.CeilToInt(height/8.0f), 1);
         
@@ -818,6 +853,7 @@ public partial class FluidSimulator : MonoBehaviour
             ? thicknessScaleNodes 
             : thicknessScaleParticles;
         compositeMaterial.SetFloat("thicknessDisplayScale", thicknessScale);
+        compositeMaterial.SetFloat("depthOfFieldStrength", depthOfFieldStrength);
         
         // Environment (Simple checkerboard settings)
         compositeMaterial.SetVector("floorPos", new Vector3(0, -5, 0)); // Adjust as needed
