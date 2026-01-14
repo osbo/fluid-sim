@@ -14,6 +14,7 @@ from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 import argparse
 import struct
+import time
 
 # --- 1. Physics Helper: Stencil Computation ---
 
@@ -178,13 +179,15 @@ class SPAIGenerator(nn.Module):
 # --- 3. Unsupervised SAI Loss (Stochastic Trace Estimation) ---
 
 class SAILoss(nn.Module):
-    def __init__(self, epsilon=1e-4):
+    def __init__(self, epsilon=1e-4, num_probe_vectors=1):
         super().__init__()
         self.epsilon = epsilon
+        self.num_probe_vectors = num_probe_vectors
 
     def forward(self, G_coeffs, A_diag, A_off, neighbors, valid_mask):
         """
         Computes Loss = || (1/||A||) * A * (G G^T + eps I) - I ||_F^2
+        Uses multiple random probe vectors and averages the losses.
         """
         B, N, _ = G_coeffs.shape
         device = G_coeffs.device
@@ -194,33 +197,38 @@ class SAILoss(nn.Module):
         active_count = valid_mask.sum()
         norm_A = (torch.abs(A_diag).sum() + torch.abs(A_off).sum()) / (active_count * 25 + 1e-6)
         
-        # 2. Sample Random Vector w ~ N(0, 1)
-        w = torch.randn(B, N, 1, device=device) * valid_mask
+        # 2. Sample multiple Random Vectors w ~ N(0, 1) and average losses
+        total_loss = 0.0
         
-        # 3. Compute v = (G G^T + eps I) * w
-        #    v = G * (G^T * w) + eps * w
+        for _ in range(self.num_probe_vectors):
+            w = torch.randn(B, N, 1, device=device) * valid_mask
+            
+            # 3. Compute v = (G G^T + eps I) * w
+            #    v = G * (G^T * w) + eps * w
+            
+            # Step A: u = G^T * w (Scatter)
+            u = self.apply_GT(w, G_coeffs, neighbors, N)
+            
+            # Step B: v_part = G * u (Gather)
+            v_part = self.apply_G(u, G_coeffs, neighbors, N)
+            
+            # Step C: Add epsilon regularization
+            v = v_part + self.epsilon * w
+            
+            # 4. Compute z = (1/||A||) * A * v
+            #    y = A * v
+            #    z = y / norm_A
+            y = self.apply_A(v, A_diag, A_off, neighbors, N)
+            z = y / (norm_A + 1e-8)
+            
+            # 5. Loss = || z - w ||^2 
+            # (Since target is Identity, A * M^-1 * w should equal w)
+            diff = (z - w) * valid_mask
+            loss = (diff ** 2).sum() / (valid_mask.sum() + 1e-6)
+            total_loss += loss
         
-        # Step A: u = G^T * w (Scatter)
-        u = self.apply_GT(w, G_coeffs, neighbors, N)
-        
-        # Step B: v_part = G * u (Gather)
-        v_part = self.apply_G(u, G_coeffs, neighbors, N)
-        
-        # Step C: Add epsilon regularization
-        v = v_part + self.epsilon * w
-        
-        # 4. Compute z = (1/||A||) * A * v
-        #    y = A * v
-        #    z = y / norm_A
-        y = self.apply_A(v, A_diag, A_off, neighbors, N)
-        z = y / (norm_A + 1e-8)
-        
-        # 5. Loss = || z - w ||^2 
-        # (Since target is Identity, A * M^-1 * w should equal w)
-        diff = (z - w) * valid_mask
-        loss = (diff ** 2).sum() / (valid_mask.sum() + 1e-6)
-        
-        return loss
+        # Average over all probe vectors
+        return total_loss / self.num_probe_vectors
 
     # --- Sparse Matrix Ops (Differentiable) ---
 
@@ -519,7 +527,16 @@ def train(args):
     # Init Model
     model = SPAIGenerator(input_dim=58, d_model=args.d_model, num_layers=args.layers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    criterion = SAILoss()
+    criterion = SAILoss(num_probe_vectors=args.num_probe_vectors)
+    
+    # Compile the model and the loss function for kernel fusion
+    # This works best on Linux/Windows NVIDIA GPUs. On Mac MPS, support is experimental.
+    try:
+        model = torch.compile(model)
+        criterion = torch.compile(criterion)
+        print("Model and loss function compiled with torch.compile")
+    except Exception as e:
+        print(f"Warning: torch.compile failed ({e}), continuing without compilation")
     
     # Paths
     script_dir = Path(__file__).parent
@@ -527,9 +544,23 @@ def train(args):
     
     print("Starting Training...")
     
+    # Create CUDA events for timing (only on CUDA)
+    use_cuda_events = device.type == 'cuda'
+    if use_cuda_events:
+        start_event = torch.cuda.Event(enable_timing=True)
+        fwd_end_event = torch.cuda.Event(enable_timing=True)
+        loss_end_event = torch.cuda.Event(enable_timing=True)
+    
+    epoch_times = []
+    
     for epoch in range(args.epochs):
+        epoch_start = time.time()
         model.train()
         total_loss = 0
+        
+        # Accumulators for average times
+        total_fwd_time = 0.0
+        total_loss_time = 0.0
         
         for batch in loader:
             x = batch['x'].to(device)
@@ -541,11 +572,28 @@ def train(args):
             
             optimizer.zero_grad()
             
-            # 1. Generate Preconditioner Matrix G
+            # --- Start Timing ---
+            if use_cuda_events:
+                start_event.record()
+            else:
+                fwd_start = time.time()
+            
+            # 1. Forward Pass (Model Inference)
             G_coeffs = model(x, layers)
             
-            # 2. Compute Unsupervised Physics Loss
+            if use_cuda_events:
+                fwd_end_event.record()
+            else:
+                fwd_end = time.time()
+            
+            # 2. Loss Calculation (Physics / Sparse Matrix Ops)
             loss = criterion(G_coeffs, A_diag, A_off, nbrs, mask)
+            
+            if use_cuda_events:
+                loss_end_event.record()
+            else:
+                loss_end = time.time()
+            # --------------------
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -553,8 +601,30 @@ def train(args):
             
             total_loss += loss.item()
             
+            # Synchronize to get accurate times
+            if use_cuda_events:
+                torch.cuda.synchronize()
+                # Calculate elapsed times in milliseconds
+                fwd_ms = start_event.elapsed_time(fwd_end_event)
+                loss_ms = fwd_end_event.elapsed_time(loss_end_event)
+            else:
+                # Use time.time() for MPS/CPU (convert to milliseconds)
+                fwd_ms = (fwd_end - fwd_start) * 1000.0
+                loss_ms = (loss_end - fwd_end) * 1000.0
+            
+            total_fwd_time += fwd_ms
+            total_loss_time += loss_ms
+        
+        epoch_time = time.time() - epoch_start
+        epoch_times.append(epoch_time)
+        avg_time = sum(epoch_times) / len(epoch_times)
+        
+        # Calculate average times per batch
+        avg_fwd = total_fwd_time / len(loader)
+        avg_loss_time = total_loss_time / len(loader)
+        
         avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.6f}")
+        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.6f} | Time: {epoch_time:.2f}s (forward: {avg_fwd:.1f}ms, loss: {avg_loss_time:.1f}ms) | Avg Time: {avg_time:.2f}s")
         
         if (epoch + 1) % 5 == 0:
             export_weights(model, weights_path)
@@ -570,6 +640,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--d_model', type=int, default=32)
     parser.add_argument('--layers', type=int, default=4)
+    parser.add_argument('--num_probe_vectors', type=int, default=1)
     args = parser.parse_args()
     
     train(args)
