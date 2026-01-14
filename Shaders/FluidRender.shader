@@ -65,6 +65,11 @@ Shader "Custom/FluidRender"
             int _UseSkybox; // 1 = use cubemap, 0 = use gradient colors
             float3 skyHorizonColor; // Dark color at horizon (used when _UseSkybox = 0)
             float3 skyTopColor; // Light color at top (used when _UseSkybox = 0)
+            
+            // Reflection tuning parameters
+            float reflectionStrength; // Multiplier for reflection intensity (0.0-1.0)
+            float reflectionTint; // Amount to mix refraction color into reflection (0.0-1.0)
+            float fresnelClamp; // Maximum fresnel weight to keep water visible (0.0-1.0)
 
             // ... (Keep Helper Functions: HitInfo, RayBox, SampleEnvironment, Refract, etc.) ...
             
@@ -186,7 +191,16 @@ Shader "Custom/FluidRender"
                 }
                 
                 // 3. Fluid Lighting
+                // 1. Unpack Normal
                 float3 normal = tex2D(_NormalTex, i.uv).xyz * 2.0 - 1.0;
+
+                // --- FIX: VISUAL REFRACTION SCALE ---
+                // Scale the "waviness" of the normal. 
+                // 0.0 = Perfectly flat mirror. 1.0 = Normal. 2.0 = Super distorted.
+                // We use the 'refractionMultiplier' parameter for this purpose now.
+                normal.xy *= refractionMultiplier; 
+                normal = normalize(normal);
+                // ------------------------------------
 
                 float tScale = exp(thicknessDisplayScale);
                 float thickness = max(0, rawThickness * tScale);
@@ -196,16 +210,31 @@ Shader "Custom/FluidRender"
                 LightResponse lr = CalculateReflectionAndRefraction(viewDir, normal, 1.0, 1.33);
                 
                 // Refraction
-                float3 refractPos = hitPos + lr.refractDir * thickness * refractionMultiplier;
+                float3 refractPos = hitPos + lr.refractDir * thickness;
                 float3 refractCol = SampleEnvironment(refractPos, lr.refractDir); 
                 float3 transmission = exp(-thickness * extinctionCoefficients);
                 refractCol *= transmission;
                 
-                // Reflection (using refraction color as base per your original code)
-                float3 reflectCol = refractCol; 
+                // 1. Sample the Environment (The "Orange" Source)
+                float3 rawReflection = SampleEnvironment(hitPos, lr.reflectDir);
 
-                // Composite fluid
-                float3 fluidCol = lerp(refractCol, reflectCol, lr.reflectWeight);
+                // 2. TWEAK: Reduce Reflection Intensity
+                // Multiply by reflectionStrength to dampen the reflection. 
+                // 1.0 = Perfect Mirror (Too strong), 0.0 = No Reflection.
+                float3 reflectCol = rawReflection * reflectionStrength;
+
+                // 3. OPTIONAL: Tint the Reflection
+                // Mix a little of the water's blue refraction color into the reflection
+                // so it doesn't look like a metallic surface sitting on top.
+                reflectCol = lerp(reflectCol, refractCol, reflectionTint); 
+
+                // 4. TWEAK: Clamp the Fresnel Weight
+                // Physically, water is 100% reflective at edges (weight 1.0).
+                // Visually, this can look like plastic. Cap it at fresnelClamp to keep it looking "wet".
+                float fresnelTerm = min(lr.reflectWeight, fresnelClamp);
+
+                // Final Composite
+                float3 fluidCol = lerp(refractCol, reflectCol, fresnelTerm);
                 
                 // --- FIX 2: Atmospheric Fog (Aerial Perspective) ---
                 // Instead of darkening the color (multiplying by < 1), we blend it towards the sky color.
