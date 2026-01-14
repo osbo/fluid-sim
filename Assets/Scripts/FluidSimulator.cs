@@ -123,6 +123,7 @@ public partial class FluidSimulator : MonoBehaviour
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
     public float gravity = 100.0f;
+    public bool useRealTime = false; // When true, uses Time.deltaTime instead of fixed frameRate
     public float frameRate = 30.0f;
     public int minLayer = 4;
     public int maxLayer = 10;
@@ -135,6 +136,9 @@ public partial class FluidSimulator : MonoBehaviour
     private int cgSolveFrameCount = 0;
     private float averageCgIterations = 0.0f;
     private int lastCgIterations = 0;
+    
+    // Pause/resume functionality
+    private bool isPaused = false;
     
     private System.Diagnostics.Stopwatch totalOctreeSw;
     private System.Diagnostics.Stopwatch renderSw = new System.Diagnostics.Stopwatch();
@@ -240,8 +244,11 @@ public partial class FluidSimulator : MonoBehaviour
     [Range(0.0001f, 1.0f)] public float depthRadius = 0.279f; // Radius for depth quads (world space)
     [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.776f; // Radius for particle thickness quads (world space)
     [Range(0, 20)] public float absorptionStrength = 5.8f;
-    [Range(0.0f, 1.0f)] public float depthOfFieldStrength = 0.034f;
-    [Range(0, 2)] public float refractionScale = 1.0f;
+    [Range(0.0f, 1.0f)] public float depthOfFieldStrength = 0.076f;
+    [Range(0.0f, 1.0f)] public float reflectionStrength = 0.633f; // Multiplier for reflection intensity
+    [Range(0.0f, 1.0f)] public float reflectionTint = 0.418f; // Amount to mix refraction color into reflection
+    [Range(0.0f, 1.0f)] public float fresnelClamp = 0.8f; // Maximum fresnel weight to keep water visible
+    [Range(0, 2)] public float refractionScale = 0.57f; // Scales normal map intensity (0.0 = flat mirror, 1.0 = normal, 2.0 = super distorted)
     
     // Helper method for resizing buffers
     private void ResizeBuffer(ref ComputeBuffer buffer, int count, int stride)
@@ -334,6 +341,19 @@ public partial class FluidSimulator : MonoBehaviour
 
     void Update()
     {
+        // Check for pause/resume toggle (space bar)
+        if (Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame)
+        {
+            isPaused = !isPaused;
+            Debug.Log(isPaused ? "Simulation PAUSED - Camera and rendering still active" : "Simulation RESUMED");
+        }
+        
+        // Skip simulation steps if paused (rendering will continue via OnEndCameraRendering)
+        if (isPaused)
+        {
+            return;
+        }
+        
         layer = minLayer;
         
         var frameSw = System.Diagnostics.Stopwatch.StartNew();
@@ -494,7 +514,8 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetBuffer(updateParticlesKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
         particlesShader.SetInt("numNodes", numNodes);
         particlesShader.SetInt("numParticles", numParticles);
-        particlesShader.SetFloat("deltaTime", (1 / frameRate));
+        float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
+        particlesShader.SetFloat("deltaTime", deltaTime);
         particlesShader.SetFloat("gravity", gravity);
         particlesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);

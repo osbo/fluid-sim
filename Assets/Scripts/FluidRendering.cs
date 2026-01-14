@@ -848,6 +848,11 @@ public partial class FluidSimulator : MonoBehaviour
         // Set sky colors (used when useSkybox is false)
         compositeMaterial.SetVector("skyHorizonColor", skyHorizonColor);
         compositeMaterial.SetVector("skyTopColor", skyTopColor);
+        
+        // Set reflection tuning parameters
+        compositeMaterial.SetFloat("reflectionStrength", reflectionStrength);
+        compositeMaterial.SetFloat("reflectionTint", reflectionTint);
+        compositeMaterial.SetFloat("fresnelClamp", fresnelClamp);
 
         // Calculate depth parameters for composite rendering
         Vector3 cameraPos = cam.transform.position;
