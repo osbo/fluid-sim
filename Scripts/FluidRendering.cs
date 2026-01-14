@@ -819,6 +819,13 @@ public partial class FluidSimulator : MonoBehaviour
         compositeMaterial.SetTexture("_DepthTex", fluidDepthTexture); // Smooth
         compositeMaterial.SetTexture("_DepthRawTex", rawDepthTexture); // Raw
         compositeMaterial.SetTexture("_ThicknessTex", fluidThicknessTexture); // Smooth
+        
+        // --- NEW: Bind Skybox (only if useSkybox is enabled) ---
+        compositeMaterial.SetInt("_UseSkybox", useSkybox ? 1 : 0);
+        if (useSkybox && skyboxTexture != null)
+        {
+            compositeMaterial.SetTexture("_SkyboxTex", skyboxTexture);
+        }
 
         // 2. Bind Parameters
         Vector3 sunDir = mainLight != null ? -mainLight.transform.forward : Vector3.up;
@@ -837,6 +844,8 @@ public partial class FluidSimulator : MonoBehaviour
         compositeMaterial.SetFloat("refractionMultiplier", refractionScale);
         compositeMaterial.SetFloat("sunIntensity", sunInt);
         compositeMaterial.SetFloat("sunSharpness", sunSharpness);
+        
+        // Set sky colors (used when useSkybox is false)
         compositeMaterial.SetVector("skyHorizonColor", skyHorizonColor);
         compositeMaterial.SetVector("skyTopColor", skyTopColor);
 

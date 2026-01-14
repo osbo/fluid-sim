@@ -3,6 +3,7 @@ Shader "Custom/FluidRender"
     Properties
     {
         _MainTex ("Background Texture", 2D) = "white" {}
+        _SkyboxTex ("Skybox Cubemap", Cube) = "" {}
     }
     SubShader
     {
@@ -39,7 +40,8 @@ Shader "Custom/FluidRender"
             sampler2D _NormalTex;    
             sampler2D _DepthTex;     
             sampler2D _ThicknessTex; 
-            sampler2D _DepthRawTex;  
+            sampler2D _DepthRawTex;
+            samplerCUBE _SkyboxTex;  
             
             // --- PARAMETERS ---
             float3 extinctionCoefficients;
@@ -60,8 +62,9 @@ Shader "Custom/FluidRender"
             float3 floorSize;
             float sunIntensity;
             float sunSharpness;
-            float3 skyHorizonColor; // Dark color at horizon (looking down)
-            float3 skyTopColor;    // Light color at top (looking up)
+            int _UseSkybox; // 1 = use cubemap, 0 = use gradient colors
+            float3 skyHorizonColor; // Dark color at horizon (used when _UseSkybox = 0)
+            float3 skyTopColor; // Light color at top (used when _UseSkybox = 0)
 
             // ... (Keep Helper Functions: HitInfo, RayBox, SampleEnvironment, Refract, etc.) ...
             
@@ -102,15 +105,28 @@ Shader "Custom/FluidRender"
             }
 
             float3 SampleEnvironment(float3 pos, float3 dir) {
+                // 1. Keep Floor Logic (if you still want the floor)
                 HitInfo floorHit = RayBox(pos, dir, floorPos, floorSize);
                 if (floorHit.didHit) {
                     float2 tile = floor(floorHit.hitPoint.xz * 0.5);
                     bool isDark = fmod(abs(tile.x + tile.y), 2.0) > 0.5;
-                    // bool isDark = true;
                     return isDark ? tileCol2.rgb : tileCol1.rgb;
                 }
+                
+                // 2. Sample Sky (either cubemap or gradient)
+                float3 skyColor;
+                if (_UseSkybox > 0) {
+                    // Sample the Skybox Cubemap
+                    skyColor = texCUBE(_SkyboxTex, dir).rgb;
+                } else {
+                    // Use gradient sky (blend between horizon and top based on direction)
+                    skyColor = lerp(skyHorizonColor, skyTopColor, dir.y * 0.5 + 0.5);
+                }
+                
+                // 3. Add Sun (Optional: Real HDRIs usually have a sun, but you can keep this for extra brightness)
                 float sun = pow(max(0, dot(dir, dirToSun)), sunSharpness) * sunIntensity;
-                return lerp(skyHorizonColor, skyTopColor, dir.y * 0.5 + 0.5) + sun;
+                
+                return skyColor + sun;
             }
 
             float CalculateReflectance(float3 inDir, float3 normal, float iorA, float iorB) {
@@ -201,10 +217,18 @@ Shader "Custom/FluidRender"
                 // Scale the effect by user strength parameter
                 float fogFactor = distFactor * depthOfFieldStrength;
                 
-                // Lerp from Fluid Color -> Sky Top Color
+                // Sample sky color for fog blending (use same method as SampleEnvironment)
+                float3 skyColor;
+                if (_UseSkybox > 0) {
+                    skyColor = texCUBE(_SkyboxTex, viewDir).rgb;
+                } else {
+                    skyColor = lerp(skyHorizonColor, skyTopColor, viewDir.y * 0.5 + 0.5);
+                }
+                
+                // Lerp from Fluid Color -> Sky Color
                 // Near (fogFactor 0) = Fluid Color
-                // Far (fogFactor 1) = Sky Top Color
-                float3 finalCol = lerp(fluidCol, skyTopColor, fogFactor);
+                // Far (fogFactor 1) = Sky Color
+                float3 finalCol = lerp(fluidCol, skyColor, fogFactor);
 
                 return float4(finalCol, 1);
             }
