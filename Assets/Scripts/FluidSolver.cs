@@ -157,7 +157,8 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "pBuffer", pBuffer);
             cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "ApBuffer", ApBuffer);
             cgSolverShader.SetBuffer(applyLaplacianAndDotKernel, "divergenceBuffer", divergenceBuffer); // For reduction output
-            cgSolverShader.SetFloat("deltaTime", (1 / frameRate));
+            float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
+            cgSolverShader.SetFloat("deltaTime", deltaTime);
             cgSolverShader.SetInt("numNodes", numNodes);
             int groups = Mathf.CeilToInt(numNodes / 256.0f);
             cgSolverShader.Dispatch(applyLaplacianAndDotKernel, groups, 1, 1);
@@ -287,7 +288,8 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer); // The result from the CG solve!
         
         nodesShader.SetInt("numNodes", numNodes);
-        nodesShader.SetFloat("deltaTime", (1 / frameRate)); // Use the same deltaTime as in advection
+        float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate); // Use the same deltaTime as in advection
+        nodesShader.SetFloat("deltaTime", deltaTime);
         nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         nodesShader.SetInt("minLayer", minLayer);
 
@@ -390,7 +392,8 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(applyExternalForcesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetFloat("gravity", gravity);
-        nodesShader.SetFloat("deltaTime", (1 / frameRate));
+        float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
+        nodesShader.SetFloat("deltaTime", deltaTime);
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(applyExternalForcesKernel, threadGroups, 1, 1);
     }
