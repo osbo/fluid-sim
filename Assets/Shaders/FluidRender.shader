@@ -117,13 +117,12 @@ Shader "Custom/FluidRender"
                 float3 skyColor;
                 if (_UseSkybox > 0) {
                     // Sample the Skybox Cubemap
-                    skyColor = texCUBE(_SkyboxTex, dir).rgb;
-                } else {
-                    // Use gradient sky (blend between horizon and top based on direction)
-                    skyColor = lerp(skyHorizonColor, skyTopColor, dir.y * 0.5 + 0.5);
+                    return texCUBE(_SkyboxTex, dir).rgb;
                 }
                 
-                // 3. Add Sun (Optional: Real HDRIs usually have a sun, but you can keep this for extra brightness)
+                skyColor = lerp(skyHorizonColor, skyTopColor, dir.y * 0.5 + 0.5);
+                
+                // 3. Add Sun
                 float sun = pow(max(0, dot(dir, dirToSun)), sunSharpness) * sunIntensity;
                 
                 return skyColor + sun;
