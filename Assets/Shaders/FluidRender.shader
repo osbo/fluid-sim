@@ -51,6 +51,7 @@ Shader "Custom/FluidRender"
             float depthDisplayScale;     // Exponent for Depth Scale
             float depthMinValue;         // Exponent for Depth Min
             float thicknessDisplayScale; // Exponent for Thickness Scale
+            float depthOfFieldStrength; // Strength of depth-based darkening (0-1)
             
             // Environment / Tile settings
             float4 tileCol1;
@@ -142,6 +143,16 @@ Shader "Custom/FluidRender"
                 return r;
             }
 
+            float ApplyDepthOfField(float depth) {
+                float dMin = exp(depthMinValue);
+                float dScale = exp(depthDisplayScale);
+                float adjustedDepth = depth - dMin;
+                float displayVal = adjustedDepth * dScale;
+                displayVal = saturate(displayVal); // Clamp to 0-1
+                // Lerp between darkened (displayVal) and original (1.0) based on strength
+                return lerp(1.0, displayVal, depthOfFieldStrength);
+            }
+
             float4 frag(v2f i) : SV_Target {
                 // 1. Sample Raw Values
                 float rawDepth = tex2D(_DepthTex, i.uv).r;
@@ -152,17 +163,21 @@ Shader "Custom/FluidRender"
                 float3 cameraPos = _WorldSpaceCameraPos;
                 float3 envCol = SampleEnvironment(cameraPos, viewDir);
                 
-                // 3. Early Exit (No Fluid) - return environment
+                // 3. Early Exit (No Fluid) - return environment with depth of field
                 // Use threshold check since blurred depth might not be exactly 10000.0
-                if (rawDepth >= 9999.0) return float4(envCol, 1);
+                if (rawDepth >= 9999.0) {
+                    // For environment, use a default far depth or skip darkening
+                    // Option: darken environment based on a reasonable default depth
+                    float envDepth = 50.0; // Default depth for environment (adjust as needed)
+                    float darkenFactor = ApplyDepthOfField(envDepth);
+                    return float4(envCol * darkenFactor, 1);
+                }
                 
                 // 4. Sample normal only when we have fluid
                 float3 normal = tex2D(_NormalTex, i.uv).xyz * 2.0 - 1.0; // Unpack Normal (0..1 -> -1..1)
 
                 // --- APPLY SCALING (Using your tuned params) ---
                 // Convert stored exponents to actual multipliers
-                float dMin = exp(depthMinValue);
-                float dScale = exp(depthDisplayScale);
                 float tScale = exp(thicknessDisplayScale);
 
                 // Apply logic: (Val - Min) * Scale
@@ -201,6 +216,10 @@ Shader "Custom/FluidRender"
                 // 6. Composite fluid on top of environment
                 float3 fluidCol = lerp(refractCol, reflectCol, lr.reflectWeight);
                 float3 finalCol = fluidCol; // Fluid already samples environment, so this is correct
+
+                // 7. Apply depth of field darkening (similar to ParticlesPoints.shader)
+                float darkenFactor = ApplyDepthOfField(depthSmooth);
+                finalCol *= darkenFactor;
 
                 // return float4(displayVal, displayVal, displayVal, 1);
                 return float4(finalCol, 1);

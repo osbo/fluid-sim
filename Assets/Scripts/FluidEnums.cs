@@ -6,6 +6,7 @@ public enum RenderingMode
     Depth,
     Thickness,
     BlurredDepth,
+    BlurredThickness,
     Normal,
     Composite
 }

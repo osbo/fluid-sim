@@ -1,5 +1,7 @@
-#pragma kernel HorizontalBlur
-#pragma kernel VerticalBlur
+#pragma kernel DepthBlurHorizontal
+#pragma kernel DepthBlurVertical
+#pragma kernel ThicknessBlurHorizontal
+#pragma kernel ThicknessBlurVertical
 
 // Inputs
 Texture2D<float4> _SourceTexture;
@@ -17,7 +19,7 @@ float Gaussian(float x, float sigma)
 }
 
 [numthreads(8, 8, 1)]
-void HorizontalBlur(uint3 id : SV_DispatchThreadID)
+void DepthBlurHorizontal(uint3 id : SV_DispatchThreadID)
 {
     uint width = (uint)_Resolution.x;
     uint height = (uint)_Resolution.y;
@@ -61,7 +63,7 @@ void HorizontalBlur(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(8, 8, 1)]
-void VerticalBlur(uint3 id : SV_DispatchThreadID)
+void DepthBlurVertical(uint3 id : SV_DispatchThreadID)
 {
     uint width = (uint)_Resolution.x;
     uint height = (uint)_Resolution.y;
@@ -96,4 +98,101 @@ void VerticalBlur(uint3 id : SV_DispatchThreadID)
     }
     
     _DestinationTexture[id.xy] = float4(result / totalWeight, 0, 0, 1);
+}
+
+[numthreads(8, 8, 1)]
+void ThicknessBlurHorizontal(uint3 id : SV_DispatchThreadID)
+{
+    uint width = (uint)_Resolution.x;
+    uint height = (uint)_Resolution.y;
+    if (id.x >= width || id.y >= height) return;
+
+    int radius = (int)_BlurRadius;
+    float4 centerVal = _SourceTexture[id.xy];
+    float centerThickness = centerVal.r;
+    
+    float totalWeight = 0.0;
+    float result = 0.0;
+    
+    // Sigma for spatial gaussian (usually radius / 2 is a good heuristic)
+    float sigma = max(1.0, _BlurRadius / 2.0);
+
+    for (int x = -radius; x <= radius; x++)
+    {
+        int sampleX = (int)id.x + x;
+        int sampleY = (int)id.y;
+        // Clamp to screen
+        sampleX = clamp(sampleX, 0, (int)width - 1);
+        uint2 sampleUV = uint2((uint)sampleX, (uint)sampleY);
+        
+        float sampleThickness = _SourceTexture[sampleUV].r;
+        
+        // Don't blur with 0 thickness - this replaces the threshold
+        if (sampleThickness <= 0.0) continue;
+        
+        // 1. Spatial Weight (Gaussian)
+        float spatialWeight = Gaussian((float)x, sigma);
+        
+        float weight = spatialWeight;
+        
+        result += sampleThickness * weight;
+        totalWeight += weight;
+    }
+    
+    // If no valid samples, preserve original value
+    if (totalWeight > 0.0)
+    {
+        _DestinationTexture[id.xy] = float4(result / totalWeight, 0, 0, 1);
+    }
+    else
+    {
+        _DestinationTexture[id.xy] = centerVal;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void ThicknessBlurVertical(uint3 id : SV_DispatchThreadID)
+{
+    uint width = (uint)_Resolution.x;
+    uint height = (uint)_Resolution.y;
+    if (id.x >= width || id.y >= height) return;
+
+    int radius = (int)_BlurRadius;
+    float4 centerVal = _SourceTexture[id.xy];
+    float centerThickness = centerVal.r;
+    
+    float totalWeight = 0.0;
+    float result = 0.0;
+    float sigma = max(1.0, _BlurRadius / 2.0);
+
+    for (int y = -radius; y <= radius; y++)
+    {
+        int sampleX = (int)id.x;
+        int sampleY = (int)id.y + y;
+        // Clamp to screen
+        sampleY = clamp(sampleY, 0, (int)height - 1);
+        uint2 sampleUV = uint2((uint)sampleX, (uint)sampleY);
+        
+        float sampleThickness = _SourceTexture[sampleUV].r;
+        
+        // Don't blur with 0 thickness - this replaces the threshold
+        if (sampleThickness <= 0.0) continue;
+        
+        float spatialWeight = Gaussian((float)y, sigma);
+        
+        float weight = spatialWeight;
+        
+        result += sampleThickness * weight;
+        totalWeight += weight;
+    }
+    
+    // If no valid samples, preserve original value
+    if (totalWeight > 0.0)
+    {
+        _DestinationTexture[id.xy] = float4(result / totalWeight, 0, 0, 1);
+    }
+    else
+    {
+        _DestinationTexture[id.xy] = centerVal;
+    }
 }
