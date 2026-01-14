@@ -416,8 +416,10 @@ def run_pcg(b, A_diag, A_off, neighbors, num_nodes, coeffs=None, precon_type='id
         if precon_type == 'neural' and coeffs is not None:
             return apply_neural_preconditioner(res, coeffs, neighbors, num_nodes, precomputed)
         elif precon_type == 'jacobi':
-            # Jacobi: z = D^-1 * r.  (A_diag is D)
-            return res / (A_diag + 1e-10) 
+            # Jacobi: z = D^-1 * r. 
+            # FIX: Clamp diagonal to avoid exploding values on isolated/padding nodes
+            safe_diag = torch.maximum(A_diag, torch.tensor(1.0, device=A_diag.device))
+            return res / safe_diag
         else:
             return res.clone()
             
@@ -493,6 +495,30 @@ def benchmark_frame(frame_path, model, device):
     
     return it_base, t_base, it_jacobi, t_jacobi, it_net, t_net, t_inf, hist_base, hist_jacobi, hist_net
 
+def benchmark_neural_only(frame_path, model, device):
+    """Benchmark only neural preconditioner. Returns (it_net, t_net, t_inf, hist_net)"""
+    x, layers, neighbors, b, A_diag, A_off, N = load_frame(frame_path, device)
+    
+    # Pre-compute indices once for optimization
+    precomputed = precompute_indices(neighbors, N, batch_size=1)
+    
+    # Generate Neural Preconditioner
+    G_coeffs = None
+    t_inf = 0.0
+    with torch.no_grad():
+        t0 = time.time()
+        G_coeffs = model(x, layers).squeeze(0)[:N]
+        if device.type == 'cuda': torch.cuda.synchronize()
+        t_inf = (time.time() - t0) * 1000
+    
+    # Neural SPAI CG
+    t0 = time.time()
+    _, it_net, hist_net = run_pcg(b, A_diag, A_off, neighbors, N, coeffs=G_coeffs, precon_type='neural', precomputed=precomputed)
+    if device.type == 'cuda': torch.cuda.synchronize()
+    t_net = (time.time() - t0) * 1000
+    
+    return it_net, t_net, t_inf, hist_net
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     script_dir = Path(__file__).parent
@@ -509,7 +535,11 @@ if __name__ == "__main__":
     parser.add_argument('--frame', type=str, default=default_frame)
     parser.add_argument('--model', type=str, default=str(script_dir / "model_weights.bytes"))
     parser.add_argument('--single', action='store_true', help='Test a single frame instead of range.')
+    parser.add_argument('--compare', action='store_true', help='Run full comparison with Standard CG and Jacobi CG (default: neural-only mode).')
     args = parser.parse_args()
+    
+    # Neural-only is the default (unless --compare is set)
+    args.neural_only = not args.compare
         
     device = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f"Device: {device}")
@@ -551,58 +581,100 @@ if __name__ == "__main__":
         
         print(f"\nTesting {len(frame_range)} frames (150-200)...")
         
-        stats = {
-            'base_iter': [], 'base_time': [],
-            'jacobi_iter': [], 'jacobi_time': [],
-            'net_iter': [], 'net_time': [], 'inf_time': []
-        }
-        
-        for i, frame_path in enumerate(frame_range):
-            if (i + 1) % 50 == 0:
-                print(f"  Progress: {i+1}/{len(frame_range)} frames...")
+        if args.neural_only:
+            stats = {
+                'net_iter': [], 'net_time': [], 'inf_time': []
+            }
             
-            # Run a dummy pass to warm up caches/JIT
-            if i == 0:
+            for i, frame_path in enumerate(frame_range):
+                if (i + 1) % 50 == 0:
+                    print(f"  Progress: {i+1}/{len(frame_range)} frames...")
+                
+                # Run a dummy pass to warm up caches/JIT
+                if i == 0:
+                    try:
+                        benchmark_neural_only(str(frame_path), model, device)
+                    except Exception as e:
+                        print(f"  Warning: Warmup failed for {frame_path.name}: {e}")
+                        continue
+                
                 try:
-                    benchmark_frame(str(frame_path), model, device)
+                    i_net, t_net, t_inf, _ = benchmark_neural_only(str(frame_path), model, device)
+                    stats['net_iter'].append(i_net)
+                    stats['net_time'].append(t_net)
+                    stats['inf_time'].append(t_inf)
                 except Exception as e:
-                    print(f"  Warning: Warmup failed for {frame_path.name}: {e}")
+                    print(f"  Warning: Failed to process {frame_path.name}: {e}")
                     continue
             
-            try:
-                ib, tb, ij, tj, i_net, t_net, t_inf, _, _, _ = benchmark_frame(str(frame_path), model, device)
-                stats['base_iter'].append(ib)
-                stats['base_time'].append(tb)
-                stats['jacobi_iter'].append(ij)
-                stats['jacobi_time'].append(tj)
-                stats['net_iter'].append(i_net)
-                stats['net_time'].append(t_net)
-                stats['inf_time'].append(t_inf)
-            except Exception as e:
-                print(f"  Warning: Failed to process {frame_path.name}: {e}")
-                continue
-        
-        print(f"\n{'='*60}")
-        print(f"Average Results ({len(frame_range)} frames):")
-        print(f"{'='*60}")
-        print(f"Standard CG:")
-        print(f"  Avg Iterations: {np.mean(stats['base_iter']):.2f}")
-        print(f"  Avg Time:       {np.mean(stats['base_time']):.2f} ms")
-        print(f"\nJacobi CG:")
-        print(f"  Avg Iterations: {np.mean(stats['jacobi_iter']):.2f}")
-        print(f"  Avg Time:       {np.mean(stats['jacobi_time']):.2f} ms")
-        print(f"  Speedup vs Std: {np.mean(stats['base_time'])/np.mean(stats['jacobi_time']):.2f}x")
-        print(f"\nNeural SPAI CG:")
-        print(f"  Avg Inference:  {np.mean(stats['inf_time']):.2f} ms")
-        print(f"  Avg Iterations: {np.mean(stats['net_iter']):.2f}")
-        print(f"  Avg Solver Time: {np.mean(stats['net_time']):.2f} ms")
-        print(f"  Avg Total Time:  {np.mean(stats['inf_time']) + np.mean(stats['net_time']):.2f} ms")
-        
-        total_net = np.mean(stats['inf_time']) + np.mean(stats['net_time'])
-        print(f"\nSpeedup (Total Time):")
-        print(f"  Neural vs Std:    {np.mean(stats['base_time']) / total_net:.2f}x")
-        print(f"  Neural vs Jacobi: {np.mean(stats['jacobi_time']) / total_net:.2f}x")
-        print(f"{'='*60}")
+            print(f"\n{'='*60}")
+            print(f"Neural SPAI CG Results ({len(frame_range)} frames):")
+            print(f"{'='*60}")
+            print(f"  Avg Inference:  {np.mean(stats['inf_time']):.2f} ms")
+            print(f"  Avg Iterations: {np.mean(stats['net_iter']):.2f}")
+            print(f"  Avg Solver Time: {np.mean(stats['net_time']):.2f} ms")
+            print(f"  Avg Total Time:  {np.mean(stats['inf_time']) + np.mean(stats['net_time']):.2f} ms")
+            print(f"{'='*60}")
+        else:
+            stats = {
+                'base_iter': [], 'base_time': [],
+                'jacobi_iter': [], 'jacobi_time': [],
+                'net_iter': [], 'net_time': [], 'inf_time': []
+            }
+            
+            for i, frame_path in enumerate(frame_range):
+                if (i + 1) % 50 == 0:
+                    print(f"  Progress: {i+1}/{len(frame_range)} frames...")
+                
+                # Run a dummy pass to warm up caches/JIT
+                if i == 0:
+                    try:
+                        benchmark_frame(str(frame_path), model, device)
+                    except Exception as e:
+                        print(f"  Warning: Warmup failed for {frame_path.name}: {e}")
+                        continue
+                
+                try:
+                    ib, tb, ij, tj, i_net, t_net, t_inf, _, _, _ = benchmark_frame(str(frame_path), model, device)
+                    stats['base_iter'].append(ib)
+                    stats['base_time'].append(tb)
+                    stats['jacobi_iter'].append(ij)
+                    stats['jacobi_time'].append(tj)
+                    stats['net_iter'].append(i_net)
+                    stats['net_time'].append(t_net)
+                    stats['inf_time'].append(t_inf)
+                except Exception as e:
+                    print(f"  Warning: Failed to process {frame_path.name}: {e}")
+                    continue
+            
+            print(f"\n{'='*60}")
+            print(f"Average Results ({len(frame_range)} frames):")
+            print(f"{'='*60}")
+            print(f"Standard CG:")
+            print(f"  Avg Iterations: {np.mean(stats['base_iter']):.2f}")
+            print(f"  Avg Time:       {np.mean(stats['base_time']):.2f} ms")
+            print(f"\nJacobi CG:")
+            print(f"  Avg Iterations: {np.mean(stats['jacobi_iter']):.2f}")
+            print(f"  Avg Time:       {np.mean(stats['jacobi_time']):.2f} ms")
+            print(f"  Speedup vs Std: {np.mean(stats['base_time'])/np.mean(stats['jacobi_time']):.2f}x")
+            print(f"\nNeural SPAI CG:")
+            print(f"  Avg Inference:  {np.mean(stats['inf_time']):.2f} ms")
+            print(f"  Avg Iterations: {np.mean(stats['net_iter']):.2f}")
+            print(f"  Avg Solver Time: {np.mean(stats['net_time']):.2f} ms")
+            print(f"  Avg Total Time:  {np.mean(stats['inf_time']) + np.mean(stats['net_time']):.2f} ms")
+            
+            total_net = np.mean(stats['inf_time']) + np.mean(stats['net_time'])
+            avg_base_iter = np.mean(stats['base_iter'])
+            avg_jacobi_iter = np.mean(stats['jacobi_iter'])
+            avg_net_iter = np.mean(stats['net_iter'])
+            
+            print(f"\nSpeedup (Total Time):")
+            print(f"  Neural vs Std:    {np.mean(stats['base_time']) / total_net:.2f}x")
+            print(f"  Neural vs Jacobi: {np.mean(stats['jacobi_time']) / total_net:.2f}x")
+            print(f"\nIteration Reduction:")
+            print(f"  Neural vs Std:    {avg_base_iter / avg_net_iter:.2f}x")
+            print(f"  Neural vs Jacobi: {avg_jacobi_iter / avg_net_iter:.2f}x")
+            print(f"{'='*60}")
         
     else:
         # Single frame mode
@@ -617,49 +689,69 @@ if __name__ == "__main__":
         # Pre-compute indices once for optimization
         precomputed = precompute_indices(neighbors, N, batch_size=1)
         
-        # Benchmarking
-        G_coeffs = None
-        t_inf = 0.0
-        with torch.no_grad():
-            t0 = time.time()
-            # CHANGE 4: No expansion needed. Get [N, 25] directly.
-            G_coeffs = model(x, layers).squeeze(0)[:N]
+        if args.neural_only:
+            # Neural-only mode
+            print("\n--- Neural SPAI CG ---")
+            i_net, t_net, t_inf, hist_net = benchmark_neural_only(args.frame, model, device)
+            t_total = t_inf + t_net
+            print(f"Inference:       {t_inf:.2f} ms")
+            print(f"Solver:          {t_net:.2f} ms ({i_net} iters)")
+            print(f"Total:           {t_total:.2f} ms")
             
+            # Plot
+            plt.figure(figsize=(10,6))
+            plt.semilogy(hist_net, label='Neural SPAI CG', linewidth=2, color='blue')
+            plt.title(f"Neural SPAI CG Convergence\nFrame: {Path(args.frame).name}")
+            plt.xlabel("Iteration")
+            plt.ylabel("Residual Norm ||r||")
+            plt.grid(True, which='both', alpha=0.3)
+            plt.legend()
+            plt.show()
+        else:
+            # Full comparison mode
+            # Benchmarking
+            G_coeffs = None
+            t_inf = 0.0
+            with torch.no_grad():
+                t0 = time.time()
+                # CHANGE 4: No expansion needed. Get [N, 25] directly.
+                G_coeffs = model(x, layers).squeeze(0)[:N]
+                
+                if device.type == 'cuda': torch.cuda.synchronize()
+                t_inf = (time.time() - t0) * 1000
+                print(f"Neural Inference Time: {t_inf:.2f} ms")
+            
+            print("\n--- Standard CG ---")
+            t0 = time.time()
+            _, it_base, hist_base = run_pcg(b, A_diag, A_off, neighbors, N, precon_type='identity', precomputed=precomputed)
             if device.type == 'cuda': torch.cuda.synchronize()
-            t_inf = (time.time() - t0) * 1000
-            print(f"Neural Inference Time: {t_inf:.2f} ms")
-        
-        print("\n--- Standard CG ---")
-        t0 = time.time()
-        _, it_base, hist_base = run_pcg(b, A_diag, A_off, neighbors, N, precon_type='identity', precomputed=precomputed)
-        if device.type == 'cuda': torch.cuda.synchronize()
-        t_base = (time.time() - t0) * 1000
-        print(f"Iterations: {it_base} | Time: {t_base:.2f} ms")
-        
-        print("\n--- Jacobi CG ---")
-        t0 = time.time()
-        _, it_jacobi, hist_jacobi = run_pcg(b, A_diag, A_off, neighbors, N, precon_type='jacobi', precomputed=precomputed)
-        if device.type == 'cuda': torch.cuda.synchronize()
-        t_jacobi = (time.time() - t0) * 1000
-        print(f"Iterations: {it_jacobi} | Time: {t_jacobi:.2f} ms")
+            t_base = (time.time() - t0) * 1000
+            print(f"Iterations: {it_base} | Time: {t_base:.2f} ms")
+            
+            print("\n--- Jacobi CG ---")
+            t0 = time.time()
+            _, it_jacobi, hist_jacobi = run_pcg(b, A_diag, A_off, neighbors, N, precon_type='jacobi', precomputed=precomputed)
+            if device.type == 'cuda': torch.cuda.synchronize()
+            t_jacobi = (time.time() - t0) * 1000
+            print(f"Iterations: {it_jacobi} | Time: {t_jacobi:.2f} ms")
 
-        print("\n--- Neural SPAI CG ---")
-        t0 = time.time()
-        _, it_net, hist_net = run_pcg(b, A_diag, A_off, neighbors, N, coeffs=G_coeffs, precon_type='neural', precomputed=precomputed)
-        if device.type == 'cuda': torch.cuda.synchronize()
-        t_net = (time.time() - t0) * 1000
-        t_total = t_inf + t_net
-        print(f"Solver:           {t_net:.2f} ms ({it_net} iters)")
-        print(f"Total:            {t_total:.2f} ms")
-        
-        # Plot
-        plt.figure(figsize=(10,6))
-        plt.semilogy(hist_base, label='Standard CG', linestyle=':', linewidth=2, color='gray')
-        plt.semilogy(hist_jacobi, label='Jacobi CG', linestyle='--', linewidth=2, color='orange')
-        plt.semilogy(hist_net, label='Neural SPAI CG', linewidth=2, color='blue')
-        plt.title(f"Convergence: Neural SPAI vs Jacobi vs Standard\nFrame: {Path(args.frame).name}")
-        plt.xlabel("Iteration")
-        plt.ylabel("Residual Norm ||r||")
-        plt.grid(True, which='both', alpha=0.3)
-        plt.legend()
-        plt.show()
+            print("\n--- Neural SPAI CG ---")
+            t0 = time.time()
+            _, it_net, hist_net = run_pcg(b, A_diag, A_off, neighbors, N, coeffs=G_coeffs, precon_type='neural', precomputed=precomputed)
+            if device.type == 'cuda': torch.cuda.synchronize()
+            t_net = (time.time() - t0) * 1000
+            t_total = t_inf + t_net
+            print(f"Solver:           {t_net:.2f} ms ({it_net} iters)")
+            print(f"Total:            {t_total:.2f} ms")
+            
+            # Plot
+            plt.figure(figsize=(10,6))
+            plt.semilogy(hist_base, label='Standard CG', linestyle=':', linewidth=2, color='gray')
+            plt.semilogy(hist_jacobi, label='Jacobi CG', linestyle='--', linewidth=2, color='orange')
+            plt.semilogy(hist_net, label='Neural SPAI CG', linewidth=2, color='blue')
+            plt.title(f"Convergence: Neural SPAI vs Jacobi vs Standard\nFrame: {Path(args.frame).name}")
+            plt.xlabel("Iteration")
+            plt.ylabel("Residual Norm ||r||")
+            plt.grid(True, which='both', alpha=0.3)
+            plt.legend()
+            plt.show()
