@@ -80,11 +80,12 @@ class SPAIGenerator(nn.Module):
 # ==========================================
 
 def load_model_from_bytes(model, bytes_path, device):
-    """Load model weights from .bytes file (Unity format)"""
+    """Load model weights from .bytes file (Unity Packed Float16 format)"""
     file_size = os.path.getsize(bytes_path)
     print(f"Reading weights from {bytes_path} (Size: {file_size} bytes)")
     
     with open(bytes_path, 'rb') as f:
+        # 1. Header is still standard 32-bit (24 bytes)
         header_bytes = f.read(24)
         header = struct.unpack('<ffiiii', header_bytes)
         p_mean, p_std, file_d_model, heads, num_layers, input_dim = header
@@ -93,23 +94,39 @@ def load_model_from_bytes(model, bytes_path, device):
         
         if file_d_model != model.d_model:
             raise ValueError(f"Model mismatch! File d_model={file_d_model}, Code d_model={model.d_model}")
-        
-        # Verify num_heads matches
-        model_num_heads = model.encoder.layers[0].self_attn.num_heads
-        if heads != model_num_heads:
-            raise ValueError(f"Model mismatch! File heads={heads}, Model num_heads={model_num_heads}. "
-                           f"Please recreate model with nhead={heads}")
             
-        def read_tensor(shape, target_tensor, tensor_name="tensor"):
-            size = int(np.prod(shape))
-            data_bytes = f.read(size * 4)
-            data = np.frombuffer(data_bytes, dtype=np.float32)
+        def read_packed_tensor(shape, target_tensor, tensor_name="tensor"):
+            # Calculate total elements
+            num_elements = int(np.prod(shape))
+            
+            # 1. Determine how many uint32s to read
+            # Each uint32 holds TWO float16s.
+            # If num_elements is odd, the export padded it with 1 extra float.
+            padded_count = num_elements if num_elements % 2 == 0 else num_elements + 1
+            uint_count = padded_count // 2
+            
+            # 2. Read uint32 bytes
+            data_bytes = f.read(uint_count * 4)
+            if len(data_bytes) != uint_count * 4:
+                raise ValueError(f"Unexpected EOF reading {tensor_name}")
+            
+            # 3. View as uint32 -> view as float16
+            data_uint = np.frombuffer(data_bytes, dtype=np.uint32)
+            data_fp16 = data_uint.view(np.float16)
+            
+            # 4. Remove padding if necessary
+            if num_elements % 2 != 0:
+                data_fp16 = data_fp16[:num_elements]
+            
+            # 5. Convert to Float32 for PyTorch (MPS/CPU operations usually prefer fp32)
+            data_fp32 = data_fp16.astype(np.float32)
             
             try:
-                t = torch.from_numpy(data.reshape(shape)).to(device)
+                t = torch.from_numpy(data_fp32.reshape(shape)).to(device)
             except Exception as e:
                 raise RuntimeError(f"Reshape failed for {tensor_name}: {e}")
 
+            # Handle Transpose (Unity weights are often transposed vs PyTorch)
             if t.shape != target_tensor.shape:
                 if t.T.shape == target_tensor.shape:
                     t = t.T
@@ -118,41 +135,41 @@ def load_model_from_bytes(model, bytes_path, device):
             
             target_tensor.data.copy_(t)
 
+        # --- Load Weights (Same Order) ---
         # 1. Stem
-        read_tensor([input_dim, file_d_model], model.feature_proj.weight, "feature_proj.weight") 
-        read_tensor([file_d_model], model.feature_proj.bias, "feature_proj.bias")
+        read_packed_tensor([input_dim, file_d_model], model.feature_proj.weight, "feature_proj.weight") 
+        read_packed_tensor([file_d_model], model.feature_proj.bias, "feature_proj.bias")
         
-        read_tensor([12, file_d_model], model.layer_embed.weight, "layer_embed")
-        read_tensor([1, model.window_size, file_d_model], model.window_pos_embed, "window_pos_embed")
+        read_packed_tensor([12, file_d_model], model.layer_embed.weight, "layer_embed")
+        read_packed_tensor([1, model.window_size, file_d_model], model.window_pos_embed, "window_pos_embed")
         
         # 2. Layers
         for i, layer in enumerate(model.encoder.layers):
             prefix = f"layer_{i}"
-            read_tensor([file_d_model, 3 * file_d_model], layer.self_attn.in_proj_weight, f"{prefix}.in_proj_w")
-            read_tensor([3 * file_d_model], layer.self_attn.in_proj_bias, f"{prefix}.in_proj_b")
+            read_packed_tensor([file_d_model, 3 * file_d_model], layer.self_attn.in_proj_weight, f"{prefix}.in_proj_w")
+            read_packed_tensor([3 * file_d_model], layer.self_attn.in_proj_bias, f"{prefix}.in_proj_b")
             
-            read_tensor([file_d_model, file_d_model], layer.self_attn.out_proj.weight, f"{prefix}.out_proj_w")
-            read_tensor([file_d_model], layer.self_attn.out_proj.bias, f"{prefix}.out_proj_b")
+            read_packed_tensor([file_d_model, file_d_model], layer.self_attn.out_proj.weight, f"{prefix}.out_proj_w")
+            read_packed_tensor([file_d_model], layer.self_attn.out_proj.bias, f"{prefix}.out_proj_b")
             
-            read_tensor([file_d_model], layer.norm1.weight, f"{prefix}.norm1_w")
-            read_tensor([file_d_model], layer.norm1.bias, f"{prefix}.norm1_b")
+            read_packed_tensor([file_d_model], layer.norm1.weight, f"{prefix}.norm1_w")
+            read_packed_tensor([file_d_model], layer.norm1.bias, f"{prefix}.norm1_b")
             
-            read_tensor([file_d_model, file_d_model * 2], layer.linear1.weight, f"{prefix}.linear1_w")
-            read_tensor([file_d_model * 2], layer.linear1.bias, f"{prefix}.linear1_b")
+            read_packed_tensor([file_d_model, file_d_model * 2], layer.linear1.weight, f"{prefix}.linear1_w")
+            read_packed_tensor([file_d_model * 2], layer.linear1.bias, f"{prefix}.linear1_b")
             
-            read_tensor([file_d_model * 2, file_d_model], layer.linear2.weight, f"{prefix}.linear2_w")
-            read_tensor([file_d_model], layer.linear2.bias, f"{prefix}.linear2_b")
+            read_packed_tensor([file_d_model * 2, file_d_model], layer.linear2.weight, f"{prefix}.linear2_w")
+            read_packed_tensor([file_d_model], layer.linear2.bias, f"{prefix}.linear2_b")
             
-            read_tensor([file_d_model], layer.norm2.weight, f"{prefix}.norm2_w")
-            read_tensor([file_d_model], layer.norm2.bias, f"{prefix}.norm2_b")
+            read_packed_tensor([file_d_model], layer.norm2.weight, f"{prefix}.norm2_w")
+            read_packed_tensor([file_d_model], layer.norm2.bias, f"{prefix}.norm2_b")
         
         # 3. Head 
-        read_tensor([file_d_model], model.norm_out.weight, "norm_out.weight")
-        read_tensor([file_d_model], model.norm_out.bias, "norm_out.bias")
+        read_packed_tensor([file_d_model], model.norm_out.weight, "norm_out.weight")
+        read_packed_tensor([file_d_model], model.norm_out.bias, "norm_out.bias")
         
-        # CHANGE 3: Read 25 output weights instead of 7
-        read_tensor([file_d_model, 25], model.head.weight, "head.weight")
-        read_tensor([25], model.head.bias, "head.bias")
+        read_packed_tensor([file_d_model, 25], model.head.weight, "head.weight")
+        read_packed_tensor([25], model.head.bias, "head.bias")
 
 # ==========================================
 # 3. PHYSICS & DATA
