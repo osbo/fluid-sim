@@ -1,7 +1,6 @@
 #pragma kernel markUniqueParticles
 #pragma kernel markUniquesPrefix
 #pragma kernel markActiveNodes
-#pragma kernel markUniquesPrefix
 #pragma kernel prefixSum
 #pragma kernel prefixFixup
 #pragma kernel scatterUniques
