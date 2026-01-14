@@ -228,15 +228,17 @@ public partial class FluidSimulator : MonoBehaviour
     private float calculatedDepthMinValue = 0.0f;     // Exponent for depth min
     private float calculatedMinDepth = 0.0f;          // Actual min depth value
     private float calculatedMaxDepth = 0.0f;          // Actual max depth value
-    [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = -8.8f; // Exponent: actual scale = exp(value) for nodes
+    [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = -8.9f; // Exponent: actual scale = exp(value) for nodes
     [Range(-20.0f, 20.0f)] public float thicknessScaleParticles = -9.6f; // Exponent: actual scale = exp(value) for particles
 
-    [Range(0, 100)] public int blurRadius = 11;
-    [Range(0.0001f, 10.0f)] public float blurDepthFalloff = 2.0f;
+    [Range(0, 100)] public int depthBlurRadius = 11;
+    [Range(0.0001f, 10.0f)] public float depthBlurThreshold = 2.0f;
+    [Range(0, 100)] public int thicknessBlurRadius = 22;
     [Range(0.0001f, 1.0f)] public float particleRadius = 0.066f; // Radius for particle points (world space)
     [Range(0.0001f, 1.0f)] public float depthRadius = 0.082f; // Radius for depth quads (world space)
     [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.776f; // Radius for particle thickness quads (world space)
     [Range(0, 20)] public float absorptionStrength = 4.1f;
+    [Range(0.0f, 1.0f)] public float depthOfFieldStrength = 0.41f;
     [Range(0, 2)] public float refractionScale = 1.0f;
     
     // Helper method for resizing buffers
