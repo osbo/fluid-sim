@@ -433,66 +433,66 @@ class FluidGraphDataset(Dataset):
 # --- 5. Export Utility ---
 
 def export_weights(model, path):
-    print(f"Exporting weights to {path}...")
+    print(f"Exporting packed 16-bit weights to {path}...")
     with open(path, 'wb') as f:
-        # 1. Header: p_mean (float), p_std (float), d_model (int), heads (int), layers (int), input_dim (int)
-        # We don't have p_mean/std here, writing 0.0
+        # 1. Header: Standard 32-bit floats/ints
+        # We assume the C# side reads these as standard 4-byte values
         header = struct.pack('<ffiiii', 
                            0.0, 0.0, 
                            model.d_model, 
-                           model.encoder.layers[0].self_attn.num_heads,  # num_heads from model
+                           model.encoder.layers[0].self_attn.num_heads,
                            len(model.encoder.layers), 
-                           58) # Input dim is fixed at 58
+                           58)
         f.write(header)
         
-        # Helper to write tensor
-        def write_tensor(tensor):
-            # TRANSPOSE 2D WEIGHTS for HLSL (Input-Major) compatibility
+        # 2. Helper to write packed tensor
+        def write_packed_tensor(tensor):
+            # A. Transpose 2D weights (Input-Major for HLSL)
             if len(tensor.shape) == 2:
-                t_data = tensor.t().cpu().detach().numpy().astype(np.float32)
+                # Transpose: [Out, In] -> [In, Out]
+                t_data = tensor.t().detach().cpu().numpy().flatten()
             else:
-                t_data = tensor.cpu().detach().numpy().astype(np.float32)
-            f.write(t_data.tobytes())
+                t_data = tensor.detach().cpu().numpy().flatten()
+            
+            # B. Pad if length is odd (Need even count to pack pairs)
+            if len(t_data) % 2 != 0:
+                t_data = np.append(t_data, 0.0)
+                
+            # C. Convert to float16, then view as uint32
+            # This packs two consecutive float16s into one 32-bit integer
+            # Low 16 bits = First float, High 16 bits = Second float
+            data_packed = t_data.astype(np.float16).view(np.uint32)
+            
+            f.write(data_packed.tobytes())
 
-        # --- 1. Feature Projection ---
-        write_tensor(model.feature_proj.weight) # Will be Transposed [58, d_model]
-        write_tensor(model.feature_proj.bias)
-        write_tensor(model.layer_embed.weight)    # [12, d_model]
-        write_tensor(model.window_pos_embed)      # [1, window_size, d_model]
+        # --- Write Weights (Same Order) ---
+        
+        # 1. Feature Projection
+        write_packed_tensor(model.feature_proj.weight)
+        write_packed_tensor(model.feature_proj.bias)
+        write_packed_tensor(model.layer_embed.weight)
+        write_packed_tensor(model.window_pos_embed)
 
-        # --- 2. Transformer Layers ---
-        for i, layer in enumerate(model.encoder.layers):
-            # Attention In (Q,K,V packed)
-            # PyTorch: [3*d_model, d_model] -> Transpose to [d_model, 3*d_model]
-            # This lines up perfectly with HLSL reading stride of 3*d_model
-            write_tensor(layer.self_attn.in_proj_weight) 
-            write_tensor(layer.self_attn.in_proj_bias)
-            
-            # Attention Out
-            write_tensor(layer.self_attn.out_proj.weight)
-            write_tensor(layer.self_attn.out_proj.bias)
-            
-            # Norm 1
-            write_tensor(layer.norm1.weight)
-            write_tensor(layer.norm1.bias)
-            
-            # FFN 1 (Linear 1)
-            write_tensor(layer.linear1.weight)
-            write_tensor(layer.linear1.bias)
-            
-            # FFN 2 (Linear 2)
-            write_tensor(layer.linear2.weight)
-            write_tensor(layer.linear2.bias)
-            
-            # Norm 2
-            write_tensor(layer.norm2.weight)
-            write_tensor(layer.norm2.bias)
+        # 2. Transformer Layers
+        for layer in model.encoder.layers:
+            write_packed_tensor(layer.self_attn.in_proj_weight) 
+            write_packed_tensor(layer.self_attn.in_proj_bias)
+            write_packed_tensor(layer.self_attn.out_proj.weight)
+            write_packed_tensor(layer.self_attn.out_proj.bias)
+            write_packed_tensor(layer.norm1.weight)
+            write_packed_tensor(layer.norm1.bias)
+            write_packed_tensor(layer.linear1.weight)
+            write_packed_tensor(layer.linear1.bias)
+            write_packed_tensor(layer.linear2.weight)
+            write_packed_tensor(layer.linear2.bias)
+            write_packed_tensor(layer.norm2.weight)
+            write_packed_tensor(layer.norm2.bias)
 
-        # --- 3. Output Head ---
-        write_tensor(model.norm_out.weight)
-        write_tensor(model.norm_out.bias)
-        write_tensor(model.head.weight)
-        write_tensor(model.head.bias)
+        # 3. Output Head
+        write_packed_tensor(model.norm_out.weight)
+        write_packed_tensor(model.norm_out.bias)
+        write_packed_tensor(model.head.weight)
+        write_packed_tensor(model.head.bias)
         
     print("Export complete.")
 
@@ -605,15 +605,15 @@ def train(args):
             if use_cuda_events:
                 torch.cuda.synchronize()
                 # Calculate elapsed times in milliseconds
-                fwd_ms = start_event.elapsed_time(fwd_end_event)
-                loss_ms = fwd_end_event.elapsed_time(loss_end_event)
+                fwd = start_event.elapsed_time(fwd_end_event)
+                loss = fwd_end_event.elapsed_time(loss_end_event)
             else:
                 # Use time.time() for MPS/CPU (convert to milliseconds)
-                fwd_ms = (fwd_end - fwd_start) * 1000.0
-                loss_ms = (loss_end - fwd_end) * 1000.0
+                fwd = (fwd_end - fwd_start) * 1000.0
+                loss = (loss_end - fwd_end) * 1000.0
             
-            total_fwd_time += fwd_ms
-            total_loss_time += loss_ms
+            total_fwd_time += fwd
+            total_loss_time += loss
         
         epoch_time = time.time() - epoch_start
         epoch_times.append(epoch_time)
@@ -624,7 +624,7 @@ def train(args):
         avg_loss_time = total_loss_time / len(loader)
         
         avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.6f} | Time: {epoch_time:.2f}s (forward: {avg_fwd:.1f}ms, loss: {avg_loss_time:.1f}ms) | Avg Time: {avg_time:.2f}s")
+        print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.6f} | Time: {epoch_time:.2f}s (forward: {avg_fwd:.1f}s, loss: {avg_loss_time:.1f}s) | Avg Time: {avg_time:.2f}s")
         
         if (epoch + 1) % 5 == 0:
             export_weights(model, weights_path)
