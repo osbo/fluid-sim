@@ -580,7 +580,7 @@ MonoBehaviour:
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
-  renderingMode: 6
+  renderingMode: 0
   thicknessSource: 0
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
@@ -592,6 +592,8 @@ MonoBehaviour:
   compositeMaterial: {fileID: 2100000, guid: 300258d4d41fa4015af599080020c3b9, type: 2}
   debugDisplayMaterial: {fileID: 2100000, guid: aac2fbb1f33ff4daba70d3fbf6629df0, type: 2}
   fluidColor: {r: 0.2, g: 0.6, b: 1, a: 1}
+  useSkybox: 1
+  skyboxTexture: {fileID: 8900000, guid: 9ef9266bdd71745d9b2ac1036b6b40e0, type: 3}
   skyHorizonColor: {r: 0, g: 0, b: 0, a: 1}
   skyTopColor: {r: 1, g: 1, b: 1, a: 1}
   sunIntensity: -2.3
