@@ -540,8 +540,10 @@ public partial class FluidSimulator : MonoBehaviour
             new Color(0.5f, 0f, 1f)    // Violet - Layer 10
         };
 
-        // nodesCPU = new Node[numNodes];
-        // nodesBuffer.GetData(nodesCPU);
+        nodesCPU = new Node[numNodes];
+        nodesBuffer.GetData(nodesCPU);
+
+        
 
         // // uint[] neighborsCPU = new uint[numNodes * 24];
         // // neighborsBuffer.GetData(neighborsCPU);

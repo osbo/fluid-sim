@@ -91,12 +91,13 @@ Material:
     - _BumpScale: 1
     - _ClearCoatMask: 0
     - _ClearCoatSmoothness: 0
+    - _CoreThreshold: 0.0072991303
     - _Cull: 2
     - _Cutoff: 0.5
-    - _DepthFadeEnd: 136.75491
-    - _DepthFadeStart: 34.147495
-    - _DepthMax: 111.73362
-    - _DepthMin: 54.932106
+    - _DepthFadeEnd: 122.558685
+    - _DepthFadeStart: 24.773129
+    - _DepthMax: 95.639824
+    - _DepthMin: 45.55774
     - _DetailAlbedoMapScale: 1
     - _DetailNormalMapScale: 1
     - _DstBlend: 0
@@ -108,15 +109,17 @@ Material:
     - _MaxLayer: 10
     - _Metallic: 0
     - _MinLayer: 4
+    - _MinScale: 0.597
     - _OcclusionStrength: 1
     - _Parallax: 0.005
     - _PointSize: 3.6
     - _QueueOffset: 0
-    - _Radius: 0.082
+    - _Radius: 0.279
     - _ReceiveShadows: 1
     - _Smoothness: 0.5
     - _SmoothnessTextureChannel: 0
     - _SpecularHighlights: 1
+    - _SprayThreshold: 0.0017820339
     - _SrcBlend: 1
     - _SrcBlendAlpha: 1
     - _Surface: 0
