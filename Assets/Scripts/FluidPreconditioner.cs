@@ -14,25 +14,17 @@ public partial class FluidSimulator : MonoBehaviour
     private System.Diagnostics.Stopwatch headSw = new System.Diagnostics.Stopwatch();
     private void LoadModelMetadata()
     {
-        if (modelWeightsAsset == null)
-        {
-            Debug.LogWarning("Model weights asset is not assigned. Please assign model_weights.bytes in the Inspector.");
-            return;
-        }
+        if (modelWeightsAsset == null) return;
 
         byte[] fileBytes = modelWeightsAsset.bytes;
         
-        if (fileBytes == null || fileBytes.Length < 24)
-        {
-            Debug.LogWarning("Model weights file is too small or invalid. Neural preconditioner will not work.");
-            return;
-        }
-
+        // ... (Header reading code remains the same: p_mean, d_model, etc.) ...
+        
         try
         {
             using (BinaryReader reader = new BinaryReader(new MemoryStream(fileBytes)))
             {
-                // 1. Header
+                // 1. Header (Standard 32-bit reads)
                 p_mean = reader.ReadSingle();
                 p_std = reader.ReadSingle();
                 d_model = reader.ReadInt32();
@@ -40,65 +32,68 @@ public partial class FluidSimulator : MonoBehaviour
                 num_layers = reader.ReadInt32();
                 input_dim = reader.ReadInt32();
 
-                // 2. Helper to read float arrays into ComputeBuffers
-                // Note: PyTorch exports float32. 
-                ComputeBuffer ReadBuffer(int count)
+                // 2. NEW Helper: Read packed integers into ComputeBuffer
+                // 'floatCount' is the number of weights the model expects.
+                ComputeBuffer ReadPackedBuffer(int floatCount)
                 {
-                    float[] data = new float[count];
-                    for (int i = 0; i < count; i++) data[i] = reader.ReadSingle();
+                    // Calculate how many uints we need (ceil(count / 2))
+                    int packedCount = Mathf.CeilToInt(floatCount / 2.0f);
                     
-                    ComputeBuffer buffer = new ComputeBuffer(count, sizeof(float));
+                    // Unity StructuredBuffers must have a stride divisible by 4.
+                    // uint is 4 bytes, so this works perfectly.
+                    ComputeBuffer buffer = new ComputeBuffer(packedCount, sizeof(uint));
+                    
+                    // Read the packed data directly as unsigned integers
+                    uint[] data = new uint[packedCount];
+                    for (int i = 0; i < packedCount; i++)
+                    {
+                        // Check end of stream
+                        if (reader.BaseStream.Position >= reader.BaseStream.Length) break;
+                        data[i] = reader.ReadUInt32();
+                    }
+                    
                     buffer.SetData(data);
                     return buffer;
                 }
 
-                // 3. Load weights into dictionary (Order matches NeuralPreconditioner.py export_weights)
-                // Clear old buffers if reloading
+                // 3. Load weights (Logic same, but function changed)
                 foreach(var b in weightBuffers.Values) b?.Release();
                 weightBuffers.Clear();
 
-                // Stem weights
-                weightBuffers["feature_proj.weight"] = ReadBuffer(input_dim * d_model); // [58, 128] -> transposed
-                weightBuffers["feature_proj.bias"] = ReadBuffer(d_model);
-                weightBuffers["layer_embed"] = ReadBuffer(12 * d_model); // [12, 128]
-                weightBuffers["window_pos_embed"] = ReadBuffer(WINDOW_SIZE * d_model); // [1, WINDOW_SIZE, d_model] flattened
+                // Stem
+                weightBuffers["feature_proj.weight"] = ReadPackedBuffer(input_dim * d_model);
+                weightBuffers["feature_proj.bias"]   = ReadPackedBuffer(d_model);
+                weightBuffers["layer_embed"]         = ReadPackedBuffer(12 * d_model);
+                weightBuffers["window_pos_embed"]    = ReadPackedBuffer(WINDOW_SIZE * d_model);
 
-                // Transformer layers
+                // Layers
                 for (int i = 0; i < num_layers; i++)
                 {
-                    string prefix = $"layer_{i}.";
-                    // Order matches NeuralPreconditioner.py export_weights function
-                    weightBuffers[prefix + "in_proj_w"] = ReadBuffer(d_model * 3 * d_model); // [128, 384] transposed
-                    weightBuffers[prefix + "in_proj_b"] = ReadBuffer(3 * d_model); // [384]
-                    weightBuffers[prefix + "out_proj_w"] = ReadBuffer(d_model * d_model); // [128, 128] transposed
-                    weightBuffers[prefix + "out_proj_b"] = ReadBuffer(d_model); // [128]
-                    weightBuffers[prefix + "norm1_w"] = ReadBuffer(d_model);
-                    weightBuffers[prefix + "norm1_b"] = ReadBuffer(d_model);
-                    weightBuffers[prefix + "linear1_w"] = ReadBuffer(d_model * 2 * d_model); // [128, 256] transposed
-                    weightBuffers[prefix + "linear1_b"] = ReadBuffer(2 * d_model); // [256]
-                    weightBuffers[prefix + "linear2_w"] = ReadBuffer(2 * d_model * d_model); // [256, 128] transposed
-                    weightBuffers[prefix + "linear2_b"] = ReadBuffer(d_model); // [128]
-                    weightBuffers[prefix + "norm2_w"] = ReadBuffer(d_model);
-                    weightBuffers[prefix + "norm2_b"] = ReadBuffer(d_model);
+                    string p = $"layer_{i}.";
+                    weightBuffers[p + "in_proj_w"]  = ReadPackedBuffer(d_model * 3 * d_model);
+                    weightBuffers[p + "in_proj_b"]  = ReadPackedBuffer(3 * d_model);
+                    weightBuffers[p + "out_proj_w"] = ReadPackedBuffer(d_model * d_model);
+                    weightBuffers[p + "out_proj_b"] = ReadPackedBuffer(d_model);
+                    weightBuffers[p + "norm1_w"]    = ReadPackedBuffer(d_model);
+                    weightBuffers[p + "norm1_b"]    = ReadPackedBuffer(d_model);
+                    weightBuffers[p + "linear1_w"]  = ReadPackedBuffer(d_model * 2 * d_model);
+                    weightBuffers[p + "linear1_b"]  = ReadPackedBuffer(2 * d_model);
+                    weightBuffers[p + "linear2_w"]  = ReadPackedBuffer(2 * d_model * d_model);
+                    weightBuffers[p + "linear2_b"]  = ReadPackedBuffer(d_model);
+                    weightBuffers[p + "norm2_w"]    = ReadPackedBuffer(d_model);
+                    weightBuffers[p + "norm2_b"]    = ReadPackedBuffer(d_model);
                 }
 
-                // Head weights
-                weightBuffers["norm_out.weight"] = ReadBuffer(d_model);
-                weightBuffers["norm_out.bias"] = ReadBuffer(d_model);
-                weightBuffers["head.weight"] = ReadBuffer(d_model * 25); // [128, 25] transposed
-                weightBuffers["head.bias"] = ReadBuffer(25);
+                // Head
+                weightBuffers["norm_out.weight"] = ReadPackedBuffer(d_model);
+                weightBuffers["norm_out.bias"]   = ReadPackedBuffer(d_model);
+                weightBuffers["head.weight"]     = ReadPackedBuffer(d_model * 25);
+                weightBuffers["head.bias"]       = ReadPackedBuffer(25);
 
-                Debug.Log("Loaded all weights into dictionary.");
+                Debug.Log("Loaded packed 16-bit weights.");
             }
-            
-            Debug.Log("Loaded " + num_layers + " Transformer layers.");
-            
-            Debug.Log($"Loaded Model Config: Mean={p_mean}, Std={p_std}, d_model={d_model}, Heads={num_heads}, Layers={num_layers}, InputDim={input_dim}");
         }
-        catch (Exception e)
-        {
-            Debug.LogError($"Failed to load model metadata: {e.Message}");
-        }
+        catch (Exception e) { Debug.LogError($"Load failed: {e.Message}"); }
     }
     private void ApplyPreconditioner(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kClear, int kJacobi)
     {

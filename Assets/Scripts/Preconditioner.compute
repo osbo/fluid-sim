@@ -14,31 +14,47 @@ StructuredBuffer<Node> nodesBuffer;
 StructuredBuffer<uint> neighborsBuffer;
 StructuredBuffer<float> diagonalBuffer; // Pre-computed diagonal of Laplacian matrix A
 
-// Weights
-StructuredBuffer<float> weightsFeatureProj;
-StructuredBuffer<float> biasFeatureProj;
-StructuredBuffer<float> weightsLayerEmbed;
-StructuredBuffer<float> weightsPosEmbed;
+// --- HELPERS ---
 
-// Transformer Layer Weights
-StructuredBuffer<float> w_attn_in;  
-StructuredBuffer<float> b_attn_in;
-StructuredBuffer<float> w_attn_out; 
-StructuredBuffer<float> b_attn_out; 
-StructuredBuffer<float> w_norm1;    
-StructuredBuffer<float> b_norm1;    
-StructuredBuffer<float> w_ffn1;     
-StructuredBuffer<float> b_ffn1;     
-StructuredBuffer<float> w_ffn2;     
-StructuredBuffer<float> b_ffn2;     
-StructuredBuffer<float> w_norm2;
-StructuredBuffer<float> b_norm2;    
+// Unpack one uint into two min16floats
+min16float2 UnpackFloat16(uint packed)
+{
+    float v1 = f16tof32(packed & 0xFFFF);
+    float v2 = f16tof32(packed >> 16);
+    return min16float2((min16float)v1, (min16float)v2);
+}
 
-// Head Weights
-StructuredBuffer<float> w_normOut;
-StructuredBuffer<float> b_normOut;
-StructuredBuffer<float> w_head;     
-StructuredBuffer<float> b_head;
+// Helper for random access: fetches the specific weight at 'idx'
+min16float UnpackWeight(StructuredBuffer<uint> buf, uint idx)
+{
+    uint packed = buf[idx >> 1]; // Divide by 2
+    min16float2 vals = UnpackFloat16(packed);
+    return (idx & 1) ? vals.y : vals.x; // Return low (even) or high (odd)
+}
+
+// --- WEIGHT BUFFERS (Change ALL to uint) ---
+StructuredBuffer<uint> weightsFeatureProj;
+StructuredBuffer<uint> biasFeatureProj;
+StructuredBuffer<uint> weightsLayerEmbed;
+StructuredBuffer<uint> weightsPosEmbed;
+
+StructuredBuffer<uint> w_attn_in;
+StructuredBuffer<uint> b_attn_in;
+StructuredBuffer<uint> w_attn_out;
+StructuredBuffer<uint> b_attn_out;
+StructuredBuffer<uint> w_norm1;
+StructuredBuffer<uint> b_norm1;
+StructuredBuffer<uint> w_ffn1;
+StructuredBuffer<uint> b_ffn1;
+StructuredBuffer<uint> w_ffn2;
+StructuredBuffer<uint> b_ffn2;
+StructuredBuffer<uint> w_norm2;
+StructuredBuffer<uint> b_norm2;
+
+StructuredBuffer<uint> w_normOut;
+StructuredBuffer<uint> b_normOut;
+StructuredBuffer<uint> w_head;
+StructuredBuffer<uint> b_head;
 
 // Data Buffers
 RWStructuredBuffer<float> tokenBuffer;
@@ -144,10 +160,10 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
     uint win_pos = i % (uint)windowSize;
     // 2. Linear Projection
     for (int d = 0; d < d_model; d++) {
-        float val = biasFeatureProj[d];
-        for (int f = 0; f < 58; f++) val += feats[f] * weightsFeatureProj[f * d_model + d];
-        val += weightsLayerEmbed[layer * d_model + d];
-        val += weightsPosEmbed[win_pos * d_model + d];
+        float val = (float)UnpackWeight(biasFeatureProj, d);
+        for (int f = 0; f < 58; f++) val += feats[f] * (float)UnpackWeight(weightsFeatureProj, f * d_model + d);
+        val += (float)UnpackWeight(weightsLayerEmbed, layer * d_model + d);
+        val += (float)UnpackWeight(weightsPosEmbed, win_pos * d_model + d);
         tokenBuffer[i * d_model + d] = val;
     }
 }
@@ -184,16 +200,16 @@ void PredictHead(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
     
     float x_norm = 0.0;
     if (dim < (uint)d_model) {
-        x_norm = diff * invStd * w_normOut[dim] + b_normOut[dim];
+        x_norm = diff * invStd * (float)UnpackWeight(w_normOut, dim) + (float)UnpackWeight(b_normOut, dim);
     }
     s_reduce_head[dim] = x_norm;
     GroupMemoryBarrierWithGroupSync();
     
     // Linear d_model -> 25
     if (dim < 25) { 
-        float outVal = b_head[dim];
+        float outVal = (float)UnpackWeight(b_head, dim);
         for(int k=0; k<d_model; k++) {
-            outVal += s_reduce_head[k] * w_head[k * 25 + dim]; 
+            outVal += s_reduce_head[k] * (float)UnpackWeight(w_head, k * 25 + dim); 
         }
             // SoA layout: matrixGBuffer[dim * numNodes + nodeIdx]
             matrixGBuffer[dim * numNodes + nodeIdx] = outVal; 
@@ -220,14 +236,6 @@ uint PackFloat16(float v1, float v2)
     uint i1 = f32tof16(v1);
     uint i2 = f32tof16(v2);
     return i1 | (i2 << 16);
-}
-
-// Helper to unpack one uint into two min16floats
-min16float2 UnpackFloat16(uint packed)
-{
-    float v1 = f16tof32(packed & 0xFFFF);
-    float v2 = f16tof32(packed >> 16);
-    return min16float2((min16float)v1, (min16float)v2);
 }
 
 [numthreads(WINDOW_SIZE, 1, 1)]
@@ -263,49 +271,56 @@ void FusedTransformerLayer(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_
 
     // Apply Norm1
     for(int i=0; i<D_MODEL; i++) {
-        curr[i] = (x[i] - mean) * invStd * (min16float)w_norm1[i] + (min16float)b_norm1[i];
+        curr[i] = (x[i] - mean) * invStd * (min16float)UnpackWeight(w_norm1, i) + (min16float)UnpackWeight(b_norm1, i);
     }
 
     // --- PHASE 2: Q, K, V Projection & Packing ---
     min16float q[D_MODEL];
     
-    // 2a. Compute K and Write Packed (uint)
+    // 2a. Compute K
     for (int d = 0; d < D_MODEL; d+=2) { 
-        float valK1 = (float)b_attn_in[D_MODEL + d];
-        float valK2 = (float)b_attn_in[D_MODEL + d + 1];
+        // Read packed BIAS
+        min16float2 b_vals = UnpackFloat16(b_attn_in[(D_MODEL + d) >> 1]);
+        float valK1 = (float)b_vals.x;
+        float valK2 = (float)b_vals.y;
 
-        // Unroll loop for optimization
         for (int in_d = 0; in_d < D_MODEL; in_d++) {
             float c = (float)curr[in_d];
-            // Read weights (stride 96: 3 * 32)
-            valK1 += c * w_attn_in[in_d * 96 + 32 + d];
-            valK2 += c * w_attn_in[in_d * 96 + 32 + d + 1];
+            // OPTIMIZATION: Read packed WEIGHT
+            // Index logic: (in_d * 96 + 32 + d). Stride 96 is even, 32 is even, d is even.
+            // So we can divide index by 2 safely.
+            uint packedW = w_attn_in[(in_d * 96 + 32 + d) >> 1];
+            min16float2 w_vals = UnpackFloat16(packedW);
+            
+            valK1 += c * (float)w_vals.x;
+            valK2 += c * (float)w_vals.y;
         }
-        
-        // Explicit Pack: 2 floats -> 1 uint
         gs_K_packed[localID * (D_MODEL/2) + (d/2)] = PackFloat16(valK1, valK2);
     }
 
-    // 2b. Compute V and Write Packed (uint)
+    // 2b. Compute V (Similar optimization)
     for (int d = 0; d < D_MODEL; d+=2) {
-        float valV1 = (float)b_attn_in[2 * D_MODEL + d];
-        float valV2 = (float)b_attn_in[2 * D_MODEL + d + 1];
+        min16float2 b_vals = UnpackFloat16(b_attn_in[(2 * D_MODEL + d) >> 1]);
+        float valV1 = (float)b_vals.x;
+        float valV2 = (float)b_vals.y;
 
         for (int in_d = 0; in_d < D_MODEL; in_d++) {
             float c = (float)curr[in_d];
-            valV1 += c * w_attn_in[in_d * 96 + 64 + d];
-            valV2 += c * w_attn_in[in_d * 96 + 64 + d + 1];
+            uint packedW = w_attn_in[(in_d * 96 + 64 + d) >> 1];
+            min16float2 w_vals = UnpackFloat16(packedW);
+            
+            valV1 += c * (float)w_vals.x;
+            valV2 += c * (float)w_vals.y;
         }
-
-        // Explicit Pack
         gs_V_packed[localID * (D_MODEL/2) + (d/2)] = PackFloat16(valV1, valV2);
     }
-
-    // 2c. Compute Q (Keep in registers)
+    
+    // 2c. Compute Q (Register accumulation)
     for (int d = 0; d < D_MODEL; d++) {
-        min16float valQ = (min16float)b_attn_in[d];
+        // Here we iterate d by 1, so simpler to use UnpackWeight helper
+        min16float valQ = UnpackWeight(b_attn_in, d);
         for (int in_d = 0; in_d < D_MODEL; in_d++) {
-            valQ += curr[in_d] * (min16float)w_attn_in[in_d * 96 + d];
+            valQ += curr[in_d] * UnpackWeight(w_attn_in, in_d * 96 + d);
         }
         q[d] = valQ;
     }
@@ -369,9 +384,9 @@ void FusedTransformerLayer(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_
     // --- PHASE 4: Proj + Residual + Norm 2 ---
     // Reuse 'q' buffer for (x + Proj(curr)) to save registers
     for (int d = 0; d < D_MODEL; d++) {
-        min16float val = (min16float)b_attn_out[d];
+        min16float val = UnpackWeight(b_attn_out, d);
         for (int k = 0; k < D_MODEL; k++) {
-            val += curr[k] * (min16float)w_attn_out[k * D_MODEL + d];
+            val += curr[k] * UnpackWeight(w_attn_out, k * D_MODEL + d);
         }
         q[d] = x[d] + val; // Residual 1
     }
@@ -385,25 +400,23 @@ void FusedTransformerLayer(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_
 
     // Reuse 'curr' for FFN input
     for(int i=0; i<D_MODEL; i++) {
-        curr[i] = (q[i] - mean) * invStd * (min16float)w_norm2[i] + (min16float)b_norm2[i];
+        curr[i] = (q[i] - mean) * invStd * UnpackWeight(w_norm2, i) + UnpackWeight(b_norm2, i);
     }
 
     // --- PHASE 5: FFN ---
-    for(int i=0; i<D_MODEL; i++) x[i] = (min16float)b_ffn2[i]; // Reuse 'x' as output accumulator
+    for(int i=0; i<D_MODEL; i++) x[i] = UnpackWeight(b_ffn2, i); // Reuse 'x' as output accumulator
 
     // Hidden layer size is 64 (2 * D_MODEL)
     for(int h=0; h<64; h++) {
-        min16float h_val = (min16float)b_ffn1[h];
+        min16float h_val = UnpackWeight(b_ffn1, h);
         for(int in_d=0; in_d<32; in_d++) {
-            h_val += curr[in_d] * (min16float)w_ffn1[in_d * 64 + h];
+            h_val += curr[in_d] * UnpackWeight(w_ffn1, in_d * 64 + h);
         }
         
-        // Gelu
         min16float gelu = h_val * 0.5 * (1.0 + tanh(0.79788 * (h_val + 0.044715 * h_val * h_val * h_val)));
         
-        // Project back
         for(int out_d=0; out_d<32; out_d++) {
-            x[out_d] += gelu * (min16float)w_ffn2[h * 32 + out_d];
+            x[out_d] += gelu * UnpackWeight(w_ffn2, h * 32 + out_d);
         }
     }
 
