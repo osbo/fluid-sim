@@ -577,17 +577,18 @@ MonoBehaviour:
   gravity: 100
   useRealTime: 0
   frameRate: 30
-  minLayer: 4
+  minLayer: 5
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
-  renderingMode: 6
+  renderingMode: 0
   thicknessSource: 0
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
   particlesMaterial: {fileID: 2100000, guid: 1b9c22194e8794a748318dae7ffe7f56, type: 2}
   particleDepthMaterial: {fileID: 2100000, guid: 02cdf3bcc869241a49f58b5e8d42a8ea, type: 2}
   nodeThicknessMaterial: {fileID: 2100000, guid: 555cc73f225be420190af8e738526deb, type: 2}
+  nodeWireframeMaterial: {fileID: 2100000, guid: 2642f661bfdf64d9a87b4324fd7f74a7, type: 2}
   particleThicknessMaterial: {fileID: 2100000, guid: 9df3c40a709154c7a8fcb0766b252408, type: 2}
   normalMaterial: {fileID: 2100000, guid: 2c9b4b14204124ea793fcbf0a077e303, type: 2}
   compositeMaterial: {fileID: 2100000, guid: 300258d4d41fa4015af599080020c3b9, type: 2}
@@ -605,7 +606,7 @@ MonoBehaviour:
   depthBlurThreshold: 1.24
   thicknessBlurRadius: 22
   particleRadius: 0.066
-  depthRadius: 0.279
+  depthRadius: 0.408
   thicknessRadius: 0.776
   absorptionStrength: 5.8
   depthOfFieldStrength: 0.076
@@ -814,8 +815,8 @@ Transform:
   m_GameObject: {fileID: 1326165318}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 10, y: 10, z: 10}
-  m_LocalScale: {x: 20, y: 20, z: 20}
+  m_LocalPosition: {x: -7.5, y: 7.5, z: -7.5}
+  m_LocalScale: {x: 25, y: 15, z: 25}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}

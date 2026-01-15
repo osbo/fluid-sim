@@ -512,62 +512,6 @@ public partial class FluidSimulator : MonoBehaviour
         int groupsLinear = (numParticles + 511) / 512;
         nodesPrefixSumsShader.Dispatch(clearActiveBuffersKernel, groupsLinear, 1, 1);
     }
-    private void OnDrawGizmos()
-    {
-        if (nodesBuffer == null) return;
-        
-        // Calculate the maximum detail cell size (smallest possible cell)
-        // With 10 bits per axis, we have 1024 possible values (0-1023)
-        // The maximum detail cell size is simulation bounds divided by 1024
-        // Use the normalized simulation bounds (simulationBoundsMin is now Vector3.zero)
-        Vector3 simulationSize = simulationBounds.bounds.size;
-        // float maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
-        float maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
-
-        // Define 11 colors for different layers (0-10)
-        Color[] layerColors = new Color[]
-        {
-            new Color(1f, 0f, 0f),     // Red - Layer 0
-            new Color(1f, 0.3f, 0f),   // Orange-red - Layer 1
-            new Color(1f, 0.6f, 0f),   // Orange - Layer 2
-            new Color(1f, 1f, 0f),     // Yellow - Layer 3
-            new Color(0.5f, 1f, 0f),   // Yellow-green - Layer 4
-            new Color(0f, 1f, 0f),     // Green - Layer 5
-            new Color(0f, 1f, 0.5f),   // Blue-green - Layer 6
-            new Color(0f, 1f, 1f),     // Cyan - Layer 7
-            new Color(0f, 0.5f, 1f),   // Light blue - Layer 8
-            new Color(0f, 0f, 1f),     // Blue - Layer 9
-            new Color(0.5f, 0f, 1f)    // Violet - Layer 10
-        };
-
-        nodesCPU = new Node[numNodes];
-        nodesBuffer.GetData(nodesCPU);
-
-        
-
-        // // uint[] neighborsCPU = new uint[numNodes * 24];
-        // // neighborsBuffer.GetData(neighborsCPU);
-
-        // for (int i = 0; i < numNodes; i++) {
-        //     Node node = nodesCPU[i];
-        //     Gizmos.color = layerColors[(int)node.layer];
-        //     Gizmos.DrawWireCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        //     // Gizmos.color = new Color(0.0f, 0.5f, 1.0f, 1.0f);
-        //     // bool isBoundary = false;
-        //     // uint neighborBaseIndex = (uint)i * 24;
-        //     // for (int d = 0; d < 6; d++) {
-        //     //     uint baseFaceIndex = neighborBaseIndex + (uint)d * 4;
-        //     //     uint n0_idx = neighborsCPU[baseFaceIndex];
-        //     //     if (n0_idx == numNodes + 1) {
-        //     //         isBoundary = true;
-        //     //         break;
-        //     //     }
-        //     // }
-        //     // if (node.layer == minLayer || isBoundary) {
-        //     //     Gizmos.DrawCube(DecodeMorton3D(node), Vector3.one * Mathf.Max(maxDetailCellSize * Mathf.Pow(2, node.layer), 0.01f));
-        //     // }
-        // }
-    }
     private Vector3 DecodeMorton3D(Node node)
     {
         int gridResolution = (int)Mathf.Pow(2, 10 - node.layer);
