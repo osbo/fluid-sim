@@ -224,9 +224,9 @@ Transform:
   m_GameObject: {fileID: 72561708}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 20, z: 0}
-  m_LocalScale: {x: 40, y: 40, z: 40}
-  m_ConstrainProportionsScale: 1
+  m_LocalPosition: {x: 0, y: 40, z: 0}
+  m_LocalScale: {x: 40, y: 80, z: 40}
+  m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
@@ -318,7 +318,7 @@ Transform:
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
   m_LocalRotation: {x: -0.015995169, y: -0.861098, z: 0.027131021, w: -0.5074626}
-  m_LocalPosition: {x: -72.77539, y: 28.732178, z: 35.24121}
+  m_LocalPosition: {x: 17255.896, y: -6904.7754, z: -8931.494}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -577,11 +577,11 @@ MonoBehaviour:
   gravity: 100
   useRealTime: 0
   frameRate: 30
-  minLayer: 5
+  minLayer: 3
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
-  renderingMode: 0
+  renderingMode: 7
   thicknessSource: 0
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
@@ -815,8 +815,8 @@ Transform:
   m_GameObject: {fileID: 1326165318}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -7.5, y: 7.5, z: -7.5}
-  m_LocalScale: {x: 25, y: 15, z: 25}
+  m_LocalPosition: {x: -10, y: 10, z: -10}
+  m_LocalScale: {x: 20, y: 20, z: 20}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
