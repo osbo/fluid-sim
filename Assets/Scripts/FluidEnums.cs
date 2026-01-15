@@ -3,6 +3,7 @@ using UnityEngine;
 public enum RenderingMode
 {
     Particles,
+    Nodes,
     Depth,
     Thickness,
     BlurredDepth,

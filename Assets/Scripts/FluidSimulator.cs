@@ -210,6 +210,9 @@ public partial class FluidSimulator : MonoBehaviour
     // Material to render nodes with thickness shader (assign a shader like Custom/NodeThickness)
     public Material nodeThicknessMaterial;
     
+    // Material to render nodes with wireframe shader (assign a shader like Custom/NodeWireframe)
+    public Material nodeWireframeMaterial;
+    
     // Material to render particles with thickness shader (assign a shader like Custom/ParticleThickness)
     public Material particleThicknessMaterial;
     
@@ -272,6 +275,7 @@ public partial class FluidSimulator : MonoBehaviour
     private RenderTexture rawDepthTexture; // Stores unblurred depth for visualization
     private RenderTexture fluidNormalTexture; // Stores the surface normals (RGB = slope vectors)
     private RenderTexture fluidThicknessTexture; // Smoothed thickness
+    private RenderTexture nodesTexture; // Stores wireframe nodes rendering
     
     void Start()
     {
@@ -703,5 +707,6 @@ public partial class FluidSimulator : MonoBehaviour
         // Clean up render textures
         if (fluidDepthTexture != null) fluidDepthTexture.Release();
         if (fluidNormalTexture != null) fluidNormalTexture.Release();
+        if (nodesTexture != null) nodesTexture.Release();
     }
 }
