@@ -125,8 +125,8 @@ public partial class FluidSimulator : MonoBehaviour
     public float gravity = 100.0f;
     public bool useRealTime = false; // When true, uses Time.deltaTime instead of fixed frameRate
     public float frameRate = 30.0f;
-    public int minLayer = 4;
-    public int maxLayer = 10;
+    [Range(0, 10)] public int minLayer = 4;
+    [Range(0, 10)] public int maxLayer = 10;
     public PreconditionerType preconditioner = PreconditionerType.Neural;
 
     private bool hasShownWaitMessage = false;
