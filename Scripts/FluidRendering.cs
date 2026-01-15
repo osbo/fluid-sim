@@ -64,6 +64,12 @@ public partial class FluidSimulator : MonoBehaviour
             rawDepthTexture.Release();
             rawDepthTexture = null;
         }
+        
+        if (nodesTexture != null)
+        {
+            nodesTexture.Release();
+            nodesTexture = null;
+        }
     }
     private void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
@@ -94,14 +100,21 @@ public partial class FluidSimulator : MonoBehaviour
             }
         }
         
-        // --- 2. Render Depth (Raw) ---
+        // --- 2. Render Nodes (Wireframe) ---
+        // Needed for: Nodes
+        if (renderingMode == RenderingMode.Nodes)
+        {
+            RenderNodes(cam);
+        }
+        
+        // --- 3. Render Depth (Raw) ---
         // Needed for: Depth, BlurredDepth, Normal, Composite
-        if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness) 
+        if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness && renderingMode != RenderingMode.Nodes) 
         {
             DrawParticles(cam, ctx); // Renders to rawDepthTexture or screen
         }
         
-        // --- 3. Blur Depth & Gen Normals ---
+        // --- 4. Blur Depth & Gen Normals ---
         // Needed for: BlurredDepth, Normal, Composite
         if (renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
         {
@@ -122,8 +135,13 @@ public partial class FluidSimulator : MonoBehaviour
             RenderNormals(cam);
         }
         
-        // --- 4. Final Display / Composite ---
-        if (renderingMode == RenderingMode.Thickness)
+        // --- 5. Final Display / Composite ---
+        if (renderingMode == RenderingMode.Nodes)
+        {
+            // Display nodes texture directly (it's already in RGB format with colors)
+            Graphics.Blit(nodesTexture, (RenderTexture)null);
+        }
+        else if (renderingMode == RenderingMode.Thickness)
         {
             float thicknessScale = thicknessSource == ThicknessSource.Nodes 
                 ? thicknessScaleNodes 
@@ -466,6 +484,91 @@ public partial class FluidSimulator : MonoBehaviour
                 particleArgsBuffer
             );
         }
+        
+        // Execute command buffer
+        Graphics.ExecuteCommandBuffer(thicknessCmd);
+
+        // Visualization is handled in OnEndCameraRendering
+    }
+    private void RenderNodes(Camera cam)
+    {
+        if (cam == null) return;
+
+        // Create quad mesh if it doesn't exist
+        if (quadMesh == null)
+        {
+            CreateQuadMesh();
+        }
+
+        // Ensure nodes texture exists and matches screen size
+        if (nodesTexture == null || nodesTexture.width != cam.pixelWidth || nodesTexture.height != cam.pixelHeight)
+        {
+            if (nodesTexture != null)
+            {
+                nodesTexture.Release();
+            }
+            nodesTexture = new RenderTexture(cam.pixelWidth, cam.pixelHeight, 24, RenderTextureFormat.ARGBFloat);
+            nodesTexture.enableRandomWrite = true;
+            nodesTexture.Create();
+        }
+
+        // Use CommandBuffer for rendering
+        thicknessCmd.Clear();
+        
+        // Set render target to nodes texture and clear to transparent
+        thicknessCmd.SetRenderTarget(nodesTexture);
+        thicknessCmd.ClearRenderTarget(true, true, Color.clear);
+
+        // Render using nodes
+        if (nodesBuffer == null || numNodes <= 0) return;
+        if (nodeWireframeMaterial == null) return;
+
+        // Update args buffer with current node count
+        if (argsBuffer == null || argsBuffer.count != 5)
+        {
+            CreateArgsBuffer();
+        }
+        else
+        {
+            // Update instance count in args buffer
+            uint[] args = new uint[5];
+            argsBuffer.GetData(args);
+            args[1] = (uint)numNodes; // Update instance count
+            argsBuffer.SetData(args);
+        }
+
+        // Set up material properties for NodeWireframe shader
+        nodeWireframeMaterial.SetBuffer("_Nodes", nodesBuffer);
+        nodeWireframeMaterial.SetVector("_SimulationBoundsMin", simulationBounds.bounds.min);
+        nodeWireframeMaterial.SetVector("_SimulationBoundsMax", simulationBounds.bounds.max);
+        nodeWireframeMaterial.SetFloat("_PointSize", maxDetailCellSize); // Use maxDetailCellSize as base size
+        // _WireframeWidth and _DensityScale are controlled from Material Inspector, not set here
+        
+        // Set depth parameters (same as particles shader - automatic depth shading)
+        if (cam != null && simulationBounds != null)
+        {
+            Vector3 cameraPos = cam.transform.position;
+            Bounds bounds = simulationBounds.bounds;
+            float boundsDiagonal = bounds.size.magnitude;
+            
+            // Calculate depth parameters for automatic depth shading
+            CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
+            
+            // Get the calculated values (convert from exponents to actual values)
+            float calculatedMinValue = Mathf.Exp(calculatedDepthMinValue);
+            float calculatedScale = Mathf.Exp(calculatedDepthDisplayScale);
+            nodeWireframeMaterial.SetFloat("_Scale", calculatedScale);
+            nodeWireframeMaterial.SetFloat("_MinValue", calculatedMinValue);
+        }
+
+        // Draw nodes to nodes texture
+        thicknessCmd.DrawMeshInstancedIndirect(
+            quadMesh,
+            0,
+            nodeWireframeMaterial,
+            0,  // shader pass index
+            argsBuffer
+        );
         
         // Execute command buffer
         Graphics.ExecuteCommandBuffer(thicknessCmd);
