@@ -19,6 +19,45 @@ from pathlib import Path
 import argparse
 import time
 
+# --- 0. UTILITY FUNCTIONS ---
+
+def smooth_losses(losses, window_size=4):
+    """
+    Smooth loss array by averaging over a moving window.
+    window_size: Number of points to average (default 4).
+    """
+    if len(losses) < window_size:
+        return losses
+    
+    smoothed = []
+    for i in range(len(losses)):
+        start = max(0, i - window_size // 2)
+        end = min(len(losses), i + window_size // 2 + 1)
+        smoothed.append(np.mean(losses[start:end]))
+    
+    return np.array(smoothed)
+
+def compute_nnz_per_row_cdf(indices, num_nodes):
+    """
+    Compute the CDF of number of nonzeros per row.
+    Returns: (nnz_values, cdf_percentages)
+    where cdf_percentages[i] is the percentage of rows with <= nnz_values[i] nonzeros.
+    """
+    # Count nonzeros per row
+    row_counts = torch.zeros(num_nodes, dtype=torch.long, device=indices.device)
+    row_indices = indices[0]  # First row of indices contains row numbers
+    row_counts.scatter_add_(0, row_indices, torch.ones_like(row_indices))
+    
+    # Convert to numpy for easier processing
+    counts_np = row_counts.cpu().numpy()
+    
+    # Compute CDF
+    max_nnz = int(counts_np.max())
+    nnz_values = np.arange(0, max_nnz + 1)
+    cdf = np.array([np.sum(counts_np <= nnz) / num_nodes * 100 for nnz in nnz_values])
+    
+    return nnz_values, cdf
+
 # --- 1. LOADER UTILITIES (Adapted from your existing scripts) ---
 
 def compute_laplacian_stencil(neighbors, layers, num_nodes):
@@ -116,7 +155,146 @@ def build_scipy_A(A_diag, A_off, neighbors, num_nodes):
                 
     return sp.csr_matrix((data, (rows, cols)), shape=(num_nodes, num_nodes))
 
-# --- 2. OPTIMIZATION ROUTINE ---
+# --- 2. SPARSITY PATTERN HELPER ---
+
+def get_sparsity_pattern(neighbors, num_nodes, degree=1):
+    """
+    Computes the indices [2, E] for a K-hop sparsity pattern.
+    degree=1: Immediate neighbors (matches current script).
+    degree=2: Neighbors + Neighbors of Neighbors.
+    """
+    device = neighbors.device
+    N = num_nodes
+    
+    # 1. Convert fixed [N, 24] neighbors to sparse indices [2, E]
+    # Filter out invalid neighbors (>= N)
+    mask = neighbors < N
+    row_idx = torch.arange(N, device=device).view(N, 1).expand(N, 24)
+    
+    src = row_idx[mask]
+    dst = neighbors[mask]
+    
+    # Create the Degree 1 adjacency matrix (Structure only)
+    # Value 1.0 indicates a connection
+    indices = torch.stack([src, dst], dim=0)
+    values = torch.ones(indices.shape[1], device=device)
+    
+    adj = torch.sparse_coo_tensor(indices, values, (N, N)).coalesce()
+    
+    # 2. Compute Higher Degrees via Matrix Power
+    # (A + I)^k captures all nodes reachable in k steps
+    
+    # Start with Identity (Degree 0)
+    eye_idx = torch.arange(N, device=device).unsqueeze(0).repeat(2, 1)
+    eye_val = torch.ones(N, device=device)
+    reached = torch.sparse_coo_tensor(eye_idx, eye_val, (N, N)).coalesce()
+    
+    # Add Degree 1
+    reached = (reached + adj).coalesce()
+    
+    # Iterate for higher degrees
+    curr_adj = adj
+    for _ in range(degree - 1):
+        # Symbolic matmul: adj_new = adj @ curr_adj
+        curr_adj = torch.sparse.mm(adj, curr_adj).coalesce()
+        reached = (reached + curr_adj).coalesce()
+        
+    # 3. Extract Indices and Remove Diagonal
+    # (Diagonal is handled separately by G_diag parameter)
+    final_indices = reached.indices()
+    
+    # Mask out self-loops (row == col)
+    row, col = final_indices[0], final_indices[1]
+    mask_off_diag = row != col
+    
+    off_diag_indices = final_indices[:, mask_off_diag]
+    
+    print(f"Sparsity Pattern (Degree {degree}): {off_diag_indices.shape[1]} edges "
+          f"(~{off_diag_indices.shape[1]/N:.1f} per node)")
+            
+    return off_diag_indices
+
+# --- 3. OPTIMIZATION ROUTINE ---
+
+def find_optimal_sparse_G_generic(A_diag, A_off, neighbors, num_nodes, indices, device='cuda', steps=2000):
+    """
+    Generic optimization for ANY sparsity pattern defined by `indices`.
+    indices: [2, E] LongTensor of (row, col) coordinates for learnable weights.
+    """
+    print(f"\n--- Optimizing generic G (Edges: {indices.shape[1]}) ---")
+    
+    # 1. Setup Fixed Physics (Matrix A)
+    # We still use the custom kernel for A because it's already built and fast
+    t_neighbors = neighbors.to(device)
+    t_A_diag = A_diag.to(device)
+    t_A_off = A_off.to(device)
+    norm_A = (torch.abs(t_A_diag).sum() + torch.abs(t_A_off).sum()) / (num_nodes * 25)
+    
+    def apply_A(x):
+        # Use existing efficient kernel for A
+        coeffs_d = t_A_diag.unsqueeze(0)
+        coeffs_o = t_A_off.unsqueeze(0)
+        
+        # Inline the gather logic briefly or reuse the one from script
+        # (Assuming reuse of simple gather logic from original script for A)
+        res = x * coeffs_d
+        B, N, _ = x.shape
+        safe_nbrs = t_neighbors.clone(); safe_nbrs[safe_nbrs >= N] = 0
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1) * N
+        flat_idx = (safe_nbrs + batch_idx).view(-1)
+        x_flat = x.view(-1, 1)
+        x_nbrs = x_flat[flat_idx].view(B, N, 24)
+        mask = (t_neighbors < N).float().unsqueeze(0)
+        res += (x_nbrs * coeffs_o * mask).sum(dim=2, keepdim=True)
+        return res
+
+    # 2. Setup Learnable G (Sparse)
+    # G_diag: [N, 1]
+    # G_off_val: [E] (The values corresponding to 'indices')
+    G_diag = torch.ones(num_nodes, 1, device=device, requires_grad=True)
+    G_off_val = torch.zeros(indices.shape[1], device=device, requires_grad=True)
+    
+    optimizer = torch.optim.Adam([G_diag, G_off_val], lr=0.01)
+    
+    losses = []
+    
+    for i in range(steps):
+        optimizer.zero_grad()
+        
+        # Construct G as a sparse tensor on the fly
+        # Note: torch.sparse doesn't support autograd for 'indices', only 'values', which is what we want.
+        G_sparse_off = torch.sparse_coo_tensor(indices, G_off_val, (num_nodes, num_nodes)).coalesce()
+        
+        # Probe Vector
+        w = torch.randn(num_nodes, 1, device=device)
+        
+        # Forward Pass: v = (G G^T + eps I) w
+        # v = G * (G^T * w)
+        
+        # 1. u = G^T * w
+        # u = D * w + G_off^T * w
+        # Sparse Transpose MM: (M^T x) is equivalent to (x^T M)^T or specialized ops.
+        # PyTorch sparse: sparse.mm(mat.t(), dense) works.
+        u = w * G_diag
+        u += torch.sparse.mm(G_sparse_off.t(), w)
+        
+        # 2. v = G * u
+        v = u * G_diag
+        v += torch.sparse.mm(G_sparse_off, u)
+        
+        # 3. Loss = || 1/|A| * A * v - w ||^2
+        y = apply_A(v.unsqueeze(0)).squeeze(0) # Add/remove batch dim for apply_A
+        z = y / norm_A
+        
+        loss = ((z - w)**2).mean()
+        loss.backward()
+        optimizer.step()
+        
+        losses.append(loss.item())
+        if i % 500 == 0:
+            print(f"  Step {i}: Loss = {loss.item():.6f}")
+
+    return losses
 
 def find_optimal_sparse_G(A_diag, A_off, neighbors, num_nodes, device='cuda', steps=2000):
     """
@@ -271,9 +449,31 @@ def inspect_matrix(frame_path):
     dists = dists[mask]
     vals = row_inv[mask]
     
-    # 4. Find Optimal Sparse G (The Ceiling)
+    # 4. Find Optimal Sparse G (The Ceiling) - Compare Degree 1 vs Degree 2
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    opt_losses, G_opt = find_optimal_sparse_G(A_diag, A_off, neighbors, N, device)
+    
+    # --- 1. Degree 1 Optimization (Baseline) ---
+    print("Generating Degree 1 Sparsity Pattern...")
+    indices_d1 = get_sparsity_pattern(neighbors.to(device), N, degree=1)
+    losses_d1 = find_optimal_sparse_G_generic(
+        A_diag, A_off, neighbors, N, indices_d1, device, steps=3000
+    )
+    
+    # --- 2. Degree 2 Optimization (Expanded) ---
+    print("Generating Degree 2 Sparsity Pattern...")
+    indices_d2 = get_sparsity_pattern(neighbors.to(device), N, degree=2)
+    losses_d2 = find_optimal_sparse_G_generic(
+        A_diag, A_off, neighbors, N, indices_d2, device, steps=3000
+    )
+    
+    # --- 3. Degree 3 Optimization (Further Expanded) ---
+    print("Generating Degree 3 Sparsity Pattern...")
+    indices_d3 = get_sparsity_pattern(neighbors.to(device), N, degree=3)
+    losses_d3 = find_optimal_sparse_G_generic(
+        A_diag, A_off, neighbors, N, indices_d3, device, steps=3000
+    )
+    
+    opt_losses = losses_d1  # Keep for backward compatibility with plotting
     
     # 5. Load Trained Model (if available) to compare
     model_loss = "N/A"
@@ -291,10 +491,10 @@ def inspect_matrix(frame_path):
         pass
 
     # --- PLOTTING ---
-    plt.figure(figsize=(15, 10))
+    plt.figure(figsize=(18, 10))
     
     # Plot 1: Inverse Decay
-    plt.subplot(2, 2, 1)
+    plt.subplot(2, 3, 1)
     plt.scatter(dists, vals, alpha=0.5, s=2)
     plt.yscale('log')
     plt.title(f"A^-1 Row Decay (Node {center_idx})")
@@ -303,7 +503,7 @@ def inspect_matrix(frame_path):
     plt.grid(True, which="both", alpha=0.3)
     
     # Plot 2: Spy Plot of Inverse (Sparsity Pattern)
-    plt.subplot(2, 2, 2)
+    plt.subplot(2, 3, 2)
     # Threshold to see "effective" sparsity
     limit = 1e-3 * np.max(np.abs(A_inv))
     plt.spy(A_inv > limit, markersize=0.1)
@@ -315,7 +515,7 @@ def inspect_matrix(frame_path):
         # Add tiny jitter to ensure stability
         L_true = scipy.linalg.cholesky(A_inv + np.eye(N)*1e-6, lower=True)
         
-        plt.subplot(2, 2, 3)
+        plt.subplot(2, 3, 3)
         plt.spy(L_true > limit, markersize=0.1)
         plt.title(f"Structure of True Cholesky(A^-1)")
         
@@ -331,15 +531,39 @@ def inspect_matrix(frame_path):
     except Exception as e:
         print(f"Cholesky failed: {e}")
 
-    # Plot 4: Optimization Curve (The Ceiling)
-    plt.subplot(2, 2, 4)
-    plt.plot(opt_losses)
+    # Plot 4: Optimization Curve (The Ceiling) - Degree 1 vs Degree 2 vs Degree 3
+    plt.subplot(2, 3, 4)
+    # Smooth the loss arrays to reduce noise
+    losses_d1_smooth = smooth_losses(losses_d1, window_size=4)
+    losses_d2_smooth = smooth_losses(losses_d2, window_size=4)
+    losses_d3_smooth = smooth_losses(losses_d3, window_size=4)
+    
+    plt.plot(losses_d1_smooth, label=f'Degree 1 (Immediate) - Final: {losses_d1[-1]:.5f}')
+    plt.plot(losses_d2_smooth, label=f'Degree 2 (Expanded) - Final: {losses_d2[-1]:.5f}')
+    plt.plot(losses_d3_smooth, label=f'Degree 3 (Further Expanded) - Final: {losses_d3[-1]:.5f}')
     plt.yscale('log')
-    plt.title("Optimization of Sparse G (The Limit)")
-    plt.xlabel("Steps")
+    plt.title("Theoretical Ceiling: Degree 1 vs Degree 2 vs Degree 3 Stencil")
+    plt.xlabel("Optimization Steps")
     plt.ylabel("SAI Loss")
-    plt.axhline(y=opt_losses[-1], color='r', linestyle='--', label=f'Best Limit: {opt_losses[-1]:.4f}')
     plt.legend()
+    plt.grid(True, which='both', alpha=0.3)
+    
+    # Plot 5: CDF of Nonzeros per Row
+    plt.subplot(2, 3, 5)
+    nnz_d1, cdf_d1 = compute_nnz_per_row_cdf(indices_d1, N)
+    nnz_d2, cdf_d2 = compute_nnz_per_row_cdf(indices_d2, N)
+    nnz_d3, cdf_d3 = compute_nnz_per_row_cdf(indices_d3, N)
+    
+    plt.plot(nnz_d1, cdf_d1, label='Degree 1', marker='o', markersize=3, linewidth=2)
+    plt.plot(nnz_d2, cdf_d2, label='Degree 2', marker='s', markersize=3, linewidth=2)
+    plt.plot(nnz_d3, cdf_d3, label='Degree 3', marker='^', markersize=3, linewidth=2)
+    plt.xlabel("Number of Nonzeros per Row")
+    plt.ylabel("Percent of Rows (≤ nnz)")
+    plt.title("CDF: Nonzeros per Row by Degree")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xlim(left=0)
+    plt.ylim(0, 100)
     
     plt.tight_layout()
     plt.show()
@@ -347,7 +571,10 @@ def inspect_matrix(frame_path):
     print("\n--- Summary ---")
     print(f"1. Decay Analysis: See Plot 1. If line is flat, inverse is global (hard for sparse G).")
     print(f"2. Structure Analysis: See Plot 2/3. If Cholesky is dense, your G pattern is insufficient.")
-    print(f"3. Theoretical Limit: The best possible loss with your sparsity pattern is {opt_losses[-1]:.5f}.")
+    print(f"3. Theoretical Limit Comparison:")
+    print(f"   - Degree 1 (Immediate neighbors): {losses_d1[-1]:.5f}")
+    print(f"   - Degree 2 (2-hop neighbors): {losses_d2[-1]:.5f}")
+    print(f"   - Degree 3 (3-hop neighbors): {losses_d3[-1]:.5f}")
     print(f"   (If your Neural Network loss is >> this, the Network is underfitting.)")
     print(f"   (If this loss is high (>0.1), the Sparsity Pattern itself is the bottleneck.)")
 

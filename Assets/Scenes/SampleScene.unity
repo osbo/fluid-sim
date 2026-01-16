@@ -317,8 +317,8 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
-  m_LocalRotation: {x: -0.015995169, y: -0.861098, z: 0.027131021, w: -0.5074626}
-  m_LocalPosition: {x: 17255.896, y: -6904.7754, z: -8931.494}
+  m_LocalRotation: {x: -0.06891694, y: -0.85426587, z: 0.117334895, w: -0.50170994}
+  m_LocalPosition: {x: -56.146484, y: 29.685547, z: 29.449219}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -575,13 +575,13 @@ MonoBehaviour:
   convergenceThreshold: 0.00001
   modelWeightsAsset: {fileID: 4900000, guid: c8c83e26cc03d4114b9402603b15f56f, type: 3}
   gravity: 100
-  useRealTime: 0
+  useRealTime: 1
   frameRate: 30
-  minLayer: 3
+  minLayer: 4
   maxLayer: 10
   preconditioner: 1
   recorder: {fileID: 944897176}
-  renderingMode: 7
+  renderingMode: 0
   thicknessSource: 0
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
@@ -604,7 +604,7 @@ MonoBehaviour:
   thicknessScaleParticles: -9.6
   depthBlurRadius: 6
   depthBlurThreshold: 1.24
-  thicknessBlurRadius: 22
+  thicknessBlurRadius: 56
   particleRadius: 0.066
   depthRadius: 0.408
   thicknessRadius: 0.776
