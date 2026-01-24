@@ -83,6 +83,9 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer ApBuffer;
     private ComputeBuffer residualBuffer;
     private ComputeBuffer pressureBuffer;
+    // NEW: Buffer for standard Laplacian Matrix A
+    // Format: [25 * numNodes] where Slot 0 = Diagonal, 1-24 = Neighbors
+    private ComputeBuffer matrixABuffer;
     private ComputeBuffer phiBuffer;
     private ComputeBuffer phiBuffer_Read;
     private ComputeBuffer dirtyFlagBuffer;
@@ -696,6 +699,7 @@ public partial class FluidSimulator : MonoBehaviour
         pBuffer?.Release();
         ApBuffer?.Release();
         pressureBuffer?.Release();
+        matrixABuffer?.Release();
         phiBuffer?.Release();
         phiBuffer_Read?.Release();
         dirtyFlagBuffer?.Release();
