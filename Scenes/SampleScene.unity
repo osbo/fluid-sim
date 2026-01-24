@@ -569,6 +569,7 @@ MonoBehaviour:
   nodesPrefixSumsShader: {fileID: 7200000, guid: c32ad71b0afda4f7d827eb945c910544, type: 3}
   nodesShader: {fileID: 7200000, guid: eab82c62a627a4a2295451473985b296, type: 3}
   cgSolverShader: {fileID: 7200000, guid: d5297ef94acc94983b6222dcf43123f9, type: 3}
+  csrBuilderShader: {fileID: 7200000, guid: a9d51c4c639e2475895d847e254df16f, type: 3}
   preconditionerShader: {fileID: 7200000, guid: 3729328c7401a4adb83d07f36029d34e, type: 3}
   numParticles: 1048576
   maxCgIterations: 400

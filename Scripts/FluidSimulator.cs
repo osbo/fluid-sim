@@ -21,6 +21,7 @@ public partial class FluidSimulator : MonoBehaviour
     public ComputeShader nodesPrefixSumsShader;
     public ComputeShader nodesShader;
     public ComputeShader cgSolverShader;
+    public ComputeShader csrBuilderShader; // NEW: CSR construction shader
     public ComputeShader preconditionerShader; // Assign Preconditioner.compute in Inspector
     public int numParticles = 1048576;
     
@@ -100,6 +101,11 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer bufferV; // V buffer for attention
     private ComputeBuffer bufferAttn; // Attention output buffer
     private ComputeBuffer diffusionGradientBuffer; // Precomputed normalized density gradient per node
+    // CSR matrix representation of A
+    private ComputeBuffer nnzPerNode;   // Per-row nnz counts
+    private ComputeBuffer csrRowPtr;    // Row pointer (size numNodes + 1)
+    private ComputeBuffer csrColIndices;
+    private ComputeBuffer csrValues;
     public TextAsset modelWeightsAsset; // Assign model_weights.bytes from Assets/Scripts/ in Inspector
     private Dictionary<string, ComputeBuffer> weightBuffers = new Dictionary<string, ComputeBuffer>();
     private float p_mean;
@@ -699,6 +705,10 @@ public partial class FluidSimulator : MonoBehaviour
         ApBuffer?.Release();
         pressureBuffer?.Release();
         matrixABuffer?.Release();
+        nnzPerNode?.Release();
+        csrRowPtr?.Release();
+        csrColIndices?.Release();
+        csrValues?.Release();
         phiBuffer?.Release();
         phiBuffer_Read?.Release();
         dirtyFlagBuffer?.Release();
