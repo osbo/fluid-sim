@@ -1,0 +1,119 @@
+// CSRBuilder.compute
+// Builds a standard CSR matrix representation from the existing
+// 27-point stencil stored in neighborsBuffer + matrixABuffer.
+//
+// Inputs:
+//  - neighborsBuffer: SoA adjacency, 24 entries per node
+//      neighborsBuffer[k * numNodes + i] = column index of k-th neighbor of row i
+//  - matrixABuffer: SoA Laplacian weights, 25 entries per node
+//      matrixABuffer[0 * numNodes + i]     = diagonal entry A_ii
+//      matrixABuffer[(k + 1) * numNodes + i] = weight for neighbor slot k
+//
+// Outputs:
+//  - nnzPerNode: number of nonzeros per row (1 diag + valid neighbors)
+//  - rowPtrBuffer: CSR row pointer array (size = numNodes + 1)
+//      rowPtrBuffer[i]   = starting index for row i in colIndices/values
+//      rowPtrBuffer[N]   = total number of nonzeros (NNZ)
+//  - colIndicesBuffer: column indices for each nonzero
+//  - valuesBuffer: values for each nonzero
+//
+// NOTE: The prefix sum over nnzPerNode → rowPtrBuffer[0..N-1] is
+// performed using the existing radixSortShader prefix-sum kernels
+// on the C# side. This shader only:
+//  - counts nnz per row (CountNNZ)
+//  - finalizes rowPtrBuffer[N] after prefix sum (FinalizeRowPtr)
+//  - fills CSR colIndices/values (FillCSR).
+
+#pragma kernel CountNNZ
+#pragma kernel FinalizeRowPtr
+#pragma kernel FillCSR
+
+StructuredBuffer<uint> neighborsBuffer;          // [24 * numNodes]
+StructuredBuffer<float> matrixABuffer;          // [25 * numNodes]
+
+RWStructuredBuffer<uint> nnzPerNode;            // [numNodes]
+RWStructuredBuffer<uint> rowPtrBuffer;          // [numNodes + 1] (RW so we can write last element)
+RWStructuredBuffer<uint> colIndicesBuffer;      // [totalNNZ]
+RWStructuredBuffer<float> valuesBuffer;         // [totalNNZ]
+
+uint numNodes;
+
+// --- KERNEL: CountNNZ -------------------------------------------------------
+// For each row i, count the number of nonzeros:
+//  1 for the diagonal, plus one for each valid neighbor entry.
+
+[numthreads(256, 1, 1)]
+void CountNNZ(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    // Start with 1 for the diagonal
+    uint count = 1u;
+
+    // Check all 24 potential neighbor slots
+    // SoA layout: neighborsBuffer[slot * numNodes + i]
+    [unroll]
+    for (int k = 0; k < 24; k++)
+    {
+        uint neighborIdx = neighborsBuffer[k * numNodes + i];
+
+        // Valid fluid node if index is in [0, numNodes)
+        if (neighborIdx < numNodes)
+        {
+            count++;
+        }
+    }
+
+    nnzPerNode[i] = count;
+}
+
+// --- KERNEL: FinalizeRowPtr -------------------------------------------------
+// After an exclusive prefix sum over nnzPerNode has been written to
+// rowPtrBuffer[0..numNodes-1] on the C# side, this kernel fills
+// rowPtrBuffer[numNodes] with the total number of nonzeros:
+//      totalNNZ = rowPtr[numNodes-1] + nnzPerNode[numNodes-1]
+
+[numthreads(1, 1, 1)]
+void FinalizeRowPtr(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0 || numNodes == 0) return;
+
+    uint last = numNodes - 1;
+    uint total = rowPtrBuffer[last] + nnzPerNode[last];
+    rowPtrBuffer[numNodes] = total;
+}
+
+// --- KERNEL: FillCSR --------------------------------------------------------
+// Uses the finalized rowPtrBuffer to write CSR colIndices and values
+// from neighborsBuffer + matrixABuffer.
+
+[numthreads(256, 1, 1)]
+void FillCSR(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    // Start writing at the offset defined by rowPtr
+    uint writeIdx = rowPtrBuffer[i];
+
+    // 1. Write Diagonal (Slot 0 in matrixABuffer)
+    colIndicesBuffer[writeIdx] = i;
+    valuesBuffer[writeIdx] = matrixABuffer[0 * numNodes + i];
+    writeIdx++;
+
+    // 2. Write Neighbors
+    [unroll]
+    for (int k = 0; k < 24; k++)
+    {
+        uint neighborIdx = neighborsBuffer[k * numNodes + i];
+        if (neighborIdx < numNodes)
+        {
+            colIndicesBuffer[writeIdx] = neighborIdx;
+            // Neighbor weights start at slot 1 in matrixABuffer
+            valuesBuffer[writeIdx] = matrixABuffer[(k + 1) * numNodes + i];
+            writeIdx++;
+        }
+    }
+}
+

@@ -11,6 +11,7 @@
 #pragma kernel PrecomputeIndices
 #pragma kernel ApplyJacobi // Keep this
 #pragma kernel GlobalReduceSum
+#pragma kernel SpMV_CSR
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
@@ -45,6 +46,11 @@ RWStructuredBuffer<uint> scatterIndicesBuffer;
 // Slot 0 = Diagonal, Slots 1-24 = Neighbors 0-23
 // Ensure this matches the C# name
 RWStructuredBuffer<float> matrixABuffer; 
+
+// --- CSR representation of A ---
+StructuredBuffer<uint> csrRowPtr;         // [numNodes + 1]
+StructuredBuffer<uint> csrColIndices;     // [totalNNZ]
+StructuredBuffer<float> csrValues;        // [totalNNZ]
 
 uint numNodes;
 float a; 
@@ -220,6 +226,68 @@ void ApplyMatrixAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, ui
     GroupMemoryBarrierWithGroupSync();
 
     // Standard Reduction
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (li < s) {
+            s_dot_reduction[li] += s_dot_reduction[li + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (li == 0) {
+        divergenceBuffer[Gid.x] = s_dot_reduction[0];
+    }
+}
+
+// --- KERNEL: SpMV_CSR + DOT -------------------------------------------------
+// Standard CSR SpMV:
+//      Ap[i] = sum_{j in row i} A_ij * p[j]
+// Fused with dot product p . Ap using the same reduction pattern as
+// ApplyMatrixAndDot, but reading from csrRowPtr/csrColIndices/csrValues.
+
+[numthreads(256, 1, 1)]
+void SpMV_CSR(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint li = Gtid.x;
+
+    float Ap_val = 0.0;
+    float p_i = 0.0;
+
+    if (i < numNodes)
+    {
+        uint start = csrRowPtr[i];
+        uint end = csrRowPtr[i + 1];
+
+        float sum = 0.0;
+
+        // Gather SpMV from CSR structure
+        for (uint idx = start; idx < end; idx++)
+        {
+            uint col = csrColIndices[idx];
+            float val = csrValues[idx];
+
+            float p_val = pBuffer[col];
+            if (!isfinite(p_val)) p_val = 0.0;
+
+            sum += val * p_val;
+        }
+
+        if (!isfinite(sum)) sum = 0.0;
+        Ap_val = sum;
+        ApBuffer[i] = Ap_val;
+
+        p_i = pBuffer[i];
+        if (!isfinite(p_i)) p_i = 0.0;
+    }
+
+    // Fused dot product p . Ap
+    float product = p_i * Ap_val;
+    if (!isfinite(product)) product = 0.0;
+
+    s_dot_reduction[li] = product;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Standard reduction (same as ApplyMatrixAndDot)
     for (uint s = 128; s > 0; s >>= 1) {
         if (li < s) {
             s_dot_reduction[li] += s_dot_reduction[li + s];
