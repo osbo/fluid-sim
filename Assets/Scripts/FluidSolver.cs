@@ -32,7 +32,6 @@ public partial class FluidSimulator : MonoBehaviour
         int applySparseGAndDotKernel = cgSolverShader.FindKernel("ApplySparseGAndDot");
         int clearBufferFloatKernel = cgSolverShader.FindKernel("ClearBufferFloat");
         int applyJacobiKernel = cgSolverShader.FindKernel("ApplyJacobi");
-        int computeDiagonalKernel = cgSolverShader.FindKernel("ComputeDiagonal");
         
         if (calculateDivergenceKernel < 0 || buildMatrixAKernel < 0 || applyMatrixAndDotKernel < 0)
         {
@@ -72,9 +71,6 @@ public partial class FluidSimulator : MonoBehaviour
         if (scatterIndicesBuffer == null || scatterIndicesBuffer.count < requiredSize * 24) {
             scatterIndicesBuffer?.Release(); scatterIndicesBuffer = new ComputeBuffer(requiredSize * 24, 4);
         }
-        if (diagonalBuffer == null || diagonalBuffer.count < requiredSize) {
-            diagonalBuffer?.Release(); diagonalBuffer = new ComputeBuffer(requiredSize, sizeof(float));
-        }
 
         // --- Step 1: Init (r = b) ---
         // 1a. Calculate Divergence (RHS 'b')
@@ -95,15 +91,6 @@ public partial class FluidSimulator : MonoBehaviour
         
         int groupsA = Mathf.CeilToInt(numNodes / 256.0f);
         cgSolverShader.Dispatch(buildMatrixAKernel, groupsA, 1, 1);
-
-        // Compute Diagonal (Legacy/Jacobi support)
-        if (computeDiagonalKernel >= 0) {
-            cgSolverShader.SetBuffer(computeDiagonalKernel, "nodesBuffer", nodesBuffer);
-            cgSolverShader.SetBuffer(computeDiagonalKernel, "neighborsBuffer", neighborsBuffer);
-            cgSolverShader.SetBuffer(computeDiagonalKernel, "diagonalBuffer", diagonalBuffer);
-            cgSolverShader.SetInt("numNodes", numNodes);
-            cgSolverShader.Dispatch(computeDiagonalKernel, groupsA, 1, 1);
-        }
 
         // Preconditioner setup (Neural)
         if (preconditioner == PreconditionerType.Neural && preconditionerShader != null) {
@@ -218,7 +205,33 @@ public partial class FluidSimulator : MonoBehaviour
         averageCgIterations = (float)(cumulativeCgIterations / Math.Max(1, cgSolveFrameCount));
         lastCgIterations = totalIterations;
         
-        // Save training data (omitted for brevity, assume exists)
+        // Save training data
+        if (recorder != null && recorder.isRecording)
+        {
+            Vector3 simBoundsMin = simulationBounds != null ? simulationBounds.bounds.min : Vector3.zero;
+            Vector3 simBoundsMax = simulationBounds != null ? simulationBounds.bounds.max : Vector3.zero;
+            Vector3 fluidBoundsMin = fluidInitialBounds != null ? fluidInitialBounds.bounds.min : Vector3.zero;
+            Vector3 fluidBoundsMax = fluidInitialBounds != null ? fluidInitialBounds.bounds.max : Vector3.zero;
+            
+            recorder.SaveFrame(
+                nodesBuffer,
+                neighborsBuffer,
+                divergenceBuffer,
+                pressureBuffer,
+                numNodes,
+                minLayer,
+                maxLayer,
+                gravity,
+                numParticles,
+                maxCgIterations,
+                convergenceThreshold,
+                frameRate,
+                simBoundsMin,
+                simBoundsMax,
+                fluidBoundsMin,
+                fluidBoundsMax
+            );
+        }
 
         // --- Step 4: Apply pressure to velocities ---
         ApplyPressureGradient();
