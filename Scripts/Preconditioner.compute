@@ -12,7 +12,7 @@ struct Node {
 // --- BUFFERS ---
 StructuredBuffer<Node> nodesBuffer;
 StructuredBuffer<uint> neighborsBuffer;
-StructuredBuffer<float> diagonalBuffer; // Pre-computed diagonal of Laplacian matrix A
+StructuredBuffer<float> matrixABuffer; // Pre-computed Laplacian matrix A (time-scaled)
 
 // --- HELPERS ---
 
@@ -74,6 +74,7 @@ uint maxNodes;
 int windowSize;  // Window size for attention (default: 256)
 int numHeads;    // Number of attention heads (default: 4)
 int headOffset;  // Offset for batched head processing
+float deltaTime; // NEW: Required to un-scale Matrix A
 
 // --- HELPERS ---
 float GetDx(uint layer) { return pow(2.0, (float)layer); }
@@ -103,55 +104,51 @@ void ComputeFeatures(uint3 id : SV_DispatchThreadID)
 
     // 1. Feature Extraction
     float feats[58];
-    // Initialize all features to 0.0
+    // Initialize
     for(int k=0; k<58; k++) feats[k] = 0.0;
-    
+
     if (i < numNodes) {
         Node n = nodesBuffer[i];
+        
+        // Position Features (0-2)
         feats[0] = n.position.x / 1024.0;
         feats[1] = n.position.y / 1024.0;
         feats[2] = n.position.z / 1024.0;
 
-        // Read pre-computed A_diag from buffer (no need to accumulate manually)
-        feats[33] = diagonalBuffer[i];
+        // --- NEW: Read Physics from Matrix A ---
+        // Matrix A contains weights scaled by deltaTime.
+        // The Neural Net expects GEOMETRIC weights (dx^2/dist).
+        // We must divide by deltaTime to recover the correct feature scale.
+        float invDt = (deltaTime > 1e-9) ? (1.0 / deltaTime) : 0.0;
 
-        float dx = GetDx(n.layer);
+        // Feature 33: Diagonal (Slot 0)
+        feats[33] = matrixABuffer[0 * numNodes + i] * invDt;
+
         int wall_starts[6] = {0, 4, 8, 12, 16, 20};
+
         for (int f = 0; f < 6; f++) {
-            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+            // Wall Flags (Features 3-8)
             uint w_idx = neighborsBuffer[wall_starts[f] * numNodes + i];
             if (w_idx == numNodes + 1) feats[3 + f] = 1.0; 
             
-            bool isCoarseOrSame = false;
-            uint slot0_idx = neighborsBuffer[(f * 4) * numNodes + i];
-            if (slot0_idx < numNodes) {
-                Node n0 = nodesBuffer[slot0_idx];
-                if (n0.layer >= n.layer) isCoarseOrSame = true;
-            }
-
+            // Air Flags (Features 9-32)
+            // Off-Diagonals (Features 34-57)
             for (int s = 0; s < 4; s++) {
                 int local_idx = f * 4 + s;
-                if (isCoarseOrSame && s > 0) continue;
-
-                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-                uint n_idx = neighborsBuffer[(f * 4 + s) * numNodes + i];
-                if (n_idx == numNodes) feats[9 + local_idx] = 1.0; 
                 
-                // We still need the loop to compute 'A_off' (indices 34-57)
-                // But we removed the 'A_diag +=' accumulator
-                float weight = 0.0;
-                if (n_idx < numNodes) {
-                    Node nb = nodesBuffer[n_idx];
-                    float dist = max(0.5 * (dx + GetDx(nb.layer)), 1e-6);
-                    float area = (isCoarseOrSame) ? (dx*dx) : (dx*dx*0.25);
-                    weight = area / dist;
-                    feats[34 + local_idx] = -weight;
-                } else if (n_idx == numNodes) { 
-                    // Dirichlet boundary contribution to off-diagonals is 0,
-                    // so we don't set feats[34+local_idx] (it stays 0.0).
-                    // We only needed this branch before for A_diag accumulation.
-                    // effectively: do nothing here.
-                }
+                // Read Neighbor Index
+                uint n_idx = neighborsBuffer[local_idx * numNodes + i];
+                
+                // Air Flag
+                if (n_idx == numNodes) feats[9 + local_idx] = 1.0; 
+
+                // Off-Diagonal Weight
+                // Matrix A neighbors start at Slot 1.
+                // matrixABuffer index = (local_idx + 1) * numNodes + i
+                float weight = matrixABuffer[(local_idx + 1) * numNodes + i];
+                
+                // Un-scale and assign
+                feats[34 + local_idx] = weight * invDt; 
             }
         }
     }

@@ -1,6 +1,6 @@
 // High-level shader language
-#pragma kernel ApplyMatrixAndDot // REPLACES ApplyLaplacianAndDot
-#pragma kernel BuildMatrixA      // NEW: Pre-computes A
+#pragma kernel ApplyMatrixAndDot
+#pragma kernel BuildMatrixA
 #pragma kernel Axpy
 #pragma kernel Scale
 #pragma kernel CalculateDivergence
@@ -9,8 +9,7 @@
 #pragma kernel ApplySparseGT
 #pragma kernel ClearBufferFloat
 #pragma kernel PrecomputeIndices
-#pragma kernel ComputeDiagonal
-#pragma kernel ApplyJacobi
+#pragma kernel ApplyJacobi // Keep this
 #pragma kernel GlobalReduceSum
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
@@ -44,6 +43,7 @@ RWStructuredBuffer<uint> scatterIndicesBuffer;
 
 // NEW: The Laplacian Matrix A [N * 25]
 // Slot 0 = Diagonal, Slots 1-24 = Neighbors 0-23
+// Ensure this matches the C# name
 RWStructuredBuffer<float> matrixABuffer; 
 
 uint numNodes;
@@ -292,7 +292,7 @@ void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id 
     if (li == 0) divergenceBuffer[Gid.x] = s_data[0];
 }
 
-// ... [Include PrecomputeIndices, ApplySparseGT, ApplySparseGAndDot, ClearBufferFloat, ComputeDiagonal, ApplyJacobi, GlobalReduceSum from original file] ...
+// ... [Include PrecomputeIndices, ApplySparseGT, ApplySparseGAndDot, ClearBufferFloat, ApplyJacobi, GlobalReduceSum from original file] ...
 // (These are needed if you toggle the preconditioner back on later)
 [numthreads(512, 1, 1)]
 void PrecomputeIndices(uint3 id : SV_DispatchThreadID) {
@@ -380,62 +380,25 @@ void ClearBufferFloat(uint3 id : SV_DispatchThreadID) {
     if (id.x < numNodes) zBuffer[id.x] = 0.0;
 }
 
-RWStructuredBuffer<float> diagonalBuffer;
-groupshared Node s_nodes_diag[256];
-[numthreads(256, 1, 1)]
-void ComputeDiagonal(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
-    // ... [Keep existing implementation] ...
-    // Note: BuildMatrixA now calculates this into matrixABuffer[i],
-    // so this kernel is redundant unless used for explicit Jacobi without A.
-    // For safety, I'll assume you keep the original code here.
-    uint i = id.x; uint li = Gtid.x; uint group_start_idx = Gid.x * 256;
-    if (i < numNodes) s_nodes_diag[li] = nodesBuffer[i];
-    GroupMemoryBarrierWithGroupSync();
-    if (i >= numNodes) return;
-    Node node = s_nodes_diag[li];
-    float dx_i = exp2((float)node.layer); if (!isfinite(dx_i)) dx_i = 1e-6;
-    float diagonal_sum = 0.0;
-    for (int d = 0; d < 6; d++) {
-        uint faceSlotBase = d * 4;
-        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i];
-        if (neighbor_idx == numNodes + 1) { }
-        else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer) {
-            Node nNode;
-            if (neighbor_idx >= group_start_idx && neighbor_idx < group_start_idx + 256) nNode = s_nodes_diag[neighbor_idx - group_start_idx];
-            else nNode = nodesBuffer[neighbor_idx];
-            float dx_j = exp2((float)nNode.layer);
-            float distance = max(0.5 * (dx_i + dx_j), 1e-6);
-            float w = (dx_i * dx_i) / distance;
-            diagonal_sum += w;
-        } else {
-            float childFaceArea = (dx_i * dx_i) / 4.0;
-            for (int k = 0; k < 4; k++) {
-                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + i];
-                if (child_idx < numNodes) {
-                    Node cNode;
-                    if (child_idx >= group_start_idx && child_idx < group_start_idx + 256) cNode = s_nodes_diag[child_idx - group_start_idx];
-                    else cNode = nodesBuffer[child_idx];
-                    float dx_k = exp2((float)cNode.layer);
-                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    diagonal_sum += childFaceArea / distance;
-                } else if (child_idx == numNodes) {
-                    float dx_k = dx_i * 0.5;
-                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    diagonal_sum += childFaceArea / distance;
-                }
-            }
-        }
-    }
-    float outVal = diagonal_sum; if (!isfinite(outVal)) outVal = 0.0;
-    diagonalBuffer[i] = outVal;
-}
-
+// --- REPLACED KERNEL: ApplyJacobi ---
+// Uses the pre-calculated diagonal from matrixABuffer (Slot 0)
 [numthreads(512, 1, 1)]
 void ApplyJacobi(uint3 id : SV_DispatchThreadID) {
-    uint i = id.x; if (i >= numNodes) return;
-    float r_val = xBuffer[i]; if (!isfinite(r_val)) r_val = 0.0;
-    float diag_val = diagonalBuffer[i]; if (!isfinite(diag_val)) diag_val = 0.0;
+    uint i = id.x;
+    if (i >= numNodes) return;
+
+    float r_val = xBuffer[i]; 
+    if (!isfinite(r_val)) r_val = 0.0;
+
+    // READ FROM MATRIX A (Slot 0 is Diagonal)
+    float diag_val = matrixABuffer[0 * numNodes + i]; 
+    
+    // Safety check for zero / NaN diagonal
+    if (!isfinite(diag_val)) diag_val = 0.0;
+    
+    // z = D^-1 * r
     float z_val = r_val / (diag_val + 1e-10);
+    
     if (!isfinite(z_val)) z_val = 0.0;
     yBuffer[i] = z_val;
 }

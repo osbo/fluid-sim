@@ -95,7 +95,6 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer zBuffer; // Intermediate buffer for PCG preconditioner application (used as 'u' in shader)
     private ComputeBuffer zVectorBuffer; // Preconditioned residual vector 'z' for PCG
     private ComputeBuffer scatterIndicesBuffer; // NEW: Pre-computed scatter indices for optimization
-    private ComputeBuffer diagonalBuffer; // Diagonal of Laplacian matrix A for Jacobi preconditioning
     private ComputeBuffer bufferQ; // Q buffer for attention
     private ComputeBuffer bufferK; // K buffer for attention
     private ComputeBuffer bufferV; // V buffer for attention

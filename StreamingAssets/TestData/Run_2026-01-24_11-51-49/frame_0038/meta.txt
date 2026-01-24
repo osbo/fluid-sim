@@ -1,0 +1,12 @@
+numNodes: 3481
+minLayer: 4
+maxLayer: 10
+gravity: 100
+numParticles: 1048576
+maxCgIterations: 400
+convergenceThreshold: 1E-05
+frameRate: 30
+simulationBoundsMin: -20 0 -20
+simulationBoundsMax: 20 80 20
+fluidInitialBoundsMin: -20 0 -20
+fluidInitialBoundsMax: 0 20 0

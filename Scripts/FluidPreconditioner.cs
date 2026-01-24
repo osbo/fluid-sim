@@ -107,11 +107,12 @@ public partial class FluidSimulator : MonoBehaviour
         {
             // Jacobi preconditioning: z = D^-1 * r
             // where D is the diagonal of the Laplacian matrix A
-            if (kJacobi >= 0 && diagonalBuffer != null)
+            // CHANGED: Use matrixABuffer instead of diagonalBuffer (slot 0 is diagonal)
+            if (kJacobi >= 0 && matrixABuffer != null)
             {
                 cgSolverShader.SetBuffer(kJacobi, "xBuffer", r);
                 cgSolverShader.SetBuffer(kJacobi, "yBuffer", z_out);
-                cgSolverShader.SetBuffer(kJacobi, "diagonalBuffer", diagonalBuffer);
+                cgSolverShader.SetBuffer(kJacobi, "matrixABuffer", matrixABuffer);
                 cgSolverShader.SetInt("numNodes", numNodes);
                 Dispatch(kJacobi, numNodes);
             }
@@ -306,7 +307,8 @@ public partial class FluidSimulator : MonoBehaviour
         preconditionerShader.SetBuffer(kFeat, "nodesBuffer", nodesBuffer);
         preconditionerShader.SetBuffer(kFeat, "neighborsBuffer", neighborsBuffer);
         preconditionerShader.SetBuffer(kFeat, "tokenBuffer", tokenBuffer);
-        preconditionerShader.SetBuffer(kFeat, "diagonalBuffer", diagonalBuffer); // Bind pre-computed diagonal buffer
+        // CHANGED: Bind Matrix A instead of Diagonal Buffer
+        preconditionerShader.SetBuffer(kFeat, "matrixABuffer", matrixABuffer); 
         preconditionerShader.SetInt("numNodes", numNodes);
         preconditionerShader.SetInt("maxNodes", paddedNodes);
         preconditionerShader.SetInt("windowSize", WINDOW_SIZE); // Pass window size to shader
@@ -315,6 +317,9 @@ public partial class FluidSimulator : MonoBehaviour
         preconditionerShader.SetInt("d_model", current_d_model);
         preconditionerShader.SetInt("d_ffn", current_d_model * 2);
         preconditionerShader.SetInt("numHeads", NUM_HEADS); // Pass num heads to shader
+        // NEW: Pass DeltaTime for un-scaling matrixA features
+        float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
+        preconditionerShader.SetFloat("deltaTime", deltaTime);
         
         // Set Feature/Embed weights
         if (weightBuffers.ContainsKey("feature_proj.weight"))
@@ -432,6 +437,5 @@ public partial class FluidSimulator : MonoBehaviour
         zBuffer?.Release();
         zVectorBuffer?.Release();
         scatterIndicesBuffer?.Release();
-        diagonalBuffer?.Release();
     }
 }
