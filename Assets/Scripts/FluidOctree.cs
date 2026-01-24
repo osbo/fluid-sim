@@ -512,24 +512,41 @@ public partial class FluidSimulator : MonoBehaviour
         int groupsLinear = (numParticles + 511) / 512;
         nodesPrefixSumsShader.Dispatch(clearActiveBuffersKernel, groupsLinear, 1, 1);
     }
+    // Deinterleave morton code to get 3D grid coordinates (matches compute shader)
+    private Vector3Int DeinterleaveMorton(uint m)
+    {
+        uint x = 0, y = 0, z = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            x |= ((m >> (3 * i + 0)) & 1) << i;
+            y |= ((m >> (3 * i + 1)) & 1) << i;
+            z |= ((m >> (3 * i + 2)) & 1) << i;
+        }
+        return new Vector3Int((int)x, (int)y, (int)z);
+    }
+
     private Vector3 DecodeMorton3D(Node node)
     {
-        int gridResolution = (int)Mathf.Pow(2, 10 - node.layer);
-        float cellSize = 1024.0f / gridResolution;
-        Vector3 quantizedPos = new Vector3(
-            Mathf.Floor(node.position.x / cellSize) * cellSize + cellSize * 0.5f,
-            Mathf.Floor(node.position.y / cellSize) * cellSize + cellSize * 0.5f,
-            Mathf.Floor(node.position.z / cellSize) * cellSize + cellSize * 0.5f
-        );
-        Vector3 simulationSize = simulationBounds.bounds.max - simulationBounds.bounds.min;
+        // Calculate cell center from morton code at the node's actual layer
+        // This matches the logic in UpdateParticles.compute and the shaders
+        uint shift = (uint)(node.layer * 3);
+        uint cellMortonCode = node.mortonCode & ~((1u << (int)shift) - 1);
+        Vector3Int cellGridMin = DeinterleaveMorton(cellMortonCode);
         
-        // Convert back to world coordinates
-        Vector3 quantizedWorldPos = simulationBounds.bounds.min + new Vector3(
-            quantizedPos.x / 1024.0f * simulationSize.x,
-            quantizedPos.y / 1024.0f * simulationSize.y,
-            quantizedPos.z / 1024.0f * simulationSize.z
+        // Calculate cell center in grid space (0-1023)
+        float cellSideLength = Mathf.Pow(2, node.layer);
+        Vector3 cellCenter = new Vector3(
+            cellGridMin.x + cellSideLength * 0.5f,
+            cellGridMin.y + cellSideLength * 0.5f,
+            cellGridMin.z + cellSideLength * 0.5f
         );
-
-        return quantizedWorldPos;
+        
+        // Convert from grid space (0-1023) to world space
+        Vector3 simulationSize = simulationBounds.bounds.max - simulationBounds.bounds.min;
+        return simulationBounds.bounds.min + new Vector3(
+            cellCenter.x / 1024.0f * simulationSize.x,
+            cellCenter.y / 1024.0f * simulationSize.y,
+            cellCenter.z / 1024.0f * simulationSize.z
+        );
     }
 }
