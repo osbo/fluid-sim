@@ -49,20 +49,37 @@ Shader "Custom/NodeThickness"
                 float density : TEXCOORD3; // Passing density to Pixel Shader
             };
 
+            // Deinterleave morton code to get 3D grid coordinates
+            uint3 DeinterleaveMorton(uint m)
+            {
+                uint x = 0, y = 0, z = 0;
+                for (uint i = 0; i < 10; i++)
+                {
+                    x |= ((m >> (3 * i + 0)) & 1) << i;
+                    y |= ((m >> (3 * i + 1)) & 1) << i;
+                    z |= ((m >> (3 * i + 2)) & 1) << i;
+                }
+                return uint3(x, y, z);
+            }
+
             float3 DecodeMorton3D(Node node)
             {
-                int gridResolution = (int)exp2(10.0 - (float)node.layer);
-                float cellSize = 1024.0 / (float)gridResolution;
-                float3 quantizedPos = float3(
-                    floor(node.position.x / cellSize) * cellSize + cellSize * 0.5,
-                    floor(node.position.y / cellSize) * cellSize + cellSize * 0.5,
-                    floor(node.position.z / cellSize) * cellSize + cellSize * 0.5
-                );
+                // Calculate cell center from morton code at the node's actual layer
+                // This matches the logic in UpdateParticles.compute (lines 254-263)
+                uint shift = node.layer * 3;
+                uint cellMortonCode = node.mortonCode & ~((1u << shift) - 1);
+                uint3 cellGridMin = DeinterleaveMorton(cellMortonCode);
+                
+                // Calculate cell center in grid space (0-1023)
+                float cellSideLength = exp2((float)node.layer);
+                float3 cellCenter = float3(cellGridMin) + cellSideLength * 0.5;
+                
+                // Convert from grid space (0-1023) to world space
                 float3 simulationSize = _SimulationBoundsMax - _SimulationBoundsMin;
                 return _SimulationBoundsMin + float3(
-                    quantizedPos.x / 1024.0 * simulationSize.x,
-                    quantizedPos.y / 1024.0 * simulationSize.y,
-                    quantizedPos.z / 1024.0 * simulationSize.z
+                    cellCenter.x / 1024.0 * simulationSize.x,
+                    cellCenter.y / 1024.0 * simulationSize.y,
+                    cellCenter.z / 1024.0 * simulationSize.z
                 );
             }
 

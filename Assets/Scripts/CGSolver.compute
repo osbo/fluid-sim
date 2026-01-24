@@ -1,6 +1,8 @@
-#pragma kernel ApplyLaplacianAndDot
-#pragma kernel Axpy // y = a*x + y
-#pragma kernel Scale // y = a*y
+// High-level shader language
+#pragma kernel ApplyMatrixAndDot // REPLACES ApplyLaplacianAndDot
+#pragma kernel BuildMatrixA      // NEW: Pre-computes A
+#pragma kernel Axpy
+#pragma kernel Scale
 #pragma kernel CalculateDivergence
 #pragma kernel DotProduct
 #pragma kernel ApplySparseGAndDot
@@ -11,693 +13,438 @@
 #pragma kernel ApplyJacobi
 #pragma kernel GlobalReduceSum
 
-// Include common HLSL functions
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
-// Struct definitions (must match C# structs)
 struct faceVelocities
 {
-    float left;
-    float right;
-    float bottom;
-    float top;
-    float front;
-    float back;
+    float left; float right; float bottom; float top; float front; float back;
 };
 
 struct Node
 {
-    float3 position;    // 12 bytes
-    float3 velocity;    // 12 bytes
-    faceVelocities velocities;    // 24 bytes
-    float mass;          // 4 bytes
-    uint layer;         // 4 bytes
-    uint mortonCode;    // 4 bytes
-    uint active;        // 4 bytes
+    float3 position; float3 velocity; faceVelocities velocities;
+    float mass; uint layer; uint mortonCode; uint active;
 };
 
-// Buffers for CG solver
+// --- Buffers ---
 RWStructuredBuffer<Node> nodesBuffer;
 RWStructuredBuffer<float> divergenceBuffer;
 RWStructuredBuffer<uint> neighborsBuffer;
-StructuredBuffer<uint> reverseNeighborsBuffer; // Reverse neighbor slot indices per node (numNodes * 24)
-RWStructuredBuffer<float> pBuffer; // The input vector 'p'
-RWStructuredBuffer<float> ApBuffer; // The output vector 'Ap'
+StructuredBuffer<uint> reverseNeighborsBuffer;
+
+RWStructuredBuffer<float> pBuffer; 
+RWStructuredBuffer<float> ApBuffer;
 RWStructuredBuffer<float> xBuffer;
 RWStructuredBuffer<float> yBuffer;
-RWStructuredBuffer<float> matrixGBuffer; // [N * 25] The Preconditioner Matrix G (0=Diag, 1-24=Neighbor Slots)
-RWStructuredBuffer<float> zBuffer;       // Intermediate buffer "u" and Output "z"
-RWStructuredBuffer<uint> scatterIndicesBuffer; // NEW: [N * 24] Pre-computed scatter indices
-uint numNodes;
-float a; // scalar 'a'
-float deltaTime; // Time step for physics scaling
-uint reductionCount; // Number of partial sums to reduce
 
-// Shared memory for dot product reduction
+// Neural / Preconditioner Buffers
+RWStructuredBuffer<float> matrixGBuffer;
+RWStructuredBuffer<float> zBuffer;
+RWStructuredBuffer<uint> scatterIndicesBuffer;
+
+// NEW: The Laplacian Matrix A [N * 25]
+// Slot 0 = Diagonal, Slots 1-24 = Neighbors 0-23
+RWStructuredBuffer<float> matrixABuffer; 
+
+uint numNodes;
+float a; 
+float deltaTime;
+uint reductionCount;
+
+// Shared memory for dot product reduction (used by DotProduct)
 groupshared float s_data[512];
 
-[numthreads(512, 1, 1)]
-void CalculateDivergence(uint3 id : SV_DispatchThreadID)
+// --- KERNEL: BUILD MATRIX A ---
+// Computes the Laplacian weights once per frame
+[numthreads(256, 1, 1)]
+void BuildMatrixA(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i >= numNodes) return;
 
     Node node = nodesBuffer[i];
-    faceVelocities v = node.velocities;
-
-    // Calculate Net Flux of Velocity
-    // Flux = Sum(Velocity * FaceArea)
-    float dx = exp2((float)node.layer);
-    float faceArea = dx * dx;
-    
-    // Net flux leaving the cell
-    float netFlux = (v.right - v.left + v.top - v.bottom + v.back - v.front) * faceArea;
-    
-    // We solve Ap = b. If A is negative Laplacian, b should be negative Divergence.
-    float outVal = -netFlux;
-    
-    if (!isfinite(outVal)) outVal = 0.0;
-    divergenceBuffer[i] = outVal;
-}
-
-
-// FUSED KERNEL: ApplyLaplacian + DotProduct
-// Computes Ap = A * p AND p · Ap in a single pass to reduce memory round-trips
-groupshared float s_dot_reduction[256];
-
-// --- OPTIMIZED LDS KERNEL ---
-// Shared memory to cache node data for the entire thread group
-groupshared Node s_nodes[256];
-groupshared float s_p_values[256];
-
-[numthreads(256, 1, 1)]
-void ApplyLaplacianAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    uint li = Gtid.x; // Local index [0..255]
-    uint group_start_idx = Gid.x * 256;
-
-    // --- Phase 1: Collaborative Load into LDS ---
-    // ALL threads must participate in the sync, so perform load within a bounds check
-    if (i < numNodes)
-    {
-        s_nodes[li] = nodesBuffer[i];
-        s_p_values[li] = pBuffer[i];
-    }
-    // Sync to ensure all data is loaded before proceeding. ALL threads hit this.
-    GroupMemoryBarrierWithGroupSync();
-
-    float p_i = 0.0;
-    float Ap_val = 0.0;
-    
-    // --- Phase 2: Main Calculation (for valid threads) ---
-    // NO early return. Inactive threads will contribute 0 to the reduction.
-    if (i < numNodes)
-    {
-        // Read own data from fast LDS
-        Node node = s_nodes[li];
-        p_i = s_p_values[li];
-        float laplacian_p = 0.0;
-
-        if (!isfinite(p_i)) p_i = 0.0;
-
-        float dx_i = exp2((float)node.layer);
-        if (!isfinite(dx_i)) dx_i = 1e-6;
-
-        // Loop over all 6 faces of the node
-        for (int d = 0; d < 6; d++)
-        {
-            uint faceSlotBase = d * 4;
-            uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i];
-
-            // Case 1: True Boundary (Neumann BC)
-            if (neighbor_idx == numNodes + 1)
-            {
-                laplacian_p += 0.0;
-            }
-            // This global read is required to decide the logic path
-            else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
-            {
-                // Case 2: Same-layer or Parent neighbor
-                Node nNode;
-                float p_j;
-
-                // --- CACHE CHECK ---
-                if (neighbor_idx >= group_start_idx && neighbor_idx < group_start_idx + 256)
-                {
-                    // Cache Hit: Read from LDS
-                    uint local_neighbor_idx = neighbor_idx - group_start_idx;
-                    nNode = s_nodes[local_neighbor_idx];
-                    p_j = s_p_values[local_neighbor_idx];
-                }
-                else
-                {
-                    // Cache Miss: Read from Global Memory
-                    nNode = nodesBuffer[neighbor_idx];
-                    p_j = pBuffer[neighbor_idx];
-                }
-
-                float dx_j = exp2((float)nNode.layer);
-                float distance = max(0.5 * (dx_i + dx_j), 1e-6);
-                float a_shared = dx_i * dx_i;
-                
-                float w = a_shared / distance;
-                float contribution = w * (p_j - p_i);
-                
-                laplacian_p += contribution;
-            }
-            else
-            {
-                // Case 3/4: Child neighbors or Dirichlet boundary
-                float faceArea = dx_i * dx_i;
-                float childFaceArea = faceArea / 4.0;
-                
-                for (int k = 0; k < 4; k++)
-                {
-                    uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + i];
-                    
-                    if (child_idx < numNodes) // Case 3: Child neighbor
-                    {
-                        Node cNode;
-                        float p_k;
-
-                        // --- CACHE CHECK ---
-                        if (child_idx >= group_start_idx && child_idx < group_start_idx + 256)
-                        {
-                            // Cache Hit
-                            uint local_child_idx = child_idx - group_start_idx;
-                            cNode = s_nodes[local_child_idx];
-                            p_k = s_p_values[local_child_idx];
-                        }
-                        else
-                        {
-                            // Cache Miss
-                            cNode = nodesBuffer[child_idx];
-                            p_k = pBuffer[child_idx];
-                        }
-                        
-                        float dx_k = exp2((float)cNode.layer);
-                        float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                        
-                        float w = childFaceArea / distance;
-                        float contribution = w * (p_k - p_i);
-                        laplacian_p += contribution;
-                    }
-                    else if (child_idx == numNodes) // Case 4: Dirichlet boundary
-                    {
-                        float dx_k = dx_i * 0.5;
-                        float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                        
-                        float w = childFaceArea / distance;
-                        float contribution = w * (-p_i);
-                        laplacian_p += contribution;
-                    }
-                }
-            }
-        }
-
-        // --- Return Net Flux (not volume-normalized) ---
-        // KEEP this (assuming negative sign is desired for the operator)
-        float outVal = -laplacian_p; 
-        
-        // Apply time step if needed, though typically handled in the update step
-        outVal *= deltaTime; 
-
-        if (!isfinite(outVal)) outVal = 0.0;
-        Ap_val = outVal;
-        
-        // Write Ap to memory (still needed for next steps)
-        ApBuffer[i] = Ap_val;
-    } // End of "if (i < numNodes)"
-
-    // 3. FUSED DOT PRODUCT (p . Ap) -- ALL threads participate
-    float product = p_i * Ap_val;
-    if (!isfinite(product)) product = 0.0;
-    
-    // Standard Parallel Reduction
-    s_dot_reduction[li] = product;
-    GroupMemoryBarrierWithGroupSync();
-    
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (li < s) {
-            float sum = s_dot_reduction[li] + s_dot_reduction[li + s];
-            if (!isfinite(sum)) sum = 0.0;
-            s_dot_reduction[li] = sum;
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    
-    // Write partial sum for this group
-    if (li == 0) {
-        // We reuse divergenceBuffer as scratch space for dot product reductions
-        // just like the standalone DotProduct kernel did
-        float result = s_dot_reduction[0];
-        if (!isfinite(result)) result = 0.0;
-        divergenceBuffer[Gid.x] = result;
-    }
-}
-
-[numthreads(512, 1, 1)]
-void Scale(uint3 id : SV_DispatchThreadID) {
-    uint i = id.x;
-    if (i >= numNodes) return;
-    
-    float y_val = yBuffer[i];
-    
-    float result = a * y_val;
-    
-    yBuffer[i] = result;
-}
-
-[numthreads(512, 1, 1)]
-void Axpy(uint3 id : SV_DispatchThreadID) {
-    uint i = id.x;
-    if (i >= numNodes) return;
-    
-    float x_val = xBuffer[i];
-    float y_val = yBuffer[i];
-    
-    float result = a * x_val + y_val;
-    
-    yBuffer[i] = result;
-}
-
-// For Dot Product (a simple, multi-pass reduction)
-[numthreads(512, 1, 1)]
-void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
-    uint i = id.x;
-    uint li = Gtid.x;
-
-    float x_val = (i < numNodes) ? xBuffer[i] : 0.0;
-    float y_val = (i < numNodes) ? yBuffer[i] : 0.0;
-    
-    // Guard against NaN values
-    if (!isfinite(x_val)) x_val = 0.0;
-    if (!isfinite(y_val)) y_val = 0.0;
-    
-    float product = x_val * y_val;
-    if (!isfinite(product)) product = 0.0;
-    
-    s_data[li] = product;
-    GroupMemoryBarrierWithGroupSync();
-
-    for (uint s = 256; s > 0; s >>= 1) {
-        if (li < s) {
-            float sum = s_data[li] + s_data[li + s];
-            if (!isfinite(sum)) sum = 0.0;
-            s_data[li] = sum;
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    if (li == 0) {
-        float result = s_data[0];
-        if (!isfinite(result)) result = 0.0;
-        divergenceBuffer[Gid.x] = result;
-    }
-}
-
-// --------------------------------------------------------------------------------
-// NEURAL PRECONDITIONER KERNELS
-// Implements M^-1 * r approx (G * G^T + eps * I) * r
-// --------------------------------------------------------------------------------
-
-// --- ADD THIS KERNEL ---
-// Pre-computes scatter indices to optimize ApplySparseGT
-[numthreads(512, 1, 1)]
-void PrecomputeIndices(uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    if (i >= numNodes) return;
-
-    // Pre-calculate indices for the Scatter (GT) operation
-    for (int n = 0; n < 24; n++)
-    {
-        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-        uint k = neighborsBuffer[n * numNodes + i];
-        // If neighbor is valid, store index. If not, store Sentinel (0xFFFFFFFF)
-        // SoA layout: scatterIndicesBuffer[slot * numNodes + nodeIndex]
-        scatterIndicesBuffer[n * numNodes + i] = (k < numNodes) ? k : 0xFFFFFFFF;
-    }
-}
-
-// OPTIMIZED GATHER KERNEL (Replaces Scatter)
-// Computes u = G^T * r
-// Formula: u_i = G_ii * r_i + Sum_{k in neighbors} ( G_ki * r_k )
-// G is now size [N, 7] where 0=Diag, 1-6=Face Neighbors
-// --- OPTIMIZATION START: Define Shared Memory ---
-groupshared float s_x[512]; 
-
-[numthreads(512, 1, 1)]
-void ApplySparseGT(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    uint li = Gtid.x;
-    uint group_start_idx = Gid.x * 512; // The global index of the first thread in this group
-
-    // --- PHASE 1: Collaborative Load into LDS ---
-    // Every thread loads its own value into shared memory
-    if (i < numNodes)
-    {
-        s_x[li] = xBuffer[i];
-    }
-    else
-    {
-        // Zero out padding threads to avoid reading garbage later
-        s_x[li] = 0.0;
-    }
-
-    // Wait for all threads to finish loading s_x
-    GroupMemoryBarrierWithGroupSync();
-
-    // --- PHASE 2: Main Calculation ---
-    if (i >= numNodes) return;
-
-    // Optimization: Read our own r_i from fast LDS instead of global memory
-    float r_i = s_x[li]; 
-    if (!isfinite(r_i)) r_i = 0.0;
-
-    // 1. Diagonal
-    // SoA layout: matrixGBuffer[dim * numNodes + nodeIndex]
-    float g_diag = matrixGBuffer[i]; // dim=0
-    if (!isfinite(g_diag)) g_diag = 0.0;
-    
-    float sum = g_diag * r_i;
-
-    // 2. Off-Diagonal (Optimized with Caching)
-    for (int n = 0; n < 24; n++)
-    {
-        // SoA layout: scatterIndicesBuffer[slot * numNodes + nodeIndex]
-        uint k = scatterIndicesBuffer[n * numNodes + i];
-
-        // 0xFFFFFFFF is uint.MaxValue, check for valid neighbor
-        if (k != 0xFFFFFFFF)
-        {
-            uint revSlot = reverseNeighborsBuffer[i * 24 + n];
-
-            if (revSlot < 24) 
-            {
-                // Formula: (SlotIndex) * numNodes + NodeIndex
-                // SlotIndex = 1 + revSlot (since 0 is diagonal)
-                float g_ki = matrixGBuffer[(1 + revSlot) * numNodes + k];
-
-                if (!isfinite(g_ki)) g_ki = 0.0;
-
-                float r_k;
-
-                // --- LDS CACHE CHECK ---
-                // Check if neighbor 'k' is within this thread group's range [start, start+512)
-                if (k >= group_start_idx && k < group_start_idx + 512)
-                {
-                    // Cache Hit: Read from fast shared memory
-                    r_k = s_x[k - group_start_idx];
-                }
-                else
-                {
-                    // Cache Miss: Read from slow global memory
-                    r_k = xBuffer[k];
-                }
-
-                if (!isfinite(r_k)) r_k = 0.0;
-                
-                sum += g_ki * r_k;
-            }
-        }
-    }
-
-    if (!isfinite(sum)) sum = 0.0;
-    zBuffer[i] = sum;
-}
-
-
-// FUSED KERNEL: ApplySparseG + DotProduct
-// Computes z = G * u + eps * r AND r · z in a single pass to reduce memory round-trips
-groupshared float s_precon_dot[256];
-groupshared float s_z_values[256]; // Cache for vector 'u' (zBuffer)
-
-[numthreads(256, 1, 1)] // Changed from 512 to 256
-void ApplySparseGAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    uint li = Gtid.x;
-    uint group_start_idx = Gid.x * 256;
-
-    // --- 1. Collaborative Load into LDS ---
-    // ALL threads must participate.
-    if (i < numNodes) {
-        s_z_values[li] = zBuffer[i];
-    }
-    GroupMemoryBarrierWithGroupSync(); // Wait for all threads in group to finish loading
-
-    float z_val = 0.0;
-    float r_val = 0.0;
-
-    if (i < numNodes)
-    {
-        // Read own value from fast LDS
-        float u_val = s_z_values[li];
-        if (!isfinite(u_val)) u_val = 0.0;
-
-        r_val = xBuffer[i]; // Residual r (needed for epsilon skip and dot product)
-        if (!isfinite(r_val)) r_val = 0.0;
-        
-        float z_sum = 0.0;
-        
-        // A. Diagonal
-        float g_diag = matrixGBuffer[i];
-        if (!isfinite(g_diag)) g_diag = 0.0;
-        z_sum += u_val * g_diag;
-
-        // B. Neighbors (Optimized Gather)
-        for(int k=0; k<24; k++)
-        {
-            uint n_idx = neighborsBuffer[k * numNodes + i];
-            if(n_idx < numNodes)
-            {
-                float g_coeff = matrixGBuffer[(k + 1) * numNodes + i];
-                if (!isfinite(g_coeff)) g_coeff = 0.0;
-
-                float u_neighbor;
-                
-                // --- LDS CACHE CHECK ---
-                if (n_idx >= group_start_idx && n_idx < group_start_idx + 256)
-                {
-                    // Cache Hit: Read from Shared Memory (Fast)
-                    u_neighbor = s_z_values[n_idx - group_start_idx];
-                }
-                else
-                {
-                    // Cache Miss: Read from Global Memory (Slow)
-                    u_neighbor = zBuffer[n_idx];
-                }
-
-                if (!isfinite(u_neighbor)) u_neighbor = 0.0;
-                z_sum += g_coeff * u_neighbor;
-            }
-        }
-
-        // C. Epsilon Regularization
-        z_sum += 1e-4 * r_val;
-        
-        if (!isfinite(z_sum)) z_sum = 0.0;
-        
-        z_val = z_sum;
-        
-        // Write Result z to memory (needed for p update later)
-        yBuffer[i] = z_val;
-    }
-
-    // --- 2. FUSED DOT PRODUCT (r . z) ---
-    float product = r_val * z_val;
-    if (!isfinite(product)) product = 0.0;
-    
-    // Parallel Reduction in Shared Memory
-    s_precon_dot[li] = product;
-    GroupMemoryBarrierWithGroupSync();
-    
-    // Reduction loop for 256 threads
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (li < s) {
-            float sum = s_precon_dot[li] + s_precon_dot[li + s];
-            if (!isfinite(sum)) sum = 0.0;
-            s_precon_dot[li] = sum;
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    
-    // Write partial reduction to global memory
-    if (li == 0) {
-        // Reuse divergenceBuffer as scratchpad
-        float result = s_precon_dot[0];
-        if (!isfinite(result)) result = 0.0;
-        divergenceBuffer[Gid.x] = result;
-    }
-}
-
-// KERNEL 3: Clear Buffer (Helper to zero out zBuffer before Scatter)
-[numthreads(512, 1, 1)]
-void ClearBufferFloat(uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    if (i < numNodes) zBuffer[i] = 0.0;
-}
-
-// KERNEL 4: Compute Diagonal of Laplacian Matrix A
-// Computes the diagonal entry A_ii for each node i
-// The diagonal is the negative sum of all off-diagonal weights
-RWStructuredBuffer<float> diagonalBuffer; // Output buffer for diagonal values
-
-// --- OPTIMIZED KERNEL WITH LDS ---
-groupshared Node s_nodes_diag[256];
-
-[numthreads(256, 1, 1)]
-void ComputeDiagonal(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
-{
-    uint i = id.x;
-    uint li = Gtid.x;
-    uint group_start_idx = Gid.x * 256;
-
-    // --- Phase 1: Collaborative Load into LDS ---
-    // Guard against out-of-bounds, but ensure barrier is hit by all
-    if (i < numNodes)
-    {
-        s_nodes_diag[li] = nodesBuffer[i];
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    // Early exit for invalid threads after sync
-    if (i >= numNodes) return;
-
-    // Read own data from fast LDS
-    Node node = s_nodes_diag[li];
-    
     float dx_i = exp2((float)node.layer);
-    if (!isfinite(dx_i)) dx_i = 1e-6;
+    float diagonal = 0.0;
     
-    float diagonal_sum = 0.0;
+    // Initialize off-diagonals to 0
+    // SoA layout: matrixABuffer[slot * numNodes + index]
+    for(int k=0; k<24; k++) {
+        matrixABuffer[(k + 1) * numNodes + i] = 0.0;
+    }
 
-    // Loop over all 6 faces of the node
+    // Loop over 6 faces
     for (int d = 0; d < 6; d++)
     {
         uint faceSlotBase = d * 4;
         uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i];
 
-        // Case 1: True Boundary (Neumann BC)
-        if (neighbor_idx == numNodes + 1)
-        {
-            // No contribution
-        }
-        // Case 2: Same-layer or Parent neighbor
-        else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
-        {
-            Node nNode;
-            
-            // --- LDS CACHE CHECK ---
-            if (neighbor_idx >= group_start_idx && neighbor_idx < group_start_idx + 256)
-            {
-                // Cache Hit: Read from Shared Memory
-                nNode = s_nodes_diag[neighbor_idx - group_start_idx];
-            }
-            else
-            {
-                // Cache Miss: Read from Global Memory
-                nNode = nodesBuffer[neighbor_idx];
-            }
+        // Case 1: True Boundary (Neumann) - No contribution
+        if (neighbor_idx == numNodes + 1) { continue; }
 
+        if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
+        {
+            // Case 2: Same-layer or Parent
+            // We cannot access neighborsBuffer here for properties, must read nodesBuffer
+            Node nNode = nodesBuffer[neighbor_idx];
             float dx_j = exp2((float)nNode.layer);
+            
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
-            float a_shared = dx_i * dx_i;
+            float faceArea = dx_i * dx_i;
+            float weight = faceArea / distance;
 
-            float w = a_shared / distance;
-            diagonal_sum += w;
+            // Apply time step scaling immediately
+            weight *= deltaTime;
+
+            // Laplacian construction:
+            // out = sum(w * p_i) - sum(w * p_j)
+            // Diagonal += weight
+            // Off-Diagonal = -weight
+            
+            diagonal += weight;
+            
+            // Find which slot this neighbor occupies (it's the first slot of the face)
+            matrixABuffer[(faceSlotBase + 1) * numNodes + i] = -weight;
         }
         else
         {
-            // Case 3 or 4: Child neighbors or Dirichlet
+            // Case 3/4: Child neighbors or Dirichlet
             float faceArea = dx_i * dx_i;
             float childFaceArea = faceArea / 4.0;
             
             for (int k = 0; k < 4; k++)
             {
                 uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + i];
-                
-                if (child_idx < numNodes) // Case 3: Child neighbor
+                uint slot = faceSlotBase + k;
+
+                if (child_idx < numNodes) // Case 3: Child
                 {
-                    Node cNode;
-
-                    // --- LDS CACHE CHECK (For Children) ---
-                    if (child_idx >= group_start_idx && child_idx < group_start_idx + 256)
-                    {
-                        cNode = s_nodes_diag[child_idx - group_start_idx];
-                    }
-                    else
-                    {
-                        cNode = nodesBuffer[child_idx];
-                    }
-
+                    Node cNode = nodesBuffer[child_idx];
                     float dx_k = exp2((float)cNode.layer);
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
+                    float weight = (childFaceArea / distance) * deltaTime;
 
-                    float w = childFaceArea / distance;
-                    diagonal_sum += w;
+                    diagonal += weight;
+                    matrixABuffer[(slot + 1) * numNodes + i] = -weight;
                 }
-                else if (child_idx == numNodes) // Case 4: Dirichlet
+                else if (child_idx == numNodes) // Case 4: Dirichlet (Air)
                 {
+                    // Ghost value is 0.0. 
+                    // Term is w * (p_i - p_ghost) = w * p_i
+                    // Contributes to diagonal only.
                     float dx_k = dx_i * 0.5;
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-
-                    float w = childFaceArea / distance;
-                    diagonal_sum += w;
+                    float weight = (childFaceArea / distance) * deltaTime;
+                    
+                    diagonal += weight;
+                    // Off-diagonal is 0 because p_ghost is 0
                 }
             }
         }
     }
 
-    float outVal = diagonal_sum;
-    if (!isfinite(outVal)) outVal = 0.0;
-    diagonalBuffer[i] = outVal;
+    if (!isfinite(diagonal)) diagonal = 0.0;
+    matrixABuffer[0 * numNodes + i] = diagonal; // Slot 0 is Diagonal
 }
 
-// KERNEL 5: Apply Jacobi Preconditioner
-// Computes z = D^-1 * r where D is the diagonal of the Laplacian matrix A
-// z[i] = r[i] / (diagonal[i] + epsilon)
+// --- KERNEL: APPLY MATRIX A + DOT ---
+// Standard Sparse Matrix-Vector Multiply: Ap = A * p
+// + Fused Dot Product (p . Ap)
+groupshared float s_dot_reduction[256];
+groupshared float s_p_values[256]; // Cache for vector p
+
+[numthreads(256, 1, 1)]
+void ApplyMatrixAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint li = Gtid.x;
+    uint group_start_idx = Gid.x * 256;
+
+    // --- Phase 1: Collaborative Load p into LDS ---
+    if (i < numNodes) {
+        s_p_values[li] = pBuffer[i];
+    } else {
+        s_p_values[li] = 0.0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float Ap_val = 0.0;
+    float p_i = 0.0;
+
+    if (i < numNodes)
+    {
+        p_i = s_p_values[li];
+        if (!isfinite(p_i)) p_i = 0.0;
+
+        // 1. Diagonal
+        float diag = matrixABuffer[i]; // Slot 0
+        float sum = diag * p_i;
+
+        // 2. Off-Diagonals (Neighbors)
+        // Iterate all 24 slots
+        for (int k = 0; k < 24; k++)
+        {
+            uint neighbor_idx = neighborsBuffer[k * numNodes + i];
+
+            // Optimization: If weight is 0, skip (though reading weight costs bandwidth)
+            // Better Optimization: Check neighbor validity first
+            if (neighbor_idx < numNodes)
+            {
+                float weight = matrixABuffer[(k + 1) * numNodes + i];
+                float p_neighbor;
+
+                // LDS Cache Check
+                if (neighbor_idx >= group_start_idx && neighbor_idx < group_start_idx + 256)
+                {
+                    p_neighbor = s_p_values[neighbor_idx - group_start_idx];
+                }
+                else
+                {
+                    p_neighbor = pBuffer[neighbor_idx];
+                }
+
+                if (!isfinite(p_neighbor)) p_neighbor = 0.0;
+                sum += weight * p_neighbor;
+            }
+        }
+
+        if (!isfinite(sum)) sum = 0.0;
+        Ap_val = sum;
+        ApBuffer[i] = Ap_val;
+    }
+
+    // --- Phase 2: Fused Dot Product (p . Ap) ---
+    float product = p_i * Ap_val;
+    if (!isfinite(product)) product = 0.0;
+
+    s_dot_reduction[li] = product;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Standard Reduction
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (li < s) {
+            s_dot_reduction[li] += s_dot_reduction[li + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (li == 0) {
+        divergenceBuffer[Gid.x] = s_dot_reduction[0];
+    }
+}
+
+// ... [REMAINING KERNELS: CalculateDivergence, Axpy, Scale, etc. UNCHANGED] ...
+// Copy the rest of the original file from "void CalculateDivergence..." downwards.
+// IMPORTANT: Keep PrecomputeIndices, ApplySparseGT, etc., for the preconditioner logic.
+
 [numthreads(512, 1, 1)]
-void ApplyJacobi(uint3 id : SV_DispatchThreadID)
+void CalculateDivergence(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i >= numNodes) return;
+    Node node = nodesBuffer[i];
+    faceVelocities v = node.velocities;
 
-    float r_val = xBuffer[i];
-    if (!isfinite(r_val)) r_val = 0.0;
+    // Calculate Net Flux of Velocity
+    float dx = exp2((float)node.layer);
+    float faceArea = dx * dx;
+    
+    // Net flux leaving the cell
+    float netFlux = (v.right - v.left + v.top - v.bottom + v.back - v.front) * faceArea;
+    // We solve Ap = b. If A is negative Laplacian (positive definite), b should be negative Divergence.
+    float outVal = -netFlux;
+    if (!isfinite(outVal)) outVal = 0.0;
+    divergenceBuffer[i] = outVal;
+}
 
-    float diag_val = diagonalBuffer[i];
-    if (!isfinite(diag_val)) diag_val = 0.0;
+[numthreads(512, 1, 1)]
+void Scale(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i >= numNodes) return;
+    float y_val = yBuffer[i];
+    yBuffer[i] = a * y_val;
+}
 
-    // Jacobi: z = D^-1 * r
-    // Add small epsilon to avoid division by zero
-    float epsilon = 1e-10;
-    float z_val = r_val / (diag_val + epsilon);
+[numthreads(512, 1, 1)]
+void Axpy(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i >= numNodes) return;
+    float x_val = xBuffer[i];
+    float y_val = yBuffer[i];
+    yBuffer[i] = a * x_val + y_val;
+}
 
+[numthreads(512, 1, 1)]
+void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    uint li = Gtid.x;
+    float x_val = (i < numNodes) ? xBuffer[i] : 0.0;
+    float y_val = (i < numNodes) ? yBuffer[i] : 0.0;
+    if (!isfinite(x_val)) x_val = 0.0;
+    if (!isfinite(y_val)) y_val = 0.0;
+    float product = x_val * y_val;
+    if (!isfinite(product)) product = 0.0;
+    s_data[li] = product;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 256; s > 0; s >>= 1) {
+        if (li < s) s_data[li] += s_data[li + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (li == 0) divergenceBuffer[Gid.x] = s_data[0];
+}
+
+// ... [Include PrecomputeIndices, ApplySparseGT, ApplySparseGAndDot, ClearBufferFloat, ComputeDiagonal, ApplyJacobi, GlobalReduceSum from original file] ...
+// (These are needed if you toggle the preconditioner back on later)
+[numthreads(512, 1, 1)]
+void PrecomputeIndices(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i >= numNodes) return;
+    for (int n = 0; n < 24; n++) {
+        uint k = neighborsBuffer[n * numNodes + i];
+        scatterIndicesBuffer[n * numNodes + i] = (k < numNodes) ? k : 0xFFFFFFFF;
+    }
+}
+
+groupshared float s_x[512];
+[numthreads(512, 1, 1)]
+void ApplySparseGT(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
+    uint i = id.x; uint li = Gtid.x; uint group_start_idx = Gid.x * 512;
+    if (i < numNodes) s_x[li] = xBuffer[i]; else s_x[li] = 0.0;
+    GroupMemoryBarrierWithGroupSync();
+    if (i >= numNodes) return;
+    float r_i = s_x[li]; if (!isfinite(r_i)) r_i = 0.0;
+    float g_diag = matrixGBuffer[i]; if (!isfinite(g_diag)) g_diag = 0.0;
+    float sum = g_diag * r_i;
+    for (int n = 0; n < 24; n++) {
+        uint k = scatterIndicesBuffer[n * numNodes + i];
+        if (k != 0xFFFFFFFF) {
+            uint revSlot = reverseNeighborsBuffer[i * 24 + n];
+            if (revSlot < 24) {
+                float g_ki = matrixGBuffer[(1 + revSlot) * numNodes + k];
+                if (!isfinite(g_ki)) g_ki = 0.0;
+                float r_k;
+                if (k >= group_start_idx && k < group_start_idx + 512) r_k = s_x[k - group_start_idx];
+                else r_k = xBuffer[k];
+                if (!isfinite(r_k)) r_k = 0.0;
+                sum += g_ki * r_k;
+            }
+        }
+    }
+    if (!isfinite(sum)) sum = 0.0;
+    zBuffer[i] = sum;
+}
+
+groupshared float s_precon_dot[256];
+groupshared float s_z_values[256];
+[numthreads(256, 1, 1)]
+void ApplySparseGAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
+    uint i = id.x; uint li = Gtid.x; uint group_start_idx = Gid.x * 256;
+    if (i < numNodes) s_z_values[li] = zBuffer[i];
+    GroupMemoryBarrierWithGroupSync();
+    float z_val = 0.0; float r_val = 0.0;
+    if (i < numNodes) {
+        float u_val = s_z_values[li]; if (!isfinite(u_val)) u_val = 0.0;
+        r_val = xBuffer[i]; if (!isfinite(r_val)) r_val = 0.0;
+        float z_sum = 0.0;
+        float g_diag = matrixGBuffer[i]; if (!isfinite(g_diag)) g_diag = 0.0;
+        z_sum += u_val * g_diag;
+        for(int k=0; k<24; k++) {
+            uint n_idx = neighborsBuffer[k * numNodes + i];
+            if(n_idx < numNodes) {
+                float g_coeff = matrixGBuffer[(k + 1) * numNodes + i];
+                if (!isfinite(g_coeff)) g_coeff = 0.0;
+                float u_neighbor;
+                if (n_idx >= group_start_idx && n_idx < group_start_idx + 256) u_neighbor = s_z_values[n_idx - group_start_idx];
+                else u_neighbor = zBuffer[n_idx];
+                if (!isfinite(u_neighbor)) u_neighbor = 0.0;
+                z_sum += g_coeff * u_neighbor;
+            }
+        }
+        z_sum += 1e-4 * r_val;
+        if (!isfinite(z_sum)) z_sum = 0.0;
+        z_val = z_sum;
+        yBuffer[i] = z_val;
+    }
+    float product = r_val * z_val;
+    if (!isfinite(product)) product = 0.0;
+    s_precon_dot[li] = product;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (li < s) s_precon_dot[li] += s_precon_dot[li + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (li == 0) divergenceBuffer[Gid.x] = s_precon_dot[0];
+}
+
+[numthreads(512, 1, 1)]
+void ClearBufferFloat(uint3 id : SV_DispatchThreadID) {
+    if (id.x < numNodes) zBuffer[id.x] = 0.0;
+}
+
+RWStructuredBuffer<float> diagonalBuffer;
+groupshared Node s_nodes_diag[256];
+[numthreads(256, 1, 1)]
+void ComputeDiagonal(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
+    // ... [Keep existing implementation] ...
+    // Note: BuildMatrixA now calculates this into matrixABuffer[i],
+    // so this kernel is redundant unless used for explicit Jacobi without A.
+    // For safety, I'll assume you keep the original code here.
+    uint i = id.x; uint li = Gtid.x; uint group_start_idx = Gid.x * 256;
+    if (i < numNodes) s_nodes_diag[li] = nodesBuffer[i];
+    GroupMemoryBarrierWithGroupSync();
+    if (i >= numNodes) return;
+    Node node = s_nodes_diag[li];
+    float dx_i = exp2((float)node.layer); if (!isfinite(dx_i)) dx_i = 1e-6;
+    float diagonal_sum = 0.0;
+    for (int d = 0; d < 6; d++) {
+        uint faceSlotBase = d * 4;
+        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i];
+        if (neighbor_idx == numNodes + 1) { }
+        else if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer) {
+            Node nNode;
+            if (neighbor_idx >= group_start_idx && neighbor_idx < group_start_idx + 256) nNode = s_nodes_diag[neighbor_idx - group_start_idx];
+            else nNode = nodesBuffer[neighbor_idx];
+            float dx_j = exp2((float)nNode.layer);
+            float distance = max(0.5 * (dx_i + dx_j), 1e-6);
+            float w = (dx_i * dx_i) / distance;
+            diagonal_sum += w;
+        } else {
+            float childFaceArea = (dx_i * dx_i) / 4.0;
+            for (int k = 0; k < 4; k++) {
+                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + i];
+                if (child_idx < numNodes) {
+                    Node cNode;
+                    if (child_idx >= group_start_idx && child_idx < group_start_idx + 256) cNode = s_nodes_diag[child_idx - group_start_idx];
+                    else cNode = nodesBuffer[child_idx];
+                    float dx_k = exp2((float)cNode.layer);
+                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
+                    diagonal_sum += childFaceArea / distance;
+                } else if (child_idx == numNodes) {
+                    float dx_k = dx_i * 0.5;
+                    float distance = max(0.5 * (dx_i + dx_k), 1e-6);
+                    diagonal_sum += childFaceArea / distance;
+                }
+            }
+        }
+    }
+    float outVal = diagonal_sum; if (!isfinite(outVal)) outVal = 0.0;
+    diagonalBuffer[i] = outVal;
+}
+
+[numthreads(512, 1, 1)]
+void ApplyJacobi(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x; if (i >= numNodes) return;
+    float r_val = xBuffer[i]; if (!isfinite(r_val)) r_val = 0.0;
+    float diag_val = diagonalBuffer[i]; if (!isfinite(diag_val)) diag_val = 0.0;
+    float z_val = r_val / (diag_val + 1e-10);
     if (!isfinite(z_val)) z_val = 0.0;
     yBuffer[i] = z_val;
 }
 
-// Global reduction kernel: Sums partial results from workgroups into a single value at index 0
 [numthreads(64, 1, 1)]
-void GlobalReduceSum(uint3 id : SV_DispatchThreadID)
-{
-    // Only thread 0 runs this linear sum (fast enough for <1024 groups)
+void GlobalReduceSum(uint3 id : SV_DispatchThreadID) {
     if (id.x != 0) return;
-    
-    // Safety clamp (reductionCount set from C#)
     uint count = min(reductionCount, 2048); 
     float total = 0.0;
-    
-    for(uint i = 0; i < count; i++) 
-    {
-        total += divergenceBuffer[i];
-    }
-    
-    // Write result to index 0
-    divergenceBuffer[0] = total; 
+    for(uint i = 0; i < count; i++) total += divergenceBuffer[i];
+    divergenceBuffer[0] = total;
 }
