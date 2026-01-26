@@ -246,10 +246,73 @@ def main():
     avg_off = np.mean(np.abs(G_off[G_off != 0])) # Mean of non-zero off-diagonals
     max_off = np.max(np.abs(G_off))
     
-    print("-" * 30)
+    # Matrix A Statistics
+    A_diag = np.diag(A)
+    A_off = A.copy()
+    np.fill_diagonal(A_off, 0)
+    
+    # Count non-zeros
+    A_nnz = np.count_nonzero(A)
+    A_total = A.shape[0] * A.shape[1]
+    A_sparsity = (1 - A_nnz / A_total) * 100
+    
+    # Diagonal and off-diagonal statistics
+    A_avg_diag = np.mean(np.abs(A_diag))
+    A_avg_off = np.mean(np.abs(A_off[A_off != 0])) if np.any(A_off != 0) else 0.0
+    A_max_off = np.max(np.abs(A_off))
+    A_min_diag = np.min(np.abs(A_diag[A_diag != 0])) if np.any(A_diag != 0) else 0.0
+    A_max_diag = np.max(np.abs(A_diag))
+    
+    # Symmetry check
+    A_sym_diff = A - A.T
+    A_max_asymmetry = np.max(np.abs(A_sym_diff))
+    
+    # Diagonal dominance
+    row_sums = np.sum(np.abs(A), axis=1)
+    off_diag_sums = row_sums - np.abs(A_diag)
+    dominance = np.abs(A_diag) - off_diag_sums
+    min_dominance = np.min(dominance)
+    
+    # Condition number (for smaller matrices)
+    cond_num = None
+    if A.shape[0] < 5000:
+        try:
+            cond_num = np.linalg.cond(A)
+        except:
+            pass
+    
+    print("-" * 60)
     print("MATRIX STATISTICS")
-    print("-" * 30)
+    print("-" * 60)
     print(f"Matrix Size (N): {G.shape[0]}")
+    
+    print("\n--- Matrix A (Physics) Statistics ---")
+    print(f"  Non-zero entries: {A_nnz} / {A_total} ({100-A_sparsity:.2f}% dense)")
+    print(f"  Sparsity: {A_sparsity:.2f}%")
+    print(f"  Average non-zeros per row: {A_nnz / A.shape[0]:.2f}")
+    print(f"\n  Diagonal:")
+    print(f"    Mean |A_diag|: {A_avg_diag:.6f}")
+    print(f"    Min |A_diag|:  {A_min_diag:.6e}")
+    print(f"    Max |A_diag|:  {A_max_diag:.6f}")
+    print(f"  Off-diagonal:")
+    print(f"    Mean |A_off|: {A_avg_off:.6f} (non-zeros)")
+    print(f"    Max |A_off|:  {A_max_off:.6f}")
+    print(f"\n  Symmetry:")
+    print(f"    Max asymmetry: {A_max_asymmetry:.2e}")
+    if A_max_asymmetry < 1e-6:
+        print(f"    ✓ Matrix is symmetric (within tolerance)")
+    else:
+        print(f"    ✗ Matrix is NOT symmetric")
+    print(f"\n  Diagonal Dominance:")
+    print(f"    Min dominance: {min_dominance:.2e}")
+    if min_dominance > 0:
+        print(f"    ✓ Matrix is diagonally dominant")
+    else:
+        print(f"    ✗ Matrix is NOT diagonally dominant")
+    if cond_num is not None:
+        print(f"\n  Condition Number: {cond_num:.2e}")
+    
+    print("\n--- Matrix G (Learned Factor) Statistics ---")
     print(f"G Diagonal Mean: {avg_diag:.6f}")
     print(f"G Off-Diag Mean: {avg_off:.6f} (non-zeros)")
     print(f"G Max Off-Diag:  {max_off:.6f}")
