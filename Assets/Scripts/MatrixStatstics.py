@@ -1,299 +1,501 @@
 #!/usr/bin/env python3
 """
-MatrixStatistics.py
-Analyzes the sparsity pattern of the A matrix (Laplacian) from recorded fluid simulation data.
-Focuses on a frame 1/4 of the way through the dataset.
+Reconstruct matrix A from saved data and visualize sparsity pattern.
+Ignores boundaries (air/wall nodes).
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-from scipy.sparse import csr_matrix, coo_matrix
 import torch
-from NeuralPreconditioner import FluidGraphDataset, compute_laplacian_stencil
+import matplotlib
+# Use Agg backend for non-interactive (works everywhere)
+# If user wants interactive, they can set MPLBACKEND environment variable
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.sparse import coo_matrix
+from pathlib import Path
+import sys
+import traceback
 
-def reconstruct_sparse_matrix(A_diag, A_off, neighbors, num_nodes):
-    """
-    Reconstructs a sparse matrix A from diagonal, off-diagonal, and neighbor information.
-    Boundaries (Air/Wall) are not counted as neighbors but tracked separately.
+# Import the compute_laplacian_stencil function from NeuralPreconditioner
+sys.path.insert(0, str(Path(__file__).parent))
+from NeuralPreconditioner import compute_laplacian_stencil
+
+def load_frame_data(frame_path):
+    """Load data from a saved frame."""
+    frame_path = Path(frame_path)
     
-    Args:
-        A_diag: [N, 1] diagonal values
-        A_off: [N, 24] off-diagonal values (one per neighbor)
-        neighbors: [N, 24] neighbor indices
-        num_nodes: actual number of nodes (excluding padding)
+    # Read metadata
+    num_nodes = 0
+    with open(frame_path / "meta.txt", 'r') as f:
+        for line in f:
+            if 'numNodes' in line:
+                num_nodes = int(line.split(':')[1].strip())
     
-    Returns:
-        A: scipy.sparse.csr_matrix of shape (num_nodes, num_nodes)
-        boundary_stats: dict with counts of Air and Wall boundaries
-    """
-    N = num_nodes
-    IDX_AIR = N
-    IDX_WALL = N + 1
+    if num_nodes == 0:
+        raise ValueError("numNodes is 0 or not found in metadata")
     
-    # Track boundaries separately
-    air_count = 0
-    wall_count = 0
+    # Define node dtype (matches NeuralPreconditioner)
+    node_dtype = np.dtype([
+        ('position', '3<f4'), ('velocity', '3<f4'), ('face_vels', '6<f4'),
+        ('mass', '<f4'), ('layer', '<u4'), ('morton', '<u4'), ('active', '<u4')
+    ])
+    
+    # Read binary files
+    raw_nodes = np.fromfile(frame_path / "nodes.bin", dtype=node_dtype)
+    
+    # Neighbors buffer uses SoA (Structure of Arrays) layout:
+    # [AllNodes_Slot0, AllNodes_Slot1, ..., AllNodes_Slot23]
+    # So we need to reshape as (24, num_nodes) first, then transpose to (num_nodes, 24)
+    raw_nbrs = np.fromfile(frame_path / "neighbors.bin", dtype=np.uint32).reshape(24, num_nodes).T
+    
+    return raw_nodes, raw_nbrs, num_nodes
+
+def print_buffer_samples(raw_nodes, raw_nbrs, num_nodes, num_samples=10):
+    """Print sample entries from decoded buffers for debugging."""
+    print(f"\n=== Sample Buffer Entries (showing {min(num_samples, num_nodes)} of {num_nodes} nodes from middle of list) ===\n")
+    
+    # Calculate start index to sample from the middle
+    start_idx = max(0, (num_nodes - num_samples) // 2)
+    end_idx = min(num_nodes, start_idx + num_samples)
+    
+    print(f"Sampling nodes {start_idx} to {end_idx-1} (middle of list)\n")
+    
+    # Print sample nodes from the middle
+    for i in range(start_idx, end_idx):
+        node = raw_nodes[i]
+        print(f"Node {i}:")
+        print(f"  Position: ({node['position'][0]:.4f}, {node['position'][1]:.4f}, {node['position'][2]:.4f})")
+        print(f"  Velocity: ({node['velocity'][0]:.4f}, {node['velocity'][1]:.4f}, {node['velocity'][2]:.4f})")
+        print(f"  Mass: {node['mass']:.4f}")
+        print(f"  Layer: {node['layer']}")
+        print(f"  Morton Code: {node['morton']}")
+        print(f"  Active: {node['active']}")
+        
+        # Print neighbors for this node
+        neighbors = raw_nbrs[i]
+        print(f"  Neighbors (24 slots):")
+        # Group by face (6 faces, 4 neighbors each)
+        all_valid_neighbors = []
+        for face in range(6):
+            face_start = face * 4
+            face_nbrs = neighbors[face_start:face_start+4]
+            face_names = ['left', 'right', 'bottom', 'top', 'front', 'back']
+            print(f"    {face_names[face]}: {face_nbrs[0]}, {face_nbrs[1]}, {face_nbrs[2]}, {face_nbrs[3]}")
+            # Show which are valid (less than num_nodes)
+            valid = [int(n) for n in face_nbrs if n < num_nodes]
+            if valid:
+                print(f"      -> Valid fluid neighbors: {valid}")
+                all_valid_neighbors.extend(valid)
+            elif face_nbrs[0] == num_nodes:
+                print(f"      -> All invalid (no neighbor)")
+            elif face_nbrs[0] == num_nodes + 1:
+                print(f"      -> Wall boundary")
+        
+        # Analyze neighbor index distribution
+        if all_valid_neighbors:
+            min_nbr = min(all_valid_neighbors)
+            max_nbr = max(all_valid_neighbors)
+            avg_nbr = sum(all_valid_neighbors) / len(all_valid_neighbors)
+            print(f"  Neighbor index stats: min={min_nbr}, max={max_nbr}, avg={avg_nbr:.1f}, current_node={i}")
+            if min_nbr < i * 0.1:  # If neighbors are much lower than current index
+                print(f"    ⚠️  WARNING: Neighbors are mostly low-index (current node is {i})")
+                # Check morton codes and spatial distances of low-index neighbors
+                print(f"    Checking low-index neighbors:")
+                current_pos = np.array([node['position'][0], node['position'][1], node['position'][2]])
+                for nbr_idx in sorted(set(all_valid_neighbors))[:5]:  # Check first 5 unique neighbors
+                    if nbr_idx < num_nodes:
+                        nbr_node = raw_nodes[nbr_idx]
+                        nbr_morton = nbr_node['morton']
+                        nbr_layer = nbr_node['layer']
+                        nbr_pos = np.array([nbr_node['position'][0], nbr_node['position'][1], nbr_node['position'][2]])
+                        distance = np.linalg.norm(current_pos - nbr_pos)
+                        print(f"      Neighbor {nbr_idx}: morton={nbr_morton}, layer={nbr_layer}, pos=({nbr_pos[0]:.1f}, {nbr_pos[1]:.1f}, {nbr_pos[2]:.1f}), distance={distance:.1f}")
+            if max_nbr > i * 1.5:  # If neighbors are much higher than current index
+                print(f"    ⚠️  WARNING: Neighbors are mostly high-index (current node is {i})")
+        print()
+    
+    # Print some statistics
+    print(f"=== Buffer Statistics ===")
+    print(f"Total nodes: {num_nodes}")
+    
+    # Count neighbor types
+    valid_count = 0
     invalid_count = 0
+    wall_count = 0
+    for i in range(num_nodes):
+        for j in range(24):
+            nbr = raw_nbrs[i, j]
+            if nbr < num_nodes:
+                valid_count += 1
+            elif nbr == num_nodes:
+                invalid_count += 1
+            elif nbr == num_nodes + 1:
+                wall_count += 1
     
-    # Build COO format (row, col, data)
+    print(f"Neighbor slots:")
+    print(f"  Valid fluid neighbors: {valid_count}")
+    print(f"  Invalid (no neighbor): {invalid_count}")
+    print(f"  Wall boundaries: {wall_count}")
+    print(f"  Total slots: {num_nodes * 24}")
+    print()
+
+def reconstruct_matrix_A(raw_nodes, raw_nbrs, num_nodes):
+    """Reconstruct sparse matrix A from node and neighbor data."""
+    # Convert to torch tensors
+    t_nbrs = torch.from_numpy(raw_nbrs.astype(np.int64))
+    t_layers = torch.from_numpy(raw_nodes['layer'][:num_nodes].astype(np.int64)).unsqueeze(1)
+    
+    # Compute Laplacian stencil (diagonal and off-diagonal weights)
+    A_diag, A_off = compute_laplacian_stencil(t_nbrs, t_layers, num_nodes)
+    
+    # Convert to numpy
+    A_diag_np = A_diag.numpy().flatten()
+    A_off_np = A_off.numpy()
+    nbrs_np = raw_nbrs.astype(np.int64)
+    
+    # Build sparse matrix (COO format)
     rows = []
     cols = []
     data = []
     
     # Add diagonal entries
-    for i in range(N):
-        rows.append(i)
-        cols.append(i)
-        data.append(A_diag[i, 0])
+    for i in range(num_nodes):
+        if abs(A_diag_np[i]) > 1e-9:
+            rows.append(i)
+            cols.append(i)
+            data.append(float(A_diag_np[i]))
     
-    # Add off-diagonal entries (only for valid fluid nodes)
-    for i in range(N):
+    # Add off-diagonal entries (ignoring boundaries: air/wall/invalid)
+    IDX_AIR = num_nodes
+    IDX_WALL = num_nodes + 1
+    
+    for i in range(num_nodes):
         for k in range(24):
-            neighbor_idx = neighbors[i, k]
-            
-            # Classify neighbor type
-            if neighbor_idx == IDX_AIR:
-                air_count += 1
-            elif neighbor_idx == IDX_WALL:
-                wall_count += 1
-            elif neighbor_idx > IDX_WALL:
-                invalid_count += 1
-            elif 0 <= neighbor_idx < N:
-                # Valid fluid node - add to matrix
-                val = A_off[i, k]
-                # Only add non-zero values
-                if abs(val) > 1e-10:
+            col = nbrs_np[i, k]
+            # Only include valid fluid neighbors (not air/wall/invalid)
+            if col < num_nodes:  # Valid fluid neighbor
+                val = A_off_np[i, k]
+                if abs(val) > 1e-9:
                     rows.append(i)
-                    cols.append(int(neighbor_idx))
-                    data.append(val)
+                    cols.append(int(col))
+                    data.append(float(val))
     
-    # Create sparse matrix
-    A = coo_matrix((data, (rows, cols)), shape=(N, N))
-    # Convert to CSR for efficient operations
-    A = A.tocsr()
+    # Create sparse COO matrix
+    if len(data) > 0:
+        A_sparse = coo_matrix((data, (rows, cols)), shape=(num_nodes, num_nodes))
+        # Convert to CSR for better performance
+        A_sparse = A_sparse.tocsr()
+    else:
+        raise ValueError("No non-zero entries found in matrix A")
     
-    boundary_stats = {
-        'air_boundaries': air_count,
-        'wall_boundaries': wall_count,
-        'invalid_indices': invalid_count,
-        'total_boundary_slots': air_count + wall_count + invalid_count
-    }
-    
-    return A, boundary_stats
+    return A_sparse, A_diag_np, A_off_np
 
-def analyze_sparsity_pattern(A, num_nodes):
-    """
-    Analyzes the sparsity pattern of matrix A.
+def compute_neighbor_distances(raw_nodes, raw_nbrs, num_nodes):
+    """Compute average Euclidean distance from each node to its valid neighbors."""
+    distances = np.zeros(num_nodes)
     
-    Returns:
-        dict with statistics
-    """
-    stats = {}
+    for i in range(num_nodes):
+        node_pos = np.array([raw_nodes[i]['position'][0], 
+                            raw_nodes[i]['position'][1], 
+                            raw_nodes[i]['position'][2]])
+        
+        neighbor_distances = []
+        for j in range(24):
+            nbr_idx = raw_nbrs[i, j]
+            if nbr_idx < num_nodes:  # Valid neighbor
+                nbr_pos = np.array([raw_nodes[nbr_idx]['position'][0],
+                                   raw_nodes[nbr_idx]['position'][1],
+                                   raw_nodes[nbr_idx]['position'][2]])
+                dist = np.linalg.norm(node_pos - nbr_pos)
+                neighbor_distances.append(dist)
+        
+        if neighbor_distances:
+            distances[i] = np.mean(neighbor_distances)
+        else:
+            distances[i] = np.nan  # No valid neighbors
     
-    # Basic properties
-    stats['shape'] = A.shape
-    stats['nnz'] = A.nnz  # Number of non-zeros
-    stats['density'] = A.nnz / (A.shape[0] * A.shape[1])
-    stats['avg_nnz_per_row'] = A.nnz / A.shape[0]
-    
-    # Diagonal statistics
-    diag = A.diagonal()
-    stats['diag_min'] = diag.min()
-    stats['diag_max'] = diag.max()
-    stats['diag_mean'] = diag.mean()
-    stats['diag_std'] = diag.std()
-    
-    # Off-diagonal statistics
-    A_off = A.copy()
-    A_off.setdiag(0)  # Remove diagonal
-    off_diag_values = A_off.data
-    if len(off_diag_values) > 0:
-        stats['off_diag_min'] = off_diag_values.min()
-        stats['off_diag_max'] = off_diag_values.max()
-        stats['off_diag_mean'] = off_diag_values.mean()
-        stats['off_diag_std'] = off_diag_values.std()
-        stats['off_diag_abs_mean'] = np.abs(off_diag_values).mean()
-    else:
-        stats['off_diag_min'] = 0
-        stats['off_diag_max'] = 0
-        stats['off_diag_mean'] = 0
-        stats['off_diag_std'] = 0
-        stats['off_diag_abs_mean'] = 0
-    
-    # Connectivity analysis
-    # Count non-zeros per row (degree of each node)
-    row_nnz = np.diff(A.indptr)  # Number of non-zeros per row
-    stats['min_degree'] = row_nnz.min()
-    stats['max_degree'] = row_nnz.max()
-    stats['mean_degree'] = row_nnz.mean()
-    stats['std_degree'] = row_nnz.std()
-    
-    # Symmetry check (A should be symmetric for Laplacian)
-    A_sym_diff = A - A.T
-    stats['symmetry_error'] = np.abs(A_sym_diff.data).max() if A_sym_diff.nnz > 0 else 0.0
-    
-    # Check for isolated nodes (zero diagonal and no connections)
-    isolated = (diag == 0) & (row_nnz == 1)  # Only diagonal entry
-    stats['num_isolated'] = isolated.sum()
-    
-    return stats
+    return distances
 
-def visualize_sparsity_pattern(A, num_nodes, frame_idx):
-    """
-    Visualizes the sparsity pattern of matrix A.
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+def visualize_sparsity_pattern(A_sparse, raw_nodes, raw_nbrs, num_nodes, save_path=None):
+    """Visualize the sparsity pattern of matrix A, colored by average neighbor distance."""
+    print(f"Matrix A: {num_nodes} x {num_nodes}")
+    print(f"Non-zero entries: {A_sparse.nnz}")
+    print(f"Sparsity: {(1 - A_sparse.nnz / (num_nodes * num_nodes)) * 100:.2f}%")
     
-    # 1. Full sparsity pattern (may be large, so sample if needed)
-    ax = axes[0, 0]
-    if num_nodes > 2000:
-        # Sample a 2000x2000 submatrix for visualization
-        sample_size = 2000
-        A_sample = A[:sample_size, :sample_size]
-        ax.spy(A_sample, markersize=0.5, precision=1e-10)
-        ax.set_title(f"Sparsity Pattern (Top-Left {sample_size}x{sample_size} of {num_nodes}x{num_nodes})")
-    else:
-        ax.spy(A, markersize=0.5, precision=1e-10)
-        ax.set_title(f"Sparsity Pattern ({num_nodes}x{num_nodes})")
-    ax.set_xlabel("Column Index")
-    ax.set_ylabel("Row Index")
+    # Compute neighbor distances
+    print("Computing neighbor distances...")
+    neighbor_distances = compute_neighbor_distances(raw_nodes, raw_nbrs, num_nodes)
     
-    # 2. Histogram of non-zero values
-    ax = axes[0, 1]
-    nnz_values = A.data
-    ax.hist(nnz_values, bins=100, alpha=0.7, edgecolor='black')
-    ax.set_xlabel("Non-zero Value")
-    ax.set_ylabel("Frequency")
-    ax.set_title("Distribution of Non-zero Values")
-    ax.set_yscale('log')
-    ax.grid(True, alpha=0.3)
+    # Statistics on distances
+    valid_distances = neighbor_distances[~np.isnan(neighbor_distances)]
+    if len(valid_distances) > 0:
+        print(f"Neighbor distance stats:")
+        print(f"  Mean: {np.mean(valid_distances):.2f}")
+        print(f"  Median: {np.median(valid_distances):.2f}")
+        print(f"  Min: {np.min(valid_distances):.2f}")
+        print(f"  Max: {np.max(valid_distances):.2f}")
+        print(f"  Nodes with neighbors > 100 units away: {np.sum(valid_distances > 100)}")
+        print(f"  Nodes with neighbors > 500 units away: {np.sum(valid_distances > 500)}")
     
-    # 3. Histogram of diagonal values
-    ax = axes[1, 0]
-    diag = A.diagonal()
-    ax.hist(diag, bins=50, alpha=0.7, edgecolor='black', color='green')
-    ax.set_xlabel("Diagonal Value")
-    ax.set_ylabel("Frequency")
-    ax.set_title("Distribution of Diagonal Values")
-    ax.grid(True, alpha=0.3)
+    # Create figure with two subplots: A and A^-1
+    fig, axes = plt.subplots(1, 2, figsize=(24, 12))
     
-    # 4. Histogram of off-diagonal values
-    ax = axes[1, 1]
-    A_off = A.copy()
-    A_off.setdiag(0)
-    off_diag_values = A_off.data
-    if len(off_diag_values) > 0:
-        ax.hist(off_diag_values, bins=100, alpha=0.7, edgecolor='black', color='red')
-        ax.set_xlabel("Off-diagonal Value")
-        ax.set_ylabel("Frequency")
-        ax.set_title("Distribution of Off-diagonal Values")
-        ax.set_yscale('log')
-        ax.grid(True, alpha=0.3)
-    else:
-        ax.text(0.5, 0.5, "No off-diagonal values", ha='center', va='center', transform=ax.transAxes)
-        ax.set_title("Distribution of Off-diagonal Values")
+    # Plot 1: Sparsity pattern of A colored by neighbor distance
+    ax1 = axes[0]
+    
+    # Convert sparse matrix to COO format for coloring
+    A_coo = A_sparse.tocoo()
+    
+    # For each non-zero entry, get the row index and find its average neighbor distance
+    row_distances = neighbor_distances[A_coo.row]
+    
+    # Create scatter plot colored by distance
+    scatter1 = ax1.scatter(A_coo.col, A_coo.row, c=row_distances, 
+                         s=0.1, cmap='viridis_r', vmin=0, vmax=np.percentile(valid_distances, 95))
+    ax1.set_xlabel('Column Index (Neighbor Node)')
+    ax1.set_ylabel('Row Index (Current Node)')
+    ax1.set_title(f'Matrix A - Sparsity Pattern\n({num_nodes}x{num_nodes})')
+    ax1.invert_yaxis()  # Match spy plot orientation
+    ax1.set_aspect('auto')
+    
+    # Add colorbar
+    cbar1 = plt.colorbar(scatter1, ax=ax1)
+    cbar1.set_label('Average Euclidean Distance to Neighbors', rotation=270, labelpad=20)
+    
+    # Plot 2: Inverse of A (A^-1) using sparse LU factorization
+    ax2 = axes[1]
+    
+    print("Computing inverse of A (using sparse LU factorization)...")
+    try:
+        from scipy.sparse.linalg import splu
+        
+        # Use sparse LU factorization to efficiently compute the full inverse
+        print(f"  Computing sparse LU factorization...")
+        lu = splu(A_sparse.tocsc())  # Convert to CSC format for efficient factorization
+        
+        print(f"  Computing all {num_nodes} columns of A^-1...")
+        A_inv = np.zeros((num_nodes, num_nodes))
+        
+        # Compute all columns by solving A * x = e_i for each unit vector
+        for col_idx in range(num_nodes):
+            if (col_idx + 1) % 500 == 0:
+                print(f"    Computing column {col_idx+1}/{num_nodes}...")
+            # Solve A * x = e_col_idx
+            e = np.zeros(num_nodes)
+            e[col_idx] = 1.0
+            x = lu.solve(e)
+            A_inv[:, col_idx] = x
+        
+        # Visualize the inverse
+        # Use log scale for better visualization of small values
+        A_inv_abs = np.abs(A_inv)
+        A_inv_log = np.log10(A_inv_abs + 1e-10)  # Add small value to avoid log(0)
+        
+        im = ax2.imshow(A_inv_log, cmap='viridis', aspect='auto', origin='upper')
+        ax2.set_xlabel('Column Index')
+        ax2.set_ylabel('Row Index')
+        ax2.set_title(f'Inverse of A (log10 |A^-1|)\n({num_nodes}x{num_nodes})')
+        
+        # Add colorbar
+        cbar2 = plt.colorbar(im, ax=ax2)
+        cbar2.set_label('log10(|A^-1|)', rotation=270, labelpad=20)
+        
+        # Print statistics on inverse
+        print(f"Inverse of A statistics:")
+        print(f"  Max |A^-1|: {np.max(A_inv_abs):.2e}")
+        print(f"  Min |A^-1|: {np.min(A_inv_abs[A_inv_abs > 0]):.2e}")
+        print(f"  Mean |A^-1|: {np.mean(A_inv_abs):.2e}")
+        
+    except ImportError:
+        print(f"  Error: scipy.sparse.linalg.splu not available, falling back to dense inverse")
+        # Fallback to original method for small matrices
+        if num_nodes < 2000:
+            A_dense = A_sparse.toarray()
+            A_inv = np.linalg.inv(A_dense)
+            A_inv_abs = np.abs(A_inv)
+            A_inv_log = np.log10(A_inv_abs + 1e-10)
+            im = ax2.imshow(A_inv_log, cmap='viridis', aspect='auto', origin='upper')
+            ax2.set_title(f'Inverse of A (log10 |A^-1|)\n({num_nodes}x{num_nodes})')
+            cbar2 = plt.colorbar(im, ax=ax2)
+            cbar2.set_label('log10(|A^-1|)', rotation=270, labelpad=20)
+        else:
+            ax2.text(0.5, 0.5, f'Matrix too large\n({num_nodes}x{num_nodes})\nfor dense inverse', 
+                    ha='center', va='center', transform=ax2.transAxes, fontsize=14)
+            ax2.set_title('Inverse of A (Not Computed)')
+    except MemoryError:
+        print(f"  Error: Not enough memory for sparse LU factorization")
+        ax2.text(0.5, 0.5, f'Not enough memory\n({num_nodes}x{num_nodes})', 
+                ha='center', va='center', transform=ax2.transAxes, fontsize=14)
+        ax2.set_title('Inverse of A (Not Computed)')
+    except Exception as e:
+        print(f"  Error computing approximate inverse: {e}")
+        import traceback
+        traceback.print_exc()
+        ax2.text(0.5, 0.5, f'Error computing inverse:\n{str(e)}', 
+                ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+        ax2.set_title('Inverse of A (Error)')
     
     plt.tight_layout()
-    plt.show()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved sparsity pattern to {save_path}")
+    else:
+        # With Agg backend, we can't show interactively, so this shouldn't be reached
+        # but handle it gracefully
+        import tempfile
+        import os
+        temp_file = os.path.join(tempfile.gettempdir(), 'sparsity_pattern.png')
+        plt.savefig(temp_file, dpi=150, bbox_inches='tight')
+        print(f"Saved plot to: {temp_file}")
+    
+    plt.close(fig)  # Close to free memory
+    return fig
+
+def analyze_matrix_properties(A_sparse):
+    """Analyze properties of matrix A."""
+    num_nodes = A_sparse.shape[0]
+    
+    print("\n=== Matrix A Properties ===")
+    print(f"Size: {num_nodes} x {num_nodes}")
+    print(f"Non-zero entries: {A_sparse.nnz}")
+    print(f"Sparsity: {(1 - A_sparse.nnz / (num_nodes * num_nodes)) * 100:.2f}%")
+    print(f"Average non-zeros per row: {A_sparse.nnz / num_nodes:.2f}")
+    
+    # Check symmetry
+    A_sym = A_sparse - A_sparse.T
+    max_asymmetry = np.abs(A_sym.data).max() if A_sym.nnz > 0 else 0.0
+    print(f"Max asymmetry: {max_asymmetry:.2e}")
+    if max_asymmetry < 1e-6:
+        print("Matrix is symmetric (within tolerance)")
+    else:
+        print("Matrix is NOT symmetric")
+    
+    # Diagonal dominance (using sparse operations to avoid memory issues)
+    try:
+        diag = A_sparse.diagonal()
+        # Compute row sums using sparse operations (absolute values)
+        # Convert to COO to work with absolute values easily
+        A_coo = A_sparse.tocoo()
+        A_abs_coo = coo_matrix((np.abs(A_coo.data), (A_coo.row, A_coo.col)), shape=A_sparse.shape)
+        A_abs_csr = A_abs_coo.tocsr()
+        row_sums = np.array(A_abs_csr.sum(axis=1)).flatten()
+        off_diag_sums = row_sums - np.abs(diag)
+        dominance = np.abs(diag) - off_diag_sums
+        min_dominance = dominance.min()
+        print(f"Diagonal dominance (min): {min_dominance:.2e}")
+        if min_dominance > 0:
+            print("Matrix is diagonally dominant")
+        else:
+            print(f"Matrix is NOT diagonally dominant (min dominance: {min_dominance:.2e})")
+    except Exception as e:
+        print(f"Could not compute diagonal dominance: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Condition number estimate (for small matrices)
+    if num_nodes < 1000:
+        try:
+            A_dense = A_sparse.toarray()
+            cond_num = np.linalg.cond(A_dense)
+            print(f"Condition number: {cond_num:.2e}")
+        except Exception as e:
+            print(f"Could not compute condition number: {e}")
 
 def main():
-    # Setup paths
-    script_dir = Path(__file__).parent
-    default_data_path = script_dir.parent / "StreamingAssets" / "TestData"
+    """Main function to load data, reconstruct A, and visualize."""
+    import argparse
     
-    # Load dataset
-    dataset = FluidGraphDataset([default_data_path])
-    if len(dataset) == 0:
-        print(f"Error: No data found at {default_data_path}")
+    parser = argparse.ArgumentParser(description='Reconstruct matrix A and visualize sparsity pattern')
+    parser.add_argument('--frame', type=str, 
+                       default='StreamingAssets/TestData/Run_2026-01-24_11-51-49/frame_0300',
+                       help='Path to frame directory (relative to Assets folder, default: frame_0300 - 1/4 through recording)')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output path for sparsity pattern image (default: auto-open saved image, no saving to file)')
+    parser.add_argument('--analyze', action='store_true', default=True,
+                       help='Print detailed matrix analysis (default: enabled)')
+    parser.add_argument('--no-analyze', dest='analyze', action='store_false',
+                       help='Disable detailed matrix analysis')
+    
+    args = parser.parse_args()
+    
+    # Construct full path
+    script_dir = Path(__file__).parent.absolute()
+    assets_dir = script_dir.parent if script_dir.name == 'Scripts' else script_dir
+    
+    # Handle both relative and absolute paths
+    if Path(args.frame).is_absolute():
+        frame_path = Path(args.frame)
+    else:
+        # Try relative to Assets directory first
+        frame_path = assets_dir / args.frame
+        if not frame_path.exists():
+            # Try relative to current working directory
+            frame_path = Path(args.frame)
+    
+    if not frame_path.exists():
+        print(f"Error: Frame path does not exist: {frame_path}")
+        print(f"Looking for: {frame_path}")
         return
     
-    # Get frame at 1/4 of the way through
-    frame_idx = len(dataset) // 4
-    print(f"Analyzing frame {frame_idx} of {len(dataset)} (1/4 of the way through)")
+    print(f"Loading data from: {frame_path}")
     
-    # Load the frame
-    batch = dataset[frame_idx]
+    # Load data
+    try:
+        raw_nodes, raw_nbrs, num_nodes = load_frame_data(frame_path)
+        print(f"Loaded {num_nodes} nodes")
+        
+        # Print sample buffer entries for debugging
+        print_buffer_samples(raw_nodes, raw_nbrs, num_nodes, num_samples=5)
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return
     
-    # Extract data (remove padding)
-    num_nodes = int(batch['mask'].sum())
-    print(f"Number of nodes: {num_nodes}")
+    # Reconstruct matrix A
+    try:
+        print("Reconstructing matrix A...")
+        A_sparse, A_diag, A_off = reconstruct_matrix_A(raw_nodes, raw_nbrs, num_nodes)
+        print("Matrix A reconstructed successfully")
+    except Exception as e:
+        print(f"Error reconstructing matrix A: {e}")
+        import traceback
+        traceback.print_exc()
+        return
     
-    A_diag = batch['A_diag'][:num_nodes]  # [N, 1]
-    A_off = batch['A_off'][:num_nodes]    # [N, 24]
-    neighbors = batch['neighbors'][:num_nodes]  # [N, 24]
+    # Analyze matrix properties (default is True)
+    analyze_matrix_properties(A_sparse)
     
-    # Reconstruct sparse matrix
-    print("Reconstructing sparse matrix A...")
-    A, boundary_stats = reconstruct_sparse_matrix(A_diag, A_off, neighbors, num_nodes)
-    
-    # Analyze sparsity pattern
-    print("Analyzing sparsity pattern...")
-    stats = analyze_sparsity_pattern(A, num_nodes)
-    
-    # Print statistics
-    print("\n" + "="*60)
-    print("MATRIX A SPARSITY STATISTICS")
-    print("="*60)
-    print(f"Matrix Shape: {stats['shape']}")
-    print(f"Number of Non-zeros: {stats['nnz']:,}")
-    print(f"Density: {stats['density']:.6f} ({stats['density']*100:.4f}%)")
-    print(f"Average Non-zeros per Row: {stats['avg_nnz_per_row']:.2f}")
-    print()
-    print("Diagonal Statistics:")
-    print(f"  Min: {stats['diag_min']:.6f}")
-    print(f"  Max: {stats['diag_max']:.6f}")
-    print(f"  Mean: {stats['diag_mean']:.6f}")
-    print(f"  Std: {stats['diag_std']:.6f}")
-    print()
-    print("Off-diagonal Statistics:")
-    print(f"  Min: {stats['off_diag_min']:.6f}")
-    print(f"  Max: {stats['off_diag_max']:.6f}")
-    print(f"  Mean: {stats['off_diag_mean']:.6f}")
-    print(f"  Mean |Value|: {stats['off_diag_abs_mean']:.6f}")
-    print(f"  Std: {stats['off_diag_std']:.6f}")
-    print()
-    print("Connectivity (Degree per Node):")
-    print(f"  Min Degree: {stats['min_degree']}")
-    print(f"  Max Degree: {stats['max_degree']}")
-    print(f"  Mean Degree: {stats['mean_degree']:.2f}")
-    print(f"  Std Degree: {stats['std_degree']:.2f}")
-    print()
-    print("Other Properties:")
-    print(f"  Symmetry Error (max |A - A^T|): {stats['symmetry_error']:.2e}")
-    print(f"  Isolated Nodes: {stats['num_isolated']}")
-    print()
-    print("Boundary Statistics (not counted as neighbors):")
-    print(f"  Air Boundaries (Dirichlet): {boundary_stats['air_boundaries']:,}")
-    print(f"  Wall Boundaries (Neumann): {boundary_stats['wall_boundaries']:,}")
-    print(f"  Invalid/Invalid Indices: {boundary_stats['invalid_indices']:,}")
-    print(f"  Total Boundary Slots: {boundary_stats['total_boundary_slots']:,}")
-    print(f"  (Out of {num_nodes * 24:,} total neighbor slots)")
-    print("="*60)
-    
-    # Visualize
-    print("\nGenerating visualizations...")
-    visualize_sparsity_pattern(A, num_nodes, frame_idx)
-    
-    # Additional analysis: Bandwidth
-    # Compute bandwidth (maximum distance from diagonal)
-    bandwidth = 0
-    for i in range(A.shape[0]):
-        row_start = A.indptr[i]
-        row_end = A.indptr[i+1]
-        if row_end > row_start:
-            cols = A.indices[row_start:row_end]
-            max_dist = np.max(np.abs(cols - i))
-            bandwidth = max(bandwidth, max_dist)
-    
-    print(f"\nMatrix Bandwidth: {bandwidth}")
-    print(f"  (Maximum distance from diagonal to any non-zero)")
-    
-    # Check if matrix is approximately banded
-    if bandwidth < num_nodes * 0.1:
-        print(f"  Matrix appears to be banded (bandwidth << N)")
-    else:
-        print(f"  Matrix is not strongly banded")
+    # Visualize sparsity pattern
+    try:
+        print("Visualizing sparsity pattern...")
+        # If no output specified, save to temp file and open it
+        if args.output is None:
+            import tempfile
+            import os
+            import subprocess
+            temp_file = os.path.join(tempfile.gettempdir(), 'sparsity_pattern.png')
+            visualize_sparsity_pattern(A_sparse, raw_nodes, raw_nbrs, num_nodes, save_path=temp_file)
+            # Try to open the image
+            try:
+                subprocess.run(['open', temp_file], check=False)  # macOS
+                print(f"Opened sparsity pattern: {temp_file}")
+            except:
+                try:
+                    subprocess.run(['xdg-open', temp_file], check=False)  # Linux
+                    print(f"Opened sparsity pattern: {temp_file}")
+                except:
+                    print(f"Sparsity pattern saved to: {temp_file}")
+        else:
+            visualize_sparsity_pattern(A_sparse, raw_nodes, raw_nbrs, num_nodes, save_path=args.output)
+        print("Visualization complete")
+    except Exception as e:
+        print(f"Error visualizing sparsity pattern: {e}")
+        traceback.print_exc()
+        # Still print basic stats even if visualization fails
+        print(f"\nBasic stats:")
+        print(f"  Matrix size: {A_sparse.shape[0]} x {A_sparse.shape[1]}")
+        print(f"  Non-zeros: {A_sparse.nnz}")
+        print(f"  Sparsity: {(1 - A_sparse.nnz / (A_sparse.shape[0] * A_sparse.shape[1])) * 100:.2f}%")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
