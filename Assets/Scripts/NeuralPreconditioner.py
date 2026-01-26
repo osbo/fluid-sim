@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
 import argparse
 import struct
 import time
@@ -95,48 +95,329 @@ def compute_laplacian_stencil(neighbors, layers, num_nodes):
     
     return A_diag, A_off_flat
 
-# --- 2. Architecture: SPAI Generator ---
+# --- 2. Architecture: Hierarchical V-Cycle Transformer ---
 
-class SPAIGenerator(nn.Module):
-    # CHANGE 1: Default d_model=32 (matches paper's ~24k parameters)
-    def __init__(self, input_dim=58, d_model=32, num_layers=4, nhead=4, window_size=256, max_octree_depth=12):
+# --- 2.1 RoPE (Rotary Positional Embeddings) ---
+
+def apply_rope(x, freqs_cis):
+    """
+    Apply Rotary Position Embedding to input tensor.
+    
+    Args:
+        x: [B, nhead, N, head_dim] query or key tensor
+        freqs_cis: [N, head_dim // 2] complex frequencies (real and imag parts)
+    
+    Returns:
+        x_rope: [B, nhead, N, head_dim] with RoPE applied
+    """
+    B, nhead, N, head_dim = x.shape
+    
+    # Split x into pairs: [B, nhead, N, head_dim//2, 2]
+    x_reshaped = x.view(B, nhead, N, head_dim // 2, 2)
+    
+    # Extract real and imaginary parts of frequencies
+    # freqs_cis is [N, head_dim//2, 2] where [:, :, 0] is cos, [:, :, 1] is sin
+    if len(freqs_cis.shape) == 3:
+        # Standard case: [N, head_dim//2, 2]
+        cos_part = freqs_cis[:, :, 0]  # [N, head_dim//2]
+        sin_part = freqs_cis[:, :, 1]  # [N, head_dim//2]
+    else:
+        # If it's a complex tensor (2D), convert to real representation
+        cos_part = freqs_cis.real if hasattr(freqs_cis, 'real') else freqs_cis
+        sin_part = freqs_cis.imag if hasattr(freqs_cis, 'imag') else torch.zeros_like(freqs_cis)
+    
+    # Expand for broadcasting: [1, 1, N, head_dim//2]
+    cos_part = cos_part.unsqueeze(0).unsqueeze(0)  # [1, 1, N, head_dim//2]
+    sin_part = sin_part.unsqueeze(0).unsqueeze(0)  # [1, 1, N, head_dim//2]
+    
+    # Apply rotation: [x0, x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]
+    x0, x1 = x_reshaped[..., 0], x_reshaped[..., 1]
+    x_rotated = torch.stack([
+        x0 * cos_part - x1 * sin_part,
+        x0 * sin_part + x1 * cos_part
+    ], dim=-1)  # [B, nhead, N, head_dim//2, 2]
+    
+    # Reshape back to [B, nhead, N, head_dim]
+    return x_rotated.view(B, nhead, N, head_dim)
+
+
+def precompute_freqs_cis(seq_len, head_dim, base=10000.0, device='cpu'):
+    """
+    Precompute frequency matrix for RoPE.
+    
+    Returns:
+        freqs_cis: [seq_len, head_dim // 2, 2] where [:, :, 0] is cos, [:, :, 1] is sin
+    """
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, inv_freq)  # [seq_len, head_dim // 2]
+    
+    # Compute cos and sin
+    cos_freqs = torch.cos(freqs)  # [seq_len, head_dim // 2]
+    sin_freqs = torch.sin(freqs)  # [seq_len, head_dim // 2]
+    
+    # Stack: [seq_len, head_dim // 2, 2]
+    freqs_cis = torch.stack([cos_freqs, sin_freqs], dim=-1)
+    return freqs_cis
+
+
+# --- 2.2 Scheduler: Calculate Depth and Padding Schedule ---
+
+class HierarchicalScheduler:
+    """
+    Pre-computes the depth and padding schedule for deterministic V-cycle execution.
+    """
+    def __init__(self, k=32, min_leaf_size=128):
+        """
+        Args:
+            k: Branching factor (compression rate per level)
+            min_leaf_size: Minimum sequence length at bottom level
+        """
+        self.k = k
+        self.min_leaf_size = min_leaf_size
+    
+    def compute_schedule(self, seq_len):
+        """
+        Compute depth and padding schedule for a given sequence length.
+        
+        Returns:
+            depth: int, number of recursive levels
+            padding_schedule: list of ints, padding needed at each level (from fine to coarse)
+        """
+        depth = 0
+        padding_schedule = []
+        current_len = seq_len
+        
+        # Calculate depth
+        while current_len > self.min_leaf_size:
+            remainder = current_len % self.k
+            padding = (self.k - remainder) % self.k
+            padding_schedule.append(padding)
+            current_len = (current_len + padding) // self.k
+            depth += 1
+        
+        # If depth is 0, we skip recursion (seq_len <= min_leaf_size)
+        if depth == 0:
+            return 0, []
+        
+        return depth, padding_schedule
+
+
+# --- 2.3 Components: Down-Sampler, Bottleneck, Up-Sampler ---
+
+class DownSampler(nn.Module):
+    """
+    Encoder: Localized mixing within groups of k tokens before pooling.
+    """
+    def __init__(self, d_model, k, expansion=2):
+        super().__init__()
+        self.k = k
+        self.d_model = d_model
+        
+        # Local mixer: MLP that operates on groups of k tokens
+        self.local_mixer = nn.Sequential(
+            nn.Linear(d_model, d_model * expansion),
+            nn.ReLU(),
+            nn.Linear(d_model * expansion, d_model)
+        )
+        
+        # Optional: Layer norm
+        self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, x):
+        """
+        x: [B, N, D]
+        Returns: [B, N//k, D] (after pooling)
+        """
+        B, N, D = x.shape
+        
+        # Reshape to [B, N//k, k, D] for local mixing
+        # First, ensure N is divisible by k (padding should be handled upstream)
+        assert N % self.k == 0, f"N ({N}) must be divisible by k ({self.k})"
+        
+        x_grouped = x.view(B, N // self.k, self.k, D)
+        
+        # Local mixing: apply MLP to each group
+        x_mixed = self.local_mixer(x_grouped)  # [B, N//k, k, D]
+        
+        # Pool: take mean across k dimension
+        x_pooled = x_mixed.mean(dim=2)  # [B, N//k, D]
+        
+        # Normalize
+        x_pooled = self.norm(x_pooled)
+        
+        return x_pooled
+
+
+class BottleneckAttention(nn.Module):
+    """
+    Global attention at the coarsest level with RoPE.
+    """
+    def __init__(self, d_model, nhead, max_seq_len=512):
         super().__init__()
         self.d_model = d_model
-        self.window_size = window_size
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        
+        # Standard multi-head attention components
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        # Precompute RoPE frequencies (will be recomputed if seq_len > max_seq_len)
+        self.max_seq_len = max_seq_len
+        self.register_buffer('freqs_cis', precompute_freqs_cis(max_seq_len, self.head_dim))
+        
+        self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, x):
+        """
+        x: [B, N, D] where N is small (<= min_leaf_size)
+        Returns: [B, N, D]
+        """
+        B, N, D = x.shape
+        
+        # Precompute RoPE if needed
+        if N > self.max_seq_len:
+            freqs_cis = precompute_freqs_cis(N, self.head_dim, device=x.device)
+        else:
+            freqs_cis = self.freqs_cis[:N]
+        
+        # Normalize
+        x_norm = self.norm(x)
+        
+        # Project to Q, K, V
+        q = self.q_proj(x_norm).view(B, N, self.nhead, self.head_dim)
+        k = self.k_proj(x_norm).view(B, N, self.nhead, self.head_dim)
+        v = self.v_proj(x_norm).view(B, N, self.nhead, self.head_dim)
+        
+        # Reshape for attention: [B, nhead, N, head_dim]
+        q = q.transpose(1, 2)  # [B, nhead, N, head_dim]
+        k = k.transpose(1, 2)  # [B, nhead, N, head_dim]
+        v = v.transpose(1, 2)  # [B, nhead, N, head_dim]
+        
+        # Apply RoPE to Q and K
+        q_rope = apply_rope(q, freqs_cis)
+        k_rope = apply_rope(k, freqs_cis)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(q_rope, k_rope.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_output = torch.matmul(attn_weights, v)  # [B, nhead, N, head_dim]
+        
+        # Reshape back: [B, N, nhead, head_dim] -> [B, N, D]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, N, D)
+        
+        # Output projection
+        output = self.out_proj(attn_output)
+        
+        # Residual connection
+        return x + output
+
+
+class UpSampler(nn.Module):
+    """
+    Decoder/Fuse: Expands coarse features and merges with skip connections.
+    """
+    def __init__(self, d_model, k, expansion=2):
+        super().__init__()
+        self.k = k
+        self.d_model = d_model
+        
+        # Up-projection: prepares coarse features for expansion
+        self.up_proj = nn.Linear(d_model, d_model)
+        
+        # Fusion MLP: merges (Fine, UpSampled_Coarse)
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * expansion),
+            nn.ReLU(),
+            nn.Linear(d_model * expansion, d_model)
+        )
+        
+        self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, x_coarse, x_fine):
+        """
+        x_coarse: [B, N_coarse, D] from lower level
+        x_fine: [B, N_fine, D] skip connection (N_fine = N_coarse * k)
+        Returns: [B, N_fine, D]
+        """
+        B, N_coarse, D = x_coarse.shape
+        _, N_fine, _ = x_fine.shape
+        
+        assert N_fine == N_coarse * self.k, f"Size mismatch: {N_fine} != {N_coarse} * {self.k}"
+        
+        # Up-project coarse features
+        x_coarse_proj = self.up_proj(x_coarse)  # [B, N_coarse, D]
+        
+        # Expand: repeat each token k times
+        x_coarse_expanded = x_coarse_proj.repeat_interleave(self.k, dim=1)  # [B, N_fine, D]
+        
+        # Concatenate fine and expanded coarse
+        x_concat = torch.cat([x_fine, x_coarse_expanded], dim=-1)  # [B, N_fine, 2*D]
+        
+        # Fuse
+        x_fused = self.fusion(x_concat)  # [B, N_fine, D]
+        
+        # Normalize
+        x_fused = self.norm(x_fused)
+        
+        return x_fused
+
+
+# --- 2.4 Main Architecture: Hierarchical V-Cycle Transformer ---
+
+class HierarchicalVCycleTransformer(nn.Module):
+    """
+    Deterministic Hierarchical (V-Cycle) Transformer.
+    Replaces sliding window with multigrid approach.
+    """
+    def __init__(self, input_dim=58, d_model=32, nhead=4, k=32, min_leaf_size=128, max_octree_depth=12):
+        super().__init__()
+        self.d_model = d_model
+        self.k = k
+        self.min_leaf_size = min_leaf_size
+        self.scheduler = HierarchicalScheduler(k=k, min_leaf_size=min_leaf_size)
         
         # 1. Feature Projection
-        # Input: Pos(3) + Wall(6) + Air(24) + A_diag(1) + A_off(24) = 58
         self.feature_proj = nn.Linear(input_dim, d_model)
         
-        # 2. Embeddings
-        # Encodes the scale of the physics (Layer 10 vs Layer 5)
+        # 2. Layer Embedding (physics scale)
         self.layer_embed = nn.Embedding(max_octree_depth, d_model)
-        # Encodes position within the local window (0-511)
-        self.window_pos_embed = nn.Parameter(torch.randn(1, window_size, d_model) * 0.02)
         
-        # 3. Backbone: Windowed Transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=d_model * 2, 
-            dropout=0.0, 
-            activation='gelu', 
-            batch_first=True, 
-            norm_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # 3. V-Cycle Components (one per level, but we'll reuse them)
+        # Down-samplers
+        self.down_samplers = nn.ModuleList()
+        # Bottleneck (only one, used at the bottom)
+        self.bottleneck = BottleneckAttention(d_model, nhead)
+        # Up-samplers
+        self.up_samplers = nn.ModuleList()
+        
+        # We'll create components dynamically based on max depth
+        # For now, create enough for reasonable depths (e.g., 5 levels max)
+        max_depth = 5
+        for _ in range(max_depth):
+            self.down_samplers.append(DownSampler(d_model, k))
+            self.up_samplers.append(UpSampler(d_model, k))
         
         # 4. Output Head
-        # Predicts Matrix G coefficients (1 Diag + 24 Off-Diag)
         self.norm_out = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, 25) 
+        self.head = nn.Linear(d_model, 25)
         
-        # Init Strategy: Start close to Identity (G_diag=1, G_off=0)
+        # Break symmetry with noise
         with torch.no_grad():
-            self.head.weight.fill_(0.0)
-            self.head.bias.fill_(0.0)
-            self.head.bias[0] = 1.0 
-
+            # Initialize weights with small variance to ensure gradient flow
+            self.head.weight.normal_(0.0, 0.001)
+            
+            # Initialize bias with uniform noise to prevent "Zero Trap"
+            # We want off-diagonals to be non-zero to force the optimizer to fix them
+            self.head.bias.uniform_(-0.01, 0.01)
+            
+            # Hard-set the diagonal to a good starting point (Identity-ish)
+            self.head.bias[0].fill_(1.0)
+    
     def forward(self, x, layers):
         """
         x: [Batch, N, 58]
@@ -147,34 +428,64 @@ class SPAIGenerator(nn.Module):
         # A. Embedding
         h = self.feature_proj(x) + self.layer_embed(layers)
         
-        # B. Windowing
-        # Pad N to multiple of window_size
-        pad_len = (self.window_size - (N % self.window_size)) % self.window_size
-        if pad_len > 0:
-            h = F.pad(h, (0, 0, 0, pad_len))
+        # B. Compute schedule
+        depth, padding_schedule = self.scheduler.compute_schedule(N)
+        
+        # If depth is 0, apply bottleneck directly
+        if depth == 0:
+            h = self.bottleneck(h)
+            coeffs = self.head(self.norm_out(h))
+            return coeffs
+        
+        # C. Phase A: Downward Pass (Restriction)
+        skip_stack = []  # Store skip connections (post-pad, for fusion)
+        residual_stack = []  # Store pre-pad versions (for residual connections)
+        current = h
+        
+        for level in range(depth):
+            # 1. Save pre-pad version for residual connection
+            residual_stack.append(current.clone())
             
-        N_padded = h.shape[1]
-        num_windows = N_padded // self.window_size
-        
-        # Reshape to [Batch * NumWindows, WindowSize, d_model]
-        h_windows = h.view(B * num_windows, self.window_size, self.d_model)
-        
-        # Add Window Position Embedding (Broadcasts)
-        h_windows = h_windows + self.window_pos_embed
-        
-        # C. Transformer (Local Attention)
-        h_encoded = self.encoder(h_windows)
-        
-        # D. Un-Window
-        h_flat = h_encoded.view(B, N_padded, self.d_model)
-        
-        # Remove Padding
-        if pad_len > 0:
-            h_flat = h_flat[:, :N, :]
+            # 2. Pad
+            padding = padding_schedule[level]
+            if padding > 0:
+                current = F.pad(current, (0, 0, 0, padding))
             
-        # E. Output Prediction
-        coeffs = self.head(self.norm_out(h_flat)) # [B, N, 25]
+            # 3. Save post-pad version (skip connection for fusion)
+            skip_stack.append(current.clone())
+            
+            # 4. Local Mix & Pool (Down-Sample)
+            down_sampler = self.down_samplers[level] if level < len(self.down_samplers) else self.down_samplers[-1]
+            current = down_sampler(current)
+        
+        # D. Phase B: Bottleneck (Global Attention)
+        current = self.bottleneck(current)
+        
+        # E. Phase C: Upward Pass (Prolongation)
+        for level in range(depth - 1, -1, -1):  # Reverse order
+            # 1. Retrieve skip connection (post-pad) and residual (pre-pad)
+            x_fine = skip_stack.pop()
+            x_residual = residual_stack.pop()
+            
+            # 2. Up-Sample and Fuse
+            up_sampler = self.up_samplers[level] if level < len(self.up_samplers) else self.up_samplers[-1]
+            current = up_sampler(current, x_fine)
+            
+            # 3. Crop padding
+            padding = padding_schedule[level]
+            if padding > 0:
+                current = current[:, :current.shape[1] - padding, :]
+            
+            # 4. Residual connection (add original input before encoder at this level)
+            current = current + x_residual
+        
+        # F. Output Prediction
+        coeffs = self.head(self.norm_out(current))  # [B, N, 25]
         return coeffs
+
+
+# Alias for backward compatibility
+SPAIGenerator = HierarchicalVCycleTransformer
 
 # --- 3. Unsupervised SAI Loss (Stochastic Trace Estimation) ---
 
@@ -436,12 +747,15 @@ def export_weights(model, path):
     print(f"Exporting packed 16-bit weights to {path}...")
     with open(path, 'wb') as f:
         # 1. Header: Standard 32-bit floats/ints
-        # We assume the C# side reads these as standard 4-byte values
+        # Format: [reserved1, reserved2, d_model, nhead, num_levels, input_dim]
+        # For hierarchical architecture, num_levels is the max depth of down/up samplers
+        num_levels = len(model.down_samplers)
+        nhead = model.bottleneck.nhead
         header = struct.pack('<ffiiii', 
                            0.0, 0.0, 
                            model.d_model, 
-                           model.encoder.layers[0].self_attn.num_heads,
-                           len(model.encoder.layers), 
+                           nhead,
+                           num_levels, 
                            58)
         f.write(header)
         
@@ -465,30 +779,50 @@ def export_weights(model, path):
             
             f.write(data_packed.tobytes())
 
-        # --- Write Weights (Same Order) ---
+        # --- Write Weights (Hierarchical V-Cycle Architecture) ---
         
         # 1. Feature Projection
         write_packed_tensor(model.feature_proj.weight)
         write_packed_tensor(model.feature_proj.bias)
         write_packed_tensor(model.layer_embed.weight)
-        write_packed_tensor(model.window_pos_embed)
 
-        # 2. Transformer Layers
-        for layer in model.encoder.layers:
-            write_packed_tensor(layer.self_attn.in_proj_weight) 
-            write_packed_tensor(layer.self_attn.in_proj_bias)
-            write_packed_tensor(layer.self_attn.out_proj.weight)
-            write_packed_tensor(layer.self_attn.out_proj.bias)
-            write_packed_tensor(layer.norm1.weight)
-            write_packed_tensor(layer.norm1.bias)
-            write_packed_tensor(layer.linear1.weight)
-            write_packed_tensor(layer.linear1.bias)
-            write_packed_tensor(layer.linear2.weight)
-            write_packed_tensor(layer.linear2.bias)
-            write_packed_tensor(layer.norm2.weight)
-            write_packed_tensor(layer.norm2.bias)
+        # 2. Down-Samplers (one per level)
+        for down_sampler in model.down_samplers:
+            # Local mixer MLP
+            write_packed_tensor(down_sampler.local_mixer[0].weight)
+            write_packed_tensor(down_sampler.local_mixer[0].bias)
+            write_packed_tensor(down_sampler.local_mixer[2].weight)
+            write_packed_tensor(down_sampler.local_mixer[2].bias)
+            write_packed_tensor(down_sampler.norm.weight)
+            write_packed_tensor(down_sampler.norm.bias)
 
-        # 3. Output Head
+        # 3. Bottleneck Attention (Global Attention with RoPE)
+        bottleneck = model.bottleneck
+        write_packed_tensor(bottleneck.q_proj.weight)
+        write_packed_tensor(bottleneck.q_proj.bias)
+        write_packed_tensor(bottleneck.k_proj.weight)
+        write_packed_tensor(bottleneck.k_proj.bias)
+        write_packed_tensor(bottleneck.v_proj.weight)
+        write_packed_tensor(bottleneck.v_proj.bias)
+        write_packed_tensor(bottleneck.out_proj.weight)
+        write_packed_tensor(bottleneck.out_proj.bias)
+        write_packed_tensor(bottleneck.norm.weight)
+        write_packed_tensor(bottleneck.norm.bias)
+
+        # 4. Up-Samplers (one per level)
+        for up_sampler in model.up_samplers:
+            # Up-projection
+            write_packed_tensor(up_sampler.up_proj.weight)
+            write_packed_tensor(up_sampler.up_proj.bias)
+            # Fusion MLP
+            write_packed_tensor(up_sampler.fusion[0].weight)
+            write_packed_tensor(up_sampler.fusion[0].bias)
+            write_packed_tensor(up_sampler.fusion[2].weight)
+            write_packed_tensor(up_sampler.fusion[2].bias)
+            write_packed_tensor(up_sampler.norm.weight)
+            write_packed_tensor(up_sampler.norm.bias)
+
+        # 5. Output Head
         write_packed_tensor(model.norm_out.weight)
         write_packed_tensor(model.norm_out.bias)
         write_packed_tensor(model.head.weight)
@@ -521,11 +855,25 @@ def train(args):
     if len(dataset) == 0:
         print("No data found! Check path.")
         return
-        
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     
-    # Init Model
-    model = SPAIGenerator(input_dim=58, d_model=args.d_model, num_layers=args.layers).to(device)
+    # Determine if we should use random frame sampling per epoch
+    use_random_sampling = args.frames_per_epoch > 0
+        
+    # Create base loader (will be recreated each epoch if using random sampling)
+    if use_random_sampling:
+        # Initial loader with full dataset (will be replaced each epoch)
+        loader = None
+    else:
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
+    # Init Model (Hierarchical V-Cycle Transformer)
+    model = HierarchicalVCycleTransformer(
+        input_dim=58, 
+        d_model=args.d_model, 
+        nhead=args.nhead if hasattr(args, 'nhead') else 4,
+        k=args.k if hasattr(args, 'k') else 32,
+        min_leaf_size=args.min_leaf_size if hasattr(args, 'min_leaf_size') else 128
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = SAILoss(num_probe_vectors=args.num_probe_vectors)
     
@@ -569,6 +917,15 @@ def train(args):
         epoch_start = time.time()
         model.train()
         total_loss = 0
+        
+        # If using random frame sampling, create a new sampler and loader for this epoch
+        if use_random_sampling:
+            # Randomly sample indices
+            num_frames = min(args.frames_per_epoch, len(dataset))
+            indices = torch.randperm(len(dataset))[:num_frames].tolist()
+            sampler = SubsetRandomSampler(indices)
+            loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False)
+            print(f"Epoch {epoch+1}: Using {num_frames} randomly selected frames")
         
         # Accumulators for average times
         total_fwd_time = 0.0
@@ -667,12 +1024,17 @@ if __name__ == "__main__":
     # Script is in Assets/Scripts/, so parent.parent = Assets/
     default_data_path = Path(__file__).parent.parent / "StreamingAssets" / "TestData"
     parser.add_argument('--data_folder', type=str, default=str(default_data_path))
-    parser.add_argument('--epochs', type=int, default=15)
+    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--d_model', type=int, default=32)
-    parser.add_argument('--layers', type=int, default=4)
-    parser.add_argument('--num_probe_vectors', type=int, default=1)
+    parser.add_argument('--layers', type=int, default=4, help='Deprecated: kept for compatibility, not used in hierarchical architecture')
+    parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads in bottleneck')
+    parser.add_argument('--k', type=int, default=32, help='Branching factor (compression rate per level)')
+    parser.add_argument('--min_leaf_size', type=int, default=128, help='Minimum sequence length at bottom level')
+    parser.add_argument('--num_probe_vectors', type=int, default=4)
+    parser.add_argument('--frames_per_epoch', type=int, default=0, 
+                        help='Number of random frames to use per epoch. If 0, uses all frames.')
     args = parser.parse_args()
     
     train(args)
