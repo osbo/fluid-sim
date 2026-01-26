@@ -1,427 +1,509 @@
 #pragma kernel ComputeFeatures
+#pragma kernel DownSample
+#pragma kernel Bottleneck
+#pragma kernel UpSample
 #pragma kernel PredictHead
-#pragma kernel FusedTransformerLayer
+#pragma kernel CopyBuffer
 
-// --- STRUCTS & CONSTANTS ---
+// ------------------------------------------------------------------
+// STRUCTS & CONSTANTS
+// ------------------------------------------------------------------
+
 struct faceVelocities { float left, right, bottom, top, front, back; };
+
 struct Node {
-    float3 position; float3 velocity; faceVelocities velocities;
-    float mass; uint layer; uint mortonCode; uint active;
+    float3 position; 
+    float3 velocity; 
+    faceVelocities velocities;
+    float mass; 
+    uint layer; 
+    uint mortonCode;
+    uint active;
 };
 
-// --- BUFFERS ---
+// ------------------------------------------------------------------
+// BUFFERS
+// ------------------------------------------------------------------
+
 StructuredBuffer<Node> nodesBuffer;
 StructuredBuffer<uint> neighborsBuffer;
-StructuredBuffer<float> matrixABuffer; // Pre-computed Laplacian matrix A (time-scaled)
+StructuredBuffer<float> matrixABuffer;
 
-// --- HELPERS ---
+// --- Unified Weight Access (Packed uints) ---
+// 1. Feature Extraction Weights
+StructuredBuffer<uint> weightsFeatureProj;
+StructuredBuffer<uint> biasFeatureProj;
+StructuredBuffer<uint> weightsLayerEmbed;
 
-// Unpack one uint into two min16floats
-min16float2 UnpackFloat16(uint packed)
-{
+// 2. Down Sample Weights
+StructuredBuffer<uint> w_mixer0, b_mixer0;
+StructuredBuffer<uint> w_mixer2, b_mixer2;
+StructuredBuffer<uint> w_normDown, b_normDown;
+
+// 3. Bottleneck (MHA) Weights
+StructuredBuffer<uint> w_q, b_q;
+StructuredBuffer<uint> w_k, b_k;
+StructuredBuffer<uint> w_v, b_v;
+StructuredBuffer<uint> w_out, b_out;
+StructuredBuffer<uint> w_norm1, b_norm1;
+
+// 4. Up Sample Weights
+StructuredBuffer<uint> w_upProj, b_upProj;
+StructuredBuffer<uint> w_fusion0, b_fusion0;
+StructuredBuffer<uint> w_fusion2, b_fusion2;
+StructuredBuffer<uint> w_normUp, b_normUp;
+
+// 5. Head Weights
+StructuredBuffer<uint> w_normOut, b_normOut;
+StructuredBuffer<uint> w_head, b_head;
+
+// --- I/O Buffers ---
+RWStructuredBuffer<float> inputBuffer;
+RWStructuredBuffer<float> outputBuffer;
+RWStructuredBuffer<float> fineBuffer;
+StructuredBuffer<float> coarseBuffer;    
+RWStructuredBuffer<float> tokenBufferOut;
+RWStructuredBuffer<float> matrixGBuffer;
+
+// --- Uniforms ---
+int d_model;
+uint numNodes;
+uint fineCount;
+uint coarseCount;
+uint seqLen;
+uint numHeads;
+int headOffset;
+float deltaTime;
+int size;
+
+// --- Constants ---
+#define K_BRANCH 32
+#define D_MAX 32
+#define HEAD_DIM 8
+
+// ------------------------------------------------------------------
+// HELPER FUNCTIONS
+// ------------------------------------------------------------------
+
+// Unpack one uint into two min16floats (Low 16, High 16)
+// All packed float16 weights are stored as uints and decoded using f16tof32
+min16float2 UnpackFloat16(uint packed) {
     float v1 = f16tof32(packed & 0xFFFF);
     float v2 = f16tof32(packed >> 16);
     return min16float2((min16float)v1, (min16float)v2);
 }
 
-// Helper for random access: fetches the specific weight at 'idx'
-min16float UnpackWeight(StructuredBuffer<uint> buf, uint idx)
-{
-    uint packed = buf[idx >> 1]; // Divide by 2
+// Fetch a specific weight scalar from a packed buffer
+min16float UnpackWeight(StructuredBuffer<uint> buf, uint idx) {
+    uint packed = buf[idx >> 1];
     min16float2 vals = UnpackFloat16(packed);
-    return (idx & 1) ? vals.y : vals.x; // Return low (even) or high (odd)
+    return (idx & 1) ? vals.y : vals.x;
 }
 
-// --- WEIGHT BUFFERS (Change ALL to uint) ---
-StructuredBuffer<uint> weightsFeatureProj;
-StructuredBuffer<uint> biasFeatureProj;
-StructuredBuffer<uint> weightsLayerEmbed;
-StructuredBuffer<uint> weightsPosEmbed;
-
-StructuredBuffer<uint> w_attn_in;
-StructuredBuffer<uint> b_attn_in;
-StructuredBuffer<uint> w_attn_out;
-StructuredBuffer<uint> b_attn_out;
-StructuredBuffer<uint> w_norm1;
-StructuredBuffer<uint> b_norm1;
-StructuredBuffer<uint> w_ffn1;
-StructuredBuffer<uint> b_ffn1;
-StructuredBuffer<uint> w_ffn2;
-StructuredBuffer<uint> b_ffn2;
-StructuredBuffer<uint> w_norm2;
-StructuredBuffer<uint> b_norm2;
-
-StructuredBuffer<uint> w_normOut;
-StructuredBuffer<uint> b_normOut;
-StructuredBuffer<uint> w_head;
-StructuredBuffer<uint> b_head;
-
-// Data Buffers
-RWStructuredBuffer<float> tokenBuffer;
-RWStructuredBuffer<float> tokenBufferOut;
-RWStructuredBuffer<float> bufferQ;          
-RWStructuredBuffer<float> bufferK;          
-RWStructuredBuffer<float> bufferV;
-RWStructuredBuffer<float> bufferAttn;       
-RWStructuredBuffer<float> matrixGBuffer;
-
-// Add Global Uniforms
-int d_model;
-int d_ffn; 
-
-uint numNodes;
-uint maxNodes;
-int windowSize;  // Window size for attention (default: 256)
-int numHeads;    // Number of attention heads (default: 4)
-int headOffset;  // Offset for batched head processing
-float deltaTime; // NEW: Required to un-scale Matrix A
-
-// --- HELPERS ---
-float GetDx(uint layer) { return pow(2.0, (float)layer); }
-
-float Gelu(float x) {
-    return x * 0.5 * (1.0 + tanh(0.79788 * (x + 0.044715 * x * x * x)));
-}
-
-// --- MACRO FOR REDUCTION (32 threads) ---
-#define REDUCE_SUM_32(tid, val, s_mem) \
-    s_mem[tid] = val; \
-    GroupMemoryBarrierWithGroupSync(); \
-    if (tid < 16) s_mem[tid] += s_mem[tid + 16]; GroupMemoryBarrierWithGroupSync(); \
-    if (tid < 8)  s_mem[tid] += s_mem[tid + 8];  GroupMemoryBarrierWithGroupSync(); \
-    if (tid < 4)  s_mem[tid] += s_mem[tid + 4];  GroupMemoryBarrierWithGroupSync(); \
-    if (tid < 2)  s_mem[tid] += s_mem[tid + 2];  GroupMemoryBarrierWithGroupSync(); \
-    if (tid < 1)  s_mem[tid] += s_mem[tid + 1];  GroupMemoryBarrierWithGroupSync(); \
-    val = s_mem[0]; \
-    GroupMemoryBarrierWithGroupSync();
-
-// --- KERNEL 1: FEATURES ---
-[numthreads(512, 1, 1)] 
+// ------------------------------------------------------------------
+// KERNEL 1: COMPUTE FEATURES (OPTIMIZED: NO STACK ARRAY)
+// ------------------------------------------------------------------
+[numthreads(256, 1, 1)] 
 void ComputeFeatures(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= maxNodes) return;
+    if (i >= numNodes) return;
 
-    // 1. Feature Extraction
-    float feats[58];
-    // Initialize
-    for(int k=0; k<58; k++) feats[k] = 0.0;
-
-    if (i < numNodes) {
-        Node n = nodesBuffer[i];
-        
-        // Position Features (0-2)
-        feats[0] = n.position.x / 1024.0;
-        feats[1] = n.position.y / 1024.0;
-        feats[2] = n.position.z / 1024.0;
-
-        // --- NEW: Read Physics from Matrix A ---
-        // Matrix A contains weights scaled by deltaTime.
-        // The Neural Net expects GEOMETRIC weights (dx^2/dist).
-        // We must divide by deltaTime to recover the correct feature scale.
-        float invDt = (deltaTime > 1e-9) ? (1.0 / deltaTime) : 0.0;
-
-        // Feature 33: Diagonal (Slot 0)
-        feats[33] = matrixABuffer[0 * numNodes + i] * invDt;
-
-        int wall_starts[6] = {0, 4, 8, 12, 16, 20};
-
-        for (int f = 0; f < 6; f++) {
-            // Wall Flags (Features 3-8)
-            uint w_idx = neighborsBuffer[wall_starts[f] * numNodes + i];
-            if (w_idx == numNodes + 1) feats[3 + f] = 1.0; 
-            
-            // Air Flags (Features 9-32)
-            // Off-Diagonals (Features 34-57)
-            for (int s = 0; s < 4; s++) {
-                int local_idx = f * 4 + s;
-                
-                // Read Neighbor Index
-                uint n_idx = neighborsBuffer[local_idx * numNodes + i];
-                
-                // Air Flag
-                if (n_idx == numNodes) feats[9 + local_idx] = 1.0; 
-
-                // Off-Diagonal Weight
-                // Matrix A neighbors start at Slot 1.
-                // matrixABuffer index = (local_idx + 1) * numNodes + i
-                float weight = matrixABuffer[(local_idx + 1) * numNodes + i];
-                
-                // Un-scale and assign
-                feats[34 + local_idx] = weight * invDt; 
-            }
-        }
+    Node n = nodesBuffer[i];
+    float invDt = (deltaTime > 1e-9) ? (1.0 / deltaTime) : 0.0;
+    
+    // 1. Initialize output with Bias + Layer Embedding
+    // We hold these 32 values in registers. This is much safer than a 58-float array.
+    float output[32];
+    uint layer = n.layer;
+    
+    for (int d = 0; d < 32; d++) {
+        output[d] = UnpackWeight(biasFeatureProj, d) + 
+                    UnpackWeight(weightsLayerEmbed, layer * 32 + d);
     }
 
-    uint layer = (i < numNodes) ? nodesBuffer[i].layer : 0;
-    uint win_pos = i % (uint)windowSize;
-    // 2. Linear Projection
-    for (int d = 0; d < d_model; d++) {
-        float val = (float)UnpackWeight(biasFeatureProj, d);
-        for (int f = 0; f < 58; f++) val += feats[f] * (float)UnpackWeight(weightsFeatureProj, f * d_model + d);
-        val += (float)UnpackWeight(weightsLayerEmbed, layer * d_model + d);
-        val += (float)UnpackWeight(weightsPosEmbed, win_pos * d_model + d);
-        tokenBuffer[i * d_model + d] = val;
+    // 2. Accumulate Position Features (Indices 0, 1, 2)
+    float p[3] = { n.position.x / 1024.0, n.position.y / 1024.0, n.position.z / 1024.0 };
+    for (int f = 0; f < 3; f++) {
+        float feat = p[f];
+        // Weight index starts at 0
+        for (int d = 0; d < 32; d++) output[d] += feat * UnpackWeight(weightsFeatureProj, f * 32 + d);
+    }
+
+    // 3. Accumulate Neighbor Features
+    // Map: Wall(6) -> Air(24) -> Matrix(1) -> Weights(24)
+    // Indices: Wall[3..8], Air[9..32], SumAbs[33], Weights[34..57]
+    
+    int wall_starts[6] = {0, 4, 8, 12, 16, 20};
+    float sumAbsOffDiag = 0.0;
+    float dx_i = exp2((float)n.layer);
+    float faceArea = dx_i * dx_i;
+    
+    for (int face = 0; face < 6; face++) {
+        // A. Wall Feature (Indices 3..8)
+        // Only check the first sub-neighbor to determine wall status for the face
+        uint w_idx = neighborsBuffer[wall_starts[face] * numNodes + i];
+        if (w_idx == numNodes + 1) {
+            int featIdx = 3 + face;
+            for (int d = 0; d < 32; d++) output[d] += 1.0 * UnpackWeight(weightsFeatureProj, featIdx * 32 + d);
+        }
+
+        // Sub-neighbors loop
+        for (int s = 0; s < 4; s++) {
+            int local_idx = face * 4 + s;
+            uint n_idx = neighborsBuffer[local_idx * numNodes + i];
+            
+            // B. Air/Fluid Feature (Indices 9..32)
+            if (n_idx == numNodes) {
+                // It is Air
+                int featIdx = 9 + local_idx;
+                for (int d = 0; d < 32; d++) output[d] += 1.0 * UnpackWeight(weightsFeatureProj, featIdx * 32 + d);
+                
+                // Calculate diagonal contribution for Air
+                float dx_k = dx_i * 0.5;
+                float dist = max(0.5 * (dx_i + dx_k), 1e-6);
+                float childArea = faceArea / 4.0;
+                float airWeight = childArea / dist;
+                sumAbsOffDiag += airWeight;
+            }
+            
+            // C. Matrix Weight Feature (Indices 34..57)
+            // Matrix A is typically negative for off-diagonals.
+            // Safety check: if matrixABuffer has not been computed, this could be garbage.
+            float weight = matrixABuffer[(local_idx + 1) * numNodes + i]; 
+            
+            // Clamp to avoid Infinity/NaN if A is uninitialized or corrupt
+            if (isinf(weight) || isnan(weight)) weight = 0.0;
+
+            float scaledWeight = weight * invDt;
+            sumAbsOffDiag += abs(scaledWeight);
+            
+            int featIdx = 34 + local_idx;
+            for (int d = 0; d < 32; d++) output[d] += scaledWeight * UnpackWeight(weightsFeatureProj, featIdx * 32 + d);
+        }
+    }
+    
+    // 4. Accumulate SumAbsOffDiag Feature (Index 33)
+    int featSumIdx = 33;
+    for (int d = 0; d < 32; d++) output[d] += sumAbsOffDiag * UnpackWeight(weightsFeatureProj, featSumIdx * 32 + d);
+
+    // 5. Write Output
+    for (int d = 0; d < 32; d++) {
+        tokenBufferOut[i * 32 + d] = output[d];
     }
 }
 
+// ------------------------------------------------------------------
+// KERNEL 2: DOWN SAMPLE (OPTIMIZED: INTERLEAVED)
+// ------------------------------------------------------------------
+groupshared float gs_feats[K_BRANCH][D_MAX];
 
-// --- KERNEL 5: PREDICT HEAD (32 Threads) ---
+[numthreads(K_BRANCH, 1, 1)]
+void DownSample(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    uint c_idx = groupID.x;
+    uint t_idx = threadID.x;
+    uint f_idx = c_idx * K_BRANCH + t_idx;
+    
+    // 1. Load Input (Safe Bounds Check)
+    float x_in[32];
+    if (f_idx < fineCount) {
+        for(int d=0; d<32; d++) x_in[d] = inputBuffer[f_idx * 32 + d];
+    } else {
+        for(int d=0; d<32; d++) x_in[d] = 0.0;
+    }
+
+    // 2. Local Mixer
+    // Init with bias of second layer to save a write
+    for(int d=0; d<32; d++) {
+        gs_feats[t_idx][d] = UnpackWeight(b_mixer2, d);
+    }
+    
+    // Interleaved compute to avoid "float hidden[64]" array
+    for(int h=0; h<64; h++) {
+        float h_val = UnpackWeight(b_mixer0, h);
+        for(int d=0; d<32; d++) {
+            h_val += x_in[d] * UnpackWeight(w_mixer0, d * 64 + h);
+        }
+        
+        // ReLU
+        h_val = max(0.0, h_val);
+        
+        // Accumulate to output
+        for(int d=0; d<32; d++) {
+            gs_feats[t_idx][d] += h_val * UnpackWeight(w_mixer2, h * 32 + d);
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // 3. Pool & Norm
+    if (t_idx == 0) {
+        float pooled[32];
+        for(int d=0; d<32; d++) {
+            float sum = 0;
+            for(int k=0; k<K_BRANCH; k++) sum += gs_feats[k][d];
+            pooled[d] = sum / (float)K_BRANCH;
+        }
+
+        // Layer Norm
+        float sum = 0;
+        for(int d=0; d<32; d++) sum += pooled[d];
+        float mean = sum / 32.0;
+        
+        float sqSum = 0;
+        for(int d=0; d<32; d++) {
+            float diff = pooled[d] - mean;
+            sqSum += diff * diff;
+        }
+        float invStd = rsqrt(sqSum / 32.0 + 1e-5);
+
+        for(int d=0; d<32; d++) {
+            float n_val = (pooled[d] - mean) * invStd;
+            float res = n_val * UnpackWeight(w_normDown, d) + UnpackWeight(b_normDown, d);
+            if(c_idx < coarseCount) {
+                outputBuffer[c_idx * 32 + d] = res;
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// KERNEL 3: BOTTLENECK
+// ------------------------------------------------------------------
+groupshared float s_q[32];
+groupshared float s_k_row[32];
+groupshared float s_v_row[32];
+groupshared float s_scores[32];
+
+[numthreads(32, 1, 1)]
+void Bottleneck(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    uint i = groupID.x;
+    uint dim = threadID.x;
+    uint head_idx = dim / 8;
+    
+    if (i >= seqLen) return;
+
+    // Load & Norm
+    float x_local[32];
+    float sum=0, sqSum=0;
+    for(int d=0; d<32; d++) {
+        x_local[d] = inputBuffer[i * 32 + d];
+        sum += x_local[d]; sqSum += x_local[d]*x_local[d];
+    }
+    float mean = sum / 32.0;
+    float invStd = rsqrt(sqSum/32.0 - mean*mean + 1e-5);
+    
+    float x_norm[32];
+    for(int d=0; d<32; d++) {
+        x_norm[d] = (x_local[d] - mean) * invStd * UnpackWeight(w_norm1, d) + UnpackWeight(b_norm1, d);
+    }
+
+    // Compute Q
+    float my_q = UnpackWeight(b_q, dim);
+    for(int d=0; d<32; d++) my_q += x_norm[d] * UnpackWeight(w_q, d * 32 + dim);
+    
+    s_q[dim] = my_q;
+    GroupMemoryBarrierWithGroupSync();
+    
+    // RoPE Q
+    bool is_even = (dim % 2) == 0;
+    float q_partner = s_q[is_even ? dim+1 : dim-1];
+    uint dim_in_head = dim % HEAD_DIM;
+    float freq = 1.0 / pow(10000.0, (float)(2 * (dim_in_head / 2)) / (float)HEAD_DIM);
+    float theta_i = (float)i * freq;
+    
+    float q_rot = is_even ? 
+        (my_q * cos(theta_i) - q_partner * sin(theta_i)) : 
+        (q_partner * sin(theta_i) + my_q * cos(theta_i));
+    s_q[dim] = q_rot;
+
+    // Online Softmax setup
+    float m = -1e9;
+    float denom = 0.0;
+    float o = 0.0;
+    float scale = 1.0 / sqrt((float)HEAD_DIM);
+
+    // Attention Loop
+    for (uint j = 0; j < seqLen; j++) {
+        GroupMemoryBarrierWithGroupSync();
+
+        float x_j[32];
+        float sum_j=0, sqSum_j=0;
+        for(int d=0; d<32; d++) {
+            x_j[d] = inputBuffer[j * 32 + d];
+            sum_j += x_j[d]; sqSum_j += x_j[d]*x_j[d];
+        }
+        float mean_j = sum_j/32.0;
+        float invStd_j = rsqrt(sqSum_j/32.0 - mean_j*mean_j + 1e-5);
+        for(int d=0; d<32; d++) x_j[d] = (x_j[d]-mean_j)*invStd_j*UnpackWeight(w_norm1, d) + UnpackWeight(b_norm1, d);
+
+        float my_k = UnpackWeight(b_k, dim);
+        float my_v = UnpackWeight(b_v, dim);
+        for(int d=0; d<32; d++) {
+            my_k += x_j[d] * UnpackWeight(w_k, d*32 + dim);
+            my_v += x_j[d] * UnpackWeight(w_v, d*32 + dim);
+        }
+
+        s_k_row[dim] = my_k;
+        s_v_row[dim] = my_v;
+        GroupMemoryBarrierWithGroupSync();
+        
+        float k_partner = s_k_row[is_even ? dim+1 : dim-1];
+        float theta_j = (float)j * freq;
+        float k_rot = is_even ? 
+            (my_k * cos(theta_j) - k_partner * sin(theta_j)) : 
+            (k_partner * sin(theta_j) + my_k * cos(theta_j));
+
+        float score_comp = s_q[dim] * k_rot;
+        s_scores[dim] = score_comp;
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (dim_in_head < 4) s_scores[dim] += s_scores[dim + 4]; GroupMemoryBarrierWithGroupSync();
+        if (dim_in_head < 2) s_scores[dim] += s_scores[dim + 2]; GroupMemoryBarrierWithGroupSync();
+        if (dim_in_head < 1) s_scores[dim] += s_scores[dim + 1]; GroupMemoryBarrierWithGroupSync();
+        
+        float dot_product = s_scores[dim - dim_in_head];
+        
+        float score = dot_product * scale;
+        float m_prev = m;
+        m = max(m_prev, score);
+        float exp_score = exp(score - m);
+        float exp_prev  = exp(m_prev - m);
+        
+        denom = denom * exp_prev + exp_score;
+        o = o * exp_prev + s_v_row[dim] * exp_score;
+    }
+    
+    float attn_out = o / (denom + 1e-6);
+    s_q[dim] = attn_out;
+    GroupMemoryBarrierWithGroupSync();
+    
+    float proj_val = UnpackWeight(b_out, dim);
+    for(int d=0; d<32; d++) {
+        proj_val += s_q[d] * UnpackWeight(w_out, d * 32 + dim);
+    }
+    
+    outputBuffer[i * 32 + dim] = proj_val + x_local[dim];
+}
+
+// ------------------------------------------------------------------
+// KERNEL 4: UP SAMPLE (OPTIMIZED: INTERLEAVED)
+// ------------------------------------------------------------------
+[numthreads(K_BRANCH, 1, 1)]
+void UpSample(uint3 groupID : SV_GroupID, uint3 threadID : SV_GroupThreadID)
+{
+    uint c_idx = groupID.x;
+    uint t_idx = threadID.x;
+    uint f_idx = c_idx * K_BRANCH + t_idx;
+
+    // 1. Read Inputs
+    float coarse[32];
+    for(int d=0; d<32; d++) coarse[d] = coarseBuffer[c_idx * 32 + d];
+    
+    float skip[32];
+    for(int d=0; d<32; d++) skip[d] = fineBuffer[f_idx * 32 + d];
+
+    // 2. Up-Project Coarse
+    float coarse_proj[32];
+    for(int d=0; d<32; d++) {
+        float val = UnpackWeight(b_upProj, d);
+        for(int in_d=0; in_d<32; in_d++) {
+            val += coarse[in_d] * UnpackWeight(w_upProj, in_d * 32 + d);
+        }
+        coarse_proj[d] = val;
+    }
+
+    // 3. Fusion (Interleaved)
+    float fused[32];
+    for(int d=0; d<32; d++) fused[d] = UnpackWeight(b_fusion2, d);
+    
+    for(int h=0; h<64; h++) {
+        // Linear 1
+        float h_val = UnpackWeight(b_fusion0, h);
+        for(int d=0; d<32; d++) h_val += skip[d] * UnpackWeight(w_fusion0, d * 64 + h);
+        for(int d=0; d<32; d++) h_val += coarse_proj[d] * UnpackWeight(w_fusion0, (32 + d) * 64 + h);
+        
+        // ReLU
+        h_val = max(0.0, h_val);
+        
+        // Linear 2 (Accumulate)
+        for(int d=0; d<32; d++) {
+            fused[d] += h_val * UnpackWeight(w_fusion2, h * 32 + d);
+        }
+    }
+
+    // 4. Layer Norm & Residual
+    float sum=0, sqSum=0;
+    for(int d=0; d<32; d++) { sum+=fused[d]; sqSum+=fused[d]*fused[d]; }
+    float mean = sum/32.0;
+    float invStd = rsqrt(sqSum/32.0 - mean*mean + 1e-5);
+
+    for(int d=0; d<32; d++) {
+        float norm_val = (fused[d] - mean) * invStd;
+        float res = norm_val * UnpackWeight(w_normUp, d) + UnpackWeight(b_normUp, d);
+        fineBuffer[f_idx * 32 + d] = res + skip[d];
+    }
+}
+
+// ------------------------------------------------------------------
+// KERNEL 5: PREDICT HEAD
+// ------------------------------------------------------------------
 groupshared float s_reduce_head[32];
 
 [numthreads(32, 1, 1)]
 void PredictHead(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
     uint nodeIdx = groupID.x + (uint)headOffset;
-    uint dim = groupIndex; // 0..31
+    uint dim = groupIndex;
+    
     if (nodeIdx >= numNodes) return;
     
-    // REMOVED: if (dim >= (uint)d_model) return;
-    
     float val = 0.0;
-    if (dim < (uint)d_model) {
-        val = tokenBufferOut[nodeIdx * d_model + dim];
-    }
+    if (dim < 32) val = tokenBufferOut[nodeIdx * 32 + dim];
 
-    // Norm Out
-    float sum = val;
-    REDUCE_SUM_32(dim, sum, s_reduce_head);
-    float mean = sum / (float)d_model;
-    
-    float diff = 0.0;
-    if (dim < (uint)d_model) diff = val - mean;
+    // Mean
+    s_reduce_head[dim] = val;
+    GroupMemoryBarrierWithGroupSync();
+    if (dim < 16) s_reduce_head[dim] += s_reduce_head[dim + 16]; GroupMemoryBarrierWithGroupSync();
+    if (dim < 8)  s_reduce_head[dim] += s_reduce_head[dim + 8];  GroupMemoryBarrierWithGroupSync();
+    if (dim < 4)  s_reduce_head[dim] += s_reduce_head[dim + 4];  GroupMemoryBarrierWithGroupSync();
+    if (dim < 2)  s_reduce_head[dim] += s_reduce_head[dim + 2];  GroupMemoryBarrierWithGroupSync();
+    if (dim < 1)  s_reduce_head[dim] += s_reduce_head[dim + 1];  GroupMemoryBarrierWithGroupSync();
+    float mean = s_reduce_head[0] / 32.0;
+
+    // Variance
+    float diff = (dim < 32) ? (val - mean) : 0.0;
     float sqDiff = diff * diff;
-    REDUCE_SUM_32(dim, sqDiff, s_reduce_head);
+    s_reduce_head[dim] = sqDiff;
+    GroupMemoryBarrierWithGroupSync();
+    if (dim < 16) s_reduce_head[dim] += s_reduce_head[dim + 16]; GroupMemoryBarrierWithGroupSync();
+    if (dim < 8)  s_reduce_head[dim] += s_reduce_head[dim + 8];  GroupMemoryBarrierWithGroupSync();
+    if (dim < 4)  s_reduce_head[dim] += s_reduce_head[dim + 4];  GroupMemoryBarrierWithGroupSync();
+    if (dim < 2)  s_reduce_head[dim] += s_reduce_head[dim + 2];  GroupMemoryBarrierWithGroupSync();
+    if (dim < 1)  s_reduce_head[dim] += s_reduce_head[dim + 1];  GroupMemoryBarrierWithGroupSync();
     
-    float invStd = rsqrt(sqDiff / (float)d_model + 1e-5);
-    
-    float x_norm = 0.0;
-    if (dim < (uint)d_model) {
-        x_norm = diff * invStd * (float)UnpackWeight(w_normOut, dim) + (float)UnpackWeight(b_normOut, dim);
-    }
+    float invStd = rsqrt(s_reduce_head[0] / 32.0 + 1e-5);
+    float x_norm = diff * invStd * UnpackWeight(w_normOut, dim) + UnpackWeight(b_normOut, dim);
+
     s_reduce_head[dim] = x_norm;
     GroupMemoryBarrierWithGroupSync();
-    
-    // Linear d_model -> 25
+
     if (dim < 25) { 
-        float outVal = (float)UnpackWeight(b_head, dim);
-        for(int k=0; k<d_model; k++) {
-            outVal += s_reduce_head[k] * (float)UnpackWeight(w_head, k * 25 + dim); 
+        float outVal = UnpackWeight(b_head, dim);
+        for(int k=0; k<32; k++) {
+            outVal += s_reduce_head[k] * UnpackWeight(w_head, k * 25 + dim);
         }
-            // SoA layout: matrixGBuffer[dim * numNodes + nodeIdx]
-            matrixGBuffer[dim * numNodes + nodeIdx] = outVal; 
-        }
+        matrixGBuffer[dim * numNodes + nodeIdx] = outVal;
+    }
 }
 
-// --- FusedTransformerLayer - Optimized with Explicit UINT Packing ---
-// Window Size: 256 | D_MODEL: 32
-// Memory Usage: 32KB (Exactly fits the 32768 byte limit)
-
-#define D_MODEL 32
-#define HEADS 4
-#define HEAD_DIM 8 // D_MODEL / HEADS
-#define WINDOW_SIZE 256
-
-// FIX: Explicitly use uint to force 4-byte storage (2x packed fp16)
-// This guarantees usage is 256 * 16 * 4 = 16KB per buffer, 32KB total.
-groupshared uint gs_K_packed[WINDOW_SIZE * D_MODEL / 2];
-groupshared uint gs_V_packed[WINDOW_SIZE * D_MODEL / 2];
-
-// Helper to pack two floats into one uint
-uint PackFloat16(float v1, float v2)
-{
-    uint i1 = f32tof16(v1);
-    uint i2 = f32tof16(v2);
-    return i1 | (i2 << 16);
-}
-
-[numthreads(WINDOW_SIZE, 1, 1)]
-void FusedTransformerLayer(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
-{
-    uint localID = groupThreadID.x;
-    uint globalID = groupID.x * WINDOW_SIZE + localID;
-
-    // --- PHASE 1: Load Input & Norm 1 ---
-    min16float x[D_MODEL];    // Keep for residual
-    min16float curr[D_MODEL]; // Working vector
-
-    min16float sum = 0;
-    min16float sqSum = 0;
-    
-    // Check bounds safely
-    if (globalID < maxNodes) {
-        for (int i = 0; i < D_MODEL; i++) {
-            min16float v = (min16float)tokenBuffer[globalID * D_MODEL + i];
-            x[i] = v;
-            sum += v;
-            sqSum += v*v;
-        }
-    } else {
-        for (int i = 0; i < D_MODEL; i++) { 
-            x[i] = 0;
-            curr[i] = 0; 
-        }
-    }
-
-    min16float invStd = rsqrt(sqSum/32.0 - (sum/32.0)*(sum/32.0) + 1e-5);
-    min16float mean = sum / 32.0;
-
-    // Apply Norm1
-    for(int i=0; i<D_MODEL; i++) {
-        curr[i] = (x[i] - mean) * invStd * (min16float)UnpackWeight(w_norm1, i) + (min16float)UnpackWeight(b_norm1, i);
-    }
-
-    // --- PHASE 2: Q, K, V Projection & Packing ---
-    min16float q[D_MODEL];
-    
-    // 2a. Compute K
-    for (int d = 0; d < D_MODEL; d+=2) { 
-        // Read packed BIAS
-        min16float2 b_vals = UnpackFloat16(b_attn_in[(D_MODEL + d) >> 1]);
-        float valK1 = (float)b_vals.x;
-        float valK2 = (float)b_vals.y;
-
-        for (int in_d = 0; in_d < D_MODEL; in_d++) {
-            float c = (float)curr[in_d];
-            // OPTIMIZATION: Read packed WEIGHT
-            // Index logic: (in_d * 96 + 32 + d). Stride 96 is even, 32 is even, d is even.
-            // So we can divide index by 2 safely.
-            uint packedW = w_attn_in[(in_d * 96 + 32 + d) >> 1];
-            min16float2 w_vals = UnpackFloat16(packedW);
-            
-            valK1 += c * (float)w_vals.x;
-            valK2 += c * (float)w_vals.y;
-        }
-        gs_K_packed[localID * (D_MODEL/2) + (d/2)] = PackFloat16(valK1, valK2);
-    }
-
-    // 2b. Compute V (Similar optimization)
-    for (int d = 0; d < D_MODEL; d+=2) {
-        min16float2 b_vals = UnpackFloat16(b_attn_in[(2 * D_MODEL + d) >> 1]);
-        float valV1 = (float)b_vals.x;
-        float valV2 = (float)b_vals.y;
-
-        for (int in_d = 0; in_d < D_MODEL; in_d++) {
-            float c = (float)curr[in_d];
-            uint packedW = w_attn_in[(in_d * 96 + 64 + d) >> 1];
-            min16float2 w_vals = UnpackFloat16(packedW);
-            
-            valV1 += c * (float)w_vals.x;
-            valV2 += c * (float)w_vals.y;
-        }
-        gs_V_packed[localID * (D_MODEL/2) + (d/2)] = PackFloat16(valV1, valV2);
-    }
-    
-    // 2c. Compute Q (Register accumulation)
-    for (int d = 0; d < D_MODEL; d++) {
-        // Here we iterate d by 1, so simpler to use UnpackWeight helper
-        min16float valQ = UnpackWeight(b_attn_in, d);
-        for (int in_d = 0; in_d < D_MODEL; in_d++) {
-            valQ += curr[in_d] * UnpackWeight(w_attn_in, in_d * 96 + d);
-        }
-        q[d] = valQ;
-    }
-
-    GroupMemoryBarrierWithGroupSync();
-
-    // --- PHASE 3: Attention (Unpacking on the fly) ---
-    
-    // Clear 'curr' to accumulate results
-    for(int i=0; i<D_MODEL; i++) curr[i] = 0;
-    min16float scale = (min16float)(1.0 / sqrt((float)HEAD_DIM)); 
-
-    [unroll] 
-    for (int h = 0; h < HEADS; h++)
-    {
-        int offset = h * HEAD_DIM;
-        min16float m = (min16float)-65504.0;
-        min16float d_soft = 0;
-        min16float head_res[HEAD_DIM]; 
-        for(int z=0; z<HEAD_DIM; z++) head_res[z] = 0;
-
-        [loop] 
-        for (int t = 0; t < WINDOW_SIZE; t++)
-        {
-            min16float score = 0;
-            
-            // Vectorized Dot Product with Unpacking
-            for (int kd = 0; kd < HEAD_DIM; kd+=2) {
-                // Read packed uint and unpack to min16float2
-                uint packedK = gs_K_packed[t * 16 + (offset + kd)/2];
-                min16float2 k_vec = UnpackFloat16(packedK);
-                
-                score += q[offset + kd] * k_vec.x + q[offset + kd + 1] * k_vec.y;
-            }
-            score *= scale;
-
-            // Online Softmax
-            min16float m_prev = m;
-            m = max(m_prev, score);
-            min16float e_score = exp(score - m);
-            min16float e_prev  = exp(m_prev - m);
-            d_soft = d_soft * e_prev + e_score;
-
-            // Accumulate V with Unpacking
-            for (int zd = 0; zd < HEAD_DIM; zd+=2) {
-                uint packedV = gs_V_packed[t * 16 + (offset + zd)/2];
-                min16float2 v_vec = UnpackFloat16(packedV);
-
-                head_res[zd]     = head_res[zd] * e_prev + v_vec.x * e_score;
-                head_res[zd + 1] = head_res[zd+1] * e_prev + v_vec.y * e_score;
-            }
-        }
-
-        // Finalize Head
-        min16float inv_d = (min16float)1.0 / (d_soft + (min16float)1e-6);
-        for (int z = 0; z < HEAD_DIM; z++) {
-            curr[offset + z] = head_res[z] * inv_d;
-        }
-    }
-
-    // --- PHASE 4: Proj + Residual + Norm 2 ---
-    // Reuse 'q' buffer for (x + Proj(curr)) to save registers
-    for (int d = 0; d < D_MODEL; d++) {
-        min16float val = UnpackWeight(b_attn_out, d);
-        for (int k = 0; k < D_MODEL; k++) {
-            val += curr[k] * UnpackWeight(w_attn_out, k * D_MODEL + d);
-        }
-        q[d] = x[d] + val; // Residual 1
-    }
-
-    // Norm2 on 'q'
-    sum = 0;
-    sqSum = 0;
-    for(int i=0; i<D_MODEL; i++) { sum+=q[i]; sqSum+=q[i]*q[i]; }
-    mean = sum/32.0;
-    invStd = rsqrt(sqSum/32.0 - mean*mean + 1e-5);
-
-    // Reuse 'curr' for FFN input
-    for(int i=0; i<D_MODEL; i++) {
-        curr[i] = (q[i] - mean) * invStd * UnpackWeight(w_norm2, i) + UnpackWeight(b_norm2, i);
-    }
-
-    // --- PHASE 5: FFN ---
-    for(int i=0; i<D_MODEL; i++) x[i] = UnpackWeight(b_ffn2, i); // Reuse 'x' as output accumulator
-
-    // Hidden layer size is 64 (2 * D_MODEL)
-    for(int h=0; h<64; h++) {
-        min16float h_val = UnpackWeight(b_ffn1, h);
-        for(int in_d=0; in_d<32; in_d++) {
-            h_val += curr[in_d] * UnpackWeight(w_ffn1, in_d * 64 + h);
-        }
-        
-        min16float gelu = h_val * 0.5 * (1.0 + tanh(0.79788 * (h_val + 0.044715 * h_val * h_val * h_val)));
-        
-        for(int out_d=0; out_d<32; out_d++) {
-            x[out_d] += gelu * UnpackWeight(w_ffn2, h * 32 + out_d);
-        }
-    }
-
-    // --- PHASE 6: Write Back ---
-    if (globalID < maxNodes) {
-        for(int i=0; i<D_MODEL; i++) {
-            // q[i] is (x + Attn), x[i] is FFN(norm(q))
-            tokenBufferOut[globalID * D_MODEL + i] = (float)(q[i] + x[i]); // Add Residual 2 (FFN)
-        }
-    }
+// ------------------------------------------------------------------
+// KERNEL 6: COPY BUFFER
+// ------------------------------------------------------------------
+[numthreads(256, 1, 1)]
+void CopyBuffer(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if(i < (uint)size) outputBuffer[i] = inputBuffer[i];
 }
