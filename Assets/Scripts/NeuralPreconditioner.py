@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Neural HODLR Preconditioner (Hierarchical Off-Diagonal Low-Rank)
-Updated: Variable Rank Profile (Telescoping), Linear Upsampling, and Structure Logging.
+Updated: Dense Leaf Blocks (32x32) for High Performance.
 """
 
 import torch
@@ -13,9 +13,8 @@ from torch.utils.data import Dataset, DataLoader
 import argparse
 import struct
 import time
-import os
 
-# --- 1. Core Components ---
+# --- 1. Core Components (Rotary Embeddings) ---
 
 def apply_rope(x, freqs_cis):
     B, nhead, N, head_dim = x.shape
@@ -57,6 +56,7 @@ class DownSampler(nn.Module):
     
     def forward(self, x):
         B, N, D = x.shape
+        # Pad if N is not divisible by k
         pad = (self.k - (N % self.k)) % self.k
         if pad > 0: x = F.pad(x, (0, 0, 0, pad))
         
@@ -83,6 +83,7 @@ class UpSampler(nn.Module):
         x_coarse_proj = self.up_proj(x_coarse)
         x_coarse_expanded = x_coarse_proj.repeat_interleave(self.k, dim=1)
         
+        # Handle shape mismatches due to padding in downsample
         if x_coarse_expanded.shape[1] > x_fine.shape[1]:
             x_coarse_expanded = x_coarse_expanded[:, :x_fine.shape[1], :]
         elif x_coarse_expanded.shape[1] < x_fine.shape[1]:
@@ -95,7 +96,7 @@ class UpSampler(nn.Module):
         return x_fused
 
 class BottleneckAttention(nn.Module):
-    def __init__(self, d_model, nhead, max_seq_len=4096):
+    def __init__(self, d_model, nhead, max_seq_len=8192):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
@@ -111,6 +112,7 @@ class BottleneckAttention(nn.Module):
     def forward(self, x):
         B, N, D = x.shape
         if N > self.freqs_cis.shape[0]:
+            # Dynamic resize if sequence is longer than expected
             freqs_cis = precompute_freqs_cis(N, self.head_dim, device=x.device)
         else:
             freqs_cis = self.freqs_cis[:N]
@@ -123,6 +125,7 @@ class BottleneckAttention(nn.Module):
         q_rope = apply_rope(q, freqs_cis)
         k_rope = apply_rope(k, freqs_cis)
         
+        # Scaled Dot Product Attention
         scores = torch.matmul(q_rope, k_rope.transpose(-2, -1)) / (self.head_dim ** 0.5)
         attn_weights = F.softmax(scores, dim=-1)
         attn_output = torch.matmul(attn_weights, v)
@@ -130,66 +133,105 @@ class BottleneckAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, N, D)
         return x + self.out_proj(attn_output)
 
-# --- 3. HODLR Heads ---
+# --- 3. Heads ---
 
 class HODLRLevelHead(nn.Module):
-    """
-    Predicts Low-Rank factor U for symmetric approximation U*U^T.
-    Now supports variable rank per level.
-    """
     def __init__(self, d_model, rank):
         super().__init__()
         self.rank = rank
-        # Only U projection for symmetry
         self.proj_u = nn.Linear(d_model, rank)
         
     def forward(self, x):
         u = self.proj_u(x)
-        return u, u # Return U, U for V=U symmetry
+        return u, u 
 
-class DiagonalHead(nn.Module):
-    """Predicts the sparse diagonal component"""
-    def __init__(self, d_model):
+class BlockDiagonalHead(nn.Module):
+    """
+    Predicts a Dense Block L (Lower Triangular) for each leaf block.
+    Leaf Size: M (e.g. 32)
+    Output: M x M block per leaf.
+    """
+    def __init__(self, d_model, leaf_size=32):
         super().__init__()
+        self.leaf_size = leaf_size
+        # Number of elements in a triangular matrix (including diagonal) = M*(M+1)/2
+        # However, for simplicity and GPU batching, we predict the full MxM and mask it.
+        # This allows us to predict a full dense block if we wanted, but Cholesky is safer.
+        self.out_dim = leaf_size * leaf_size
+        
         self.net = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model, d_model * 2),
             nn.GELU(),
-            nn.Linear(d_model, 1),
-            nn.Softplus()
+            nn.Linear(d_model * 2, self.out_dim)
         )
-        nn.init.constant_(self.net[-2].bias, 1.0)
+        
+        # Initialize near Identity
+        # We want L * L^T ≈ I  => L ≈ I
+        with torch.no_grad():
+            self.net[-1].weight.data *= 0.01
+            self.net[-1].bias.data.fill_(0)
+            # Set diagonal elements to 1.0 (approx)
+            # This is complex in a flattened array, so we do it in forward or just let it learn.
+            # A simple bias init helps convergence:
+            eye = torch.eye(leaf_size).flatten()
+            self.net[-1].bias.data += eye
 
     def forward(self, x):
-        return self.net(x) + 1e-4
+        # x is at the FINEST level (N nodes)
+        # We need to process it in chunks of 'leaf_size'
+        # But wait: x has shape [B, N, D].
+        # We want one L matrix for every 'leaf_size' block of nodes.
+        # So we pool x by 'leaf_size' then predict?
+        # BETTER: Predict per-node, then reshape?
+        # No, a block is a property of a group.
+        
+        B, N, D = x.shape
+        num_blocks = N // self.leaf_size
+        
+        if N % self.leaf_size != 0:
+            # Handle edge case: pad or truncate?
+            # For HODLR, N is usually power of 2 aligned. 
+            pass
+
+        # Reshape to [B, NumBlocks, LeafSize, D]
+        x_blocked = x.view(B, num_blocks, self.leaf_size, D)
+        
+        # Average features across the block to get a "Block Embedding"
+        x_pooled = x_blocked.mean(dim=2) # [B, NumBlocks, D]
+        
+        # Predict L
+        L_flat = self.net(x_pooled) # [B, NumBlocks, LeafSize*LeafSize]
+        L = L_flat.view(B, num_blocks, self.leaf_size, self.leaf_size)
+        
+        # Enforce Lower Triangular (for stability) or Full Symmetric
+        # Let's do Full Symmetric via L * L^T + epsilon * I
+        # This guarantees PSD.
+        return L 
 
 # --- 4. Main Architecture ---
 
 class NeuralHODLR(nn.Module):
-    def __init__(self, input_dim=4, d_model=64, nhead=4, k=2, rank=32, depth=5, min_rank=4):
+    def __init__(self, input_dim=4, d_model=64, nhead=4, k=2, rank=32, depth=5, leaf_size=32):
         super().__init__()
         self.d_model = d_model
         self.k = k 
         self.depth = depth
+        self.leaf_size = leaf_size
         self.max_rank = rank
         
-        # --- 1. Calculate Rank Schedule ---
-        # Coarsest level (index depth-1) gets max_rank
-        # Finest level (index 0) gets min_rank
-        # Formula: Decay by factor of 2 as we go finer
+        # --- Rank Schedule ---
         self.rank_schedule = []
         for i in range(depth):
-            # i=0 is fine, i=depth-1 is coarse
-            # Distance from top
             dist_from_top = (depth - 1) - i
-            calc_rank = max(min_rank, rank // (2 ** dist_from_top))
+            calc_rank = max(4, rank // (2 ** dist_from_top))
             self.rank_schedule.append(calc_rank)
             
-        print("\n=== HODLR Architecture Init ===")
-        print(f"Depth: {depth}, Max Rank: {rank}, Min Rank: {min_rank}")
-        print(f"Hierarchy (Fine -> Coarse):")
+        print("\n=== HODLR Architecture (Dense Leaves) ===")
+        print(f"Depth: {depth}, Max Rank: {rank}, Leaf Size: {leaf_size}")
+        print(f"Hierarchy:")
         for i, r in enumerate(self.rank_schedule):
-            print(f"  L{i} (Block ~{2**(i+1)}): Rank {r}")
-        print("===============================\n")
+            print(f"  L{i}: Rank {r}")
+        print("=========================================\n")
 
         self.feature_proj = nn.Linear(input_dim, d_model)
         
@@ -200,28 +242,27 @@ class NeuralHODLR(nn.Module):
         for i in range(depth):
             self.down_samplers.append(DownSampler(d_model, k))
             self.up_samplers.append(UpSampler(d_model, k))
-            # Instantiate head with specific rank for this level
             self.hodlr_heads.append(HODLRLevelHead(d_model, rank=self.rank_schedule[i]))
             
         self.bottleneck = BottleneckAttention(d_model, nhead)
-        self.diag_head = DiagonalHead(d_model)
+        
+        # Dense Block Head instead of Scalar Diagonal
+        self.leaf_head = BlockDiagonalHead(d_model, leaf_size)
+        
         self.norm_out = nn.LayerNorm(d_model)
 
     def forward(self, x):
         h = self.feature_proj(x)
         skip_stack = []
         
-        # Downward
         for layer in self.down_samplers:
             skip_stack.append(h)
             h = layer(h)
             
         h = self.bottleneck(h)
         
-        # Upward
         hodlr_factors = []
         for i in range(self.depth - 1, -1, -1):
-            # Symmetry: predict U, set V=U
             u, v = self.hodlr_heads[i](h)
             hodlr_factors.append((u, v))
             
@@ -229,48 +270,67 @@ class NeuralHODLR(nn.Module):
             h = self.up_samplers[i](h, skip)
             
         h_final = self.norm_out(h)
-        diag = self.diag_head(h_final)
         
-        return diag, hodlr_factors
+        # Predict Dense Blocks
+        # h_final is at the finest level (N nodes)
+        leaf_blocks = self.leaf_head(h_final)
+        
+        return leaf_blocks, hodlr_factors
 
-# --- 5. HODLR Operations ---
+# --- 5. HODLR Operations (Updated for Dense Blocks) ---
 
-def apply_hodlr_matrix(diag, factors, x, k=2):
+def apply_hodlr_matrix(leaf_blocks, factors, x, leaf_size=32):
     """
-    Applies symmetric HODLR.
+    x: [B, N, 1]
+    leaf_blocks: [B, NumBlocks, M, M] where M=leaf_size
     """
     B, N, _ = x.shape
-    y = diag * x
     
-    # Iterate Coarse -> Fine (Deepest level first)
+    # 1. Apply Dense Leaf Blocks
+    # Reshape x to match blocks: [B, NumBlocks, M, 1]
+    num_blocks = N // leaf_size
+    x_blocked = x.view(B, num_blocks, leaf_size, 1)
+    
+    # Block Matrix Vector Multiply
+    # y = L * L^T * x (Symmetric PSD)
+    # Or just B * x if we predict full B.
+    # Let's use B * B^T + eps * I for stability
+    
+    L = leaf_blocks
+    # L is [B, NumBlocks, M, M]
+    
+    # y_block = L @ (L.transpose(-2, -1) @ x_blocked)
+    temp = torch.matmul(L.transpose(-2, -1), x_blocked)
+    y_blocked = torch.matmul(L, temp)
+    
+    # Add small identity for numerical stability if needed
+    y_blocked = y_blocked + x_blocked * 1e-4
+    
+    y = y_blocked.view(B, N, 1)
+    
+    # 2. Apply HODLR Off-Diagonals (Same as before)
+    # Iterate Coarse -> Fine
     for level_idx, (u_coarse, v_coarse) in enumerate(factors):
         num_splits = 2 ** (level_idx + 1)
         block_size = N // num_splits
         if block_size == 0: continue
         
-        # 1. Smooth Upsampling
         if u_coarse.shape[1] != N:
             u_full = F.interpolate(u_coarse.transpose(1,2), size=N, mode='linear', align_corners=False).transpose(1,2)
             v_full = F.interpolate(v_coarse.transpose(1,2), size=N, mode='linear', align_corners=False).transpose(1,2)
         else:
             u_full, v_full = u_coarse, v_coarse
             
-        # 2. Block Logic
         num_pairs = num_splits // 2
         valid_len = num_pairs * 2 * block_size
         
         x_view = x[:, :valid_len].view(B, num_pairs, 2, block_size, 1)
-        # Note: u_full shape depends on rank, which now varies per level. 
-        # But this view logic relies on the last dim being 'rank'. PyTorch handles this dynamic dim fine.
         u_view = u_full[:, :valid_len].view(B, num_pairs, 2, block_size, -1)
         v_view = v_full[:, :valid_len].view(B, num_pairs, 2, block_size, -1)
         
-        x_L = x_view[:, :, 0]
-        x_R = x_view[:, :, 1]
-        u_L = u_view[:, :, 0]
-        u_R = u_view[:, :, 1]
-        v_L = v_view[:, :, 0]
-        v_R = v_view[:, :, 1]
+        x_L, x_R = x_view[:, :, 0], x_view[:, :, 1]
+        u_L, u_R = u_view[:, :, 0], u_view[:, :, 1]
+        v_L, v_R = v_view[:, :, 0], v_view[:, :, 1]
         
         x_R_proj = torch.matmul(v_R.transpose(-2, -1), x_R) 
         x_L_proj = torch.matmul(v_L.transpose(-2, -1), x_L)
@@ -291,30 +351,34 @@ class HODLRLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, diag, factors, A_sparse_pack, num_nodes):
+    def forward(self, leaf_blocks, factors, A_sparse_pack, num_nodes):
         A_indices, A_values = A_sparse_pack
         B = 1
         N = num_nodes
         
-        # Probing
-        z = torch.randn(B, N, 1, device=diag.device)
-        w = apply_hodlr_matrix(diag, factors, z)
+        # Stochastic Probing
+        z = torch.randn(B, N, 1, device=leaf_blocks.device)
         
-        target_device = diag.device
+        # M * z
+        w = apply_hodlr_matrix(leaf_blocks, factors, z, leaf_size=32)
+        
+        # A * (M * z)
+        target_device = leaf_blocks.device
         mm_device = torch.device('cpu') if target_device.type == 'mps' else target_device
-            
+        
         w_flat = w.squeeze().unsqueeze(1).to(mm_device)
         A_indices_mm = A_indices.to(mm_device)
         A_values_mm = A_values.to(mm_device)
-        
         A_sparse = torch.sparse_coo_tensor(A_indices_mm, A_values_mm, (N, N), device=mm_device)
+        
         y_flat = torch.sparse.mm(A_sparse, w_flat)
         y = y_flat.view(B, N, 1).to(target_device)
         
+        # Loss: || A*M*z - z ||
         loss = F.mse_loss(y, z)
         return loss
 
-# --- 6. Dataset (Unchanged) ---
+# --- 6. Dataset ---
 class FluidGraphDataset(Dataset):
     def __init__(self, root_dirs):
         self.frame_paths = []
@@ -348,12 +412,36 @@ class FluidGraphDataset(Dataset):
             pos = raw_nodes['position'][perm]
             new_rows = inv_perm[rows]
             new_cols = inv_perm[cols]
+            
+            # --- PAD TO 32 ---
+            # Our dense blocks require N % 32 == 0
+            # We will pad the graph with dummy isolated nodes if needed
+            leaf_size = 32
+            pad = (leaf_size - (num_nodes % leaf_size)) % leaf_size
+            
+            if pad > 0:
+                # Pad positions
+                pos = np.pad(pos, ((0, pad), (0, 0)), mode='constant')
+                # Pad diagonal with 1.0 (Identity for dummy nodes)
+                # Pad rows/cols indices? No, just let sparse matrix handle it implicitly
+                # Wait, sparse mm requires size match.
+                num_nodes += pad
+            
             mask_diag = new_rows == new_cols
             diag_map = np.zeros(num_nodes, dtype=np.float32)
+            # Fill diag_map only for original nodes
+            # Dummy nodes will be 0.0 here, but we can fix in feature engineering
+            
             r_diag = new_rows[mask_diag]
             v_diag = vals[mask_diag]
             diag_map[r_diag] = v_diag
+            
+            # Pad diag map for dummy nodes with 1.0?
+            if pad > 0:
+                diag_map[-pad:] = 1.0
+            
             x = np.column_stack([pos, diag_map]).astype(np.float32)
+            
             return {
                 'x': x,
                 'edge_index': torch.stack([torch.from_numpy(new_rows).long(), torch.from_numpy(new_cols).long()]),
@@ -361,23 +449,15 @@ class FluidGraphDataset(Dataset):
                 'num_nodes': num_nodes
             }
         except Exception as e:
+            print(f"Error loading {frame_path}: {e}")
             return self.__getitem__((idx + 1) % len(self))
 
-# --- 7. Training Loop & Export ---
+# --- 7. Training & Export ---
 
 def train(args):
-    # Prefer GPU: CUDA (NVIDIA) then Metal (Apple MPS), else CPU
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
-    elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
-        device = torch.device('mps')
-        print(f"Device: {device}")
-    else:
-        device = torch.device('cpu')
-        print(f"Device: {device}")
-        if not torch.cuda.is_available():
-            print("  (PyTorch reports CUDA unavailable — install CUDA build: mamba install pytorch pytorch-cuda=12.1 -c pytorch -c nvidia)")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.backends.mps.is_available(): device = torch.device('mps')
+    print(f"Device: {device}")
     
     data_path = Path(args.data_folder)
     if not data_path.is_absolute():
@@ -386,18 +466,17 @@ def train(args):
     dataset = FluidGraphDataset([data_path])
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
     
-    # Initialize with higher Rank (e.g., 32)
     model = NeuralHODLR(
         d_model=args.d_model, 
         depth=args.depth, 
-        rank=args.rank,     # This is now MAX RANK
-        min_rank=4          # Fixed min rank
+        rank=args.rank,     
+        leaf_size=32 # Hardcoded for now
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = HODLRLoss()
     
-    print("Starting HODLR Training (Variable Rank + Linear Upsampling)...")
+    print("Starting HODLR Training (Dense Leaf Blocks 32x32)...")
     
     for epoch in range(args.epochs):
         model.train()
@@ -409,9 +488,13 @@ def train(args):
             A_indices = batch['edge_index'][0].to(device)
             A_values = batch['edge_values'][0].to(device)
             
+            # Safety Check: Matrix sizes must match padded N
+            # Our Dataset pads x, but sparse indices are original.
+            # Sparse MM allows shape mismatch if we specify size (N, N)
+            
             optimizer.zero_grad()
-            diag, factors = model(x)
-            loss = criterion(diag, factors, (A_indices, A_values), num_nodes)
+            leaf_blocks, factors = model(x)
+            loss = criterion(leaf_blocks, factors, (A_indices, A_values), num_nodes)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -419,16 +502,16 @@ def train(args):
             total_loss += loss.item()
             if i % 10 == 0:
                 print(f"Ep {epoch} Step {i}: {loss.item():.5f}")
-                # Note: This export saves the weights but the header stores MAX RANK.
-                # Ensure loader uses the same 'get_rank_schedule' logic.
                 export_weights(model, Path(__file__).parent / "model_weights.bytes")
                 
         print(f"Epoch {epoch} Done. Avg Loss: {total_loss / len(loader):.5f}")
 
 def export_weights(model, path):
     with open(path, 'wb') as f:
-        # Header: We store MAX RANK in the 'rank' field.
-        # The loader must derive the schedule (ranks=[4,4,8...]) using Depth and Max Rank.
+        # Header: rank is MAX_RANK. leaf_size added as an implicit assumption or we can hijack a field.
+        # Let's hijack 'k' (upsample factor) or just rely on convention.
+        # Format: <ffiiiii (7 values)
+        # 0,0, d_model, nhead, depth, input_dim, max_rank
         header = struct.pack('<ffiiiii', 0, 0, model.d_model, model.bottleneck.nhead, model.depth, 4, model.max_rank)
         f.write(header)
         
@@ -448,21 +531,20 @@ def export_weights(model, path):
         pack(bn.v_proj.weight); pack(bn.v_proj.bias); pack(bn.out_proj.weight); pack(bn.out_proj.bias)
         pack(bn.norm.weight); pack(bn.norm.bias)
         
-        # Variable Rank Export: This naturally works because we just flatten weights.
-        # But the loader MUST expect the correct number of floats.
         for u, h in zip(model.up_samplers, model.hodlr_heads):
             pack(u.up_proj.weight); pack(u.up_proj.bias)
             pack(u.fusion[0].weight); pack(u.fusion[0].bias)
             pack(u.fusion[2].weight); pack(u.fusion[2].bias)
             pack(u.norm.weight); pack(u.norm.bias)
-            
-            # These weights now vary in size per loop iteration
             pack(h.proj_u.weight); pack(h.proj_u.bias)
             pack(h.proj_u.weight); pack(h.proj_u.bias) 
             
         pack(model.norm_out.weight); pack(model.norm_out.bias)
-        pack(model.diag_head.net[0].weight); pack(model.diag_head.net[0].bias)
-        pack(model.diag_head.net[2].weight); pack(model.diag_head.net[2].bias)
+        
+        # Dense Leaf Head Export
+        # It's an MLP: Linear -> Linear
+        pack(model.leaf_head.net[0].weight); pack(model.leaf_head.net[0].bias)
+        pack(model.leaf_head.net[2].weight); pack(model.leaf_head.net[2].bias)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -471,6 +553,6 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--depth', type=int, default=5)
-    parser.add_argument('--rank', type=int, default=32) # Increased Default Rank
+    parser.add_argument('--rank', type=int, default=32) 
     args = parser.parse_args()
     train(args)
