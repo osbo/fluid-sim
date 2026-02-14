@@ -34,6 +34,7 @@ StructuredBuffer<float> matrixABuffer;          // [25 * numNodes]
 RWStructuredBuffer<uint> nnzPerNode;            // [numNodes]
 RWStructuredBuffer<uint> rowPtrBuffer;          // [numNodes + 1] (RW so we can write last element)
 RWStructuredBuffer<uint> colIndicesBuffer;      // [totalNNZ]
+RWStructuredBuffer<uint> rowIndicesBuffer;      // [totalNNZ] - Explicit row indices (edge_index[0])
 RWStructuredBuffer<float> valuesBuffer;         // [totalNNZ]
 
 uint numNodes;
@@ -99,6 +100,7 @@ void FillCSR(uint3 id : SV_DispatchThreadID)
 
     // 1. Write Diagonal (Slot 0 in matrixABuffer)
     colIndicesBuffer[writeIdx] = i;
+    rowIndicesBuffer[writeIdx] = i; // Source is i
     valuesBuffer[writeIdx] = matrixABuffer[0 * numNodes + i];
     writeIdx++;
 
@@ -110,6 +112,7 @@ void FillCSR(uint3 id : SV_DispatchThreadID)
         if (neighborIdx < numNodes)
         {
             colIndicesBuffer[writeIdx] = neighborIdx;
+            rowIndicesBuffer[writeIdx] = i; // Source is i
             // Neighbor weights start at slot 1 in matrixABuffer
             valuesBuffer[writeIdx] = matrixABuffer[(k + 1) * numNodes + i];
             writeIdx++;
