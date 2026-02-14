@@ -1,7 +1,12 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+# Use non-interactive backend when no display (e.g. SSH) so plt.show() doesn't hang
+if not os.environ.get('DISPLAY'):
+    import matplotlib
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import struct
 import argparse
@@ -86,7 +91,7 @@ class DirectHODLR(nn.Module):
         factors = [(u, u) for u in self.u_factors]
         return self.diag, factors
 
-def train_overfit_baseline(A_indices, A_values, num_nodes, depth, rank, device, steps=2000):
+def train_overfit_baseline(A_indices, A_values, num_nodes, depth, rank, device, steps=400):
     print(f"\n--- Training Overfit HODLR Baseline ({steps} steps) ---")
     
     # 1. Setup Model
@@ -201,10 +206,17 @@ def main():
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--depth', type=int, default=5)
     parser.add_argument('--rank', type=int, default=4)
+    parser.add_argument('--output', '-o', type=str, default=None,
+                        help='Path to save plot image (default: script_dir/inspect_model_plot.png)')
     args = parser.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if torch.backends.mps.is_available(): device = torch.device('mps')
+    # Prefer GPU: CUDA (NVIDIA) then Metal (Apple MPS), else CPU
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
 
     # 1. Load Data
     print(f"Loading Data from {args.data_folder}")
@@ -316,6 +328,15 @@ def main():
             ax_t.text(0.1, 0.8 - i*0.15, line, fontsize=12, color='black' if i!=2 else color, fontfamily='monospace')
 
     plt.tight_layout()
+
+    out_path = args.output
+    if out_path is None:
+        out_path = script_dir / "inspect_model_plot.png"
+    else:
+        out_path = Path(out_path)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    print(f"\nPlot saved to: {out_path}")
+
     plt.show()
 
 if __name__ == "__main__":
