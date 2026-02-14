@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Videos (large; keep out of repo)
+*.mp4
+*.mov
+*.avi
+*.mkv
+Recordings/
+
+# Optional: ignore additional training runs to keep repo smaller (uncomment if needed)
+# StreamingAssets/TestData/Run_*/
+
+# Unity generated (if repo ever includes project root)
+# Library/
+# Logs/
+# UserSettings/
+# MemoryCaptures/
+# *.csproj
+# *.sln
