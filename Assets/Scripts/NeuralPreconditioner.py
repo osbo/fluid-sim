@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Neural HODLR Preconditioner (Hierarchical Off-Diagonal Low-Rank)
-Updated: Dense Leaf Blocks (32x32) for High Performance.
+Neural HODLR Preconditioner
+Updated: Dynamic Depth & Auto-Padding.
+The network automatically adapts its depth based on the input system size.
 """
 
 import torch
@@ -12,7 +13,7 @@ from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 import argparse
 import struct
-import time
+import math
 
 # --- 1. Core Components (Rotary Embeddings) ---
 
@@ -56,7 +57,6 @@ class DownSampler(nn.Module):
     
     def forward(self, x):
         B, N, D = x.shape
-        # Pad if N is not divisible by k
         pad = (self.k - (N % self.k)) % self.k
         if pad > 0: x = F.pad(x, (0, 0, 0, pad))
         
@@ -83,7 +83,6 @@ class UpSampler(nn.Module):
         x_coarse_proj = self.up_proj(x_coarse)
         x_coarse_expanded = x_coarse_proj.repeat_interleave(self.k, dim=1)
         
-        # Handle shape mismatches due to padding in downsample
         if x_coarse_expanded.shape[1] > x_fine.shape[1]:
             x_coarse_expanded = x_coarse_expanded[:, :x_fine.shape[1], :]
         elif x_coarse_expanded.shape[1] < x_fine.shape[1]:
@@ -96,7 +95,7 @@ class UpSampler(nn.Module):
         return x_fused
 
 class BottleneckAttention(nn.Module):
-    def __init__(self, d_model, nhead, max_seq_len=8192):
+    def __init__(self, d_model, nhead, max_seq_len=16384): # Increased max seq for padding
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
@@ -112,7 +111,6 @@ class BottleneckAttention(nn.Module):
     def forward(self, x):
         B, N, D = x.shape
         if N > self.freqs_cis.shape[0]:
-            # Dynamic resize if sequence is longer than expected
             freqs_cis = precompute_freqs_cis(N, self.head_dim, device=x.device)
         else:
             freqs_cis = self.freqs_cis[:N]
@@ -125,7 +123,6 @@ class BottleneckAttention(nn.Module):
         q_rope = apply_rope(q, freqs_cis)
         k_rope = apply_rope(k, freqs_cis)
         
-        # Scaled Dot Product Attention
         scores = torch.matmul(q_rope, k_rope.transpose(-2, -1)) / (self.head_dim ** 0.5)
         attn_weights = F.softmax(scores, dim=-1)
         attn_output = torch.matmul(attn_weights, v)
@@ -146,17 +143,9 @@ class HODLRLevelHead(nn.Module):
         return u, u 
 
 class BlockDiagonalHead(nn.Module):
-    """
-    Predicts a Dense Block L (Lower Triangular) for each leaf block.
-    Leaf Size: M (e.g. 32)
-    Output: M x M block per leaf.
-    """
     def __init__(self, d_model, leaf_size=32):
         super().__init__()
         self.leaf_size = leaf_size
-        # Number of elements in a triangular matrix (including diagonal) = M*(M+1)/2
-        # However, for simplicity and GPU batching, we predict the full MxM and mask it.
-        # This allows us to predict a full dense block if we wanted, but Cholesky is safer.
         self.out_dim = leaf_size * leaf_size
         
         self.net = nn.Sequential(
@@ -165,73 +154,47 @@ class BlockDiagonalHead(nn.Module):
             nn.Linear(d_model * 2, self.out_dim)
         )
         
-        # Initialize near Identity
-        # We want L * L^T ≈ I  => L ≈ I
         with torch.no_grad():
             self.net[-1].weight.data *= 0.01
             self.net[-1].bias.data.fill_(0)
-            # Set diagonal elements to 1.0 (approx)
-            # This is complex in a flattened array, so we do it in forward or just let it learn.
-            # A simple bias init helps convergence:
             eye = torch.eye(leaf_size).flatten()
             self.net[-1].bias.data += eye
 
     def forward(self, x):
-        # x is at the FINEST level (N nodes)
-        # We need to process it in chunks of 'leaf_size'
-        # But wait: x has shape [B, N, D].
-        # We want one L matrix for every 'leaf_size' block of nodes.
-        # So we pool x by 'leaf_size' then predict?
-        # BETTER: Predict per-node, then reshape?
-        # No, a block is a property of a group.
-        
         B, N, D = x.shape
+        # NOTE: x is already padded by the main model to be divisible by leaf_size
         num_blocks = N // self.leaf_size
-        
-        if N % self.leaf_size != 0:
-            # Handle edge case: pad or truncate?
-            # For HODLR, N is usually power of 2 aligned. 
-            pass
-
-        # Reshape to [B, NumBlocks, LeafSize, D]
         x_blocked = x.view(B, num_blocks, self.leaf_size, D)
-        
-        # Average features across the block to get a "Block Embedding"
-        x_pooled = x_blocked.mean(dim=2) # [B, NumBlocks, D]
-        
-        # Predict L
-        L_flat = self.net(x_pooled) # [B, NumBlocks, LeafSize*LeafSize]
+        x_pooled = x_blocked.mean(dim=2) 
+        L_flat = self.net(x_pooled) 
         L = L_flat.view(B, num_blocks, self.leaf_size, self.leaf_size)
-        
-        # Enforce Lower Triangular (for stability) or Full Symmetric
-        # Let's do Full Symmetric via L * L^T + epsilon * I
-        # This guarantees PSD.
         return L 
 
-# --- 4. Main Architecture ---
+# --- 4. Main Architecture (Dynamic Depth) ---
 
 class NeuralHODLR(nn.Module):
-    def __init__(self, input_dim=4, d_model=64, nhead=4, k=2, rank=32, depth=5, leaf_size=32):
+    def __init__(self, input_dim=4, d_model=64, nhead=4, k=2, max_rank=32, max_depth=10, leaf_size=32):
         super().__init__()
         self.d_model = d_model
         self.k = k 
-        self.depth = depth
+        self.max_depth = max_depth # Capacity
         self.leaf_size = leaf_size
-        self.max_rank = rank
+        self.max_rank = max_rank
         
-        # --- Rank Schedule ---
+        # --- Rank Schedule (Bottom-Up) ---
+        # Level 0 is Finest (Leaves). Level max_depth-1 is Coarsest (Root).
+        # We define schedule based on distance from leaves to be scale invariant.
         self.rank_schedule = []
-        for i in range(depth):
-            dist_from_top = (depth - 1) - i
-            calc_rank = max(4, rank // (2 ** dist_from_top))
-            self.rank_schedule.append(calc_rank)
+        for i in range(max_depth):
+            # i=0 (Level 0, finest). Rank should be small (e.g. 4)
+            # Rank doubles every level up to max_rank
+            r = min(max_rank, 4 * (2 ** i))
+            self.rank_schedule.append(r)
             
-        print("\n=== HODLR Architecture (Dense Leaves) ===")
-        print(f"Depth: {depth}, Max Rank: {rank}, Leaf Size: {leaf_size}")
-        print(f"Hierarchy:")
-        for i, r in enumerate(self.rank_schedule):
-            print(f"  L{i}: Rank {r}")
-        print("=========================================\n")
+        print("\n=== HODLR Architecture (Dynamic Depth) ===")
+        print(f"Capacity: {max_depth} levels, Max Rank: {max_rank}, Leaf: {leaf_size}")
+        print(f"Rank Profile (Fine -> Coarse): {self.rank_schedule}")
+        print("==========================================\n")
 
         self.feature_proj = nn.Linear(input_dim, d_model)
         
@@ -239,80 +202,115 @@ class NeuralHODLR(nn.Module):
         self.up_samplers = nn.ModuleList()
         self.hodlr_heads = nn.ModuleList()
         
-        for i in range(depth):
+        for i in range(max_depth):
             self.down_samplers.append(DownSampler(d_model, k))
             self.up_samplers.append(UpSampler(d_model, k))
             self.hodlr_heads.append(HODLRLevelHead(d_model, rank=self.rank_schedule[i]))
             
         self.bottleneck = BottleneckAttention(d_model, nhead)
-        
-        # Dense Block Head instead of Scalar Diagonal
         self.leaf_head = BlockDiagonalHead(d_model, leaf_size)
-        
         self.norm_out = nn.LayerNorm(d_model)
 
+    def get_hierarchical_params(self, num_nodes):
+        # Calculate required depth to reach leaf_size
+        # N / 2^d <= leaf_size  => 2^d >= N/leaf_size
+        if num_nodes <= self.leaf_size:
+            return 0, self.leaf_size
+            
+        ratio = num_nodes / self.leaf_size
+        required_depth = math.ceil(math.log2(ratio))
+        
+        # Clamp to max capacity
+        active_depth = min(required_depth, self.max_depth)
+        
+        # Calculate padded size
+        # We need the full tree to be valid. 
+        # Size = leaf_size * 2^active_depth
+        padded_size = self.leaf_size * (2 ** active_depth)
+        
+        return active_depth, padded_size
+
     def forward(self, x):
-        h = self.feature_proj(x)
+        # x: [B, N, D] (Raw input size)
+        B, N, _ = x.shape
+        
+        # 1. Determine Dynamic Depth
+        active_depth, padded_size = self.get_hierarchical_params(N)
+        
+        # 2. Pad Input
+        pad_amt = padded_size - N
+        if pad_amt > 0:
+            # Pad with 0.0 features. 
+            # Note: For diagonal (feature 3), 0.0 is technically wrong (should be 1.0 identity),
+            # but since these are dummy nodes, their output won't affect the real loss directly.
+            x_pad = F.pad(x, (0, 0, 0, pad_amt))
+        else:
+            x_pad = x
+            
+        # 3. U-Net Pass (Only use active levels)
+        h = self.feature_proj(x_pad)
         skip_stack = []
         
-        for layer in self.down_samplers:
+        # Down (0 -> active_depth)
+        for i in range(active_depth):
             skip_stack.append(h)
-            h = layer(h)
+            h = self.down_samplers[i](h)
             
         h = self.bottleneck(h)
         
-        hodlr_factors = []
-        for i in range(self.depth - 1, -1, -1):
+        # Up (active_depth -> 0)
+        hodlr_factors = [] # Stores (U, V) tuples. 
+        # We need to return them such that index 0 corresponds to Coarsest split (Root)
+        # and last index corresponds to Finest split (Level 0).
+        # OR match apply_hodlr_matrix expectation.
+        # apply_hodlr_matrix iterates factors. First factor = Root (Coarse).
+        # Our layers are indexed 0 (Fine) to Max (Coarse).
+        # So we should collect them, then reverse?
+        
+        # Let's iterate backwards from active_depth-1 down to 0
+        for i in range(active_depth - 1, -1, -1):
             u, v = self.hodlr_heads[i](h)
-            hodlr_factors.append((u, v))
+            hodlr_factors.append((u, v)) # Append Coarse -> Fine order
             
             skip = skip_stack.pop()
             h = self.up_samplers[i](h, skip)
             
         h_final = self.norm_out(h)
         
-        # Predict Dense Blocks
-        # h_final is at the finest level (N nodes)
+        # 4. Leaf Prediction
         leaf_blocks = self.leaf_head(h_final)
         
-        return leaf_blocks, hodlr_factors
+        return leaf_blocks, hodlr_factors, padded_size
 
-# --- 5. HODLR Operations (Updated for Dense Blocks) ---
+# --- 5. HODLR Operations ---
 
 def apply_hodlr_matrix(leaf_blocks, factors, x, leaf_size=32):
     """
-    x: [B, N, 1]
-    leaf_blocks: [B, NumBlocks, M, M] where M=leaf_size
+    x: [B, N_pad, 1]
+    leaf_blocks: [B, NumBlocks, M, M]
+    factors: List of (U, V) from Coarse to Fine
     """
     B, N, _ = x.shape
     
     # 1. Apply Dense Leaf Blocks
-    # Reshape x to match blocks: [B, NumBlocks, M, 1]
     num_blocks = N // leaf_size
     x_blocked = x.view(B, num_blocks, leaf_size, 1)
     
-    # Block Matrix Vector Multiply
-    # y = L * L^T * x (Symmetric PSD)
-    # Or just B * x if we predict full B.
-    # Let's use B * B^T + eps * I for stability
-    
     L = leaf_blocks
-    # L is [B, NumBlocks, M, M]
-    
-    # y_block = L @ (L.transpose(-2, -1) @ x_blocked)
+    # y = L * L^T * x + eps*x
     temp = torch.matmul(L.transpose(-2, -1), x_blocked)
     y_blocked = torch.matmul(L, temp)
-    
-    # Add small identity for numerical stability if needed
     y_blocked = y_blocked + x_blocked * 1e-4
     
     y = y_blocked.view(B, N, 1)
     
-    # 2. Apply HODLR Off-Diagonals (Same as before)
-    # Iterate Coarse -> Fine
+    # 2. Apply HODLR Off-Diagonals
+    # Factors are ordered Coarse (Split=2) -> Fine (Split=2^k)
     for level_idx, (u_coarse, v_coarse) in enumerate(factors):
+        # Level 0 (Root) has 2 splits.
         num_splits = 2 ** (level_idx + 1)
         block_size = N // num_splits
+        
         if block_size == 0: continue
         
         if u_coarse.shape[1] != N:
@@ -351,34 +349,54 @@ class HODLRLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, leaf_blocks, factors, A_sparse_pack, num_nodes):
+    def forward(self, leaf_blocks, factors, padded_size, A_sparse_pack, num_nodes_real):
         A_indices, A_values = A_sparse_pack
         B = 1
-        N = num_nodes
         
-        # Stochastic Probing
-        z = torch.randn(B, N, 1, device=leaf_blocks.device)
+        # 1. Generate Z in PADDED space
+        z_pad = torch.randn(B, padded_size, 1, device=leaf_blocks.device)
         
-        # M * z
-        w = apply_hodlr_matrix(leaf_blocks, factors, z, leaf_size=32)
+        # 2. Apply M (Preconditioner) in PADDED space
+        w_pad = apply_hodlr_matrix(leaf_blocks, factors, z_pad, leaf_size=32)
         
-        # A * (M * z)
+        # 3. Apply A (System Matrix)
+        # We need to construct A_pad. 
+        # A_pad = [ A_real  0 ]
+        #         [ 0       I ]
+        # The pad region is Identity so dummy nodes behave well (M*z = z).
+        
         target_device = leaf_blocks.device
         mm_device = torch.device('cpu') if target_device.type == 'mps' else target_device
         
-        w_flat = w.squeeze().unsqueeze(1).to(mm_device)
-        A_indices_mm = A_indices.to(mm_device)
-        A_values_mm = A_values.to(mm_device)
-        A_sparse = torch.sparse_coo_tensor(A_indices_mm, A_values_mm, (N, N), device=mm_device)
+        # Move to CPU for sparse construction if needed
+        A_ind = A_indices.to(mm_device)
+        A_val = A_values.to(mm_device)
         
+        # Add diagonal identity for padded nodes
+        pad_amt = padded_size - num_nodes_real
+        if pad_amt > 0:
+            pad_range = torch.arange(num_nodes_real, padded_size, device=mm_device)
+            pad_rows = pad_range
+            pad_cols = pad_range
+            pad_vals = torch.ones_like(pad_range, dtype=torch.float32)
+            
+            # Concatenate
+            A_ind = torch.cat([A_ind, torch.stack([pad_rows, pad_cols])], dim=1)
+            A_val = torch.cat([A_val, pad_vals])
+            
+        A_sparse = torch.sparse_coo_tensor(A_ind, A_val, (padded_size, padded_size), device=mm_device)
+        
+        w_flat = w_pad.squeeze().unsqueeze(1).to(mm_device)
         y_flat = torch.sparse.mm(A_sparse, w_flat)
-        y = y_flat.view(B, N, 1).to(target_device)
+        y_pad = y_flat.view(B, padded_size, 1).to(target_device)
         
-        # Loss: || A*M*z - z ||
-        loss = F.mse_loss(y, z)
+        # 4. Loss
+        # We can calculate loss over the whole padded vector.
+        # Since dummy nodes do M=I, A=I, z=z -> loss=0, they don't corrupt the gradient.
+        loss = F.mse_loss(y_pad, z_pad)
         return loss
 
-# --- 6. Dataset ---
+# --- 6. Dataset (Simplified) ---
 class FluidGraphDataset(Dataset):
     def __init__(self, root_dirs):
         self.frame_paths = []
@@ -413,35 +431,15 @@ class FluidGraphDataset(Dataset):
             new_rows = inv_perm[rows]
             new_cols = inv_perm[cols]
             
-            # --- PAD TO 32 ---
-            # Our dense blocks require N % 32 == 0
-            # We will pad the graph with dummy isolated nodes if needed
-            leaf_size = 32
-            pad = (leaf_size - (num_nodes % leaf_size)) % leaf_size
-            
-            if pad > 0:
-                # Pad positions
-                pos = np.pad(pos, ((0, pad), (0, 0)), mode='constant')
-                # Pad diagonal with 1.0 (Identity for dummy nodes)
-                # Pad rows/cols indices? No, just let sparse matrix handle it implicitly
-                # Wait, sparse mm requires size match.
-                num_nodes += pad
-            
             mask_diag = new_rows == new_cols
             diag_map = np.zeros(num_nodes, dtype=np.float32)
-            # Fill diag_map only for original nodes
-            # Dummy nodes will be 0.0 here, but we can fix in feature engineering
-            
             r_diag = new_rows[mask_diag]
             v_diag = vals[mask_diag]
             diag_map[r_diag] = v_diag
             
-            # Pad diag map for dummy nodes with 1.0?
-            if pad > 0:
-                diag_map[-pad:] = 1.0
-            
             x = np.column_stack([pos, diag_map]).astype(np.float32)
             
+            # Return RAW data. Padding is handled by Model.
             return {
                 'x': x,
                 'edge_index': torch.stack([torch.from_numpy(new_rows).long(), torch.from_numpy(new_cols).long()]),
@@ -468,15 +466,15 @@ def train(args):
     
     model = NeuralHODLR(
         d_model=args.d_model, 
-        depth=args.depth, 
-        rank=args.rank,     
-        leaf_size=32 # Hardcoded for now
+        max_rank=args.rank, 
+        max_depth=10, # Capacity
+        leaf_size=32 
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = HODLRLoss()
     
-    print("Starting HODLR Training (Dense Leaf Blocks 32x32)...")
+    print("Starting HODLR Training (Dynamic Depth + Dense Leaves)...")
     
     for epoch in range(args.epochs):
         model.train()
@@ -484,17 +482,17 @@ def train(args):
         
         for i, batch in enumerate(loader):
             x = batch['x'].to(device)
-            num_nodes = batch['num_nodes'].item()
+            num_nodes_real = batch['num_nodes'].item()
             A_indices = batch['edge_index'][0].to(device)
             A_values = batch['edge_values'][0].to(device)
             
-            # Safety Check: Matrix sizes must match padded N
-            # Our Dataset pads x, but sparse indices are original.
-            # Sparse MM allows shape mismatch if we specify size (N, N)
-            
             optimizer.zero_grad()
-            leaf_blocks, factors = model(x)
-            loss = criterion(leaf_blocks, factors, (A_indices, A_values), num_nodes)
+            
+            # Forward returns PADDED results
+            leaf_blocks, factors, padded_size = model(x)
+            
+            loss = criterion(leaf_blocks, factors, padded_size, (A_indices, A_values), num_nodes_real)
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -508,11 +506,10 @@ def train(args):
 
 def export_weights(model, path):
     with open(path, 'wb') as f:
-        # Header: rank is MAX_RANK. leaf_size added as an implicit assumption or we can hijack a field.
-        # Let's hijack 'k' (upsample factor) or just rely on convention.
+        # Header: rank is MAX_RANK.
         # Format: <ffiiiii (7 values)
-        # 0,0, d_model, nhead, depth, input_dim, max_rank
-        header = struct.pack('<ffiiiii', 0, 0, model.d_model, model.bottleneck.nhead, model.depth, 4, model.max_rank)
+        # 0,0, d_model, nhead, max_depth, input_dim, max_rank
+        header = struct.pack('<ffiiiii', 0, 0, model.d_model, model.bottleneck.nhead, model.max_depth, 4, model.max_rank)
         f.write(header)
         
         def pack(t):
@@ -540,9 +537,6 @@ def export_weights(model, path):
             pack(h.proj_u.weight); pack(h.proj_u.bias) 
             
         pack(model.norm_out.weight); pack(model.norm_out.bias)
-        
-        # Dense Leaf Head Export
-        # It's an MLP: Linear -> Linear
         pack(model.leaf_head.net[0].weight); pack(model.leaf_head.net[0].bias)
         pack(model.leaf_head.net[2].weight); pack(model.leaf_head.net[2].bias)
 
@@ -552,7 +546,6 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--d_model', type=int, default=64)
-    parser.add_argument('--depth', type=int, default=5)
     parser.add_argument('--rank', type=int, default=32) 
     args = parser.parse_args()
     train(args)
