@@ -291,36 +291,35 @@ def apply_hodlr_matrix(leaf_blocks, factors, x, leaf_size=32):
     factors: List of (U, V) from Coarse to Fine
     """
     B, N, _ = x.shape
-    
+    num_levels = len(factors)
+
     # 1. Apply Dense Leaf Blocks
     num_blocks = N // leaf_size
     x_blocked = x.view(B, num_blocks, leaf_size, 1)
-    
+
     L = leaf_blocks
     # y = L * L^T * x + eps*x
     temp = torch.matmul(L.transpose(-2, -1), x_blocked)
     y_blocked = torch.matmul(L, temp)
     y_blocked = y_blocked + x_blocked * 1e-4
-    
+
     y = y_blocked.view(B, N, 1)
-    
+
     # 2. Apply HODLR Off-Diagonals
-    # Factors are ordered Coarse (Split=2) -> Fine (Split=2^k)
+    # Block sizes are leaf-aligned: finest = leaf_size, then double each level (leaf_size * 2^(num_levels-1-level_idx))
     for level_idx, (u_coarse, v_coarse) in enumerate(factors):
-        # Level 0 (Root) has 2 splits.
-        num_splits = 2 ** (level_idx + 1)
-        block_size = N // num_splits
-        
+        block_size = leaf_size * (2 ** (num_levels - 1 - level_idx))
         if block_size == 0: continue
-        
+        num_blocks_at_level = N // block_size
+        num_pairs = num_blocks_at_level // 2
+        valid_len = num_pairs * 2 * block_size
+        if valid_len == 0: continue
+
         if u_coarse.shape[1] != N:
             u_full = F.interpolate(u_coarse.transpose(1,2), size=N, mode='linear', align_corners=False).transpose(1,2)
             v_full = F.interpolate(v_coarse.transpose(1,2), size=N, mode='linear', align_corners=False).transpose(1,2)
         else:
             u_full, v_full = u_coarse, v_coarse
-            
-        num_pairs = num_splits // 2
-        valid_len = num_pairs * 2 * block_size
         
         x_view = x[:, :valid_len].view(B, num_pairs, 2, block_size, 1)
         u_view = u_full[:, :valid_len].view(B, num_pairs, 2, block_size, -1)
