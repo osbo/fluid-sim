@@ -439,6 +439,9 @@ def main():
     M_overfit_n = M_overfit[:viz_n, :viz_n]
     M_amg_n = M_amg[:viz_n, :viz_n]
 
+    # Approximate true inverse of the viz block (for comparison; only this block is inverted)
+    A_inv_viz = np.linalg.inv(A_viz_n)
+
     matrices = {
         "A (Input)": A_viz_n,
         "Neural M": M_neural_n,
@@ -449,12 +452,16 @@ def main():
     leaf_size = 32
 
     fig, axes = plt.subplots(4, 4, figsize=(20, 14))
-    # Row 0: A (input) with leaf grid to check alignment of 32x32 blocks with matrix structure
+    # Row 0: A (input) and A^{-1} (viz block)
     ax_a = axes[0, 0]
     im_a = ax_a.imshow(np.log10(np.abs(A_viz_n) + 1e-9), cmap='magma', aspect='auto')
     ax_a.set_title(f"A (input) log10 [grid=leaf {leaf_size}x{leaf_size}]")
     plt.colorbar(im_a, ax=ax_a)
-    for j in range(1, 4):
+    ax_ainv = axes[0, 1]
+    im_ainv = ax_ainv.imshow(np.log10(np.abs(A_inv_viz) + 1e-9), cmap='magma', aspect='auto')
+    ax_ainv.set_title(f"A^{{-1}} (viz {viz_n}x{viz_n} block) log10")
+    plt.colorbar(im_ainv, ax=ax_ainv)
+    for j in range(2, 4):
         axes[0, j].axis('off')
     # Row 1–3: Neural, Overfit, AMG (or placeholder when disabled)
     amg_label = "AMG (disabled)" if SKIP_AMG else "AMG"
