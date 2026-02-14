@@ -1,0 +1,44 @@
+# Unity generated
+Library/
+Logs/
+UserSettings/
+MemoryCaptures/
+Temp/
+Obj/
+Build/
+Builds/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.csproj
+*.sln
+*.unityproj
+*.suo
+*.user
+*.userprefs
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Videos and large recordings
+*.mp4
+*.mov
+*.avi
+*.mkv
+Recordings/
+
+# Crash logs
+*.stackdump
+mono_crash.*
+
+# Python (scripts in Assets/Scripts)
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+
+# Optional: uncomment to avoid committing large training runs
+# Assets/StreamingAssets/TestData/Run_*/
