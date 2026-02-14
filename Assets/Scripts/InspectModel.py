@@ -99,9 +99,8 @@ def load_weights_from_bytes(model, path):
         
     print("Weights loaded successfully.")
 
-# --- 2. Overfit Baseline: DirectHODLR (Scalar) ---
-# Note: This uses Scalar Diagonals. The Neural model uses Block Diagonals.
-# The Neural model has a massive advantage here.
+# --- 2. Overfit Baseline ---
+# Option A: Scalar diagonal (legacy). Option B: Dense 32x32 leaf blocks (like Neural).
 
 def apply_hodlr_matrix_diag(diag, factors, x):
     """Legacy scalar apply for Overfit Baseline."""
@@ -183,16 +182,54 @@ class DirectHODLR(nn.Module):
         factors = [(u, u) for u in self.u_factors]
         return self.diag, factors
 
-def train_overfit_baseline(A_indices, A_values, num_nodes, depth, max_rank, device, steps=100):
-    print(f"\n--- Training Overfit HODLR Baseline ({steps} steps) ---")
-    model = DirectHODLR(num_nodes, depth, max_rank, device).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.005) 
-    
-    # Use randomized probes (Stochastic) to prevent cheating/overfitting to noise
-    # Batch size 32
+
+class DirectHODLRBlocks(nn.Module):
+    """Overfit baseline with dense 32x32 leaf blocks (like Neural), so M has dense chunks on the diagonal.
+    Uses a learnable scale for the low-rank (HODLR) part so it can balance with the dense leaf scale."""
+    def __init__(self, num_nodes, depth, max_rank, device, leaf_size=32):
+        super().__init__()
+        assert num_nodes % leaf_size == 0, "num_nodes must be divisible by leaf_size"
+        self.depth = depth
+        self.leaf_size = leaf_size
+        num_blocks = num_nodes // leaf_size
+
+        # Learnable dense blocks [1, NumBlocks, leaf_size, leaf_size]; init near identity (L so L@L.T ~ I)
+        eye = torch.eye(leaf_size, device=device).unsqueeze(0).unsqueeze(0).expand(1, num_blocks, -1, -1).clone()
+        self.leaf_blocks = nn.Parameter(eye + 0.01 * torch.randn(1, num_blocks, leaf_size, leaf_size, device=device))
+
+        # Low-rank factors: init larger so off-diagonal is on a comparable scale to the dense blocks (avoids black background in viz)
+        rank_schedule = []
+        for i in range(depth):
+            r = min(max_rank, 4 * (2 ** i))
+            rank_schedule.append(r)
+        self.ranks_coarse_to_fine = rank_schedule[::-1]
+
+        self.u_factors = nn.ParameterList()
+        for r in self.ranks_coarse_to_fine:
+            u = nn.Parameter(torch.randn(1, num_nodes, r, device=device) * 0.05)
+            self.u_factors.append(u)
+
+        # Learnable scale for the entire HODLR off-diagonal sum so optimizer can balance dense vs low-rank
+        self.hodlr_scale = nn.Parameter(torch.tensor(1.0, device=device))
+
+    def forward(self, x):
+        s = self.hodlr_scale
+        factors = [(u * s, u * s) for u in self.u_factors]
+        return apply_hodlr_matrix(self.leaf_blocks, factors, x, leaf_size=self.leaf_size)
+
+    def get_params(self):
+        s = self.hodlr_scale
+        factors = [(u * s, u * s) for u in self.u_factors]
+        return self.leaf_blocks, factors
+
+
+def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_rank, device, leaf_size=32, steps=4000):
+    """Overfit with dense leaf blocks (same structure as Neural); M will show dense chunks on the diagonal."""
+    print(f"\n--- Training Overfit HODLR Baseline (block diagonal, {steps} steps) ---")
+    model = DirectHODLRBlocks(num_nodes, depth, max_rank, device, leaf_size=leaf_size).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.005)
     batch_size = 32
 
-    # Pre-construct sparse A
     if device.type == 'mps':
         A_sparse = torch.sparse_coo_tensor(A_indices.cpu(), A_values.cpu(), (num_nodes, num_nodes)).to('cpu')
     else:
@@ -201,12 +238,9 @@ def train_overfit_baseline(A_indices, A_values, num_nodes, depth, max_rank, devi
     t0 = time.time()
     for i in range(steps):
         optimizer.zero_grad()
-        diag, factors = model.get_params()
-        
-        # Random Probe
+        leaf_blocks, factors = model.get_params()
+
         z = torch.randn(batch_size, num_nodes, 1, device=device)
-        
-        # Compute A*z (sparse matmul only supported on CPU, not MPS)
         if device.type == 'mps':
             z_cpu = z.squeeze().t().cpu()
             Az_cpu = torch.sparse.mm(A_sparse, z_cpu).t().unsqueeze(-1)
@@ -216,38 +250,35 @@ def train_overfit_baseline(A_indices, A_values, num_nodes, depth, max_rank, devi
             Az_flat = torch.sparse.mm(A_sparse, z_flat)
             Az = Az_flat.t().unsqueeze(-1)
 
-        # M * (A*z) -> should be z
-        
-        # Expand params
-        diag_exp = diag.expand(batch_size, -1, -1)
+        leaf_exp = leaf_blocks.expand(batch_size, -1, -1, -1)
         factors_exp = [(u.expand(batch_size, -1, -1), v.expand(batch_size, -1, -1)) for u, v in factors]
-        
-        res = apply_hodlr_matrix_diag(diag_exp, factors_exp, Az)
-        
+        res = apply_hodlr_matrix(leaf_exp, factors_exp, Az, leaf_size=leaf_size)
+
         loss = F.mse_loss(res, z)
         loss.backward()
         optimizer.step()
-        
+
         if i % 100 == 0:
             print(f"  [Step {i}] Loss: {loss.item():.6f}")
-            
+
     print(f"  Overfit Training finished in {time.time()-t0:.2f}s. Final Loss: {loss.item():.6f}")
     return model.get_params()
 
+
 # --- 3. Dense Reconstruction ---
 
-def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_real, device, leaf_size=32):
+def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_real, device, leaf_size=32, viz_limit=200):
     """
     Reconstructs dense M from Neural Output (full n x n).
     The Neural Output operates on 'padded_size'; we probe in Padded Space, then crop to num_nodes_real.
     """
-    n = num_nodes_real
-    M = torch.zeros(n, n, device='cpu')
+    viz_limit = min(num_nodes_real, viz_limit)
+    M = torch.zeros(viz_limit, viz_limit, device='cpu')
     batch_size = 32
 
     with torch.no_grad():
-        for i in range(0, n, batch_size):
-            end = min(i + batch_size, n)
+        for i in range(0, viz_limit, batch_size):
+            end = min(i + batch_size, viz_limit)
             current_batch = end - i
 
             # 1. Create Identity Probes in Padded Space [Batch, PaddedSize, 1]
@@ -264,12 +295,12 @@ def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_re
             y_pad = apply_hodlr_matrix(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size)
 
             # 4. Crop to real size and store
-            y_real = y_pad[:, :n, 0].cpu()
+            y_real = y_pad[:, :viz_limit, 0].cpu()
             M[:, i:end] = y_real.T
 
     return M.numpy()
 
-def get_dense_matrix_overfit(diag, factors, num_nodes, device, viz_limit=1000):
+def get_dense_matrix_overfit(diag, factors, num_nodes, device, viz_limit=200):
     limit = min(num_nodes, viz_limit)
     M = torch.zeros(limit, limit, device='cpu')
     batch_size = 32
@@ -291,7 +322,7 @@ def get_dense_matrix_overfit(diag, factors, num_nodes, device, viz_limit=1000):
             
     return M.numpy()
 
-def get_dense_amg(A_sparse_scipy, viz_limit=1000, maxiter=1, tol=1e-6, progress_interval=200):
+def get_dense_amg(A_sparse_scipy, viz_limit=200, maxiter=1, tol=1e-6, progress_interval=200):
     """Build dense M by columns via AMG solves. Use smaller viz_limit to reduce work."""
     if not HAS_AMG: return np.eye(min(A_sparse_scipy.shape[0], viz_limit))
     print("\n--- Computing AMG Baseline ---")
@@ -326,7 +357,9 @@ def main():
     # Note: --rank is MAX_RANK. Depth is max_depth (capacity).
     parser.add_argument('--rank', type=int, default=32) 
     parser.add_argument('--max_depth', type=int, default=10)
-    parser.add_argument('--viz_limit', type=int, default=1000,
+    parser.add_argument('--output', '-o', type=str, default=None,
+                        help='Path to save plot image (default: script_dir/inspect_model_plot.png)')
+    parser.add_argument('--viz_limit', type=int, default=200,
                         help="Max size for dense M reconstruction and viz (reduces AMG work). Use 0 for full N.")
     args = parser.parse_args()
 
@@ -364,31 +397,41 @@ def main():
         
     print(f"  Neural Inference used Padded Size: {padded_size} (Active Depth: {int(math.log2(padded_size/32))})")
     
-    M_neural = get_dense_matrix_from_neural(
-        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=32
-    )
-
-    # --- MODEL 2: OVERFIT HODLR (Scalar Baseline) ---
-    print("\n2. Training Overfit HODLR (Scalar Baseline)...")
-    # We use active_depth calculated from padded_size for fair comparison of hierarchy
-    active_depth = int(math.log2(padded_size/32))
-    
-    diag_overfit, factors_overfit = train_overfit_baseline(
-        A_indices, A_values, num_nodes_real, active_depth, args.rank, device
-    )
     viz_n = (args.viz_limit if args.viz_limit > 0 else n)
     viz_n = min(viz_n, n)
+    
+    M_neural = get_dense_matrix_from_neural(
+        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=32, viz_limit=viz_n
+    )
+
+    # --- MODEL 2: OVERFIT HODLR (Block Diagonal, same structure as Neural) ---
+    print("\n2. Training Overfit HODLR (block diagonal)...")
+    leaf_size = 32
+    # Mandate power-of-2 * leaf_size so HODLR levels align: finest block_size=leaf_size, then double each level
+    num_blocks_min = (num_nodes_real + leaf_size - 1) // leaf_size
+    active_depth = int(math.ceil(math.log2(num_blocks_min)))
+    padded_size_overfit = leaf_size * (2 ** active_depth)
+    leaf_blocks_overfit, factors_overfit = train_overfit_baseline_blocks(
+        A_indices, A_values, padded_size_overfit, active_depth, args.rank, device, leaf_size=leaf_size
+    )
     print(f"  Viz limit: {viz_n} (full N={n})")
 
-    M_overfit = get_dense_matrix_overfit(diag_overfit, factors_overfit, num_nodes_real, device, viz_limit=viz_n)
+    M_overfit = get_dense_matrix_from_neural(
+        leaf_blocks_overfit, factors_overfit, padded_size_overfit, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n
+    )
 
-    # --- MODEL 3: AMG ---
-    print("\n3. Computing AMG...")
-    row = batch['edge_index'][0].numpy()
-    col = batch['edge_index'][1].numpy()
-    data = batch['edge_values'].numpy().astype(np.float64)
-    A_scipy = csr_matrix((data, (row, col)), shape=(num_nodes_real, num_nodes_real))
-    M_amg = get_dense_amg(A_scipy, viz_limit=viz_n, tol=1e-6, progress_interval=200)
+    # --- MODEL 3: AMG (temporarily disabled) ---
+    SKIP_AMG = False
+    if SKIP_AMG:
+        print("\n3. AMG skipped (disabled).")
+        M_amg = np.eye(viz_n)
+    else:
+        print("\n3. Computing AMG...")
+        row = batch['edge_index'][0].numpy()
+        col = batch['edge_index'][1].numpy()
+        data = batch['edge_values'].numpy().astype(np.float64)
+        A_scipy = csr_matrix((data, (row, col)), shape=(num_nodes_real, num_nodes_real))
+        M_amg = get_dense_amg(A_scipy, viz_limit=viz_n, tol=1e-6, progress_interval=200)
 
     # --- Visualization (use viz_n so all matrices are consistent) ---
     A_viz_n = A_viz[:viz_n, :viz_n]
@@ -403,32 +446,45 @@ def main():
         "AMG M": M_amg_n
     }
     
-    fig, axes = plt.subplots(3, 4, figsize=(20, 12))
-    methods = [("Neural", M_neural_n), ("Overfit", M_overfit_n), ("AMG", M_amg_n)]
+    leaf_size = 32
+
+    fig, axes = plt.subplots(4, 4, figsize=(20, 14))
+    # Row 0: A (input) with leaf grid to check alignment of 32x32 blocks with matrix structure
+    ax_a = axes[0, 0]
+    im_a = ax_a.imshow(np.log10(np.abs(A_viz_n) + 1e-9), cmap='magma', aspect='auto')
+    ax_a.set_title(f"A (input) log10 [grid=leaf {leaf_size}x{leaf_size}]")
+    plt.colorbar(im_a, ax=ax_a)
+    for j in range(1, 4):
+        axes[0, j].axis('off')
+    # Row 1–3: Neural, Overfit, AMG (or placeholder when disabled)
+    amg_label = "AMG (disabled)" if SKIP_AMG else "AMG"
+    methods = [("Neural", M_neural_n), ("Overfit", M_overfit_n), (amg_label, M_amg_n)]
     cond_A = np.linalg.cond(A_viz_n)
     print(f"\nCondition Number (Block A): {cond_A:.2e}")
-    
+    print(f"Leaf boundaries: every {leaf_size} (cyan grid on M plots; nodes are Morton-ordered)")
+
     for idx, (name, M) in enumerate(methods):
-        ax_m = axes[idx, 0]
+        row = idx + 1
+        ax_m = axes[row, 0]
         im = ax_m.imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto')
-        ax_m.set_title(f"{name} M (log10)")
+        ax_m.set_title(f"{name} M (log10) [grid=leaf {leaf_size}x{leaf_size}]")
         plt.colorbar(im, ax=ax_m)
 
         AM = A_viz_n @ M
-        ax_am = axes[idx, 1]
+        ax_am = axes[row, 1]
         am_min, am_max = np.percentile(AM, [2, 98])
         if am_max - am_min < 1e-8: am_min, am_max = 0.0, 1.0
         im2 = ax_am.imshow(AM, cmap='RdBu_r', vmin=am_min, vmax=am_max, aspect='auto')
         plt.colorbar(im2, ax=ax_am)
         ax_am.set_title(f"{name} A·M")
         
-        ax_d = axes[idx, 2]
+        ax_d = axes[row, 2]
         ax_d.plot(np.diag(AM), alpha=0.8)
         ax_d.axhline(1.0, color='r', linestyle='--')
         ax_d.set_ylim(-0.5, 2.0)
         ax_d.set_title(f"{name} Diag(A·M)")
         
-        ax_t = axes[idx, 3]
+        ax_t = axes[row, 3]
         ax_t.axis('off')
         
         cond_AM = np.linalg.cond(AM)
@@ -445,6 +501,15 @@ def main():
             ax_t.text(0.1, 0.8 - i*0.15, line, fontsize=12, color='black' if i!=2 else color, fontfamily='monospace')
 
     plt.tight_layout()
+
+    out_path = args.output
+    if out_path is None:
+        out_path = script_dir / "inspect_model_plot.png"
+    else:
+        out_path = Path(out_path)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    print(f"\nPlot saved to: {out_path}")
+
     plt.show()
 
 if __name__ == "__main__":
