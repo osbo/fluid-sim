@@ -105,6 +105,7 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer nnzPerNode;   // Per-row nnz counts
     private ComputeBuffer csrRowPtr;    // Row pointer (size numNodes + 1)
     private ComputeBuffer csrColIndices;
+    private ComputeBuffer csrRowIndices; // Explicit row indices (edge_index[0])
     private ComputeBuffer csrValues;
     public TextAsset modelWeightsAsset; // Assign model_weights.bytes from Assets/Scripts/ in Inspector
     private Dictionary<string, ComputeBuffer> weightBuffers = new Dictionary<string, ComputeBuffer>();
@@ -708,6 +709,7 @@ public partial class FluidSimulator : MonoBehaviour
         nnzPerNode?.Release();
         csrRowPtr?.Release();
         csrColIndices?.Release();
+        csrRowIndices?.Release();
         csrValues?.Release();
         phiBuffer?.Release();
         phiBuffer_Read?.Release();

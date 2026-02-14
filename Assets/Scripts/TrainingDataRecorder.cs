@@ -43,8 +43,9 @@ public class TrainingDataRecorder : MonoBehaviour
         Debug.Log($"Started recording to: {currentRunFolder} (max {maxFrames} frames)");
     }
 
-    public void SaveFrame(ComputeBuffer nodes, ComputeBuffer neighbors, ComputeBuffer divergence, ComputeBuffer pressure, int numNodes,
-        int minLayer, int maxLayer, float gravity, int numParticles, int maxCgIterations, float convergenceThreshold, float frameRate,
+    public void SaveFrame(ComputeBuffer nodes, ComputeBuffer neighbors, ComputeBuffer divergence, ComputeBuffer pressure,
+        ComputeBuffer rowIndices, ComputeBuffer colIndices, ComputeBuffer csrValues, int totalNNZ,
+        int numNodes, int minLayer, int maxLayer, float gravity, int numParticles, int maxCgIterations, float convergenceThreshold, float frameRate,
         Vector3 simulationBoundsMin, Vector3 simulationBoundsMax, Vector3 fluidInitialBoundsMin, Vector3 fluidInitialBoundsMax)
     {
         if (!isRecording || !record) return;
@@ -85,6 +86,14 @@ public class TrainingDataRecorder : MonoBehaviour
         SaveBuffer(divergence, numNodes, sizeof(float), Path.Combine(framePath, "divergence.bin"));
         // Pressure buffer: 1 float per node = 4 bytes
         SaveBuffer(pressure, numNodes, sizeof(float), Path.Combine(framePath, "pressure.bin"));
+
+        // Save the Sparse Graph (Edge Index)
+        // We save exactly totalNNZ elements. Stride is sizeof(uint) = 4.
+        SaveBuffer(rowIndices, totalNNZ, sizeof(uint), Path.Combine(framePath, "edge_index_rows.bin"));
+        SaveBuffer(colIndices, totalNNZ, sizeof(uint), Path.Combine(framePath, "edge_index_cols.bin"));
+
+        // Save the exact physics weights "A" (matrix values)
+        SaveBuffer(csrValues, totalNNZ, sizeof(float), Path.Combine(framePath, "A_values.bin"));
 
         Debug.Log($"Saved frame {frameIndex}");
         frameIndex++;

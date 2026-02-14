@@ -195,6 +195,11 @@ public partial class FluidSimulator : MonoBehaviour
             csrColIndices?.Release();
             csrColIndices = new ComputeBuffer(totalNNZ, sizeof(uint));
         }
+        if (csrRowIndices == null || csrRowIndices.count < totalNNZ)
+        {
+            csrRowIndices?.Release();
+            csrRowIndices = new ComputeBuffer(totalNNZ, sizeof(uint));
+        }
         if (csrValues == null || csrValues.count < totalNNZ)
         {
             csrValues?.Release();
@@ -206,6 +211,7 @@ public partial class FluidSimulator : MonoBehaviour
         csrBuilderShader.SetBuffer(fillCsrKernel, "matrixABuffer", matrixABuffer);
         csrBuilderShader.SetBuffer(fillCsrKernel, "rowPtrBuffer", csrRowPtr);
         csrBuilderShader.SetBuffer(fillCsrKernel, "colIndicesBuffer", csrColIndices);
+        csrBuilderShader.SetBuffer(fillCsrKernel, "rowIndicesBuffer", csrRowIndices);
         csrBuilderShader.SetBuffer(fillCsrKernel, "valuesBuffer", csrValues);
         csrBuilderShader.SetInt("numNodes", numNodes);
         csrBuilderShader.Dispatch(fillCsrKernel, csrGroups, 1, 1);
@@ -335,6 +341,10 @@ public partial class FluidSimulator : MonoBehaviour
                 neighborsBuffer,
                 divergenceBuffer,
                 pressureBuffer,
+                csrRowIndices,
+                csrColIndices,
+                csrValues,
+                totalNNZ,
                 numNodes,
                 minLayer,
                 maxLayer,
