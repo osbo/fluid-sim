@@ -249,7 +249,7 @@ class DirectHODLRBlocks(nn.Module):
         return self.leaf_blocks, factors
 
 
-def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_rank, device, leaf_size=32, steps=1000):
+def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_rank, device, leaf_size=32, steps=100):
     """Overfit with dense leaf blocks (same structure as Neural); M will show dense chunks on the diagonal."""
     print(f"\n--- Training Overfit HODLR Baseline (block diagonal, {steps} steps) ---")
     model = DirectHODLRBlocks(num_nodes, depth, max_rank, device, leaf_size=leaf_size).to(device)
@@ -548,7 +548,7 @@ def main():
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     print(f"\nPlot saved to: {out_path}")
 
-    plt.show()
+    # plt.show()
 
 if __name__ == "__main__":
     main()
