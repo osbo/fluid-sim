@@ -25,6 +25,13 @@ from NeuralPreconditioner import NeuralHODLR, apply_hodlr_matrix, FluidGraphData
 
 # --- 1. Weight Loading ---
 
+def read_weights_header(path):
+    """Read the 28-byte header only. Returns (d_model, nhead, max_depth, input_dim, max_rank)."""
+    with open(path, 'rb') as f:
+        header = f.read(28)
+    _, _, d_model, nhead, max_depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
+    return d_model, nhead, max_depth, input_dim, max_rank
+
 def load_weights_from_bytes(model, path):
     """Load NeuralHODLR weights from .bytes format (Dynamic Depth + Block Leaves)."""
     print(f"Loading weights from {path}...")
@@ -183,10 +190,24 @@ class DirectHODLR(nn.Module):
         return self.diag, factors
 
 
+def _hodlr_rank_schedule_n23(depth, leaf_size, num_nodes, max_rank, min_rank=4, scale=0.5):
+    """Rank per level using N^(2/3) scaling: r(level) = scale * block_size^(2/3), clamped to [min_rank, max_rank].
+    Levels are ordered Coarse (index 0) -> Fine, matching apply_hodlr_matrix (level_idx 0 = coarsest)."""
+    ranks = []
+    for level_idx in range(depth):
+        # Same block_size formula as NeuralPreconditioner.apply_hodlr_matrix
+        block_size = leaf_size * (2 ** (depth - 1 - level_idx))
+        r = max(min_rank, min(max_rank, int(round(scale * (block_size ** (2 / 3))))))
+        if r % 2 != 0:
+            r = min(max_rank, r + 1)  # keep even for stability
+        ranks.append(r)
+    return ranks
+
+
 class DirectHODLRBlocks(nn.Module):
     """Overfit baseline with dense 32x32 leaf blocks (like Neural), so M has dense chunks on the diagonal.
-    Uses a learnable scale for the low-rank (HODLR) part so it can balance with the dense leaf scale."""
-    def __init__(self, num_nodes, depth, max_rank, device, leaf_size=32):
+    Uses N^(2/3) rank scaling per level and a learnable scale for the low-rank part."""
+    def __init__(self, num_nodes, depth, max_rank, device, leaf_size=32, rank_scale=2.0):
         super().__init__()
         assert num_nodes % leaf_size == 0, "num_nodes must be divisible by leaf_size"
         self.depth = depth
@@ -197,12 +218,10 @@ class DirectHODLRBlocks(nn.Module):
         eye = torch.eye(leaf_size, device=device).unsqueeze(0).unsqueeze(0).expand(1, num_blocks, -1, -1).clone()
         self.leaf_blocks = nn.Parameter(eye + 0.01 * torch.randn(1, num_blocks, leaf_size, leaf_size, device=device))
 
-        # Low-rank factors: init larger so off-diagonal is on a comparable scale to the dense blocks (avoids black background in viz)
-        rank_schedule = []
-        for i in range(depth):
-            r = min(max_rank, 4 * (2 ** i))
-            rank_schedule.append(r)
-        self.ranks_coarse_to_fine = rank_schedule[::-1]
+        # N^(2/3) rank schedule: Coarse -> Fine (index 0 = coarsest, matches apply_hodlr_matrix)
+        self.ranks_coarse_to_fine = _hodlr_rank_schedule_n23(depth, leaf_size, num_nodes, max_rank, scale=rank_scale)
+        if depth > 0:
+            print(f"  Rank Schedule (N^2/3, Coarse->Fine): {self.ranks_coarse_to_fine}")
 
         self.u_factors = nn.ParameterList()
         for r in self.ranks_coarse_to_fine:
@@ -354,12 +373,11 @@ def main():
     parser.add_argument('--data_folder', type=str, default=str(default_data))
     parser.add_argument('--weights', type=str, default=str(default_model))
     parser.add_argument('--d_model', type=int, default=64)
-    # Note: --rank is MAX_RANK. Depth is max_depth (capacity).
-    parser.add_argument('--rank', type=int, default=32) 
+    parser.add_argument('--rank', type=int, default=128)
     parser.add_argument('--max_depth', type=int, default=10)
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Path to save plot image (default: script_dir/inspect_model_plot.png)')
-    parser.add_argument('--viz_limit', type=int, default=200,
+    parser.add_argument('--viz_limit', type=int, default=4000,
                         help="Max size for dense M reconstruction and viz (reduces AMG work). Use 0 for full N.")
     args = parser.parse_args()
 
@@ -388,7 +406,9 @@ def main():
     print("\n1. Running Neural HODLR...")
     
     # Initialize Model with Capacity
-    model = NeuralHODLR(d_model=args.d_model, max_rank=args.rank, max_depth=args.max_depth, leaf_size=32).to(device)
+    # Build model from weights file header so parameter shapes match (avoids Unexpected EOF)
+    d_model, nhead, max_depth_file, _, max_rank_file = read_weights_header(Path(args.weights))
+    model = NeuralHODLR(d_model=d_model, max_rank=max_rank_file, max_depth=max_depth_file, leaf_size=32).to(device)
     load_weights_from_bytes(model, Path(args.weights))
     
     with torch.no_grad():
