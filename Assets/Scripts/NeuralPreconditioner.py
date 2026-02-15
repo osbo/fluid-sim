@@ -143,17 +143,18 @@ class HODLRLevelHead(nn.Module):
         return u, u 
 
 class BlockDiagonalHead(nn.Module):
+    """Predict 32x32 leaf blocks from per-node features (no pooling) so blocks can vary within the block."""
     def __init__(self, d_model, leaf_size=32):
         super().__init__()
         self.leaf_size = leaf_size
         self.out_dim = leaf_size * leaf_size
-        
+        in_dim = leaf_size * d_model
+        hidden = 1024
         self.net = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
+            nn.Linear(in_dim, hidden),
             nn.GELU(),
-            nn.Linear(d_model * 2, self.out_dim)
+            nn.Linear(hidden, self.out_dim)
         )
-        
         with torch.no_grad():
             self.net[-1].weight.data *= 0.01
             self.net[-1].bias.data.fill_(0)
@@ -162,11 +163,10 @@ class BlockDiagonalHead(nn.Module):
 
     def forward(self, x):
         B, N, D = x.shape
-        # NOTE: x is already padded by the main model to be divisible by leaf_size
         num_blocks = N // self.leaf_size
         x_blocked = x.view(B, num_blocks, self.leaf_size, D)
-        x_pooled = x_blocked.mean(dim=2) 
-        L_flat = self.net(x_pooled) 
+        x_flat = x_blocked.reshape(B, num_blocks, -1)
+        L_flat = self.net(x_flat)
         L = L_flat.view(B, num_blocks, self.leaf_size, self.leaf_size)
         return L 
 
@@ -252,14 +252,14 @@ class NeuralHODLR(nn.Module):
 
         h = self.bottleneck(h)
 
-        # Up (active_depth -> 0); factors output Coarse -> Fine for apply_hodlr_matrix
+        # Up (active_depth -> 0); factors output Coarse -> Fine for apply_hodlr_matrix.
+        # Predict factors *after* upsampling so each level sees full-resolution features for its block (avoids "one value per half-matrix").
         hodlr_factors = []
         for i in range(active_depth - 1, -1, -1):
-            u, v = self.hodlr_heads[i](h)
-            hodlr_factors.append((u, v))
-
             skip = skip_stack.pop()
             h = self.up_samplers[i](h, skip)
+            u, v = self.hodlr_heads[i](h)
+            hodlr_factors.append((u, v))
 
         h_final = self.norm_out(h)
 
@@ -320,8 +320,15 @@ def apply_hodlr_matrix(leaf_blocks, factors, x, leaf_size=32):
         if valid_len == 0: continue
 
         if u_coarse.shape[1] != N:
-            u_full = F.interpolate(u_coarse.transpose(1,2), size=N, mode='linear', align_corners=False).transpose(1,2)
-            v_full = F.interpolate(v_coarse.transpose(1,2), size=N, mode='linear', align_corners=False).transpose(1,2)
+            # Block-aligned upscaling: preserve sharp HODLR block boundaries (no linear blur).
+            L = u_coarse.shape[1]
+            if L > 0 and N % L == 0:
+                repeat_count = N // L
+                u_full = u_coarse.repeat_interleave(repeat_count, dim=1)
+                v_full = v_coarse.repeat_interleave(repeat_count, dim=1)
+            else:
+                u_full = F.interpolate(u_coarse.transpose(1, 2), size=N, mode='nearest').transpose(1, 2)
+                v_full = F.interpolate(v_coarse.transpose(1, 2), size=N, mode='nearest').transpose(1, 2)
         else:
             u_full, v_full = u_coarse, v_coarse
         
@@ -349,55 +356,40 @@ def apply_hodlr_matrix(leaf_blocks, factors, x, leaf_size=32):
     return y
 
 class HODLRLoss(nn.Module):
-    def __init__(self):
+    """Same as overfit: MSE(M*A*z, z) with batch of random z. No diagonal probe term."""
+    def __init__(self, batch_size=32):
         super().__init__()
+        self.batch_size = batch_size
 
     def forward(self, leaf_blocks, factors, padded_size, A_sparse_pack, num_nodes_real):
         A_indices, A_values = A_sparse_pack
-        B = 1
-        
-        # 1. Generate Z in PADDED space
-        z_pad = torch.randn(B, padded_size, 1, device=leaf_blocks.device)
-        
-        # 2. Apply M (Preconditioner) in PADDED space
-        w_pad = apply_hodlr_matrix(leaf_blocks, factors, z_pad, leaf_size=32)
-        
-        # 3. Apply A (System Matrix)
-        # We need to construct A_pad. 
-        # A_pad = [ A_real  0 ]
-        #         [ 0       I ]
-        # The pad region is Identity so dummy nodes behave well (M*z = z).
-        
+        B = self.batch_size
         target_device = leaf_blocks.device
         mm_device = torch.device('cpu') if target_device.type == 'mps' else target_device
-        
-        # Move to CPU for sparse construction if needed
+
         A_ind = A_indices.to(mm_device)
         A_val = A_values.to(mm_device)
-        
-        # Add diagonal identity for padded nodes
         pad_amt = padded_size - num_nodes_real
         if pad_amt > 0:
             pad_range = torch.arange(num_nodes_real, padded_size, device=mm_device)
-            pad_rows = pad_range
-            pad_cols = pad_range
-            pad_vals = torch.ones_like(pad_range, dtype=torch.float32)
-            
-            # Concatenate
-            A_ind = torch.cat([A_ind, torch.stack([pad_rows, pad_cols])], dim=1)
-            A_val = torch.cat([A_val, pad_vals])
-            
+            A_ind = torch.cat([A_ind, torch.stack([pad_range, pad_range])], dim=1)
+            A_val = torch.cat([A_val, torch.ones_like(pad_range, dtype=torch.float32)])
         A_sparse = torch.sparse_coo_tensor(A_ind, A_val, (padded_size, padded_size), device=mm_device)
-        
-        w_flat = w_pad.squeeze().unsqueeze(1).to(mm_device)
-        y_flat = torch.sparse.mm(A_sparse, w_flat)
-        y_pad = y_flat.view(B, padded_size, 1).to(target_device)
-        
-        # 4. Loss
-        # We can calculate loss over the whole padded vector.
-        # Since dummy nodes do M=I, A=I, z=z -> loss=0, they don't corrupt the gradient.
-        loss = F.mse_loss(y_pad, z_pad)
-        return loss
+
+        z_pad = torch.randn(B, padded_size, 1, device=target_device)
+        if target_device.type == 'mps':
+            z_flat = z_pad.squeeze(-1).t().cpu()
+            Az_flat = torch.sparse.mm(A_sparse, z_flat)
+            Az_pad = Az_flat.t().unsqueeze(-1).to(target_device)
+        else:
+            z_flat = z_pad.squeeze(-1).t()
+            Az_flat = torch.sparse.mm(A_sparse, z_flat)
+            Az_pad = Az_flat.t().unsqueeze(-1)
+
+        leaf_exp = leaf_blocks.expand(B, -1, -1, -1)
+        factors_exp = [(u.expand(B, -1, -1), v.expand(B, -1, -1)) for u, v in factors]
+        res = apply_hodlr_matrix(leaf_exp, factors_exp, Az_pad, leaf_size=32)
+        return F.mse_loss(res, z_pad)
 
 # --- 6. Dataset (Simplified) ---
 class FluidGraphDataset(Dataset):
