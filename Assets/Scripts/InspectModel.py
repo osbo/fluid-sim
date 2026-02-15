@@ -1,3 +1,11 @@
+import sys
+from pathlib import Path
+
+# Ensure script directory is on path so NeuralPreconditioner imports when run from any cwd
+_script_dir = Path(__file__).resolve().parent
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +14,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import struct
 import argparse
-from pathlib import Path
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.linalg import splu
 import time
@@ -20,7 +27,7 @@ except ImportError:
     HAS_AMG = False
     print("Warning: 'pyamg' not installed. AMG baseline will be skipped.")
 
-# Import components from your updated NeuralPreconditioner
+# Import components from NeuralPreconditioner (same directory)
 from NeuralPreconditioner import NeuralHODLR, apply_hodlr_matrix, FluidGraphDataset, HODLRLoss
 
 # --- 1. Weight Loading ---
@@ -242,7 +249,7 @@ class DirectHODLRBlocks(nn.Module):
         return self.leaf_blocks, factors
 
 
-def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_rank, device, leaf_size=32, steps=4000):
+def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_rank, device, leaf_size=32, steps=1000):
     """Overfit with dense leaf blocks (same structure as Neural); M will show dense chunks on the diagonal."""
     print(f"\n--- Training Overfit HODLR Baseline (block diagonal, {steps} steps) ---")
     model = DirectHODLRBlocks(num_nodes, depth, max_rank, device, leaf_size=leaf_size).to(device)
@@ -377,7 +384,7 @@ def main():
     parser.add_argument('--max_depth', type=int, default=10)
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Path to save plot image (default: script_dir/inspect_model_plot.png)')
-    parser.add_argument('--viz_limit', type=int, default=4000,
+    parser.add_argument('--viz_limit', type=int, default=500,
                         help="Max size for dense M reconstruction and viz (reduces AMG work). Use 0 for full N.")
     args = parser.parse_args()
 
@@ -414,8 +421,12 @@ def main():
     with torch.no_grad():
         # Forward returns PADDED results and the size used
         leaf_blocks_neural, factors_neural, padded_size = model(x)
-        
-    print(f"  Neural Inference used Padded Size: {padded_size} (Active Depth: {int(math.log2(padded_size/32))})")
+
+    active_depth_neural = int(round(math.log2(padded_size / 32)))
+    # Effective schedule = first active_depth entries of Coarse->Fine (same as overfit for this N)
+    active_schedule = list(reversed(model.rank_schedule[:active_depth_neural]))
+    print(f"  Neural Inference used Padded Size: {padded_size} (Active Depth: {active_depth_neural})")
+    print(f"  Active rank schedule (Coarse->Fine, matches overfit for this N): {active_schedule}")
     
     viz_n = (args.viz_limit if args.viz_limit > 0 else n)
     viz_n = min(viz_n, n)

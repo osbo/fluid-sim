@@ -209,7 +209,7 @@ def main():
     ax2.set_xlabel("Singular value index (rank)")
     ax2.set_ylabel("Singular value (normalized to max per layer)")
     ax2.set_title("Rank decay by layer")
-    ax2.set_xlim(0, 100)
+    ax2.set_xlim(0, 256)
     ax2.set_ylim(0, 1)
     ax2.legend(ncol=2, fontsize=8)
     ax2.grid(True, alpha=0.3)
