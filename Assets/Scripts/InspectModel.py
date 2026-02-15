@@ -60,7 +60,11 @@ def load_weights_from_bytes(model, path):
             
             buffer = f.read(bytes_to_read)
             if len(buffer) != bytes_to_read:
-                raise ValueError(f"Unexpected EOF: wanted {bytes_to_read} bytes, got {len(buffer)}")
+                raise ValueError(
+                    f"Unexpected EOF: wanted {bytes_to_read} bytes, got {len(buffer)}. "
+                    "Weights file may be from a smaller model (e.g. d_model=64) or truncated. "
+                    "Try --d_model 64 to load a 64-d checkpoint, or re-train and save with the current architecture."
+                )
             
             packed = np.frombuffer(buffer, dtype=np.uint32)
             data_fp16 = packed.view(np.float16)
@@ -379,7 +383,8 @@ def main():
     
     parser.add_argument('--data_folder', type=str, default=str(default_data))
     parser.add_argument('--weights', type=str, default=str(default_model))
-    parser.add_argument('--d_model', type=int, default=64)
+    parser.add_argument('--d_model', type=int, default=None,
+                        help='Override d_model when loading (default: use value from weights file header). Use e.g. 64 to load old/smaller checkpoints.')
     parser.add_argument('--rank', type=int, default=128)
     parser.add_argument('--max_depth', type=int, default=10)
     parser.add_argument('--output', '-o', type=str, default=None,
@@ -412,9 +417,11 @@ def main():
     # --- MODEL 1: NEURAL HODLR ---
     print("\n1. Running Neural HODLR...")
     
-    # Initialize Model with Capacity
-    # Build model from weights file header so parameter shapes match (avoids Unexpected EOF)
-    d_model, nhead, max_depth_file, _, max_rank_file = read_weights_header(Path(args.weights))
+    # Build model: use header from file unless --d_model override (for loading old/smaller checkpoints)
+    d_model_h, nhead, max_depth_file, _, max_rank_file = read_weights_header(Path(args.weights))
+    d_model = args.d_model if args.d_model is not None else d_model_h
+    if args.d_model is not None:
+        print(f"  Using d_model={d_model} (override; header had {d_model_h})")
     model = NeuralHODLR(d_model=d_model, max_rank=max_rank_file, max_depth=max_depth_file, leaf_size=32).to(device)
     load_weights_from_bytes(model, Path(args.weights))
     
