@@ -12,7 +12,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-import struct
 import argparse
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.linalg import splu
@@ -27,97 +26,18 @@ except ImportError:
     HAS_AMG = False
     print("Warning: 'pyamg' not installed. AMG baseline will be skipped.")
 
-# Import components from NeuralPreconditioner (same directory)
-from NeuralPreconditioner import NeuralHODLR, apply_hodlr_matrix, FluidGraphDataset, HODLRLoss
+# Import model, apply, data, and weight loading from NeuralPreconditioner
+from NeuralPreconditioner import (
+    HGT_OL,
+    apply_neural_hodlr,
+    apply_hodlr_matrix,
+    FluidGraphDataset,
+    _pad_to_hodlr_size,
+    read_weights_header,
+    load_hgt_ol_weights_from_bytes,
+)
 
-# --- 1. Weight Loading ---
-
-def read_weights_header(path):
-    """Read the 28-byte header only. Returns (d_model, nhead, max_depth, input_dim, max_rank)."""
-    with open(path, 'rb') as f:
-        header = f.read(28)
-    _, _, d_model, nhead, max_depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
-    return d_model, nhead, max_depth, input_dim, max_rank
-
-def load_weights_from_bytes(model, path):
-    """Load NeuralHODLR weights from .bytes format (Dynamic Depth + Block Leaves)."""
-    print(f"Loading weights from {path}...")
-    with open(path, 'rb') as f:
-        # Header: 2 floats + 5 ints = 28 bytes
-        # Format: <ffiiiii 
-        # (0, 0, d_model, nhead, max_depth, input_dim, max_rank)
-        header = f.read(28)
-        _, _, d_model, nhead, max_depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
-        
-        print(f"  Header Info -> Capacity (Depth): {max_depth}, Max Rank: {max_rank}, d_model: {d_model}")
-
-        # Helper to read tensors
-        def read_packed_tensor(target_param, transpose_check=False):
-            num_elements = target_param.numel()
-            # Padding: Aligned to 4 bytes (float32) but stored as float16
-            read_len = num_elements + (1 if num_elements % 2 else 0)
-            bytes_to_read = read_len * 2 
-            
-            buffer = f.read(bytes_to_read)
-            if len(buffer) != bytes_to_read:
-                raise ValueError(
-                    f"Unexpected EOF: wanted {bytes_to_read} bytes, got {len(buffer)}. "
-                    "Weights file may be from a smaller model (e.g. d_model=64) or truncated. "
-                    "Try --d_model 64 to load a 64-d checkpoint, or re-train and save with the current architecture."
-                )
-            
-            packed = np.frombuffer(buffer, dtype=np.uint32)
-            data_fp16 = packed.view(np.float16)
-            
-            if num_elements % 2 != 0:
-                data_fp16 = data_fp16[:-1]
-                
-            data_fp32 = torch.from_numpy(data_fp16.astype(np.float32)).to(target_param.device)
-            
-            if transpose_check and len(target_param.shape) == 2:
-                reshaped = data_fp32.view(target_param.shape[1], target_param.shape[0]).t()
-            else:
-                reshaped = data_fp32.view(target_param.shape)
-                
-            with torch.no_grad():
-                target_param.copy_(reshaped)
-
-        pack = lambda p, trans: read_packed_tensor(p, trans)
-        
-        # 1. Feature Projector
-        pack(model.feature_proj.weight, True); pack(model.feature_proj.bias, False)
-        
-        # 2. Down Samplers
-        for d in model.down_samplers:
-            pack(d.local_mixer[0].weight, True); pack(d.local_mixer[0].bias, False)
-            pack(d.local_mixer[2].weight, True); pack(d.local_mixer[2].bias, False)
-            pack(d.norm.weight, False); pack(d.norm.bias, False)
-            
-        # 3. Bottleneck
-        bn = model.bottleneck
-        pack(bn.q_proj.weight, True); pack(bn.q_proj.bias, False); pack(bn.k_proj.weight, True); pack(bn.k_proj.bias, False)
-        pack(bn.v_proj.weight, True); pack(bn.v_proj.bias, False); pack(bn.out_proj.weight, True); pack(bn.out_proj.bias, False)
-        pack(bn.norm.weight, False); pack(bn.norm.bias, False)
-        
-        # 4. Up Samplers & HODLR Heads
-        # Iterates 0 (Fine) -> MaxDepth (Coarse) matches export order
-        for up, hodlr_head in zip(model.up_samplers, model.hodlr_heads):
-            pack(up.up_proj.weight, True); pack(up.up_proj.bias, False)
-            pack(up.fusion[0].weight, True); pack(up.fusion[0].bias, False)
-            pack(up.fusion[2].weight, True); pack(up.fusion[2].bias, False)
-            pack(up.norm.weight, False); pack(up.norm.bias, False)
-            
-            pack(hodlr_head.proj_u.weight, True); pack(hodlr_head.proj_u.bias, False)
-            pack(hodlr_head.proj_u.weight, True); pack(hodlr_head.proj_u.bias, False) # U written twice
-            
-        # 5. Output Heads (Leaf Head)
-        pack(model.norm_out.weight, False); pack(model.norm_out.bias, False)
-        pack(model.leaf_head.net[0].weight, True); pack(model.leaf_head.net[0].bias, False)
-        pack(model.leaf_head.net[2].weight, True); pack(model.leaf_head.net[2].bias, False)
-        
-    print("Weights loaded successfully.")
-
-# --- 2. Overfit Baseline ---
+# --- 1. Overfit Baseline ---
 # Option A: Scalar diagonal (legacy). Option B: Dense 32x32 leaf blocks (like Neural).
 
 def apply_hodlr_matrix_diag(diag, factors, x):
@@ -297,34 +217,33 @@ def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_ran
 
 # --- 3. Dense Reconstruction ---
 
-def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_real, device, leaf_size=32, viz_limit=200):
+def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_real, device, leaf_size=32, viz_limit=200, use_neural_apply=False):
     """
-    Reconstructs dense M from Neural Output (full n x n).
-    The Neural Output operates on 'padded_size'; we probe in Padded Space, then crop to num_nodes_real.
+    Reconstructs dense M from HODLR output (full n x n).
+    Operates on padded_size; we probe in padded space, then crop to num_nodes_real.
+    use_neural_apply: True for HGT_OL output (token-space factors -> apply_neural_hodlr),
+                      False for overfit baseline (full-node factors -> apply_hodlr_matrix).
     """
     viz_limit = min(num_nodes_real, viz_limit)
     M = torch.zeros(viz_limit, viz_limit, device='cpu')
     batch_size = 32
+    apply_fn = apply_neural_hodlr if use_neural_apply else apply_hodlr_matrix
 
     with torch.no_grad():
         for i in range(0, viz_limit, batch_size):
             end = min(i + batch_size, viz_limit)
             current_batch = end - i
 
-            # 1. Create Identity Probes in Padded Space [Batch, PaddedSize, 1]
             x_pad = torch.zeros(current_batch, padded_size, 1, device=device)
             batch_indices = torch.arange(current_batch, device=device)
             row_indices = torch.arange(i, end, device=device)
             x_pad[batch_indices, row_indices, 0] = 1.0
 
-            # 2. Expand Params
             leaf_exp = leaf_blocks.expand(current_batch, -1, -1, -1)
             factors_exp = [(u.expand(current_batch, -1, -1), v.expand(current_batch, -1, -1)) for u, v in factors]
 
-            # 3. Apply Neural M
-            y_pad = apply_hodlr_matrix(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size)
+            y_pad = apply_fn(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size)
 
-            # 4. Crop to real size and store
             y_real = y_pad[:, :viz_limit, 0].cpu()
             M[:, i:end] = y_real.T
 
@@ -389,7 +308,7 @@ def main():
     parser.add_argument('--max_depth', type=int, default=10)
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Path to save plot image (default: script_dir/inspect_model_plot.png)')
-    parser.add_argument('--viz_limit', type=int, default=500,
+    parser.add_argument('--viz_limit', type=int, default=300,
                         help="Max size for dense M reconstruction and viz (reduces AMG work). Use 0 for full N.")
     args = parser.parse_args()
 
@@ -399,10 +318,13 @@ def main():
     # 1. Load Data (Raw)
     print(f"Loading Data from {args.data_folder}")
     dataset = FluidGraphDataset([Path(args.data_folder)])
-    batch = dataset[600]
+    if len(dataset) == 0:
+        raise SystemExit("No frames found in data folder (need nodes.bin, edge_index_*.bin, A_values.bin).")
+    frame_idx = min(600, len(dataset) - 1)
+    batch = dataset[frame_idx]
     
     # Raw Data (Not Padded yet)
-    x = torch.from_numpy(batch['x']).unsqueeze(0).to(device)
+    x = batch['x'].unsqueeze(0).to(device)
     num_nodes_real = int(batch['num_nodes'])
     A_indices = batch['edge_index'].to(device)
     A_values = batch['edge_values'].to(device)
@@ -414,32 +336,42 @@ def main():
     n = num_nodes_real
     A_viz = A_sparse_cpu.to_dense().numpy()
 
-    # --- MODEL 1: NEURAL HODLR ---
-    print("\n1. Running Neural HODLR...")
-    
-    # Build model: use header from file unless --d_model override (for loading old/smaller checkpoints)
-    d_model_h, nhead, max_depth_file, _, max_rank_file = read_weights_header(Path(args.weights))
+    # --- MODEL 1: HGT_OL (Neural Preconditioner) ---
+    print("\n1. Loading and running HGT_OL (neural preconditioner)...")
+    leaf_size = 32
+    d_model_h, nhead, depth_file, input_dim_file, max_rank_file = read_weights_header(Path(args.weights))
     d_model = args.d_model if args.d_model is not None else d_model_h
     if args.d_model is not None:
         print(f"  Using d_model={d_model} (override; header had {d_model_h})")
-    model = NeuralHODLR(d_model=d_model, max_rank=max_rank_file, max_depth=max_depth_file, leaf_size=32).to(device)
-    load_weights_from_bytes(model, Path(args.weights))
-    
-    with torch.no_grad():
-        # Forward returns PADDED results and the size used
-        leaf_blocks_neural, factors_neural, padded_size = model(x)
+    depth = depth_file
+    # Use N_pad from the saved model (leaf_size * 2^depth) so sequence length matches training
+    N_pad = leaf_size * (2 ** depth)
+    padded_size = N_pad
+    if num_nodes_real > N_pad:
+        raise SystemExit(f"Data has num_nodes={num_nodes_real} but model (depth={depth}) expects N_pad={N_pad}. Use weights trained for this size.")
+    rank_scale = 2.0  # must match training; not stored in header
+    model = HGT_OL(
+        input_dim=input_dim_file,
+        d_model=d_model,
+        depth=depth,
+        leaf_size=leaf_size,
+        max_rank=max_rank_file,
+        rank_scale=rank_scale,
+    ).to(device)
+    load_hgt_ol_weights_from_bytes(model, Path(args.weights))
 
-    active_depth_neural = int(round(math.log2(padded_size / 32)))
-    # Effective schedule = first active_depth entries of Coarse->Fine (same as overfit for this N)
-    active_schedule = list(reversed(model.rank_schedule[:active_depth_neural]))
-    print(f"  Neural Inference used Padded Size: {padded_size} (Active Depth: {active_depth_neural})")
-    print(f"  Active rank schedule (Coarse->Fine, matches overfit for this N): {active_schedule}")
-    
+    # Pad node features to N_pad
+    x_padded = F.pad(x, (0, 0, 0, N_pad - num_nodes_real), value=0.0)
+    with torch.no_grad():
+        leaf_blocks_neural, factors_neural = model(x_padded)
+
+    print(f"  HGT_OL inference: padded_size={padded_size}, depth={depth}")
+
     viz_n = (args.viz_limit if args.viz_limit > 0 else n)
     viz_n = min(viz_n, n)
-    
+
     M_neural = get_dense_matrix_from_neural(
-        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=32, viz_limit=viz_n
+        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True
     )
 
     # --- MODEL 2: OVERFIT HODLR (Block Diagonal, same structure as Neural) ---
