@@ -173,27 +173,24 @@ class BlockDiagonalHead(nn.Module):
 # --- 4. Main Architecture (Dynamic Depth) ---
 
 class NeuralHODLR(nn.Module):
-    def __init__(self, input_dim=4, d_model=64, nhead=4, k=2, max_rank=32, max_depth=10, leaf_size=32):
+    def __init__(self, input_dim=4, d_model=64, nhead=4, k=2, max_rank=128, max_depth=10, leaf_size=32, rank_scale=2.0, min_rank=4):
         super().__init__()
         self.d_model = d_model
-        self.k = k 
-        self.max_depth = max_depth # Capacity
+        self.k = k
+        self.max_depth = max_depth  # Capacity
         self.leaf_size = leaf_size
         self.max_rank = max_rank
-        
-        # --- Rank Schedule (Bottom-Up) ---
-        # Level 0 is Finest (Leaves). Level max_depth-1 is Coarsest (Root).
-        # We define schedule based on distance from leaves to be scale invariant.
-        self.rank_schedule = []
-        for i in range(max_depth):
-            # i=0 (Level 0, finest). Rank should be small (e.g. 4)
-            # Rank doubles every level up to max_rank
-            r = min(max_rank, 4 * (2 ** i))
-            self.rank_schedule.append(r)
-            
+
+        # --- Rank Schedule: N^(2/3) scaling (same as overfit HODLR) ---
+        # Coarse -> Fine order for apply_hodlr_matrix; hodlr_heads use Fine -> Coarse (index 0 = finest).
+        ranks_coarse_to_fine = _hodlr_rank_schedule_n23(max_depth, leaf_size, max_rank, min_rank=min_rank, scale=rank_scale)
+        self.rank_schedule = _rank_schedule_fine_to_coarse(ranks_coarse_to_fine)
+
         print("\n=== HODLR Architecture (Dynamic Depth) ===")
         print(f"Capacity: {max_depth} levels, Max Rank: {max_rank}, Leaf: {leaf_size}")
         print(f"Rank Profile (Fine -> Coarse): {self.rank_schedule}")
+        print(f"N^2/3 schedule (Coarse -> Fine): {ranks_coarse_to_fine}")
+        print("  (At runtime only the first 'active_depth' levels are used for a given N; active_depth ≤ capacity)")
         print("==========================================\n")
 
         self.feature_proj = nn.Linear(input_dim, d_model)
@@ -233,54 +230,61 @@ class NeuralHODLR(nn.Module):
     def forward(self, x):
         # x: [B, N, D] (Raw input size)
         B, N, _ = x.shape
-        
+
         # 1. Determine Dynamic Depth
         active_depth, padded_size = self.get_hierarchical_params(N)
-        
+
         # 2. Pad Input
         pad_amt = padded_size - N
         if pad_amt > 0:
-            # Pad with 0.0 features. 
-            # Note: For diagonal (feature 3), 0.0 is technically wrong (should be 1.0 identity),
-            # but since these are dummy nodes, their output won't affect the real loss directly.
             x_pad = F.pad(x, (0, 0, 0, pad_amt))
         else:
             x_pad = x
-            
+
         # 3. U-Net Pass (Only use active levels)
         h = self.feature_proj(x_pad)
         skip_stack = []
-        
+
         # Down (0 -> active_depth)
         for i in range(active_depth):
             skip_stack.append(h)
             h = self.down_samplers[i](h)
-            
+
         h = self.bottleneck(h)
-        
-        # Up (active_depth -> 0)
-        hodlr_factors = [] # Stores (U, V) tuples. 
-        # We need to return them such that index 0 corresponds to Coarsest split (Root)
-        # and last index corresponds to Finest split (Level 0).
-        # OR match apply_hodlr_matrix expectation.
-        # apply_hodlr_matrix iterates factors. First factor = Root (Coarse).
-        # Our layers are indexed 0 (Fine) to Max (Coarse).
-        # So we should collect them, then reverse?
-        
-        # Let's iterate backwards from active_depth-1 down to 0
+
+        # Up (active_depth -> 0); factors output Coarse -> Fine for apply_hodlr_matrix
+        hodlr_factors = []
         for i in range(active_depth - 1, -1, -1):
             u, v = self.hodlr_heads[i](h)
-            hodlr_factors.append((u, v)) # Append Coarse -> Fine order
-            
+            hodlr_factors.append((u, v))
+
             skip = skip_stack.pop()
             h = self.up_samplers[i](h, skip)
-            
+
         h_final = self.norm_out(h)
-        
+
         # 4. Leaf Prediction
         leaf_blocks = self.leaf_head(h_final)
-        
+
         return leaf_blocks, hodlr_factors, padded_size
+
+
+def _hodlr_rank_schedule_n23(depth, leaf_size, max_rank, min_rank=4, scale=0.5):
+    """Rank per level using N^(2/3) scaling: r(level) = scale * block_size^(2/3), clamped to [min_rank, max_rank].
+    Returns list in Coarse -> Fine order (index 0 = coarsest), matching apply_hodlr_matrix."""
+    ranks = []
+    for level_idx in range(depth):
+        block_size = leaf_size * (2 ** (depth - 1 - level_idx))
+        r = max(min_rank, min(max_rank, int(round(scale * (block_size ** (2 / 3))))))
+        if r % 2 != 0:
+            r = min(max_rank, r + 1)
+        ranks.append(r)
+    return ranks
+
+
+def _rank_schedule_fine_to_coarse(ranks_coarse_to_fine):
+    """Convert Coarse->Fine list to Fine->Coarse (index 0 = finest) for hodlr_heads[i]."""
+    return list(reversed(ranks_coarse_to_fine))
 
 # --- 5. HODLR Operations ---
 
@@ -464,10 +468,12 @@ def train(args):
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
     
     model = NeuralHODLR(
-        d_model=args.d_model, 
-        max_rank=args.rank, 
-        max_depth=10, # Capacity
-        leaf_size=32 
+        d_model=args.d_model,
+        max_rank=args.rank,
+        max_depth=10,  # Capacity
+        leaf_size=32,
+        rank_scale=args.rank_scale,
+        min_rank=args.min_rank,
     ).to(device)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -545,6 +551,8 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--d_model', type=int, default=64)
-    parser.add_argument('--rank', type=int, default=32) 
+    parser.add_argument('--rank', type=int, default=128, help='Max rank for N^2/3 schedule (match overfit).')
+    parser.add_argument('--rank_scale', type=float, default=2.0, help='N^2/3 rank scale (match overfit).')
+    parser.add_argument('--min_rank', type=int, default=4, help='Min rank per level.') 
     args = parser.parse_args()
     train(args)
