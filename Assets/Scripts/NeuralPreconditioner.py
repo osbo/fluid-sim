@@ -187,7 +187,7 @@ class NeuralHODLR(nn.Module):
         self.rank_schedule = _rank_schedule_fine_to_coarse(ranks_coarse_to_fine)
 
         print("\n=== HODLR Architecture (Dynamic Depth) ===")
-        print(f"Capacity: {max_depth} levels, Max Rank: {max_rank}, Leaf: {leaf_size}")
+        print(f"d_model: {d_model}, Capacity: {max_depth} levels, Max Rank: {max_rank}, Leaf: {leaf_size}")
         print(f"Rank Profile (Fine -> Coarse): {self.rank_schedule}")
         print(f"N^2/3 schedule (Coarse -> Fine): {ranks_coarse_to_fine}")
         print("  (At runtime only the first 'active_depth' levels are used for a given N; active_depth ≤ capacity)")
@@ -393,7 +393,7 @@ class HODLRLoss(nn.Module):
 
 # --- 6. Dataset (Simplified) ---
 class FluidGraphDataset(Dataset):
-    def __init__(self, root_dirs):
+    def __init__(self, root_dirs, frame_indices=None):
         self.frame_paths = []
         for d in root_dirs:
             d = Path(d)
@@ -401,7 +401,12 @@ class FluidGraphDataset(Dataset):
                 frames = sorted([f for f in d.rglob('nodes.bin')])
                 self.frame_paths.extend([f.parent for f in frames])
 
-        print(f"Dataset: Found {len(self.frame_paths)} frames.")
+        if frame_indices is not None:
+            n = len(self.frame_paths)
+            self.frame_paths = [self.frame_paths[i] for i in frame_indices if 0 <= i < n]
+            print(f"Dataset: Using {len(self.frame_paths)} frame(s) (indices {frame_indices}).")
+        else:
+            print(f"Dataset: Found {len(self.frame_paths)} frames.")
         self.node_dtype = np.dtype([
             ('position', '3<f4'), ('velocity', '3<f4'), ('face_vels', '6<f4'),
             ('mass', '<f4'), ('layer', '<u4'), ('morton', '<u4'), ('active', '<u4')
@@ -455,9 +460,10 @@ def train(args):
     data_path = Path(args.data_folder)
     if not data_path.is_absolute():
         data_path = Path(__file__).parent.parent / "StreamingAssets" / "TestData"
-        
-    dataset = FluidGraphDataset([data_path])
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
+
+    frame_indices = [args.frame] if getattr(args, 'frame', None) is not None else None
+    dataset = FluidGraphDataset([data_path], frame_indices=frame_indices)
+    loader = DataLoader(dataset, batch_size=1, shuffle=(frame_indices is None))
     
     model = NeuralHODLR(
         d_model=args.d_model,
@@ -471,7 +477,7 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = HODLRLoss()
     
-    print("Starting HODLR Training (Dynamic Depth + Dense Leaves)...")
+    print(f"Starting HODLR Training (d_model={args.d_model}, Dynamic Depth + Dense Leaves)...")
     
     for epoch in range(args.epochs):
         model.train()
@@ -540,11 +546,12 @@ def export_weights(model, path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_folder', type=str, default="")
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--d_model', type=int, default=64)
     parser.add_argument('--rank', type=int, default=128, help='Max rank for N^2/3 schedule (match overfit).')
     parser.add_argument('--rank_scale', type=float, default=2.0, help='N^2/3 rank scale (match overfit).')
-    parser.add_argument('--min_rank', type=int, default=4, help='Min rank per level.') 
+    parser.add_argument('--min_rank', type=int, default=4, help='Min rank per level.')
+    parser.add_argument('--frame', type=int, default=600, help='Train on single frame index only (e.g. 600).')
     args = parser.parse_args()
     train(args)
