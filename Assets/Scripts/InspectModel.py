@@ -13,8 +13,7 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
-from scipy.sparse import coo_matrix, csr_matrix
-from scipy.sparse.linalg import splu
+from scipy.sparse import csr_matrix
 import time
 import math
 
@@ -37,89 +36,7 @@ from NeuralPreconditioner import (
     load_hgt_ol_weights_from_bytes,
 )
 
-# --- 1. Overfit Baseline ---
-# Option A: Scalar diagonal (legacy). Option B: Dense 32x32 leaf blocks (like Neural).
-
-def apply_hodlr_matrix_diag(diag, factors, x):
-    """Legacy scalar apply for Overfit Baseline."""
-    B, N, _ = x.shape
-    y = diag * x
-    for level_idx, (u_coarse, v_coarse) in enumerate(factors):
-        num_splits = 2 ** (level_idx + 1)
-        block_size = N // num_splits
-        if block_size == 0: continue
-        
-        if u_coarse.shape[1] != N:
-            u_full = F.interpolate(u_coarse.transpose(1, 2), size=N, mode='linear', align_corners=False).transpose(1, 2)
-            v_full = F.interpolate(v_coarse.transpose(1, 2), size=N, mode='linear', align_corners=False).transpose(1, 2)
-        else:
-            u_full, v_full = u_coarse, v_coarse
-            
-        num_pairs = num_splits // 2
-        valid_len = num_pairs * 2 * block_size
-        
-        x_view = x[:, :valid_len].view(B, num_pairs, 2, block_size, 1)
-        u_view = u_full[:, :valid_len].view(B, num_pairs, 2, block_size, -1)
-        v_view = v_full[:, :valid_len].view(B, num_pairs, 2, block_size, -1)
-        
-        x_L, x_R = x_view[:, :, 0], x_view[:, :, 1]
-        u_L, u_R = u_view[:, :, 0], u_view[:, :, 1]
-        v_L, v_R = v_view[:, :, 0], v_view[:, :, 1]
-        
-        x_R_proj = torch.matmul(v_R.transpose(-2, -1), x_R)
-        x_L_proj = torch.matmul(v_L.transpose(-2, -1), x_L)
-        
-        y_L_update = torch.matmul(u_L, x_R_proj)
-        y_R_update = torch.matmul(u_R, x_L_proj)
-        
-        updates = torch.stack([y_L_update, y_R_update], dim=2).view(B, valid_len, 1)
-        if valid_len < N:
-            y = y + F.pad(updates, (0, 0, 0, N - valid_len))
-        else:
-            y = y + updates
-    return y
-
-
-class DirectHODLR(nn.Module):
-    """Overfit Baseline (Scalar Diagonal + HODLR)."""
-    def __init__(self, num_nodes, depth, max_rank, device):
-        super().__init__()
-        self.depth = depth
-        # Learnable Scalar Diagonal
-        self.diag = nn.Parameter(torch.ones(1, num_nodes, 1, device=device))
-        
-        self.u_factors = nn.ParameterList()
-        
-        # Rank Schedule: Match the Bottom-Up approach
-        # Fine -> Coarse
-        rank_schedule = []
-        for i in range(depth):
-            # i=0 (Level 0, finest).
-            r = min(max_rank, 4 * (2 ** i))
-            rank_schedule.append(r)
-        
-        # We need factors to be Coarse -> Fine for the apply function
-        # But our schedule is Fine -> Coarse. 
-        # The apply function (legacy) expects Coarse First.
-        # So we reverse the schedule list for creation.
-        # Wait, the neural model stores them Fine->Coarse in list, but applies them... how?
-        # New apply_hodlr_matrix iterates factors. First factor = Root (Coarse).
-        # We should stick to Coarse->Fine for storage here to match simple logic.
-        
-        self.ranks_coarse_to_fine = rank_schedule[::-1] # Reverse
-
-        for r in self.ranks_coarse_to_fine:
-            u = nn.Parameter(torch.randn(1, num_nodes, r, device=device) * 0.001)
-            self.u_factors.append(u)
-
-    def forward(self, x):
-        factors = [(u, u) for u in self.u_factors]
-        return apply_hodlr_matrix_diag(self.diag, factors, x)
-    
-    def get_params(self):
-        factors = [(u, u) for u in self.u_factors]
-        return self.diag, factors
-
+# --- 1. Overfit Baseline (Dense 32x32 leaf blocks, like Neural) ---
 
 def _hodlr_rank_schedule_n23(depth, leaf_size, num_nodes, max_rank, min_rank=4, scale=0.5):
     """Rank per level using N^(2/3) scaling: r(level) = scale * block_size^(2/3), clamped to [min_rank, max_rank].
@@ -217,12 +134,13 @@ def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_ran
 
 # --- 3. Dense Reconstruction ---
 
-def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_real, device, leaf_size=32, viz_limit=200, use_neural_apply=False):
+def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_real, device, leaf_size=32, viz_limit=200, use_neural_apply=False, off_diag_scale=None):
     """
     Reconstructs dense M from HODLR output (full n x n).
     Operates on padded_size; we probe in padded space, then crop to num_nodes_real.
     use_neural_apply: True for HGT_OL output (token-space factors -> apply_neural_hodlr),
                       False for overfit baseline (full-node factors -> apply_hodlr_matrix).
+    off_diag_scale: when use_neural_apply, pass model.hodlr_scale for correct scaling.
     """
     viz_limit = min(num_nodes_real, viz_limit)
     M = torch.zeros(viz_limit, viz_limit, device='cpu')
@@ -240,35 +158,19 @@ def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_re
             x_pad[batch_indices, row_indices, 0] = 1.0
 
             leaf_exp = leaf_blocks.expand(current_batch, -1, -1, -1)
-            factors_exp = [(u.expand(current_batch, -1, -1), v.expand(current_batch, -1, -1)) for u, v in factors]
+            if use_neural_apply:
+                factors_exp = [u.expand(current_batch, -1, -1) for u in factors]
+            else:
+                factors_exp = [(u.expand(current_batch, -1, -1), v.expand(current_batch, -1, -1)) for u, v in factors]
 
-            y_pad = apply_fn(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size)
+            if use_neural_apply:
+                y_pad = apply_fn(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size, off_diag_scale=off_diag_scale)
+            else:
+                y_pad = apply_fn(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size)
 
             y_real = y_pad[:, :viz_limit, 0].cpu()
             M[:, i:end] = y_real.T
 
-    return M.numpy()
-
-def get_dense_matrix_overfit(diag, factors, num_nodes, device, viz_limit=200):
-    limit = min(num_nodes, viz_limit)
-    M = torch.zeros(limit, limit, device='cpu')
-    batch_size = 32
-    with torch.no_grad():
-        for i in range(0, limit, batch_size):
-            end = min(i + batch_size, limit)
-            current_batch = end - i
-            
-            x = torch.zeros(current_batch, num_nodes, 1, device=device)
-            indices = torch.arange(current_batch, device=device)
-            rows = torch.arange(i, end, device=device)
-            x[indices, rows, 0] = 1.0
-            
-            diag_exp = diag.expand(current_batch, -1, -1)
-            factors_exp = [(u.expand(current_batch, -1, -1), v.expand(current_batch, -1, -1)) for u, v in factors]
-            
-            y = apply_hodlr_matrix_diag(diag_exp, factors_exp, x)
-            M[:, i:end] = y[:, :limit, 0].T.cpu()
-            
     return M.numpy()
 
 def get_dense_amg(A_sparse_scipy, viz_limit=200, maxiter=1, tol=1e-6, progress_interval=200):
@@ -337,6 +239,7 @@ def main():
     A_viz = A_sparse_cpu.to_dense().numpy()
 
     # --- MODEL 1: HGT_OL (Neural Preconditioner) ---
+    # HGT_OL uses SymmetricNeighborEmbed and expects 124-dim node features (pos, diag, 24 neighbor slots).
     print("\n1. Loading and running HGT_OL (neural preconditioner)...")
     leaf_size = 32
     d_model_h, nhead, depth_file, input_dim_file, max_rank_file = read_weights_header(Path(args.weights))
@@ -344,6 +247,8 @@ def main():
     if args.d_model is not None:
         print(f"  Using d_model={d_model} (override; header had {d_model_h})")
     depth = depth_file
+    if x.shape[-1] != 124:
+        raise SystemExit(f"Neural model expects 124-dim input (SymmetricNeighborEmbed); got {x.shape[-1]}. Use FluidGraphDataset with the same feature layout.")
     # Use N_pad from the saved model (leaf_size * 2^depth) so sequence length matches training
     N_pad = leaf_size * (2 ** depth)
     padded_size = N_pad
@@ -371,7 +276,7 @@ def main():
     viz_n = min(viz_n, n)
 
     M_neural = get_dense_matrix_from_neural(
-        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True
+        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=model.hodlr_scale
     )
 
     # --- MODEL 2: OVERFIT HODLR (Block Diagonal, same structure as Neural) ---
