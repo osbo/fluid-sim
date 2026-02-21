@@ -158,10 +158,7 @@ def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_re
             x_pad[batch_indices, row_indices, 0] = 1.0
 
             leaf_exp = leaf_blocks.expand(current_batch, -1, -1, -1)
-            if use_neural_apply:
-                factors_exp = [u.expand(current_batch, -1, -1) for u in factors]
-            else:
-                factors_exp = [(u.expand(current_batch, -1, -1), v.expand(current_batch, -1, -1)) for u, v in factors]
+            factors_exp = [(u.expand(current_batch, -1, -1), v.expand(current_batch, -1, -1)) for u, v in factors]
 
             if use_neural_apply:
                 y_pad = apply_fn(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size, off_diag_scale=off_diag_scale)
@@ -270,16 +267,20 @@ def main():
 
     # Pad node features to N_pad
     x_padded = F.pad(x, (0, 0, 0, N_pad - num_nodes_real), value=0.0)
+    scale_A = batch.get('scale_A')
+    if scale_A is not None and not isinstance(scale_A, torch.Tensor):
+        scale_A = torch.tensor(scale_A, device=device, dtype=x_padded.dtype)
     with torch.no_grad():
-        leaf_blocks_neural, factors_neural = model(x_padded)
+        leaf_blocks_neural, factors_neural = model(x_padded, scale_A=scale_A)
 
     print(f"  HGT_OL inference: padded_size={padded_size}, depth={depth}")
 
     viz_n = (args.viz_limit if args.viz_limit > 0 else n)
     viz_n = min(viz_n, n)
 
+    _scale = torch.exp(model.log_hodlr_scales) if hasattr(model, 'log_hodlr_scales') else (model.hodlr_scale if hasattr(model, 'hodlr_scale') else None)
     M_neural = get_dense_matrix_from_neural(
-        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=model.hodlr_scale
+        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=_scale
     )
 
     # --- MODEL 2: OVERFIT HODLR (Block Diagonal, same structure as Neural) ---

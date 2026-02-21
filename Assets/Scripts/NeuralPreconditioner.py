@@ -79,11 +79,22 @@ class FluidGraphDataset:
             else:
                 row_edges[r].append((c, v))
 
+        # Normalize so inputs are mostly in [-1, 1] for scale-invariant generalization
+        pos_scale = float(np.abs(positions).max())
+        if pos_scale <= 0.0:
+            pos_scale = 1.0
+        positions_n = positions / pos_scale
+
+        scale_A = float(np.abs(vals).max())
+        if scale_A <= 0.0:
+            scale_A = 1.0
+        diag_map_n = diag_map / scale_A
+
         # Build per-node features: [pos(3), diag(1), slot0(5), slot1(5), ...] with slot = (j/N, pos_j[0], pos_j[1], pos_j[2], A_ij)
         n_float = 3 + 1 + MAX_OFFDIAG_SLOTS * 5
         x = np.zeros((num_nodes, n_float), dtype=np.float32)
-        x[:, :3] = positions
-        x[:, 3] = diag_map
+        x[:, :3] = positions_n
+        x[:, 3] = diag_map_n
         for i in range(num_nodes):
             slots = row_edges.get(i, [])
             for k, (j, v) in enumerate(slots):
@@ -91,14 +102,15 @@ class FluidGraphDataset:
                     break
                 base = 4 + k * 5
                 x[i, base + 0] = j / max(num_nodes, 1)
-                x[i, base + 1:base + 4] = positions[j]
-                x[i, base + 4] = v
+                x[i, base + 1:base + 4] = positions_n[j]
+                x[i, base + 4] = v / scale_A
 
         return {
             'x': torch.from_numpy(x).float(),
             'edge_index': torch.stack([torch.from_numpy(rows.astype(np.int64)), torch.from_numpy(cols.astype(np.int64))]),
             'edge_values': torch.from_numpy(vals.copy()),
             'num_nodes': int(num_nodes),
+            'scale_A': scale_A,
         }
 
 # --- 1. Hierarchical Transformer Components ---
@@ -232,16 +244,17 @@ class LearnableFourierPosEncoding(nn.Module):
 
 class HODLRHead(nn.Module):
     """
-    Generates U (and U again as V) for a specific HODLR level. U = V enforces symmetric
-    positive semi-definite off-diagonal blocks.
+    Generates U and V for a specific HODLR level. Separate proj_u and proj_v allow
+    distinct row and column bases for off-diagonal blocks (e.g. A_12 vs A_21).
     """
     def __init__(self, in_dim, rank):
         super().__init__()
         self.rank = rank
         self.proj_u = nn.Linear(in_dim, rank)
+        self.proj_v = nn.Linear(in_dim, rank)
 
     def forward(self, x):
-        return self.proj_u(x)
+        return self.proj_u(x), self.proj_v(x)
 
 
 def _print_hodlr_architecture(leaf_size, depth, ranks, decoder_dims, bottleneck_dim, root_block_size):
@@ -346,29 +359,36 @@ class HGT_OL(nn.Module):
             self.skip_projs.append(nn.Linear(enc_skip_dim, dim_i))
             self.skip_fusions.append(nn.Linear(dim_i * 2, dim_i))
             self.dec_blocks.append(TransformerBlock(dim_i, block_size=enc_dec_block))
-            self.hodlr_heads.append(HODLRHead(dim_i, rank_i))
             prev_dim = dim_i
 
-        # 4. Leaf: project decoder dim (e.g. 20) up to leaf_size, then full-rank U (leaf_size x leaf_size)
+        # Attach all HODLR heads to the final, N-length, full-resolution feature map (leaf_dim)
         leaf_dim = decoder_dims[-1]
+        self.hodlr_heads = nn.ModuleList([
+            HODLRHead(leaf_dim, ranks[i]) for i in range(depth)
+        ])
+
+        # 4. Leaf: project decoder dim (leaf_dim) up to leaf_size, then full-rank U (leaf_size x leaf_size)
         self.leaf_proj = nn.Linear(leaf_dim, leaf_size)
-        nn.init.normal_(self.leaf_proj.weight, std=1e-4)
-        nn.init.constant_(self.leaf_proj.bias, 0.0)
+        # default init (no override) so leaf_proj(h) has normal scale
         self.leaf_head = nn.Linear(leaf_size, leaf_size)
         nn.init.normal_(self.leaf_head.weight, std=1e-4)
         nn.init.constant_(self.leaf_head.bias, 0.0)
-        self.hodlr_scale = nn.Parameter(torch.ones(1) * 1e-4)  # tame off-diagonal init (like overfit baseline)
+        # Per-level log-scales so fine levels can grow independently (avoids fighting a single decaying scale)
+        self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
+        self.log_hodlr_scales = nn.Parameter(torch.ones(depth) * math.log(1e-2))
 
         # --- Same small init as HODLR heads (off-diagonal only; leaf init done above)
         for head in self.hodlr_heads:
             nn.init.normal_(head.proj_u.weight, std=1e-4)
             nn.init.constant_(head.proj_u.bias, 0.0)
+            nn.init.normal_(head.proj_v.weight, std=1e-4)
+            nn.init.constant_(head.proj_v.bias, 0.0)
 
         # Print architecture once: leaves -> Level 0 .. Level (depth-1) -> bottleneck
         _print_hodlr_architecture(leaf_size, depth, ranks, decoder_dims, bottleneck_dim, root_block_size)
 
-    def forward(self, x, pos=None, _timing=None):
-        # Input x is already in Morton order; no reordering.
+    def forward(self, x, pos=None, scale_A=None, _timing=None):
+        # Input x is already in Morton order; no reordering. scale_A: when x has normalized diag, use for Jacobi.
         B, N, _ = x.shape
         if _timing is not None:
             t0 = time.time()
@@ -397,8 +417,7 @@ class HGT_OL(nn.Module):
         if _timing is not None:
             _timing["bottleneck"] = time.time() - t0
 
-        # 3. Decoder & HODLR Generation
-        factors_levels = []
+        # 3. Decoder (no factor generation here; h is built up to full N tokens)
         for i in range(len(self.dec_blocks)):
             if _timing is not None:
                 t0 = time.time()
@@ -410,10 +429,16 @@ class HGT_OL(nn.Module):
             h = torch.cat([h, skip], dim=-1)
             h = self.skip_fusions[i](h)
             h = checkpoint(self.dec_blocks[i], h, use_reentrant=True) if self.training else self.dec_blocks[i](h)
-            u = self.hodlr_heads[i](h)
-            factors_levels.append(u)
             if _timing is not None:
                 _timing[f"dec_{i}"] = time.time() - t0
+
+        # Generate ALL factors from the final, N-length, full-resolution feature map h
+        factors_levels = []
+        for i in range(self.depth):
+            u, v = self.hodlr_heads[i](h)
+            u = F.normalize(u, p=2, dim=-1) * math.sqrt(u.size(-1))
+            v = F.normalize(v, p=2, dim=-1) * math.sqrt(v.size(-1))
+            factors_levels.append((u, v))
 
         # 4. Leaf: predict U, then (U@U.T)*hodlr_scale; add Jacobi prior from A's diagonal in x
         if _timing is not None:
@@ -423,14 +448,20 @@ class HGT_OL(nn.Module):
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
         h_leaves = self.leaf_proj(h_leaves)
         u_leaf = self.leaf_head(h_leaves)  # (B, num_leaves, leaf_size, leaf_size)
-        dense_blocks_out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * self.hodlr_scale
+        dense_blocks_out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * torch.exp(self.log_hodlr_scale_leaf)
         # Base = identity so leaves have a visible init that matches the look of other HODLR blocks
         dense_blocks_out = dense_blocks_out + torch.eye(self.leaf_size, device=dense_blocks_out.device, dtype=dense_blocks_out.dtype)
         # Jacobi: scale only the diagonal by 1/diag(A); leave off-diagonals unchanged
-        diag_A = x[..., 3]
-        jacobi_diag = torch.zeros_like(diag_A)
-        mask = diag_A.abs() > 1e-6
-        jacobi_diag[mask] = 1.0 / diag_A[mask]
+        # x[..., 3] is normalized diag when dataset uses normalization; scale_A from forward() recovers real diag
+        diag_A_n = x[..., 3]
+        if scale_A is not None:
+            s = scale_A if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=x.device, dtype=x.dtype)
+            diag_A_real = diag_A_n * s
+        else:
+            diag_A_real = diag_A_n
+        jacobi_diag = torch.zeros_like(diag_A_real)
+        mask = diag_A_real.abs() > 1e-6
+        jacobi_diag[mask] = 1.0 / diag_A_real[mask]
         jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
         leaf_diag = torch.diagonal(dense_blocks_out, dim1=-2, dim2=-1)  # (B, num_leaves, leaf_size)
         mask_blocks = mask.view(B, num_leaves, self.leaf_size)
@@ -446,44 +477,42 @@ class HGT_OL(nn.Module):
 
 def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32, off_diag_scale=None):
     """
-    Applies the HODLR matrix defined by (leaf_blocks, factors) to vector x.
-    x: (B, N, 1)
-    off_diag_scale: optional scalar or (1,) tensor to scale off-diagonal updates (e.g. model.hodlr_scale).
+    Applies the HODLR matrix defined by (leaf_blocks, factors) to vector(s) x.
+    x: (B, N, 1) or (B, N, K) for K probe vectors (processed in parallel).
+    off_diag_scale: optional tensor (depth,) for per-level scales, or scalar/(1,) for single scale (legacy).
+    Returns same shape as x.
     """
-    B, N, _ = x.shape
-    scale = off_diag_scale if off_diag_scale is not None else 1.0
-    
-    # 1. Leaf Level (Diagonal Blocks)
-    # Reshape x to (B, NumLeaves, LeafSize, 1)
+    B, N, K = x.shape
+
+    # 1. Leaf Level (Diagonal Blocks) — leaf scale is already baked into leaf_blocks
     num_leaves = N // leaf_size
-    x_leaves = x.view(B, num_leaves, leaf_size, 1)
-    
-    # leaf_blocks: (B, NumLeaves, LeafSize, LeafSize)
-    # y = Block * x
+    x_leaves = x.view(B, num_leaves, leaf_size, K)
     y_leaves = torch.matmul(leaf_blocks, x_leaves)
-    y = y_leaves.view(B, N, 1)
-    
-    # 2. Off-Diagonal Levels (token-level U,V; expand to node resolution via repeat_interleave)
-    block_size_token = leaf_size
-    for i, u_full in enumerate(factors_levels):
-        v_full = u_full  # U = V (symmetric); duplication done here
+    y = y_leaves.view(B, N, K)
+
+    # 2. Off-Diagonal Levels: per-level scale (u_full, v_full are natively (B, N, rank))
+    for i, factor in enumerate(factors_levels):
+        if isinstance(factor, tuple):
+            u_full, v_full = factor[0], factor[1]
+        else:
+            u_full = v_full = factor
+        if off_diag_scale is not None:
+            scale_i = off_diag_scale[i] if off_diag_scale.numel() > 1 else off_diag_scale.squeeze()
+        else:
+            scale_i = 1.0
         B, n_tokens, rank = u_full.shape
         num_splits = 2 ** (i + 1)
         block_size_node = N // num_splits
         if block_size_node < 1:
             continue
         num_pairs = num_splits // 2
-        expand = block_size_node // block_size_token
 
-        # View as (B, num_pairs, 2, block_size_token, R), then repeat each token to fill node block
-        u_view = u_full.view(B, num_pairs, 2, block_size_token, rank)
-        v_view = v_full.view(B, num_pairs, 2, block_size_token, rank)
-        u_L = u_view[:, :, 0].repeat_interleave(expand, dim=2)
-        u_R = u_view[:, :, 1].repeat_interleave(expand, dim=2)
-        v_L = v_view[:, :, 0].repeat_interleave(expand, dim=2)
-        v_R = v_view[:, :, 1].repeat_interleave(expand, dim=2)
+        u_view = u_full.view(B, num_pairs, 2, block_size_node, rank)
+        v_view = v_full.view(B, num_pairs, 2, block_size_node, rank)
+        u_L, u_R = u_view[:, :, 0], u_view[:, :, 1]
+        v_L, v_R = v_view[:, :, 0], v_view[:, :, 1]
 
-        x_view = x.view(B, num_pairs, 2, block_size_node, 1)
+        x_view = x.view(B, num_pairs, 2, block_size_node, K)
         x_L, x_R = x_view[:, :, 0], x_view[:, :, 1]
 
         vr_xr = torch.matmul(v_R.transpose(-2, -1), x_R)
@@ -491,7 +520,7 @@ def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32, off_diag_sc
         vl_xl = torch.matmul(v_L.transpose(-2, -1), x_L)
         y_R_update = torch.matmul(u_R, vl_xl)
         updates = torch.cat([y_L_update, y_R_update], dim=2)
-        y = y + scale * updates.view(B, N, 1)
+        y = y + scale_i * updates.view(B, N, K)
     return y
 
 # --- 4b. Save/Load HGT_OL to .bytes (28-byte header + float16 tensors) ---
@@ -591,12 +620,15 @@ def save_weights_to_bytes(model, path, input_dim=None):
             _write_packed_tensor(f, blk.mlp[2].bias, False)
             _write_packed_tensor(f, model.hodlr_heads[i].proj_u.weight, True)
             _write_packed_tensor(f, model.hodlr_heads[i].proj_u.bias, False)
+            _write_packed_tensor(f, model.hodlr_heads[i].proj_v.weight, True)
+            _write_packed_tensor(f, model.hodlr_heads[i].proj_v.bias, False)
         # 6. Leaf: leaf_proj, then leaf_head + hodlr_scale
         _write_packed_tensor(f, model.leaf_proj.weight, True)
         _write_packed_tensor(f, model.leaf_proj.bias, False)
         _write_packed_tensor(f, model.leaf_head.weight, True)
         _write_packed_tensor(f, model.leaf_head.bias, False)
-        _write_packed_tensor(f, model.hodlr_scale, False)
+        _write_packed_tensor(f, torch.exp(model.log_hodlr_scale_leaf).detach(), False)
+        _write_packed_tensor(f, torch.exp(model.log_hodlr_scales).detach(), False)
     # print(f"Saved to {path}")
 
 
@@ -690,12 +722,39 @@ def load_hgt_ol_weights_from_bytes(model, path):
             _read_packed_tensor(f, blk.mlp[2].bias, False)
             _read_packed_tensor(f, model.hodlr_heads[i].proj_u.weight, True)
             _read_packed_tensor(f, model.hodlr_heads[i].proj_u.bias, False)
+            try:
+                _read_packed_tensor(f, model.hodlr_heads[i].proj_v.weight, True)
+                _read_packed_tensor(f, model.hodlr_heads[i].proj_v.bias, False)
+            except (ValueError, OSError):
+                with torch.no_grad():
+                    model.hodlr_heads[i].proj_v.weight.copy_(model.hodlr_heads[i].proj_u.weight)
+                    model.hodlr_heads[i].proj_v.bias.copy_(model.hodlr_heads[i].proj_u.bias)
+                for j in range(i + 1, model.depth):
+                    _read_packed_tensor(f, model.hodlr_heads[j].proj_u.weight, True)
+                    _read_packed_tensor(f, model.hodlr_heads[j].proj_u.bias, False)
+                    with torch.no_grad():
+                        model.hodlr_heads[j].proj_v.weight.copy_(model.hodlr_heads[j].proj_u.weight)
+                        model.hodlr_heads[j].proj_v.bias.copy_(model.hodlr_heads[j].proj_u.bias)
+                break
         # 6. Leaf: leaf_proj, then leaf_head + hodlr_scale
         _read_packed_tensor(f, model.leaf_proj.weight, True)
         _read_packed_tensor(f, model.leaf_proj.bias, False)
         _read_packed_tensor(f, model.leaf_head.weight, True)
         _read_packed_tensor(f, model.leaf_head.bias, False)
-        _read_packed_tensor(f, model.hodlr_scale, False)
+        _hodlr_leaf = torch.empty(1)
+        _read_packed_tensor(f, _hodlr_leaf, False)
+        with torch.no_grad():
+            model.log_hodlr_scale_leaf.copy_(torch.log(_hodlr_leaf.clamp(min=1e-10)).to(model.log_hodlr_scale_leaf.device))
+        depth = model.depth
+        level_bytes = 2 * (depth + (1 if depth % 2 else 0))
+        remainder = f.read(level_bytes)
+        if len(remainder) >= 2 * depth:
+            level_scales = np.frombuffer(remainder[: 2 * depth], dtype=np.float16).astype(np.float32)
+            with torch.no_grad():
+                model.log_hodlr_scales.copy_(torch.log(torch.from_numpy(level_scales).clamp(min=1e-10).to(model.log_hodlr_scales.device)))
+        else:
+            with torch.no_grad():
+                model.log_hodlr_scales.copy_(torch.ones(depth, device=model.log_hodlr_scales.device) * model.log_hodlr_scale_leaf.item())
     print(f"Loaded HGT_OL weights from {path}")
 
 
@@ -754,9 +813,13 @@ def print_diagnostics(model, leaf_blocks, factors, step):
     """
     print(f"\n--- Diagnostics Step {step} ---")
 
-    # 1. Global Scale (if you added the learnable scalar)
-    if hasattr(model, 'hodlr_scale'):
-        print(f"  Global HODLR Scale: {model.hodlr_scale.item():.6f}")
+    # 1. Per-level scales (leaf + HODLR levels)
+    if hasattr(model, 'log_hodlr_scale_leaf'):
+        leaf_s = torch.exp(model.log_hodlr_scale_leaf).item()
+        print(f"  Leaf off-diag scale: {leaf_s:.6f}")
+    if hasattr(model, 'log_hodlr_scales'):
+        scales = torch.exp(model.log_hodlr_scales).cpu().numpy()
+        print(f"  HODLR level scales: {[f'{s:.6f}' for s in scales]}")
 
     # 2. Leaf Block Stats (The Diagonal)
     # leaf_blocks shape: (B, NumLeaves, LeafSize, LeafSize)
@@ -767,18 +830,18 @@ def print_diagnostics(model, leaf_blocks, factors, step):
     leaf_off = leaf_blocks - torch.diag_embed(leaf_diag)
     print(f"  Leaf Blocks (Off):  MeanAbs={leaf_off.abs().mean().item():.4f}, Max={leaf_off.abs().max().item():.4f}")
 
-    # 3. HODLR Factor Stats (The Off-Diagonal / Global structure)
-    # factors is a list of U tensors (symmetric: we use U for both U and V)
+    # 3. HODLR Factor Stats (U and V per level)
     print("  HODLR Levels (Coarse -> Fine):")
     for i, factor_tuple in enumerate(factors):
         if isinstance(factor_tuple, tuple):
-            U = factor_tuple[0]
+            U, V = factor_tuple[0], factor_tuple[1]
         else:
-            U = factor_tuple
-
+            U = V = factor_tuple
         u_norm = U.norm(dim=-1).mean().item()
         u_max = U.abs().max().item()
-        print(f"    Lvl {i}: MeanNorm={u_norm:.5f}, MaxVal={u_max:.5f}")
+        v_norm = V.norm(dim=-1).mean().item()
+        v_max = V.abs().max().item()
+        print(f"    Lvl {i}: U MeanNorm={u_norm:.5f} MaxVal={u_max:.5f}  V MeanNorm={v_norm:.5f} MaxVal={v_max:.5f}")
 
     print("----------------------------\n")
 
@@ -792,6 +855,8 @@ def train_hgt_ol():
     parser.add_argument('--data_folder', type=str, default=str(default_data),
                         help="Path to TestData (e.g. .../StreamingAssets/TestData). Uses most recent Run_* subfolder.")
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Clip gradient norm to avoid explosion (0 = no clip).')
+    parser.add_argument('--num_probes', type=int, default=32, help='Number of random probe vectors per step (reduces gradient variance).')
     parser.add_argument('--leaf_size', type=int, default=32)
     parser.add_argument('--frame', type=int, default=600, help="Single frame index to use (e.g. 600, same as InspectModel).")
     parser.add_argument('--rank_scale', type=float, default=2.0, help="Rank = min(max_rank, scale * block^(2/3)).")
@@ -840,7 +905,7 @@ def train_hgt_ol():
     print(f"  [startup] model.to(device): {time.time()-t0:.2f}s")
 
     print(f"Data: single frame {frame_idx} only (~few MB). Memory is model+optimizer, not data.")
-    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, num_nodes={num_nodes_real}, N_pad={N_pad}, depth={depth}, d_model={d_model}, input_dim={input_dim}, rank_scale={args.rank_scale}, max_rank={args.max_rank}")
+    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, num_nodes={num_nodes_real}, N_pad={N_pad}, depth={depth}, d_model={d_model}, num_probes={args.num_probes}, rank_scale={args.rank_scale}, max_rank={args.max_rank}")
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
@@ -874,18 +939,22 @@ def train_hgt_ol():
 
         t0 = time.time()
         timing_dict = {} if step == 100 else None
-        leaf_blocks, factors = model(x_input, _timing=timing_dict)
+        scale_A = batch.get('scale_A')
+        if scale_A is not None and not isinstance(scale_A, torch.Tensor):
+            scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
+        leaf_blocks, factors = model(x_input, scale_A=scale_A, _timing=timing_dict)
         if step == 100:
             print(f"  [timing] model(x): {time.time()-t0:.3f}s (leaf_blocks {tuple(leaf_blocks.shape)}, {len(factors)} levels)")
             for k, v in sorted(timing_dict.items(), key=lambda x: x[0]):
                 print(f"    model.{k}: {v:.3f}s")
 
         t0 = time.time()
-        z = torch.randn(1, n_real, 1, device=device)
-        y_flat = torch.sparse.mm(A_sparse, z.view(-1, 1))
-        y = y_flat.view(1, n_real, 1)
+        num_probes = args.num_probes
+        z = torch.randn(1, n_real, num_probes, device=device)
+        y_flat = torch.sparse.mm(A_sparse, z.squeeze(0))
+        y = y_flat.unsqueeze(0)
         if step == 100:
-            print(f"  [timing] z + A@z (sparse mm): {time.time()-t0:.3f}s")
+            print(f"  [timing] z + A@z (sparse mm): {time.time()-t0:.3f}s (z {tuple(z.shape)})")
 
         t0 = time.time()
         if N_cur > n_real:
@@ -894,7 +963,7 @@ def train_hgt_ol():
             print(f"  [timing] pad y to N_cur: {time.time()-t0:.3f}s (y {tuple(y.shape)})")
 
         t0 = time.time()
-        z_hat = apply_neural_hodlr(leaf_blocks, factors, y, leaf_size=leaf_size, off_diag_scale=model.hodlr_scale)
+        z_hat = apply_neural_hodlr(leaf_blocks, factors, y, leaf_size=leaf_size, off_diag_scale=torch.exp(model.log_hodlr_scales))
         if step == 100:
             print(f"  [timing] apply_neural_hodlr: {time.time()-t0:.3f}s")
 
@@ -909,6 +978,8 @@ def train_hgt_ol():
         if step == 100:
             print(f"  [timing] loss.backward(): {time.time()-t0:.3f}s")
 
+        if args.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         t0 = time.time()
         optimizer.step()
         if step == 100:
@@ -921,7 +992,7 @@ def train_hgt_ol():
             t0 = time.time()
             model.eval()
             with torch.no_grad():
-                lb_debug, fact_debug = model(x_input, _timing=None)
+                lb_debug, fact_debug = model(x_input, scale_A=scale_A, _timing=None)
                 print_diagnostics(model, lb_debug, fact_debug, step)
             model.train()
             t_diag = time.time() - t0
