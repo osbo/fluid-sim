@@ -212,7 +212,10 @@ def main():
                         help='Path to save plot image (default: script_dir/inspect_model_plot.png)')
     parser.add_argument('--viz_limit', type=int, default=300,
                         help="Max size for dense M reconstruction and viz (reduces AMG work). Use 0 for full N.")
+    parser.add_argument('--overfit', action='store_true',
+                        help='Enable Overfit HODLR baseline training and its graphs (disabled by default).')
     args = parser.parse_args()
+    SKIP_OVERFIT = not args.overfit
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available(): device = torch.device('mps')
@@ -280,20 +283,24 @@ def main():
     )
 
     # --- MODEL 2: OVERFIT HODLR (Block Diagonal, same structure as Neural) ---
-    print("\n2. Training Overfit HODLR (block diagonal)...")
-    leaf_size = 32
-    # Mandate power-of-2 * leaf_size so HODLR levels align: finest block_size=leaf_size, then double each level
-    num_blocks_min = (num_nodes_real + leaf_size - 1) // leaf_size
-    active_depth = int(math.ceil(math.log2(num_blocks_min)))
-    padded_size_overfit = leaf_size * (2 ** active_depth)
-    leaf_blocks_overfit, factors_overfit = train_overfit_baseline_blocks(
-        A_indices, A_values, padded_size_overfit, active_depth, args.rank, device, leaf_size=leaf_size
-    )
-    print(f"  Viz limit: {viz_n} (full N={n})")
+    if SKIP_OVERFIT:
+        print("\n2. Overfit HODLR skipped (disabled).")
+        M_overfit = np.eye(viz_n)  # placeholder, not plotted
+    else:
+        print("\n2. Training Overfit HODLR (block diagonal)...")
+        leaf_size = 32
+        # Mandate power-of-2 * leaf_size so HODLR levels align: finest block_size=leaf_size, then double each level
+        num_blocks_min = (num_nodes_real + leaf_size - 1) // leaf_size
+        active_depth = int(math.ceil(math.log2(num_blocks_min)))
+        padded_size_overfit = leaf_size * (2 ** active_depth)
+        leaf_blocks_overfit, factors_overfit = train_overfit_baseline_blocks(
+            A_indices, A_values, padded_size_overfit, active_depth, args.rank, device, leaf_size=leaf_size
+        )
+        print(f"  Viz limit: {viz_n} (full N={n})")
 
-    M_overfit = get_dense_matrix_from_neural(
-        leaf_blocks_overfit, factors_overfit, padded_size_overfit, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n
-    )
+        M_overfit = get_dense_matrix_from_neural(
+            leaf_blocks_overfit, factors_overfit, padded_size_overfit, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n
+        )
 
     # --- MODEL 3: AMG (temporarily disabled) ---
     SKIP_AMG = False
@@ -316,6 +323,8 @@ def main():
 
     # Approximate true inverse of the viz block (for comparison; only this block is inverted)
     A_inv_viz = np.linalg.inv(A_viz_n)
+    diag_ainv = np.diag(A_inv_viz)
+    print(f"\nTrue inverse A^{{-1}} diagonal (viz {viz_n}x{viz_n}): min={diag_ainv.min():.6f}, max={diag_ainv.max():.6f}, mean={diag_ainv.mean():.6f}, std={diag_ainv.std():.6f}")
 
     matrices = {
         "A (Input)": A_viz_n,
@@ -338,9 +347,12 @@ def main():
     plt.colorbar(im_ainv, ax=ax_ainv)
     for j in range(2, 4):
         axes[0, j].axis('off')
-    # Row 1–3: Neural, Overfit, AMG (or placeholder when disabled)
+    # Row 1–3: Neural, Overfit (if enabled), AMG (or placeholder when disabled)
     amg_label = "AMG (disabled)" if SKIP_AMG else "AMG"
-    methods = [("Neural", M_neural_n), ("Overfit", M_overfit_n), (amg_label, M_amg_n)]
+    methods = [("Neural", M_neural_n)]
+    if not SKIP_OVERFIT:
+        methods.append(("Overfit", M_overfit_n))
+    methods.append((amg_label, M_amg_n))
     cond_A = np.linalg.cond(A_viz_n)
     print(f"\nCondition Number (Block A): {cond_A:.2e}")
     print(f"Leaf boundaries: every {leaf_size} (cyan grid on M plots; nodes are Morton-ordered)")
