@@ -243,6 +243,27 @@ class HODLRHead(nn.Module):
     def forward(self, x):
         return self.proj_u(x)
 
+
+def _print_hodlr_architecture(leaf_size, depth, ranks, decoder_dims, bottleneck_dim, root_block_size):
+    """Print HODLR architecture once, from leaves (finest) to bottleneck (coarsest)."""
+    lines = [
+        "HODLR architecture (leaves -> bottleneck):",
+        f"  Leaf:           dense {leaf_size}x{leaf_size} diagonal blocks",
+    ]
+    for level_idx_from_bottom in range(depth):
+        block_real_size = leaf_size * (2 ** level_idx_from_bottom)
+        rank_i = ranks[depth - 1 - level_idx_from_bottom]
+        dim_i = decoder_dims[depth - 1 - level_idx_from_bottom]
+        num_attn_blocks = 2 ** (level_idx_from_bottom + 1)
+        lines.append(
+            f"  Level {level_idx_from_bottom}:  BlockSize {block_real_size:4d}, Rank {rank_i:3d}, Dim {dim_i:3d}, AttnBlocks {num_attn_blocks:3d} (each {leaf_size}x{leaf_size})"
+        )
+    lines.append(
+        f"  Bottleneck:     BlockSize {root_block_size:4d}, Dim {bottleneck_dim:3d}, AttnBlocks 1 (each {leaf_size}x{leaf_size})"
+    )
+    print("\n" + "\n".join(lines) + "\n")
+
+
 # --- 3. The Main Architecture ---
 
 class HGT_OL(nn.Module):
@@ -305,8 +326,6 @@ class HGT_OL(nn.Module):
         # Bottleneck = global/root layer: same rank-sized dim as coarsest encoder
         self.bottleneck = TransformerBlock(bottleneck_dim, block_size=enc_dec_block)
         root_block_size = leaf_size * (2 ** depth)
-        print(f"Building Bottleneck (global/root): BlockSize {root_block_size}, Dim {bottleneck_dim}, AttnBlocks 1 (each {leaf_size}x{leaf_size})")
-        print(f"Encoder dims (fine->coarse): {encoder_dims} (same factor as decoder)")
 
         # 3. Decoder (Top-Down): each level has dim = same factor * rank; skip dim matches (encoder_dims[depth-1-i] == decoder_dims[i])
         self.dec_blocks = nn.ModuleList()
@@ -329,21 +348,24 @@ class HGT_OL(nn.Module):
             self.dec_blocks.append(TransformerBlock(dim_i, block_size=enc_dec_block))
             self.hodlr_heads.append(HODLRHead(dim_i, rank_i))
             prev_dim = dim_i
-            num_attn_blocks = 2 ** (i + 1)
-            print(f"Building Layer Level {level_idx_from_bottom} (Coarse->Fine): BlockSize {block_real_size}, Rank {rank_i}, Dim {dim_i}, AttnBlocks {num_attn_blocks} (each {leaf_size}x{leaf_size})")
 
-        # 4. Leaf: predict U factor (same as HODLR blocks), then U @ U.T; no extra attention layer
+        # 4. Leaf: project decoder dim (e.g. 20) up to leaf_size, then full-rank U (leaf_size x leaf_size)
         leaf_dim = decoder_dims[-1]
-        # Per-token prediction -> (B, num_leaves, leaf_size, leaf_size) U factor; then U@U.T like off-diagonal
-        self.leaf_head = nn.Linear(leaf_dim, leaf_size)
-        self.hodlr_scale = nn.Parameter(torch.ones(1) * 0.01)  # tame off-diagonal init (like overfit baseline)
-
-        # --- Same small init as HODLR heads (leaf and off-diagonal)
-        nn.init.normal_(self.leaf_head.weight, std=0.01)
+        self.leaf_proj = nn.Linear(leaf_dim, leaf_size)
+        nn.init.normal_(self.leaf_proj.weight, std=1e-4)
+        nn.init.constant_(self.leaf_proj.bias, 0.0)
+        self.leaf_head = nn.Linear(leaf_size, leaf_size)
+        nn.init.normal_(self.leaf_head.weight, std=1e-4)
         nn.init.constant_(self.leaf_head.bias, 0.0)
+        self.hodlr_scale = nn.Parameter(torch.ones(1) * 1e-4)  # tame off-diagonal init (like overfit baseline)
+
+        # --- Same small init as HODLR heads (off-diagonal only; leaf init done above)
         for head in self.hodlr_heads:
-            nn.init.normal_(head.proj_u.weight, std=0.01)
+            nn.init.normal_(head.proj_u.weight, std=1e-4)
             nn.init.constant_(head.proj_u.bias, 0.0)
+
+        # Print architecture once: leaves -> Level 0 .. Level (depth-1) -> bottleneck
+        _print_hodlr_architecture(leaf_size, depth, ranks, decoder_dims, bottleneck_dim, root_block_size)
 
     def forward(self, x, pos=None, _timing=None):
         # Input x is already in Morton order; no reordering.
@@ -393,14 +415,28 @@ class HGT_OL(nn.Module):
             if _timing is not None:
                 _timing[f"dec_{i}"] = time.time() - t0
 
-        # 4. Leaf: predict U, then (U@U.T)*hodlr_scale only; U inited so this is near-identity (U = (1/sqrt(scale))*I)
+        # 4. Leaf: predict U, then (U@U.T)*hodlr_scale; add Jacobi prior from A's diagonal in x
         if _timing is not None:
             t0 = time.time()
         B, N, _ = h.shape
         num_leaves = N // self.leaf_size
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
+        h_leaves = self.leaf_proj(h_leaves)
         u_leaf = self.leaf_head(h_leaves)  # (B, num_leaves, leaf_size, leaf_size)
         dense_blocks_out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * self.hodlr_scale
+        # Base = identity so leaves have a visible init that matches the look of other HODLR blocks
+        dense_blocks_out = dense_blocks_out + torch.eye(self.leaf_size, device=dense_blocks_out.device, dtype=dense_blocks_out.dtype)
+        # Jacobi: scale only the diagonal by 1/diag(A); leave off-diagonals unchanged
+        diag_A = x[..., 3]
+        jacobi_diag = torch.zeros_like(diag_A)
+        mask = diag_A.abs() > 1e-6
+        jacobi_diag[mask] = 1.0 / diag_A[mask]
+        jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
+        leaf_diag = torch.diagonal(dense_blocks_out, dim1=-2, dim2=-1)  # (B, num_leaves, leaf_size)
+        mask_blocks = mask.view(B, num_leaves, self.leaf_size)
+        new_diag = torch.where(mask_blocks, leaf_diag * jacobi_diag_blocks, leaf_diag)
+        dense_blocks_out = dense_blocks_out - torch.diag_embed(leaf_diag) + torch.diag_embed(new_diag)
+
         if _timing is not None:
             _timing["leaf_head"] = time.time() - t0
         return dense_blocks_out, factors_levels
@@ -555,7 +591,9 @@ def save_weights_to_bytes(model, path, input_dim=None):
             _write_packed_tensor(f, blk.mlp[2].bias, False)
             _write_packed_tensor(f, model.hodlr_heads[i].proj_u.weight, True)
             _write_packed_tensor(f, model.hodlr_heads[i].proj_u.bias, False)
-        # 6. Leaf head (Linear) + hodlr_scale
+        # 6. Leaf: leaf_proj, then leaf_head + hodlr_scale
+        _write_packed_tensor(f, model.leaf_proj.weight, True)
+        _write_packed_tensor(f, model.leaf_proj.bias, False)
         _write_packed_tensor(f, model.leaf_head.weight, True)
         _write_packed_tensor(f, model.leaf_head.bias, False)
         _write_packed_tensor(f, model.hodlr_scale, False)
@@ -652,7 +690,9 @@ def load_hgt_ol_weights_from_bytes(model, path):
             _read_packed_tensor(f, blk.mlp[2].bias, False)
             _read_packed_tensor(f, model.hodlr_heads[i].proj_u.weight, True)
             _read_packed_tensor(f, model.hodlr_heads[i].proj_u.bias, False)
-        # 6. Leaf head + hodlr_scale
+        # 6. Leaf: leaf_proj, then leaf_head + hodlr_scale
+        _read_packed_tensor(f, model.leaf_proj.weight, True)
+        _read_packed_tensor(f, model.leaf_proj.bias, False)
         _read_packed_tensor(f, model.leaf_head.weight, True)
         _read_packed_tensor(f, model.leaf_head.bias, False)
         _read_packed_tensor(f, model.hodlr_scale, False)
