@@ -166,14 +166,54 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-class PatchEmbed(nn.Module):
-    """ Linearize graph node features into tokens. """
-    def __init__(self, input_dim, embed_dim):
+class SymmetricNeighborEmbed(nn.Module):
+    """ Encodes center node and sum-pools neighbor geometry + weights. """
+    def __init__(self, embed_dim, max_offdiag_slots=24):
         super().__init__()
-        self.proj = nn.Linear(input_dim, embed_dim)
+        self.max_offdiag_slots = max_offdiag_slots
+
+        # Center feature: [pos_x, pos_y, pos_z, diag]
+        self.center_proj = nn.Linear(4, embed_dim)
+
+        # Neighbor feature: [delta_x, delta_y, delta_z, weight]
+        self.neighbor_proj = nn.Linear(4, embed_dim)
 
     def forward(self, x):
-        return self.proj(x)
+        # x shape: (B, N, 124)
+        pos_i = x[..., 0:3]
+        diag_i = x[..., 3:4]
+
+        # 1. Project center node
+        center_feat = torch.cat([pos_i, diag_i], dim=-1)
+        h_center = self.center_proj(center_feat)
+
+        # 2. Process and pool neighbors
+        h_neighbors = torch.zeros_like(h_center)
+
+        for k in range(self.max_offdiag_slots):
+            base = 4 + k * 5
+            # Skip the normalized index (base+0), grab position and weight
+            pos_j = x[..., base+1 : base+4]
+            weight_ij = x[..., base+4 : base+5]
+
+            # Identify active neighbors vs zero-padded slots
+            is_active = (weight_ij != 0.0).float()
+
+            # Relative position (masked so padded slots don't create garbage delta vectors)
+            delta_pos = (pos_j - pos_i) * is_active
+
+            # Concatenate [delta_p, weight] and project
+            neighbor_feat = torch.cat([delta_pos, weight_ij], dim=-1)
+            e_ij = self.neighbor_proj(neighbor_feat)
+
+            # Mask the output to ensure padded slots (and their biases) add exactly 0
+            e_ij = e_ij * is_active
+
+            # Symmetric Sum Pool
+            h_neighbors = h_neighbors + e_ij
+
+        return h_center + h_neighbors
+
 
 class LearnableFourierPosEncoding(nn.Module):
     """Learnable Fourier features based on the Z-order index (sequence position)."""
@@ -192,28 +232,16 @@ class LearnableFourierPosEncoding(nn.Module):
 
 class HODLRHead(nn.Module):
     """
-    Generates U and V matrices for a specific HODLR level.
-    Input: (B, N_level, Dim)
-    Output: U, V factors packed. 
-    
-    At level k, the sequence N_level represents the rows of the matrix at that resolution.
-    We need to generate rank 'r' vectors for each row.
+    Generates U (and U again as V) for a specific HODLR level. U = V enforces symmetric
+    positive semi-definite off-diagonal blocks.
     """
     def __init__(self, in_dim, rank):
         super().__init__()
         self.rank = rank
-        # We output U and V. 
-        # U is applied to the left child's rows interacting with right.
-        # V is applied to the right child's rows interacting with left.
-        # We predict both for every token, but only use them based on position.
         self.proj_u = nn.Linear(in_dim, rank)
-        self.proj_v = nn.Linear(in_dim, rank)
 
     def forward(self, x):
-        # x: (B, SeqLen, Dim)
-        u = self.proj_u(x) # (B, SeqLen, Rank)
-        v = self.proj_v(x) # (B, SeqLen, Rank)
-        return u, v
+        return self.proj_u(x)
 
 # --- 3. The Main Architecture ---
 
@@ -242,7 +270,7 @@ class HGT_OL(nn.Module):
         self.rank_scale = rank_scale
 
         # 1. Embedding
-        self.embed = PatchEmbed(input_dim, d_model)
+        self.embed = SymmetricNeighborEmbed(d_model)
         self.pos_encoding = LearnableFourierPosEncoding(d_model)
 
         # Block size = HODLR block at current resolution (leaf_size tokens per block at every level)
@@ -304,12 +332,18 @@ class HGT_OL(nn.Module):
             num_attn_blocks = 2 ** (i + 1)
             print(f"Building Layer Level {level_idx_from_bottom} (Coarse->Fine): BlockSize {block_real_size}, Rank {rank_i}, Dim {dim_i}, AttnBlocks {num_attn_blocks} (each {leaf_size}x{leaf_size})")
 
-        # 4. Leaf: dense attention within each leaf block, then predict leaf_size x leaf_size block
+        # 4. Leaf: predict U factor (same as HODLR blocks), then U @ U.T; no extra attention layer
         leaf_dim = decoder_dims[-1]
-        self.leaf_attn = TransformerBlock(leaf_dim, block_size=enc_dec_block)
-        # Per-token prediction of one row of the block: (B, num_leaves, leaf_size, dim) -> (B, num_leaves, leaf_size, leaf_size)
+        # Per-token prediction -> (B, num_leaves, leaf_size, leaf_size) U factor; then U@U.T like off-diagonal
         self.leaf_head = nn.Linear(leaf_dim, leaf_size)
-        self.leaf_diag_bias = nn.Parameter(torch.zeros(leaf_size))
+        self.hodlr_scale = nn.Parameter(torch.ones(1) * 0.01)  # tame off-diagonal init (like overfit baseline)
+
+        # --- Same small init as HODLR heads (leaf and off-diagonal)
+        nn.init.normal_(self.leaf_head.weight, std=0.01)
+        nn.init.constant_(self.leaf_head.bias, 0.0)
+        for head in self.hodlr_heads:
+            nn.init.normal_(head.proj_u.weight, std=0.01)
+            nn.init.constant_(head.proj_u.bias, 0.0)
 
     def forward(self, x, pos=None, _timing=None):
         # Input x is already in Morton order; no reordering.
@@ -327,7 +361,7 @@ class HGT_OL(nn.Module):
         for i, (block, down) in enumerate(zip(self.enc_blocks, self.down_samples)):
             if _timing is not None:
                 t0 = time.time()
-            h = checkpoint(block, h, use_reentrant=True)
+            h = checkpoint(block, h, use_reentrant=True) if self.training else block(h)
             skips.append(h)
             B, n_curr, c_curr = h.shape
             h_reshaped = h.view(B, n_curr // 2, 2 * c_curr)
@@ -337,7 +371,7 @@ class HGT_OL(nn.Module):
 
         if _timing is not None:
             t0 = time.time()
-        h = checkpoint(self.bottleneck, h, use_reentrant=True)
+        h = checkpoint(self.bottleneck, h, use_reentrant=True) if self.training else self.bottleneck(h)
         if _timing is not None:
             _timing["bottleneck"] = time.time() - t0
 
@@ -353,27 +387,20 @@ class HGT_OL(nn.Module):
             skip = self.skip_projs[i](skip)
             h = torch.cat([h, skip], dim=-1)
             h = self.skip_fusions[i](h)
-            h = checkpoint(self.dec_blocks[i], h, use_reentrant=True)
-            u, v = self.hodlr_heads[i](h)
-            factors_levels.append((u, v))
+            h = checkpoint(self.dec_blocks[i], h, use_reentrant=True) if self.training else self.dec_blocks[i](h)
+            u = self.hodlr_heads[i](h)
+            factors_levels.append(u)
             if _timing is not None:
                 _timing[f"dec_{i}"] = time.time() - t0
 
-        # 4. Leaf: dense attention within each leaf, then predict leaf_size x leaf_size block
+        # 4. Leaf: predict U, then (U@U.T)*hodlr_scale only; U inited so this is near-identity (U = (1/sqrt(scale))*I)
         if _timing is not None:
             t0 = time.time()
         B, N, _ = h.shape
         num_leaves = N // self.leaf_size
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
-        # Dense self-attention within each leaf: (B*num_leaves, leaf_size, dim)
-        h_leaf_flat = h_leaves.view(B * num_leaves, self.leaf_size, -1)
-        h_leaf_flat = checkpoint(self.leaf_attn, h_leaf_flat, use_reentrant=True)
-        h_leaves = h_leaf_flat.view(B, num_leaves, self.leaf_size, -1)
-        # Per-token predict one row of the block -> (B, num_leaves, leaf_size, leaf_size)
-        dense_blocks = self.leaf_head(h_leaves)
-        tril = torch.tril(dense_blocks)
-        diag_bias = torch.exp(self.leaf_diag_bias).diag_embed().unsqueeze(0).unsqueeze(0)
-        dense_blocks_out = torch.matmul(tril, tril.transpose(-1, -2)) + diag_bias
+        u_leaf = self.leaf_head(h_leaves)  # (B, num_leaves, leaf_size, leaf_size)
+        dense_blocks_out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * self.hodlr_scale
         if _timing is not None:
             _timing["leaf_head"] = time.time() - t0
         return dense_blocks_out, factors_levels
@@ -381,12 +408,14 @@ class HGT_OL(nn.Module):
 
 # --- 4. Fast HODLR MatMul (The "Forward" Pass of the Operator) ---
 
-def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32):
+def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32, off_diag_scale=None):
     """
     Applies the HODLR matrix defined by (leaf_blocks, factors) to vector x.
     x: (B, N, 1)
+    off_diag_scale: optional scalar or (1,) tensor to scale off-diagonal updates (e.g. model.hodlr_scale).
     """
     B, N, _ = x.shape
+    scale = off_diag_scale if off_diag_scale is not None else 1.0
     
     # 1. Leaf Level (Diagonal Blocks)
     # Reshape x to (B, NumLeaves, LeafSize, 1)
@@ -398,37 +427,21 @@ def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32):
     y_leaves = torch.matmul(leaf_blocks, x_leaves)
     y = y_leaves.view(B, N, 1)
     
-    # 2. Off-Diagonal Levels
-    # factors_levels is ordered Coarse (Level 0) -> Fine (Level Depth-1)
-    # We iterate through them.
-    
-    # Current block size for this level
-    # If factors_levels[0] is Coarse (Root), it splits N into N/2, N/2.
-    # We process top-down or bottom-up?
-    # HODLR matmul is additive. We can add off-diagonal contributions at any time.
-    
-    # For Level i (Coarse -> Fine):
-    # The matrix is partitioned into blocks of size 'current_block_size'.
-    # Each block is split into Left/Right. 
-    # Interaction is:
-    #   y_left += U_left @ V_right.T @ x_right
-    #   y_right += U_right @ V_left.T @ x_left
-    
-    # We need to map the predicted (B, N, R) factors to this structure.
-    
-    # Factors at level i have shape (B, 32*2^(i+1), R); view as (B, 2^i, 2, 32, R), then expand to node space
-    for i, (u_full, v_full) in enumerate(factors_levels):
-        seq_i = u_full.shape[1]
-        num_pairs = 2 ** i
-        block_size_token = 32
-        assert seq_i == num_pairs * 2 * block_size_token
-        block_size_node = N // (2 ** (i + 1))
+    # 2. Off-Diagonal Levels (token-level U,V; expand to node resolution via repeat_interleave)
+    block_size_token = leaf_size
+    for i, u_full in enumerate(factors_levels):
+        v_full = u_full  # U = V (symmetric); duplication done here
+        B, n_tokens, rank = u_full.shape
+        num_splits = 2 ** (i + 1)
+        block_size_node = N // num_splits
         if block_size_node < 1:
             continue
+        num_pairs = num_splits // 2
         expand = block_size_node // block_size_token
 
-        u_view = u_full.view(B, num_pairs, 2, block_size_token, -1)
-        v_view = v_full.view(B, num_pairs, 2, block_size_token, -1)
+        # View as (B, num_pairs, 2, block_size_token, R), then repeat each token to fill node block
+        u_view = u_full.view(B, num_pairs, 2, block_size_token, rank)
+        v_view = v_full.view(B, num_pairs, 2, block_size_token, rank)
         u_L = u_view[:, :, 0].repeat_interleave(expand, dim=2)
         u_R = u_view[:, :, 1].repeat_interleave(expand, dim=2)
         v_L = v_view[:, :, 0].repeat_interleave(expand, dim=2)
@@ -442,7 +455,7 @@ def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32):
         vl_xl = torch.matmul(v_L.transpose(-2, -1), x_L)
         y_R_update = torch.matmul(u_R, vl_xl)
         updates = torch.cat([y_L_update, y_R_update], dim=2)
-        y = y + updates.view(B, N, 1)
+        y = y + scale * updates.view(B, N, 1)
     return y
 
 # --- 4b. Save/Load HGT_OL to .bytes (28-byte header + float16 tensors) ---
@@ -475,13 +488,15 @@ def save_weights_to_bytes(model, path, input_dim=None):
     depth = model.depth
     max_rank = model.max_rank
     if input_dim is None:
-        input_dim = model.embed.proj.weight.shape[1]
+        input_dim = 124  # SymmetricNeighborEmbed expects 124-dim input
     nhead = 4
     with open(path, 'wb') as f:
         f.write(struct.pack('<ffiiiii', 0.0, 0.0, d_model, nhead, depth, input_dim, max_rank))
         # 1. Embed
-        _write_packed_tensor(f, model.embed.proj.weight, transpose=True)
-        _write_packed_tensor(f, model.embed.proj.bias, transpose=False)
+        _write_packed_tensor(f, model.embed.center_proj.weight, transpose=True)
+        _write_packed_tensor(f, model.embed.center_proj.bias, transpose=False)
+        _write_packed_tensor(f, model.embed.neighbor_proj.weight, transpose=True)
+        _write_packed_tensor(f, model.embed.neighbor_proj.bias, transpose=False)
         # 2. Pos encoding
         _write_packed_tensor(f, model.pos_encoding.freqs, transpose=False)
         # 2b. Encoder input proj (d_model -> rank-sized finest)
@@ -540,25 +555,10 @@ def save_weights_to_bytes(model, path, input_dim=None):
             _write_packed_tensor(f, blk.mlp[2].bias, False)
             _write_packed_tensor(f, model.hodlr_heads[i].proj_u.weight, True)
             _write_packed_tensor(f, model.hodlr_heads[i].proj_u.bias, False)
-            _write_packed_tensor(f, model.hodlr_heads[i].proj_v.weight, True)
-            _write_packed_tensor(f, model.hodlr_heads[i].proj_v.bias, False)
-        # 6. Leaf attn (TransformerBlock) + leaf_head (Linear) + diag bias
-        la = model.leaf_attn
-        _write_packed_tensor(f, la.norm1.weight, False)
-        _write_packed_tensor(f, la.norm1.bias, False)
-        _write_packed_tensor(f, la.attn.qkv.weight, True)
-        _write_packed_tensor(f, la.attn.qkv.bias, False)
-        _write_packed_tensor(f, la.attn.proj.weight, True)
-        _write_packed_tensor(f, la.attn.proj.bias, False)
-        _write_packed_tensor(f, la.norm2.weight, False)
-        _write_packed_tensor(f, la.norm2.bias, False)
-        _write_packed_tensor(f, la.mlp[0].weight, True)
-        _write_packed_tensor(f, la.mlp[0].bias, False)
-        _write_packed_tensor(f, la.mlp[2].weight, True)
-        _write_packed_tensor(f, la.mlp[2].bias, False)
+        # 6. Leaf head (Linear) + hodlr_scale
         _write_packed_tensor(f, model.leaf_head.weight, True)
         _write_packed_tensor(f, model.leaf_head.bias, False)
-        _write_packed_tensor(f, model.leaf_diag_bias, False)
+        _write_packed_tensor(f, model.hodlr_scale, False)
     # print(f"Saved to {path}")
 
 
@@ -590,8 +590,10 @@ def load_hgt_ol_weights_from_bytes(model, path):
         header = f.read(28)
         _, _, d_model, nhead, depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
         # 1. Embed
-        _read_packed_tensor(f, model.embed.proj.weight, transpose=True)
-        _read_packed_tensor(f, model.embed.proj.bias, False)
+        _read_packed_tensor(f, model.embed.center_proj.weight, transpose=True)
+        _read_packed_tensor(f, model.embed.center_proj.bias, False)
+        _read_packed_tensor(f, model.embed.neighbor_proj.weight, transpose=True)
+        _read_packed_tensor(f, model.embed.neighbor_proj.bias, False)
         # 2. Pos encoding
         _read_packed_tensor(f, model.pos_encoding.freqs, False)
         # 2b. Encoder input proj
@@ -650,25 +652,10 @@ def load_hgt_ol_weights_from_bytes(model, path):
             _read_packed_tensor(f, blk.mlp[2].bias, False)
             _read_packed_tensor(f, model.hodlr_heads[i].proj_u.weight, True)
             _read_packed_tensor(f, model.hodlr_heads[i].proj_u.bias, False)
-            _read_packed_tensor(f, model.hodlr_heads[i].proj_v.weight, True)
-            _read_packed_tensor(f, model.hodlr_heads[i].proj_v.bias, False)
-        # 6. Leaf attn + leaf_head + diag bias
-        la = model.leaf_attn
-        _read_packed_tensor(f, la.norm1.weight, False)
-        _read_packed_tensor(f, la.norm1.bias, False)
-        _read_packed_tensor(f, la.attn.qkv.weight, True)
-        _read_packed_tensor(f, la.attn.qkv.bias, False)
-        _read_packed_tensor(f, la.attn.proj.weight, True)
-        _read_packed_tensor(f, la.attn.proj.bias, False)
-        _read_packed_tensor(f, la.norm2.weight, False)
-        _read_packed_tensor(f, la.norm2.bias, False)
-        _read_packed_tensor(f, la.mlp[0].weight, True)
-        _read_packed_tensor(f, la.mlp[0].bias, False)
-        _read_packed_tensor(f, la.mlp[2].weight, True)
-        _read_packed_tensor(f, la.mlp[2].bias, False)
+        # 6. Leaf head + hodlr_scale
         _read_packed_tensor(f, model.leaf_head.weight, True)
         _read_packed_tensor(f, model.leaf_head.bias, False)
-        _read_packed_tensor(f, model.leaf_diag_bias, False)
+        _read_packed_tensor(f, model.hodlr_scale, False)
     print(f"Loaded HGT_OL weights from {path}")
 
 
@@ -720,12 +707,48 @@ def _most_recent_run_folder(base_path):
         return base
     return runs[0]
 
+
+def print_diagnostics(model, leaf_blocks, factors, step):
+    """
+    Prints internal stats of the HODLR matrix components to debug scaling and physics.
+    """
+    print(f"\n--- Diagnostics Step {step} ---")
+
+    # 1. Global Scale (if you added the learnable scalar)
+    if hasattr(model, 'hodlr_scale'):
+        print(f"  Global HODLR Scale: {model.hodlr_scale.item():.6f}")
+
+    # 2. Leaf Block Stats (The Diagonal)
+    # leaf_blocks shape: (B, NumLeaves, LeafSize, LeafSize)
+    leaf_diag = torch.diagonal(leaf_blocks, dim1=-2, dim2=-1)
+    print(f"  Leaf Blocks (Diag): Mean={leaf_diag.mean().item():.4f}, Min={leaf_diag.min().item():.4f}, Max={leaf_diag.max().item():.4f}")
+
+    # Check off-diagonal elements of leaf blocks (should be smaller than diagonal)
+    leaf_off = leaf_blocks - torch.diag_embed(leaf_diag)
+    print(f"  Leaf Blocks (Off):  MeanAbs={leaf_off.abs().mean().item():.4f}, Max={leaf_off.abs().max().item():.4f}")
+
+    # 3. HODLR Factor Stats (The Off-Diagonal / Global structure)
+    # factors is a list of U tensors (symmetric: we use U for both U and V)
+    print("  HODLR Levels (Coarse -> Fine):")
+    for i, factor_tuple in enumerate(factors):
+        if isinstance(factor_tuple, tuple):
+            U = factor_tuple[0]
+        else:
+            U = factor_tuple
+
+        u_norm = U.norm(dim=-1).mean().item()
+        u_max = U.abs().max().item()
+        print(f"    Lvl {i}: MeanNorm={u_norm:.5f}, MaxVal={u_max:.5f}")
+
+    print("----------------------------\n")
+
+
 def train_hgt_ol():
     parser = argparse.ArgumentParser()
     script_dir = Path(__file__).resolve().parent
     # Known location: Assets/StreamingAssets/TestData (under repo root = script_dir.parent.parent for Assets)
     default_data = script_dir.parent / "StreamingAssets" / "TestData"
-    parser.add_argument('--steps', type=int, default=4000)
+    parser.add_argument('--steps', type=int, default=10000)
     parser.add_argument('--data_folder', type=str, default=str(default_data),
                         help="Path to TestData (e.g. .../StreamingAssets/TestData). Uses most recent Run_* subfolder.")
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -733,7 +756,7 @@ def train_hgt_ol():
     parser.add_argument('--frame', type=int, default=600, help="Single frame index to use (e.g. 600, same as InspectModel).")
     parser.add_argument('--rank_scale', type=float, default=2.0, help="Rank = min(max_rank, scale * block^(2/3)).")
     parser.add_argument('--max_rank', type=int, default=128, help="Cap on HODLR rank per level.")
-    parser.add_argument('--d_model', type=int, default=32, help="Base channel dim (64 = larger model, needs ~44GB+ GPU; 32 fits single-frame on 44GB).")
+    parser.add_argument('--d_model', type=int, default=128, help="Base channel dim (64 = larger model, needs ~44GB+ GPU; 32 fits single-frame on 44GB).")
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -781,38 +804,38 @@ def train_hgt_ol():
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    def get_batch():
-        # Single frame only (no batching over frames); one frame's data is small (~few MB).
-        batch = dataset[frame_idx]
-        n_real = batch['num_nodes']
-        N_pad_batch = _pad_to_hodlr_size(n_real, leaf_size)
-        x = batch['x'].unsqueeze(0).to(device)
-        pad_len = N_pad_batch - n_real
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, pad_len), value=0.0)
-        A = torch.sparse_coo_tensor(
-            batch['edge_index'].to(device),
-            batch['edge_values'].to(device),
-            (n_real, n_real),
-        ).coalesce()
-        return x, A, n_real, N_pad_batch
+    # Single frame only: batch is identical every step, so load once and reuse.
+    batch = dataset[frame_idx]
+    n_real = batch['num_nodes']
+    N_cur = _pad_to_hodlr_size(n_real, leaf_size)
+    x_input = batch['x'].unsqueeze(0).to(device)
+    pad_len = N_cur - n_real
+    if pad_len > 0:
+        x_input = F.pad(x_input, (0, 0, 0, pad_len), value=0.0)
+    A_sparse = torch.sparse_coo_tensor(
+        batch['edge_index'].to(device),
+        batch['edge_values'].to(device),
+        (n_real, n_real),
+    ).coalesce()
 
     model.train()
     step_start = time.time()
 
     for step in range(args.steps):
-        if step == 0:
-            print("Step 0 (timing breakdown below):")
+        if step == 100:
+            t_step_start = time.time()
+            print("Step 100 (timing breakdown below; total step time at end):")
         t0 = time.time()
         optimizer.zero_grad()
-        x_input, A_sparse, n_real, N_cur = get_batch()
-        if step == 0:
-            print(f"  [timing] get_batch: {time.time()-t0:.3f}s (n_real={n_real}, N_cur={N_cur})")
+        if step == 100:
+            print(f"  [timing] zero_grad: {time.time()-t0:.3f}s")
+            print(f"  [timing] get_batch: 0.000s (cached; n_real={n_real}, N_cur={N_cur})")
+            t0 = time.time()
 
         t0 = time.time()
-        timing_dict = {} if step == 0 else None
+        timing_dict = {} if step == 100 else None
         leaf_blocks, factors = model(x_input, _timing=timing_dict)
-        if step == 0:
+        if step == 100:
             print(f"  [timing] model(x): {time.time()-t0:.3f}s (leaf_blocks {tuple(leaf_blocks.shape)}, {len(factors)} levels)")
             for k, v in sorted(timing_dict.items(), key=lambda x: x[0]):
                 print(f"    model.{k}: {v:.3f}s")
@@ -821,40 +844,55 @@ def train_hgt_ol():
         z = torch.randn(1, n_real, 1, device=device)
         y_flat = torch.sparse.mm(A_sparse, z.view(-1, 1))
         y = y_flat.view(1, n_real, 1)
-        if step == 0:
+        if step == 100:
             print(f"  [timing] z + A@z (sparse mm): {time.time()-t0:.3f}s")
 
         t0 = time.time()
         if N_cur > n_real:
             y = F.pad(y, (0, 0, 0, N_cur - n_real), value=0.0)
-        if step == 0:
+        if step == 100:
             print(f"  [timing] pad y to N_cur: {time.time()-t0:.3f}s (y {tuple(y.shape)})")
 
         t0 = time.time()
-        z_hat = apply_neural_hodlr(leaf_blocks, factors, y, leaf_size=leaf_size)
-        if step == 0:
+        z_hat = apply_neural_hodlr(leaf_blocks, factors, y, leaf_size=leaf_size, off_diag_scale=model.hodlr_scale)
+        if step == 100:
             print(f"  [timing] apply_neural_hodlr: {time.time()-t0:.3f}s")
 
         t0 = time.time()
         z_hat_real = z_hat[:, :n_real, :]
         loss = F.mse_loss(z_hat_real, z)
-        if step == 0:
+        if step == 100:
             print(f"  [timing] loss: {time.time()-t0:.3f}s")
 
         t0 = time.time()
         loss.backward()
-        if step == 0:
+        if step == 100:
             print(f"  [timing] loss.backward(): {time.time()-t0:.3f}s")
 
         t0 = time.time()
         optimizer.step()
-        if step == 0:
+        if step == 100:
             print(f"  [timing] optimizer.step(): {time.time()-t0:.3f}s")
+            print(f"  [timing] >>> step 100 total (train only): {time.time() - t_step_start:.3f}s")
 
         if step % 100 == 0:
-            print(f"Step {step}: Loss {loss.item():.6f} (total since last log: {time.time() - step_start:.1f}s)")
+            t_interval_start = time.time()
+            print(f"Step {step}: Loss {loss.item():.6f} ({time.time() - step_start:.1f}s elapsed for last {step + 1 if step == 0 else 100} steps)")
+            t0 = time.time()
+            model.eval()
+            with torch.no_grad():
+                lb_debug, fact_debug = model(x_input, _timing=None)
+                print_diagnostics(model, lb_debug, fact_debug, step)
+            model.train()
+            t_diag = time.time() - t0
+            t0 = time.time()
             out_path = script_dir / "model_weights.bytes"
             save_weights_to_bytes(model, out_path, input_dim=input_dim)
+            t_save = time.time() - t0
+            if step == 100:
+                print(f"  [timing] diagnostics (eval forward + print): {t_diag:.3f}s")
+                print(f"  [timing] save_weights_to_bytes: {t_save:.3f}s")
+                print(f"  [timing] >>> step 100 checkpoint total (diagnostics + save): {time.time() - t_interval_start:.3f}s")
             step_start = time.time()
 
     print("Training complete.")
