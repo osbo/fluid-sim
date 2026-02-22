@@ -884,6 +884,7 @@ def train_hgt_ol():
     parser.add_argument('--rank_scale', type=float, default=2.0, help="Rank = min(max_rank, scale * block^(2/3)).")
     parser.add_argument('--max_rank', type=int, default=128, help="Cap on HODLR rank per level.")
     parser.add_argument('--d_model', type=int, default=128, help="Base channel dim (64 = larger model, needs ~44GB+ GPU; 32 fits single-frame on 44GB).")
+    parser.add_argument('--viz_limit', type=int, default=300, help="Train on first viz_limit nodes only (smaller/faster; 0 = full size). Like InspectModel.")
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -908,11 +909,15 @@ def train_hgt_ol():
     frame_idx = min(args.frame, len(dataset) - 1) if dataset else 0
     # dataset[600] = frame_0600 (paths sorted: frame_0000, frame_0001, ...)
     sample = dataset[frame_idx]
-    num_nodes_real = sample['num_nodes']
-    N_pad = _pad_to_hodlr_size(num_nodes_real, leaf_size)
+    num_nodes_full = sample['num_nodes']
+    # Optionally train on first viz_limit nodes only (faster; model thinks matrix is smaller)
+    n_real = min(num_nodes_full, args.viz_limit) if args.viz_limit > 0 else num_nodes_full
+    N_pad = _pad_to_hodlr_size(n_real, leaf_size)
     depth = int(round(math.log2(N_pad // leaf_size)))
     input_dim = sample['x'].shape[1]
     d_model = args.d_model
+    if args.viz_limit > 0 and n_real < num_nodes_full:
+        print(f"  [startup] viz_limit={args.viz_limit}: training on first {n_real} nodes (full frame has {num_nodes_full})")
     print(f"  [startup] load frame {frame_idx} + compute N_pad/depth: {time.time()-t0:.2f}s")
 
     t0 = time.time()
@@ -927,23 +932,28 @@ def train_hgt_ol():
     print(f"  [startup] model.to(device): {time.time()-t0:.2f}s")
 
     print(f"Data: single frame {frame_idx} only (~few MB). Memory is model+optimizer, not data.")
-    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, num_nodes={num_nodes_real}, N_pad={N_pad}, depth={depth}, d_model={d_model}, num_probes={args.num_probes}, rank_scale={args.rank_scale}, max_rank={args.max_rank}")
+    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, num_nodes={n_real}, N_pad={N_pad}, depth={depth}, d_model={d_model}, num_probes={args.num_probes}, rank_scale={args.rank_scale}, max_rank={args.max_rank}" + (f" (viz_limit={args.viz_limit})" if args.viz_limit > 0 and n_real < num_nodes_full else ""))
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     # Single frame only: batch is identical every step, so load once and reuse.
     batch = dataset[frame_idx]
-    n_real = batch['num_nodes']
-    N_cur = _pad_to_hodlr_size(n_real, leaf_size)
-    x_input = batch['x'].unsqueeze(0).to(device)
-    pad_len = N_cur - n_real
+    # Use first n_real nodes (already set above for viz_limit)
+    x_input = batch['x'].unsqueeze(0)[:, :n_real, :].to(device)
+    pad_len = N_pad - n_real
     if pad_len > 0:
         x_input = F.pad(x_input, (0, 0, 0, pad_len), value=0.0)
+    # Principal submatrix A[0:n_real, 0:n_real] for the smaller system
+    rows, cols = batch['edge_index'][0], batch['edge_index'][1]
+    mask = (rows < n_real) & (cols < n_real)
+    edge_index_viz = batch['edge_index'][:, mask]
+    edge_values_viz = batch['edge_values'][mask]
     A_sparse = torch.sparse_coo_tensor(
-        batch['edge_index'].to(device),
-        batch['edge_values'].to(device),
+        edge_index_viz.to(device),
+        edge_values_viz.to(device),
         (n_real, n_real),
     ).coalesce()
+    N_cur = N_pad
 
     model.train()
     step_start = time.time()
