@@ -29,7 +29,6 @@ except ImportError:
 from NeuralPreconditioner import (
     HGT_OL,
     apply_neural_hodlr,
-    apply_hodlr_matrix,
     FluidGraphDataset,
     _pad_to_hodlr_size,
     read_weights_header,
@@ -40,10 +39,10 @@ from NeuralPreconditioner import (
 
 def _hodlr_rank_schedule_n23(depth, leaf_size, num_nodes, max_rank, min_rank=4, scale=0.5):
     """Rank per level using N^(2/3) scaling: r(level) = scale * block_size^(2/3), clamped to [min_rank, max_rank].
-    Levels are ordered Coarse (index 0) -> Fine, matching apply_hodlr_matrix (level_idx 0 = coarsest)."""
+    Levels are ordered Coarse (index 0) -> Fine, matching apply_neural_hodlr (level_idx 0 = coarsest)."""
     ranks = []
     for level_idx in range(depth):
-        # Same block_size formula as NeuralPreconditioner.apply_hodlr_matrix
+        # Same block_size formula as apply_neural_hodlr
         block_size = leaf_size * (2 ** (depth - 1 - level_idx))
         r = max(min_rank, min(max_rank, int(round(scale * (block_size ** (2 / 3))))))
         if r % 2 != 0:
@@ -66,7 +65,7 @@ class DirectHODLRBlocks(nn.Module):
         eye = torch.eye(leaf_size, device=device).unsqueeze(0).unsqueeze(0).expand(1, num_blocks, -1, -1).clone()
         self.leaf_blocks = nn.Parameter(eye + 0.01 * torch.randn(1, num_blocks, leaf_size, leaf_size, device=device))
 
-        # N^(2/3) rank schedule: Coarse -> Fine (index 0 = coarsest, matches apply_hodlr_matrix)
+        # N^(2/3) rank schedule: Coarse -> Fine (index 0 = coarsest, matches apply_neural_hodlr)
         self.ranks_coarse_to_fine = _hodlr_rank_schedule_n23(depth, leaf_size, num_nodes, max_rank, scale=rank_scale)
         if depth > 0:
             print(f"  Rank Schedule (N^2/3, Coarse->Fine): {self.ranks_coarse_to_fine}")
@@ -82,7 +81,7 @@ class DirectHODLRBlocks(nn.Module):
     def forward(self, x):
         s = self.hodlr_scale
         factors = [(u * s, u * s) for u in self.u_factors]
-        return apply_hodlr_matrix(self.leaf_blocks, factors, x, leaf_size=self.leaf_size)
+        return apply_neural_hodlr(self.leaf_blocks, factors, x, leaf_size=self.leaf_size, off_diag_scale=self.hodlr_scale)
 
     def get_params(self):
         s = self.hodlr_scale
@@ -119,7 +118,7 @@ def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_ran
 
         leaf_exp = leaf_blocks.expand(batch_size, -1, -1, -1)
         factors_exp = [(u.expand(batch_size, -1, -1), v.expand(batch_size, -1, -1)) for u, v in factors]
-        res = apply_hodlr_matrix(leaf_exp, factors_exp, Az, leaf_size=leaf_size)
+        res = apply_neural_hodlr(leaf_exp, factors_exp, Az, leaf_size=leaf_size, off_diag_scale=model.hodlr_scale)
 
         loss = F.mse_loss(res, z)
         loss.backward()
@@ -136,16 +135,13 @@ def train_overfit_baseline_blocks(A_indices, A_values, num_nodes, depth, max_ran
 
 def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_real, device, leaf_size=32, viz_limit=200, use_neural_apply=False, off_diag_scale=None):
     """
-    Reconstructs dense M from HODLR output (full n x n).
+    Reconstructs dense M from HODLR output (full n x n) via apply_neural_hodlr.
     Operates on padded_size; we probe in padded space, then crop to num_nodes_real.
-    use_neural_apply: True for HGT_OL output (token-space factors -> apply_neural_hodlr),
-                      False for overfit baseline (full-node factors -> apply_hodlr_matrix).
-    off_diag_scale: when use_neural_apply, pass model.hodlr_scale for correct scaling.
+    off_diag_scale: pass model's scale for neural (e.g. exp(log_hodlr_scales)); None for overfit (scale in factors).
     """
     viz_limit = min(num_nodes_real, viz_limit)
     M = torch.zeros(viz_limit, viz_limit, device='cpu')
     batch_size = 32
-    apply_fn = apply_neural_hodlr if use_neural_apply else apply_hodlr_matrix
 
     with torch.no_grad():
         for i in range(0, viz_limit, batch_size):
@@ -160,10 +156,7 @@ def get_dense_matrix_from_neural(leaf_blocks, factors, padded_size, num_nodes_re
             leaf_exp = leaf_blocks.expand(current_batch, -1, -1, -1)
             factors_exp = [(u.expand(current_batch, -1, -1), v.expand(current_batch, -1, -1)) for u, v in factors]
 
-            if use_neural_apply:
-                y_pad = apply_fn(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size, off_diag_scale=off_diag_scale)
-            else:
-                y_pad = apply_fn(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size)
+            y_pad = apply_neural_hodlr(leaf_exp, factors_exp, x_pad, leaf_size=leaf_size, off_diag_scale=off_diag_scale)
 
             y_real = y_pad[:, :viz_limit, 0].cpu()
             M[:, i:end] = y_real.T
