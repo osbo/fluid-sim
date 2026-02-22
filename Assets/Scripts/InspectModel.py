@@ -336,7 +336,16 @@ def main():
     
     leaf_size = 32
 
-    fig, axes = plt.subplots(4, 4, figsize=(20, 14))
+    amg_label = "AMG (disabled)" if SKIP_AMG else "AMG"
+    methods = [("Neural", M_neural_n)]
+    if not SKIP_OVERFIT:
+        methods.append(("Overfit", M_overfit_n))
+    methods.append((amg_label, M_amg_n))
+
+    n_rows = 1 + len(methods)  # header row + one per method (no blank rows when overfit disabled)
+    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 4 + 3 * n_rows))
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
     # Row 0: A (input) and A^{-1} (viz block)
     ax_a = axes[0, 0]
     im_a = ax_a.imshow(np.log10(np.abs(A_viz_n) + 1e-9), cmap='magma', aspect='auto')
@@ -348,12 +357,7 @@ def main():
     plt.colorbar(im_ainv, ax=ax_ainv)
     for j in range(2, 4):
         axes[0, j].axis('off')
-    # Row 1–3: Neural, Overfit (if enabled), AMG (or placeholder when disabled)
-    amg_label = "AMG (disabled)" if SKIP_AMG else "AMG"
-    methods = [("Neural", M_neural_n)]
-    if not SKIP_OVERFIT:
-        methods.append(("Overfit", M_overfit_n))
-    methods.append((amg_label, M_amg_n))
+    # Row 1..n_rows-1: Neural, Overfit (if enabled), AMG
     cond_A = np.linalg.cond(A_viz_n)
     print(f"\nCondition Number (Block A): {cond_A:.2e}")
     print(f"Leaf boundaries: every {leaf_size} (cyan grid on M plots; nodes are Morton-ordered)")
