@@ -252,8 +252,10 @@ def main():
     # Use N_pad from the saved model (leaf_size * 2^depth) so sequence length matches training
     N_pad = leaf_size * (2 ** depth)
     padded_size = N_pad
+    # Model may have been trained with viz_limit (smaller system): use first N_pad nodes only
     if num_nodes_real > N_pad:
-        raise SystemExit(f"Data has num_nodes={num_nodes_real} but model (depth={depth}) expects N_pad={N_pad}. Use weights trained for this size.")
+        print(f"  Model expects N_pad={N_pad} (trained on smaller system); using first {N_pad} nodes of data.")
+    n_for_model = min(num_nodes_real, N_pad)
     rank_scale = 2.0  # must match training; not stored in header
     model = HGT_OL(
         input_dim=input_dim_file,
@@ -265,8 +267,10 @@ def main():
     ).to(device)
     load_hgt_ol_weights_from_bytes(model, Path(args.weights))
 
-    # Pad node features to N_pad
-    x_padded = F.pad(x, (0, 0, 0, N_pad - num_nodes_real), value=0.0)
+    # Feed first n_for_model nodes and pad to N_pad
+    x_padded = x[:, :n_for_model, :].clone()
+    if n_for_model < N_pad:
+        x_padded = F.pad(x_padded, (0, 0, 0, N_pad - n_for_model), value=0.0)
     scale_A = batch.get('scale_A')
     if scale_A is not None and not isinstance(scale_A, torch.Tensor):
         scale_A = torch.tensor(scale_A, device=device, dtype=x_padded.dtype)
@@ -277,10 +281,13 @@ def main():
 
     viz_n = (args.viz_limit if args.viz_limit > 0 else n)
     viz_n = min(viz_n, n)
+    # When model was trained on smaller system, only visualize up to N_pad
+    if num_nodes_real > N_pad:
+        viz_n = min(viz_n, N_pad)
 
     _scale = torch.exp(model.log_hodlr_scales) if hasattr(model, 'log_hodlr_scales') else (model.hodlr_scale if hasattr(model, 'hodlr_scale') else None)
     M_neural = get_dense_matrix_from_neural(
-        leaf_blocks_neural, factors_neural, padded_size, num_nodes_real, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=_scale
+        leaf_blocks_neural, factors_neural, padded_size, n_for_model, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=_scale
     )
 
     # --- MODEL 2: OVERFIT HODLR (Block Diagonal, same structure as Neural) ---
