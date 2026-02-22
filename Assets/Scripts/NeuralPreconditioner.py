@@ -101,7 +101,10 @@ class FluidGraphDataset:
                 if k >= MAX_OFFDIAG_SLOTS:
                     break
                 base = 4 + k * 5
-                x[i, base + 0] = j / max(num_nodes, 1)
+                # Compute relative index and apply a sign-preserving log scale (int() avoids uint32 overflow)
+                delta_idx = float(int(j) - int(i))
+                x[i, base + 0] = math.copysign(math.log1p(abs(delta_idx)), delta_idx)
+
                 x[i, base + 1:base + 4] = positions_n[j]
                 x[i, base + 4] = v / scale_A
 
@@ -116,25 +119,59 @@ class FluidGraphDataset:
 # --- 1. Hierarchical Transformer Components ---
 # Inputs are in Morton order. Attention is restricted to HODLR blocks (see below).
 
+class RotaryEmbedding(nn.Module):
+    """RoPE for head_dim; uses even rope_dim = 2*(dim//2) so odd head_dims (e.g. 5) work."""
+    def __init__(self, dim, max_seq_len=8192):
+        super().__init__()
+        self.rope_dim = 2 * (dim // 2)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.seq_len_cached = 0
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x, seq_len=None):
+        if seq_len is None:
+            seq_len = x.shape[-2]
+        if seq_len > self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            # Shape: (1, 1, seq_len, rope_dim) to broadcast with (B*num_blocks, heads, seq_len, head_dim)
+            self.cos_cached = emb.cos()[None, None, :, :]
+            self.sin_cached = emb.sin()[None, None, :, :]
+        return self.cos_cached[:, :, :seq_len, :], self.sin_cached[:, :, :seq_len, :]
+
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rope(q, k, cos, sin):
+    # RoPE may use only first rope_dim dims when head_dim is odd
+    d = cos.shape[-1]
+    q_rope = (q[..., :d] * cos) + (rotate_half(q[..., :d]) * sin)
+    k_rope = (k[..., :d] * cos) + (rotate_half(k[..., :d]) * sin)
+    q_embed = torch.cat([q_rope, q[..., d:]], dim=-1) if d < q.shape[-1] else q_rope
+    k_embed = torch.cat([k_rope, k[..., d:]], dim=-1) if d < k.shape[-1] else k_rope
+    return q_embed, k_embed
+
+
 class HODLRBlockAttention(nn.Module):
-    """
-    Attention within each HODLR block. Sequence is partitioned into consecutive chunks of
-    block_size (= leaf_size) tokens; each chunk is one HODLR block at the current level.
-    Encoder: after k merges we have N/2^k tokens = (N/2^k)/leaf_size blocks of leaf_size.
-    Decoder: same — at each level we do leaf_size x leaf_size attention per block.
-    So we are not doing naive sliding windows; we attend only inside the binary HODLR structure.
-    """
     def __init__(self, dim, block_size, num_heads=4):
         super().__init__()
         self.dim = dim
         self.block_size = block_size
-        # dim may not be divisible by 4 (e.g. 20, 82 from rank schedule); use a divisor so head_dim is integer
         self.num_heads = num_heads if dim % num_heads == 0 else 1
         self.head_dim = dim // self.num_heads
         self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
+
+        self.rope = RotaryEmbedding(self.head_dim)
 
     def forward(self, x):
         B, N, C = x.shape
@@ -150,6 +187,9 @@ class HODLRBlockAttention(nn.Module):
         qkv = self.qkv(x_blk).reshape(B * num_blocks, self.block_size, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
+
+        cos, sin = self.rope(q, seq_len=self.block_size)
+        q, k = apply_rope(q, k, cos, sin)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -179,7 +219,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class SymmetricNeighborEmbed(nn.Module):
-    """ Encodes center node and sum-pools neighbor geometry + weights. """
+    """ Encodes center node and sum-pools neighbor geometry, weights, and sequence index. """
     def __init__(self, embed_dim, max_offdiag_slots=24):
         super().__init__()
         self.max_offdiag_slots = max_offdiag_slots
@@ -187,8 +227,8 @@ class SymmetricNeighborEmbed(nn.Module):
         # Center feature: [pos_x, pos_y, pos_z, diag]
         self.center_proj = nn.Linear(4, embed_dim)
 
-        # Neighbor feature: [delta_x, delta_y, delta_z, weight]
-        self.neighbor_proj = nn.Linear(4, embed_dim)
+        # Neighbor feature: [rel_idx, delta_x, delta_y, delta_z, weight]
+        self.neighbor_proj = nn.Linear(5, embed_dim)
 
     def forward(self, x):
         # x shape: (B, N, 124)
@@ -204,18 +244,21 @@ class SymmetricNeighborEmbed(nn.Module):
 
         for k in range(self.max_offdiag_slots):
             base = 4 + k * 5
-            # Skip the normalized index (base+0), grab position and weight
+
+            # Grab the log-scaled relative index, position, and weight
+            rel_idx = x[..., base+0 : base+1]
             pos_j = x[..., base+1 : base+4]
             weight_ij = x[..., base+4 : base+5]
 
             # Identify active neighbors vs zero-padded slots
             is_active = (weight_ij != 0.0).float()
 
-            # Relative position (masked so padded slots don't create garbage delta vectors)
+            # Relative position and masked index
             delta_pos = (pos_j - pos_i) * is_active
+            rel_idx = rel_idx * is_active
 
-            # Concatenate [delta_p, weight] and project
-            neighbor_feat = torch.cat([delta_pos, weight_ij], dim=-1)
+            # Concatenate [rel_idx, delta_p, weight] and project
+            neighbor_feat = torch.cat([rel_idx, delta_pos, weight_ij], dim=-1)
             e_ij = self.neighbor_proj(neighbor_feat)
 
             # Mask the output to ensure padded slots (and their biases) add exactly 0
@@ -226,21 +269,6 @@ class SymmetricNeighborEmbed(nn.Module):
 
         return h_center + h_neighbors
 
-
-class LearnableFourierPosEncoding(nn.Module):
-    """Learnable Fourier features based on the Z-order index (sequence position)."""
-    def __init__(self, d_model):
-        super().__init__()
-        assert d_model % 2 == 0
-        self.num_freq = d_model // 2
-        self.freqs = nn.Parameter(torch.randn(self.num_freq) * 0.1)
-
-    def forward(self, N):
-        device = self.freqs.device
-        idx = torch.arange(N, device=device, dtype=torch.float32).unsqueeze(1)
-        angles = idx * self.freqs.unsqueeze(0)
-        out = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
-        return out.unsqueeze(0)
 
 class HODLRHead(nn.Module):
     """
@@ -305,7 +333,6 @@ class HGT_OL(nn.Module):
 
         # 1. Embedding
         self.embed = SymmetricNeighborEmbed(d_model)
-        self.pos_encoding = LearnableFourierPosEncoding(d_model)
 
         # Block size = HODLR block at current resolution (leaf_size tokens per block at every level)
         enc_dec_block = leaf_size
@@ -371,7 +398,7 @@ class HGT_OL(nn.Module):
         self.leaf_proj = nn.Linear(leaf_dim, leaf_size)
         # default init (no override) so leaf_proj(h) has normal scale
         self.leaf_head = nn.Linear(leaf_size, leaf_size)
-        nn.init.normal_(self.leaf_head.weight, std=1e-4)
+        nn.init.normal_(self.leaf_head.weight, std=0.01)
         nn.init.constant_(self.leaf_head.bias, 0.0)
         # Per-level log-scales so fine levels can grow independently (avoids fighting a single decaying scale)
         self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
@@ -379,9 +406,9 @@ class HGT_OL(nn.Module):
 
         # --- Same small init as HODLR heads (off-diagonal only; leaf init done above)
         for head in self.hodlr_heads:
-            nn.init.normal_(head.proj_u.weight, std=1e-4)
+            nn.init.normal_(head.proj_u.weight, std=0.01)
             nn.init.constant_(head.proj_u.bias, 0.0)
-            nn.init.normal_(head.proj_v.weight, std=1e-4)
+            nn.init.normal_(head.proj_v.weight, std=0.01)
             nn.init.constant_(head.proj_v.bias, 0.0)
 
         # Print architecture once: leaves -> Level 0 .. Level (depth-1) -> bottleneck
@@ -393,7 +420,6 @@ class HGT_OL(nn.Module):
         if _timing is not None:
             t0 = time.time()
         h = self.embed(x)
-        h = h + self.pos_encoding(N)
         h = self.enc_input_proj(h)
         if _timing is not None:
             _timing["embed+pos"] = time.time() - t0
@@ -436,11 +462,9 @@ class HGT_OL(nn.Module):
         factors_levels = []
         for i in range(self.depth):
             u, v = self.hodlr_heads[i](h)
-            u = F.normalize(u, p=2, dim=-1) * math.sqrt(u.size(-1))
-            v = F.normalize(v, p=2, dim=-1) * math.sqrt(v.size(-1))
             factors_levels.append((u, v))
 
-        # 4. Leaf: predict U, then (U@U.T)*hodlr_scale; add Jacobi prior from A's diagonal in x
+        # 4. Leaf: off-diagonal same as HODLR (normalized U@U.T * scale); diagonal from data (Jacobi 1/diag(A))
         if _timing is not None:
             t0 = time.time()
         B, N, _ = h.shape
@@ -448,11 +472,13 @@ class HGT_OL(nn.Module):
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
         h_leaves = self.leaf_proj(h_leaves)
         u_leaf = self.leaf_head(h_leaves)  # (B, num_leaves, leaf_size, leaf_size)
+
+        # Off-diagonal only: scale * U@U.T (no identity), then zero the diagonal of that
         dense_blocks_out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * torch.exp(self.log_hodlr_scale_leaf)
-        # Base = identity so leaves have a visible init that matches the look of other HODLR blocks
-        dense_blocks_out = dense_blocks_out + torch.eye(self.leaf_size, device=dense_blocks_out.device, dtype=dense_blocks_out.dtype)
-        # Jacobi: scale only the diagonal by 1/diag(A); leave off-diagonals unchanged
-        # x[..., 3] is normalized diag when dataset uses normalization; scale_A from forward() recovers real diag
+        leaf_diag_off = torch.diagonal(dense_blocks_out, dim1=-2, dim2=-1)
+        dense_blocks_out = dense_blocks_out - torch.diag_embed(leaf_diag_off)
+
+        # Diagonal: from data (Jacobi 1/diag(A)); use 1.0 where A has no diagonal entry
         diag_A_n = x[..., 3]
         if scale_A is not None:
             s = scale_A if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=x.device, dtype=x.dtype)
@@ -463,10 +489,9 @@ class HGT_OL(nn.Module):
         mask = diag_A_real.abs() > 1e-6
         jacobi_diag[mask] = 1.0 / diag_A_real[mask]
         jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
-        leaf_diag = torch.diagonal(dense_blocks_out, dim1=-2, dim2=-1)  # (B, num_leaves, leaf_size)
         mask_blocks = mask.view(B, num_leaves, self.leaf_size)
-        new_diag = torch.where(mask_blocks, leaf_diag * jacobi_diag_blocks, leaf_diag)
-        dense_blocks_out = dense_blocks_out - torch.diag_embed(leaf_diag) + torch.diag_embed(new_diag)
+        new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
+        dense_blocks_out = dense_blocks_out + torch.diag_embed(new_diag)
 
         if _timing is not None:
             _timing["leaf_head"] = time.time() - t0
@@ -523,6 +548,7 @@ def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32, off_diag_sc
         y = y + scale_i * updates.view(B, N, K)
     return y
 
+
 # --- 4b. Save/Load HGT_OL to .bytes (28-byte header + float16 tensors) ---
 
 def read_weights_header(path):
@@ -562,9 +588,7 @@ def save_weights_to_bytes(model, path, input_dim=None):
         _write_packed_tensor(f, model.embed.center_proj.bias, transpose=False)
         _write_packed_tensor(f, model.embed.neighbor_proj.weight, transpose=True)
         _write_packed_tensor(f, model.embed.neighbor_proj.bias, transpose=False)
-        # 2. Pos encoding
-        _write_packed_tensor(f, model.pos_encoding.freqs, transpose=False)
-        # 2b. Encoder input proj (d_model -> rank-sized finest)
+        # 2. Encoder input proj (d_model -> rank-sized finest)
         _write_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
         _write_packed_tensor(f, model.enc_input_proj.bias, transpose=False)
         # 3. Encoder blocks + down_samples
@@ -664,9 +688,7 @@ def load_hgt_ol_weights_from_bytes(model, path):
         _read_packed_tensor(f, model.embed.center_proj.bias, False)
         _read_packed_tensor(f, model.embed.neighbor_proj.weight, transpose=True)
         _read_packed_tensor(f, model.embed.neighbor_proj.bias, False)
-        # 2. Pos encoding
-        _read_packed_tensor(f, model.pos_encoding.freqs, False)
-        # 2b. Encoder input proj
+        # 2. Encoder input proj
         _read_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
         _read_packed_tensor(f, model.enc_input_proj.bias, False)
         # 3. Encoder blocks + down_samples
