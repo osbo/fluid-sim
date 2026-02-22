@@ -337,8 +337,7 @@ class HGT_OL(nn.Module):
         # Block size = HODLR block at current resolution (leaf_size tokens per block at every level)
         enc_dec_block = leaf_size
 
-        # Rank schedule: same factor for both encoder and decoder (coarse -> fine order)
-        RANK_DIM_CONSTANT = 1
+        # Rank schedule for HODLR heads only (output ranks per level)
         ranks = []
         for i in range(depth):
             level_idx_from_bottom = depth - 1 - i
@@ -346,12 +345,11 @@ class HGT_OL(nn.Module):
             r = min(max_rank, int(round(rank_scale * (block_real_size ** (2.0 / 3.0)))))
             r = r if r % 2 == 0 else r + 1
             ranks.append(r)
-        # Decoder dims (coarse -> fine): dim_i = factor * rank_i
-        decoder_dims = [RANK_DIM_CONSTANT * r for r in ranks]
-        # Encoder dims (fine -> coarse): enc level j uses same rank as decoder level (depth-1-j), so same dim
-        encoder_dims = [RANK_DIM_CONSTANT * ranks[depth - 1 - j] for j in range(depth)]
+        # U-Net maintains full d_model capacity so neighbor geometry can pass through
+        decoder_dims = [self.d_model] * depth
+        encoder_dims = [self.d_model] * depth
 
-        # Project embed output (d_model) into rank-sized encoder dim at finest level
+        # Project embed output into encoder (d_model -> d_model)
         self.enc_input_proj = nn.Linear(d_model, encoder_dims[0])
 
         # 2. Encoder (Bottom-Up): each level uses rank-sized dim (same factor as decoder)
@@ -404,7 +402,7 @@ class HGT_OL(nn.Module):
         self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
         self.log_hodlr_scales = nn.Parameter(torch.ones(depth) * math.log(1e-2))
 
-        # --- Same small init as HODLR heads (off-diagonal only; leaf init done above)
+        # --- Same init as HODLR heads (match Overfit)
         for head in self.hodlr_heads:
             nn.init.normal_(head.proj_u.weight, std=0.01)
             nn.init.constant_(head.proj_u.bias, 0.0)
@@ -464,7 +462,7 @@ class HGT_OL(nn.Module):
             u, v = self.hodlr_heads[i](h)
             factors_levels.append((u, v))
 
-        # 4. Leaf: off-diagonal same as HODLR (normalized U@U.T * scale); diagonal from data (Jacobi 1/diag(A))
+        # 4. Leaf: U @ U.T, no normalization, no diagonal subtraction; add Jacobi prior
         if _timing is not None:
             t0 = time.time()
         B, N, _ = h.shape
@@ -473,12 +471,10 @@ class HGT_OL(nn.Module):
         h_leaves = self.leaf_proj(h_leaves)
         u_leaf = self.leaf_head(h_leaves)  # (B, num_leaves, leaf_size, leaf_size)
 
-        # Off-diagonal only: scale * U@U.T (no identity), then zero the diagonal of that
+        # NO normalization. Let the network natively predict magnitudes.
         dense_blocks_out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * torch.exp(self.log_hodlr_scale_leaf)
-        leaf_diag_off = torch.diagonal(dense_blocks_out, dim1=-2, dim2=-1)
-        dense_blocks_out = dense_blocks_out - torch.diag_embed(leaf_diag_off)
 
-        # Diagonal: from data (Jacobi 1/diag(A)); use 1.0 where A has no diagonal entry
+        # NO diagonal subtraction. Allow the network to add its correction to the Jacobi guess.
         diag_A_n = x[..., 3]
         if scale_A is not None:
             s = scale_A if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=x.device, dtype=x.dtype)
@@ -491,6 +487,7 @@ class HGT_OL(nn.Module):
         jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
         mask_blocks = mask.view(B, num_leaves, self.leaf_size)
         new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
+        # Add the Jacobi prior directly to the learned blocks
         dense_blocks_out = dense_blocks_out + torch.diag_embed(new_diag)
 
         if _timing is not None:
@@ -979,6 +976,25 @@ def train_hgt_ol():
             print(f"  [timing] model(x): {time.time()-t0:.3f}s (leaf_blocks {tuple(leaf_blocks.shape)}, {len(factors)} levels)")
             for k, v in sorted(timing_dict.items(), key=lambda x: x[0]):
                 print(f"    model.{k}: {v:.3f}s")
+            # --- Step 100: debug inputs and embedding for one node ---
+            _node = n_real // 2
+            _x = x_input[0, _node]
+            _x_cpu = _x.detach().cpu().numpy()
+            print(f"  [debug] Input x shape: {tuple(x_input.shape)} (B, N, 124)")
+            print(f"  [debug] Node {_node}: pos = [{_x_cpu[0]:.4f}, {_x_cpu[1]:.4f}, {_x_cpu[2]:.4f}], diag = {_x_cpu[3]:.4f}")
+            _n_active = 0
+            for _k in range(24):
+                _b = 4 + _k * 5
+                _w = _x_cpu[_b + 4]
+                if _w != 0.0:
+                    _n_active += 1
+                    if _n_active <= 4:
+                        print(f"  [debug]   slot {_k}: rel_idx={_x_cpu[_b]:.4f}, pos_j=[{_x_cpu[_b+1]:.4f},{_x_cpu[_b+2]:.4f},{_x_cpu[_b+3]:.4f}], weight={_w:.4f}")
+            print(f"  [debug]   ... node {_node} has {_n_active} non-zero neighbor slots (of 24)")
+            with torch.no_grad():
+                _h_embed = model.embed(x_input)[0, _node].cpu().numpy()
+            print(f"  [debug] Embedding for node {_node}: shape={_h_embed.shape}, norm={float(np.linalg.norm(_h_embed)):.4f}, min={_h_embed.min():.4f}, max={_h_embed.max():.4f}, mean={_h_embed.mean():.4f}")
+            print(f"  [debug]   first 8 dims: {_h_embed[:8].tolist()}")
 
         t0 = time.time()
         num_probes = args.num_probes
