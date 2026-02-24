@@ -396,32 +396,61 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.norm1(x), edge_index=edge_index, edge_values=edge_values, positions=positions, scale_A=scale_A, save_attention=save_attention)
         return x
 
-class SimpleNeighborhoodMLP(nn.Module):
-    """Per-node input (position 3 + diagonal 1) -> MLP -> d_model. Block attention does the rest."""
-    CENTER_DIMS = 4   # pos_i (3) + diag_i (1); no neighbor slots
+class SparsePhysicsGCN(nn.Module):
+    """
+    Lightweight message passing layer: neighbor features scaled by PDE matrix values (edge_values).
+    Uses index_add_ for aggregation; no PyTorch Geometric dependency.
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        self.linear_self = nn.Linear(d_model, d_model)
+        self.linear_neighbor = nn.Linear(d_model, d_model)
+        self.update_gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
 
+    def forward(self, x, edge_index, edge_values, scale_A=None):
+        B, N, C = x.shape
+        x_flat = x.squeeze(0) if B == 1 else x.view(B * N, C)
+
+        row, col = edge_index[0], edge_index[1]
+        w = edge_values.clone()
+        if scale_A is not None and scale_A != 1.0:
+            s = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else float(scale_A)
+            w = w / s
+
+        neighbor_features = self.linear_neighbor(x_flat)
+        messages = neighbor_features[col] * w.unsqueeze(-1)
+        aggr = torch.zeros_like(x_flat)
+        aggr.index_add_(0, row, messages)
+
+        self_features = self.linear_self(x_flat)
+        out = self.update_gate(torch.cat([self_features, aggr], dim=-1))
+        out = x_flat + out
+
+        return out.unsqueeze(0) if B == 1 else out.view(B, N, C)
+
+
+class PhysicsAwareEmbedding(nn.Module):
+    """Lift 4D input to d_model and run one physics-weighted message pass (GCN) with the graph."""
     def __init__(self, input_dim, d_model):
         super().__init__()
-        self.input_dim = input_dim
-        self.net = nn.Sequential(
+        self.lift = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
-        self.last_center_norm = 0.0
-        self.last_neighbor_norm = 0.0
+        self.gcn = SparsePhysicsGCN(d_model)
+        self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x):
-        # x is (B, N, input_dim) e.g. (B, N, 4) — node-only features
-        if not self.training and x.shape[-1] >= self.CENTER_DIMS:
-            c_part = F.linear(x[..., :self.CENTER_DIMS], self.net[0].weight[:, :self.CENTER_DIMS])
-            self.last_center_norm = c_part.norm(dim=-1).mean().item()
-            if x.shape[-1] > self.CENTER_DIMS:
-                n_part = F.linear(x[..., self.CENTER_DIMS:], self.net[0].weight[:, self.CENTER_DIMS:])
-                self.last_neighbor_norm = n_part.norm(dim=-1).mean().item()
-            else:
-                self.last_neighbor_norm = 0.0
-        return self.net(x)
+    def forward(self, x, edge_index=None, edge_values=None, scale_A=None):
+        h = self.lift(x)
+        if edge_index is not None and edge_values is not None:
+            h = self.gcn(h, edge_index, edge_values, scale_A)
+        return self.norm(h)
+
 
 class HODLRHead(nn.Module):
     """Generates U and V directly from the pooled token."""
@@ -463,7 +492,7 @@ class HGT_OL(nn.Module):
                  leaf_size=32,
                  max_rank=128,
                  rank_scale=2.0,
-                 num_layers_per_scale=4):
+                 num_layers_per_scale=3):
         super().__init__()
         self.d_model = d_model
         self.depth = depth
@@ -472,8 +501,8 @@ class HGT_OL(nn.Module):
         self.rank_scale = rank_scale
         self.num_layers_per_scale = num_layers_per_scale
 
-        # 1. Embedding: raw input_dim -> d_model
-        self.embed = SimpleNeighborhoodMLP(input_dim, d_model)
+        # 1. Embedding: lift + physics GCN (graph at full resolution)
+        self.embed = PhysicsAwareEmbedding(input_dim, d_model)
         self.enc_input_proj = nn.Linear(d_model, d_model)
 
         # HODLR Ranks (Ordered Coarse -> Fine)
@@ -485,10 +514,11 @@ class HGT_OL(nn.Module):
             r = r if r % 2 == 0 else r + 1
             self.ranks.append(r)
 
-        # 2. Down-Path: per scale, multiple residual-attention layers; leaf/HODLR/downsample only after last layer
+        # 2. Down-Path: per scale, level GCN then multiple residual-attention layers; leaf/HODLR/downsample after last layer
         self.enc_blocks = nn.ModuleList()
         self.down_samples = nn.ModuleList()
         self.hodlr_heads = nn.ModuleList()
+        self.level_gcns = nn.ModuleList()
 
         for j in range(depth):
             layers = nn.ModuleList([
@@ -497,6 +527,7 @@ class HGT_OL(nn.Module):
             ])
             self.enc_blocks.append(layers)
             self.down_samples.append(nn.Linear(d_model * 2, d_model))
+            self.level_gcns.append(SparsePhysicsGCN(d_model))
             rank_j = self.ranks[depth - 1 - j]
             expansion = 2 ** j
             self.hodlr_heads.append(HODLRHead(d_model, rank_j * expansion))
@@ -522,7 +553,7 @@ class HGT_OL(nn.Module):
         if _timing is not None: t0 = time.time()
         positions = x[..., :3].squeeze(0) if x.dim() == 3 else x[..., :3]
 
-        h = self.embed(x)
+        h = self.embed(x, edge_index, edge_values, scale_A)
         h = self.enc_input_proj(h)
         if _timing is not None: _timing["embed+pos"] = time.time() - t0
 
@@ -530,7 +561,7 @@ class HGT_OL(nn.Module):
         factors_fine_to_coarse = []
         dense_blocks_out = None  # Initialize before the loop
 
-        # Precompute per-level connectivity for masked attention (level j -> sequence length N/2^j)
+        # Precompute per-level connectivity for masked attention and level GCNs
         graph_per_level = None
         if edge_index is not None and edge_values is not None:
             device = x.device
@@ -542,6 +573,11 @@ class HGT_OL(nn.Module):
 
         for j in range(self.depth):
             if _timing is not None: t0 = time.time()
+
+            # Hierarchical physics: GCN at this scale (j=0 already done in embed)
+            if graph_per_level is not None and j > 0:
+                ei_j, ev_j, pos_j = graph_per_level[j]
+                h = self.level_gcns[j](h, ei_j, ev_j, scale_A)
 
             # Multiple residual-attention layers at this scale; leaf/HODLR/downsample only after last
             nlay = self.num_layers_per_scale
@@ -688,18 +724,37 @@ def save_weights_to_bytes(model, path, input_dim=None):
     
     with open(path, 'wb') as f:
         f.write(struct.pack('<ffiiiiii', 0.0, 0.0, d_model, nhead, depth, input_dim, max_rank, num_layers_per_scale))
-        # 1. Embed
-        _write_packed_tensor(f, model.embed.net[0].weight, transpose=True)
-        _write_packed_tensor(f, model.embed.net[0].bias, transpose=False)
-        _write_packed_tensor(f, model.embed.net[2].weight, transpose=True)
-        _write_packed_tensor(f, model.embed.net[2].bias, transpose=False)
+        # 1. Embed (PhysicsAwareEmbedding: lift + gcn + norm)
+        _write_packed_tensor(f, model.embed.lift[0].weight, transpose=True)
+        _write_packed_tensor(f, model.embed.lift[0].bias, transpose=False)
+        _write_packed_tensor(f, model.embed.lift[2].weight, transpose=True)
+        _write_packed_tensor(f, model.embed.lift[2].bias, transpose=False)
+        _write_packed_tensor(f, model.embed.gcn.linear_self.weight, transpose=True)
+        _write_packed_tensor(f, model.embed.gcn.linear_self.bias, transpose=False)
+        _write_packed_tensor(f, model.embed.gcn.linear_neighbor.weight, transpose=True)
+        _write_packed_tensor(f, model.embed.gcn.linear_neighbor.bias, transpose=False)
+        _write_packed_tensor(f, model.embed.gcn.update_gate[0].weight, transpose=True)
+        _write_packed_tensor(f, model.embed.gcn.update_gate[0].bias, transpose=False)
+        _write_packed_tensor(f, model.embed.gcn.update_gate[2].weight, transpose=True)
+        _write_packed_tensor(f, model.embed.gcn.update_gate[2].bias, transpose=False)
+        _write_packed_tensor(f, model.embed.norm.weight, transpose=False)
+        _write_packed_tensor(f, model.embed.norm.bias, transpose=False)
         
         # 2. Encoder input proj 
         _write_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
         _write_packed_tensor(f, model.enc_input_proj.bias, transpose=False)
         
-        # 3. Down Path: per scale, num_layers_per_scale blocks then down + head
+        # 3. Down Path: per scale, level_gcn then num_layers_per_scale blocks then down + head
         for i in range(model.depth):
+            gcn = model.level_gcns[i]
+            _write_packed_tensor(f, gcn.linear_self.weight, transpose=True)
+            _write_packed_tensor(f, gcn.linear_self.bias, transpose=False)
+            _write_packed_tensor(f, gcn.linear_neighbor.weight, transpose=True)
+            _write_packed_tensor(f, gcn.linear_neighbor.bias, transpose=False)
+            _write_packed_tensor(f, gcn.update_gate[0].weight, transpose=True)
+            _write_packed_tensor(f, gcn.update_gate[0].bias, transpose=False)
+            _write_packed_tensor(f, gcn.update_gate[2].weight, transpose=True)
+            _write_packed_tensor(f, gcn.update_gate[2].bias, transpose=False)
             for layer_idx in range(num_layers_per_scale):
                 block = model.enc_blocks[i][layer_idx]
                 _write_packed_tensor(f, block.norm1.weight, False)
@@ -763,18 +818,37 @@ def load_hgt_ol_weights_from_bytes(model, path):
                 "model must have >= checkpoint layers per scale."
             )
         
-        # 1. Embed
-        _read_packed_tensor(f, model.embed.net[0].weight, transpose=True)
-        _read_packed_tensor(f, model.embed.net[0].bias, False)
-        _read_packed_tensor(f, model.embed.net[2].weight, transpose=True)
-        _read_packed_tensor(f, model.embed.net[2].bias, False)
+        # 1. Embed (PhysicsAwareEmbedding)
+        _read_packed_tensor(f, model.embed.lift[0].weight, transpose=True)
+        _read_packed_tensor(f, model.embed.lift[0].bias, False)
+        _read_packed_tensor(f, model.embed.lift[2].weight, transpose=True)
+        _read_packed_tensor(f, model.embed.lift[2].bias, False)
+        _read_packed_tensor(f, model.embed.gcn.linear_self.weight, transpose=True)
+        _read_packed_tensor(f, model.embed.gcn.linear_self.bias, False)
+        _read_packed_tensor(f, model.embed.gcn.linear_neighbor.weight, transpose=True)
+        _read_packed_tensor(f, model.embed.gcn.linear_neighbor.bias, False)
+        _read_packed_tensor(f, model.embed.gcn.update_gate[0].weight, transpose=True)
+        _read_packed_tensor(f, model.embed.gcn.update_gate[0].bias, False)
+        _read_packed_tensor(f, model.embed.gcn.update_gate[2].weight, transpose=True)
+        _read_packed_tensor(f, model.embed.gcn.update_gate[2].bias, False)
+        _read_packed_tensor(f, model.embed.norm.weight, False)
+        _read_packed_tensor(f, model.embed.norm.bias, False)
         
         # 2. Enc Input Proj
         _read_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
         _read_packed_tensor(f, model.enc_input_proj.bias, False)
         
-        # 3. Down Path: num_layers_per_scale blocks per scale, then down + head
+        # 3. Down Path: level_gcn then num_layers_per_scale blocks per scale, then down + head
         for i in range(model.depth):
+            gcn = model.level_gcns[i]
+            _read_packed_tensor(f, gcn.linear_self.weight, transpose=True)
+            _read_packed_tensor(f, gcn.linear_self.bias, False)
+            _read_packed_tensor(f, gcn.linear_neighbor.weight, transpose=True)
+            _read_packed_tensor(f, gcn.linear_neighbor.bias, False)
+            _read_packed_tensor(f, gcn.update_gate[0].weight, transpose=True)
+            _read_packed_tensor(f, gcn.update_gate[0].bias, False)
+            _read_packed_tensor(f, gcn.update_gate[2].weight, transpose=True)
+            _read_packed_tensor(f, gcn.update_gate[2].bias, False)
             for layer_idx in range(num_layers_per_scale):
                 block = model.enc_blocks[i][layer_idx]
                 _read_packed_tensor(f, block.norm1.weight, False)
@@ -884,7 +958,7 @@ def train_hgt_ol():
     parser.add_argument('--frame', type=int, default=600)
     parser.add_argument('--rank_scale', type=float, default=2.0)
     parser.add_argument('--max_rank', type=int, default=128)
-    parser.add_argument('--d_model', type=int, default=512)
+    parser.add_argument('--d_model', type=int, default=128)
     parser.add_argument('--viz_limit', type=int, default=150)
     parser.add_argument('--save_attention', action='store_true', default=True, help='Save leaf attention weights every diagnostic step to debug_attention.pt for InspectModel --debug_attention')
     args = parser.parse_args()
