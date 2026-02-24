@@ -693,9 +693,10 @@ def train_hgt_ol():
     mask = (rows < n_real) & (cols < n_real)
     edge_index_viz = batch['edge_index'][:, mask]
     edge_values_viz = batch['edge_values'][mask]
+    mm_device = torch.device('cpu') if device.type == 'mps' else device
     A_sparse = torch.sparse_coo_tensor(
-        edge_index_viz.to(device),
-        edge_values_viz.to(device),
+        edge_index_viz.to(mm_device),
+        edge_values_viz.to(mm_device),
         (n_real, n_real),
     ).coalesce()
     N_cur = N_pad
@@ -715,8 +716,9 @@ def train_hgt_ol():
 
         num_probes = args.num_probes
         z = torch.randn(1, n_real, num_probes, device=device)
-        y_flat = torch.sparse.mm(A_sparse, z.squeeze(0))
-        y = y_flat.unsqueeze(0)
+        z_mm = z.squeeze(0).to(mm_device)
+        y_flat = torch.sparse.mm(A_sparse, z_mm)
+        y = y_flat.unsqueeze(0).to(device)
         
         if N_cur > n_real:
             y = F.pad(y, (0, 0, 0, N_cur - n_real), value=0.0)
