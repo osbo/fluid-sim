@@ -953,7 +953,6 @@ def train_hgt_ol():
     parser.add_argument('--data_folder', type=str, default=str(default_data))
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--num_probes', type=int, default=32)
     parser.add_argument('--leaf_size', type=int, default=32)
     parser.add_argument('--frame', type=int, default=600)
     parser.add_argument('--rank_scale', type=float, default=2.0)
@@ -1041,19 +1040,18 @@ def train_hgt_ol():
         edge_values_dev = edge_values_viz.to(device)
         leaf_blocks, factors = model(x_input, scale_A=scale_A, edge_index=edge_index_dev, edge_values=edge_values_dev)
 
-        num_probes = args.num_probes
-        z = torch.randn(1, n_real, num_probes, device=device)
-        z_mm = z.squeeze(0).to(mm_device)
-        y_flat = torch.sparse.mm(A_sparse, z_mm)
-        y = y_flat.unsqueeze(0).to(device)
-        
-        if N_cur > n_real:
-            y = F.pad(y, (0, 0, 0, N_cur - n_real), value=0.0)
+        # Form n_real x n_real block of M by applying preconditioner to identity columns
+        E = torch.zeros(1, N_cur, n_real, device=device, dtype=x_input.dtype)
+        E[0, :n_real, :] = torch.eye(n_real, device=device, dtype=x_input.dtype)
+        M_cols = apply_neural_hodlr(leaf_blocks, factors, E, leaf_size=leaf_size, off_diag_scale=torch.exp(model.log_hodlr_scales))
+        M_block = M_cols[0, :n_real, :]
 
-        z_hat = apply_neural_hodlr(leaf_blocks, factors, y, leaf_size=leaf_size, off_diag_scale=torch.exp(model.log_hodlr_scales))
-        z_hat_real = z_hat[:, :n_real, :]
-        
-        loss = F.mse_loss(z_hat_real, z)
+        A_dense = A_sparse.to_dense().to(device)
+        AM = A_dense @ M_block
+
+        # Loss = condition number of A*M (2-norm: ratio of largest to smallest singular value)
+        s = torch.linalg.svdvals(AM)
+        loss = s[0] / s[-1].clamp(min=1e-10)
         loss.backward()
 
         if args.max_grad_norm > 0:
@@ -1063,7 +1061,7 @@ def train_hgt_ol():
 
         if step % 100 == 0:
             t_interval_start = time.time()
-            print(f"Step {step}: Loss {loss.item():.6f} ({time.time() - step_start:.1f}s elapsed for last 100 steps)")
+            print(f"Step {step}: Cond(A·M) {loss.item():.4f} ({time.time() - step_start:.1f}s elapsed for last 100 steps)")
             model.eval()
             with torch.no_grad():
                 lb_debug, fact_debug = model(x_input, scale_A=scale_A, edge_index=edge_index_dev, edge_values=edge_values_dev, save_attention=args.save_attention)

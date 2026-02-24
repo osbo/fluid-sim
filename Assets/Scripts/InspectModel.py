@@ -247,10 +247,13 @@ def main():
     # Use N_pad from the saved model (leaf_size * 2^depth) so sequence length matches training
     N_pad = leaf_size * (2 ** depth)
     padded_size = N_pad
-    # Model may have been trained with viz_limit (smaller system): use first N_pad nodes only
+    # Match training: training uses min(num_nodes, viz_limit) nodes; cap so cond(AM) is comparable to training log
     if num_nodes_real > N_pad:
         print(f"  Model expects N_pad={N_pad} (trained on smaller system); using first {N_pad} nodes of data.")
-    n_for_model = min(num_nodes_real, N_pad)
+    viz_limit_for_forward = args.viz_limit if args.viz_limit > 0 else num_nodes_real
+    n_for_model = min(num_nodes_real, N_pad, viz_limit_for_forward)
+    if n_for_model < min(num_nodes_real, N_pad):
+        print(f"  Neural forward uses n_for_model={n_for_model} (viz_limit) so Cond(AM) matches training.")
     rank_scale = 2.0  # must match training; not stored in header
     model = HGT_OL(
         input_dim=input_dim_file,
