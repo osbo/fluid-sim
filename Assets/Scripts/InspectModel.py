@@ -200,8 +200,10 @@ def main():
     parser.add_argument('--max_depth', type=int, default=10)
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Path to save plot image (default: script_dir/inspect_model_plot.png)')
-    parser.add_argument('--viz_limit', type=int, default=300,
+    parser.add_argument('--viz_limit', type=int, default=150,
                         help="Max size for dense M reconstruction and viz (reduces AMG work). Use 0 for full N.")
+    parser.add_argument('--debug_attention', default=True, action='store_true',
+                        help='Show leaf attention heatmap in top right (requires debug_attention.pt from training with --save_attention).')
     parser.add_argument('--overfit', action='store_true',
                         help='Enable Overfit HODLR baseline training and its graphs (disabled by default).')
     args = parser.parse_args()
@@ -232,16 +234,16 @@ def main():
     A_viz = A_sparse_cpu.to_dense().numpy()
 
     # --- MODEL 1: HGT_OL (Neural Preconditioner) ---
-    # HGT_OL uses SymmetricNeighborEmbed and expects 124-dim node features (pos, diag, 24 neighbor slots).
+    # HGT_OL expects 4-dim node features (position 3 + diagonal 1) from FluidGraphDataset.
     print("\n1. Loading and running HGT_OL (neural preconditioner)...")
     leaf_size = 32
-    d_model_h, nhead, depth_file, input_dim_file, max_rank_file = read_weights_header(Path(args.weights))
+    d_model_h, nhead, depth_file, input_dim_file, max_rank_file, num_layers_per_scale = read_weights_header(Path(args.weights))
     d_model = args.d_model if args.d_model is not None else d_model_h
     if args.d_model is not None:
         print(f"  Using d_model={d_model} (override; header had {d_model_h})")
     depth = depth_file
-    if x.shape[-1] != 124:
-        raise SystemExit(f"Neural model expects 124-dim input (SymmetricNeighborEmbed); got {x.shape[-1]}. Use FluidGraphDataset with the same feature layout.")
+    if x.shape[-1] != 4:
+        raise SystemExit(f"Neural model expects 4-dim input (position + diagonal); got {x.shape[-1]}. Use FluidGraphDataset with the same feature layout.")
     # Use N_pad from the saved model (leaf_size * 2^depth) so sequence length matches training
     N_pad = leaf_size * (2 ** depth)
     padded_size = N_pad
@@ -257,6 +259,7 @@ def main():
         leaf_size=leaf_size,
         max_rank=max_rank_file,
         rank_scale=rank_scale,
+        num_layers_per_scale=num_layers_per_scale,
     ).to(device)
     load_hgt_ol_weights_from_bytes(model, Path(args.weights))
 
@@ -267,8 +270,13 @@ def main():
     scale_A = batch.get('scale_A')
     if scale_A is not None and not isinstance(scale_A, torch.Tensor):
         scale_A = torch.tensor(scale_A, device=device, dtype=x_padded.dtype)
+    # Edge list for leaf masked attention (only edges within first n_for_model nodes)
+    ei = batch['edge_index']
+    em = (ei[0] < n_for_model) & (ei[1] < n_for_model)
+    edge_index_model = ei[:, em].to(device)
+    edge_values_model = batch['edge_values'][em].to(device)
     with torch.no_grad():
-        leaf_blocks_neural, factors_neural = model(x_padded, scale_A=scale_A)
+        leaf_blocks_neural, factors_neural = model(x_padded, scale_A=scale_A, edge_index=edge_index_model, edge_values=edge_values_model)
 
     print(f"  HGT_OL inference: padded_size={padded_size}, depth={depth}")
 
@@ -316,6 +324,52 @@ def main():
         A_scipy = csr_matrix((data, (row, col)), shape=(num_nodes_real, num_nodes_real))
         M_amg = get_dense_amg(A_scipy, viz_limit=viz_n, tol=1e-6, progress_interval=200)
 
+    # --- Load debug attention/scores/bias for all blocks if requested ---
+    debug_blocks = None  # list of dicts: [{'attn': (N_j,N_j) viz, 'scores': viz, 'bias_physics': viz}, ...]
+    if args.debug_attention:
+        debug_path = script_dir / "debug_attention.pt"
+        if debug_path.exists():
+            try:
+                data = torch.load(debug_path, map_location='cpu')
+                blocks_data = data.get('blocks', [])
+                if not blocks_data:
+                    blocks_data = [{'attn': data['attn_blocks'], 'scores': None, 'bias_physics': None}]
+                ls = int(data['leaf_size'])
+                depth_debug = len(blocks_data)
+                debug_blocks = []
+                for j in range(depth_debug):
+                    bd = blocks_data[j]
+                    attn_b = bd['attn']
+                    if isinstance(attn_b, torch.Tensor):
+                        attn_b = attn_b.numpy()
+                    num_b = attn_b.shape[0]
+                    N_j = num_b * ls
+                    side = min(viz_n, N_j)
+                    def to_viz(mat, fill_val=0.0):
+                        if mat is None:
+                            return np.full((viz_n, viz_n), fill_val, dtype=np.float32)
+                        if isinstance(mat, torch.Tensor):
+                            mat = mat.numpy()
+                        full = np.zeros((N_j, N_j), dtype=np.float32)
+                        for b in range(num_b):
+                            r0, r1 = b * ls, (b + 1) * ls
+                            full[r0:r1, r0:r1] = mat[b]
+                        out = np.full((viz_n, viz_n), fill_val, dtype=np.float32)
+                        out[:side, :side] = full[:side, :side]
+                        return out
+                    debug_blocks.append({
+                        'attn': to_viz(attn_b),
+                        'scores': to_viz(bd.get('scores'), np.nan),
+                        'bias_physics': to_viz(bd.get('bias_physics'), np.nan),
+                    })
+                print(f"  Loaded debug attention from {debug_path.name} (step {data.get('step', '?')}, {depth_debug} blocks, {viz_n}x{viz_n} viz)")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"  Warning: could not load debug attention: {e}")
+        else:
+            print("  --debug_attention: debug_attention.pt not found (run training with --save_attention)")
+
     # --- Visualization (use viz_n so all matrices are consistent) ---
     A_viz_n = A_viz[:viz_n, :viz_n]
     M_neural_n = M_neural[:viz_n, :viz_n]
@@ -342,8 +396,10 @@ def main():
         methods.append(("Overfit", M_overfit_n))
     methods.append((amg_label, M_amg_n))
 
-    n_rows = 1 + len(methods)  # header row + one per method (no blank rows when overfit disabled)
-    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 4 + 3 * n_rows))
+    depth_debug = len(debug_blocks) if debug_blocks else 0
+    n_cols = max(4, depth_debug) if depth_debug else 4
+    n_rows = 1 + (2 if depth_debug else 0) + len(methods)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows))
     if n_rows == 1:
         axes = axes.reshape(1, -1)
     # Row 0: A (input) and A^{-1} (viz block)
@@ -355,15 +411,39 @@ def main():
     im_ainv = ax_ainv.imshow(np.log10(np.abs(A_inv_viz) + 1e-9), cmap='magma', aspect='auto')
     ax_ainv.set_title(f"A^{{-1}} (viz {viz_n}x{viz_n} block) log10")
     plt.colorbar(im_ainv, ax=ax_ainv)
-    for j in range(2, 4):
+    for j in range(2, n_cols):
         axes[0, j].axis('off')
-    # Row 1..n_rows-1: Neural, Overfit (if enabled), AMG
+
+    # Rows 1–2: Scores and Bias physics (all blocks) when debug_attention loaded
+    if depth_debug:
+        for col in range(depth_debug):
+            ax = axes[1, col]
+            scores_viz = debug_blocks[col]['scores']
+            if np.any(np.isfinite(scores_viz)):
+                s_log = np.where(np.isfinite(scores_viz), np.log10(np.abs(scores_viz) + 1e-9), np.nan)
+                im = ax.imshow(s_log, cmap='magma', aspect='auto')
+                plt.colorbar(im, ax=ax)
+            ax.set_title(f"Scores block {col} (log10)")
+        for col in range(depth_debug, n_cols):
+            axes[1, col].axis('off')
+        for col in range(depth_debug):
+            ax = axes[2, col]
+            bias_viz = debug_blocks[col]['bias_physics']
+            if np.any(np.isfinite(bias_viz)):
+                b_log = np.where(np.isfinite(bias_viz), np.log10(np.abs(bias_viz) + 1e-9), np.nan)
+                im = ax.imshow(b_log, cmap='magma', aspect='auto')
+                plt.colorbar(im, ax=ax)
+            ax.set_title(f"Bias physics block {col} (log10)")
+        for col in range(depth_debug, n_cols):
+            axes[2, col].axis('off')
+    # Method rows: Neural, Overfit (if enabled), AMG
     cond_A = np.linalg.cond(A_viz_n)
     print(f"\nCondition Number (Block A): {cond_A:.2e}")
     print(f"Leaf boundaries: every {leaf_size} (cyan grid on M plots; nodes are Morton-ordered)")
 
+    method_row_start = 1 + (2 if depth_debug else 0)
     for idx, (name, M) in enumerate(methods):
-        row = idx + 1
+        row = method_row_start + idx
         ax_m = axes[row, 0]
         im = ax_m.imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto')
         ax_m.set_title(f"{name} M (log10) [grid=leaf {leaf_size}x{leaf_size}]")
@@ -378,10 +458,25 @@ def main():
         ax_am.set_title(f"{name} A·M")
         
         ax_d = axes[row, 2]
-        ax_d.plot(np.diag(AM), alpha=0.8)
-        ax_d.axhline(1.0, color='r', linestyle='--')
-        ax_d.set_ylim(-0.5, 2.0)
-        ax_d.set_title(f"{name} Diag(A·M)")
+        # Eigenvalue clustering of A·M (within viz_limit); ideal preconditioning clusters near 1
+        try:
+            evals = np.linalg.eigvals(AM)
+            ax_d.scatter(evals.real, evals.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
+            ax_d.axvline(1.0, color='r', linestyle='--', alpha=0.8)
+            ax_d.axhline(0.0, color='k', linestyle='-', alpha=0.3)
+            ax_d.set_xlabel('Re(λ)')
+            ax_d.set_ylabel('Im(λ)')
+            ax_d.set_title(f"{name} Eigenvalues of A·M (n={viz_n})")
+            ax_d.set_aspect('equal', adjustable='box')
+            # Auto-scale with margin; include (1,0) in view if possible
+            r_min, r_max = evals.real.min(), evals.real.max()
+            i_max = np.abs(evals.imag).max()
+            margin = 0.1 * max(r_max - r_min, 2 * i_max, 1.0) or 0.2
+            ax_d.set_xlim(min(r_min, 1.0) - margin, max(r_max, 1.0) + margin)
+            ax_d.set_ylim(-max(i_max, margin), max(i_max, margin))
+        except Exception as e:
+            ax_d.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_d.transAxes, ha='center', va='center', fontsize=9)
+            ax_d.set_title(f"{name} Eigenvalues (failed)")
         
         ax_t = axes[row, 3]
         ax_t.axis('off')
