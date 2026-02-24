@@ -193,36 +193,19 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-class SymmetricNeighborEmbed(nn.Module):
-    def __init__(self, embed_dim, max_offdiag_slots=24):
+class SimpleNeighborhoodMLP(nn.Module):
+    """Raw 124-dim (center + 24 neighbor slots) -> MLP -> d_model. Block attention does the rest."""
+    def __init__(self, input_dim, d_model):
         super().__init__()
-        self.max_offdiag_slots = max_offdiag_slots
-        self.center_proj = nn.Linear(4, embed_dim)
-        self.neighbor_proj = nn.Linear(5, embed_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
 
     def forward(self, x):
-        pos_i = x[..., 0:3]
-        diag_i = x[..., 3:4]
-        center_feat = torch.cat([pos_i, diag_i], dim=-1)
-        h_center = self.center_proj(center_feat)
-
-        h_neighbors = torch.zeros_like(h_center)
-        for k in range(self.max_offdiag_slots):
-            base = 4 + k * 5
-            rel_idx = x[..., base+0 : base+1]
-            pos_j = x[..., base+1 : base+4]
-            weight_ij = x[..., base+4 : base+5]
-
-            is_active = (weight_ij != 0.0).float()
-            delta_pos = (pos_j - pos_i) * is_active
-            rel_idx = rel_idx * is_active
-
-            neighbor_feat = torch.cat([rel_idx, delta_pos, weight_ij], dim=-1)
-            e_ij = self.neighbor_proj(neighbor_feat)
-            e_ij = e_ij * is_active
-            h_neighbors = h_neighbors + e_ij
-
-        return h_center + h_neighbors
+        # x is (B, N, input_dim) e.g. (B, N, 124)
+        return self.net(x)
 
 class HODLRHead(nn.Module):
     """Generates U and V directly from the pooled token."""
@@ -270,8 +253,8 @@ class HGT_OL(nn.Module):
         self.max_rank = max_rank
         self.rank_scale = rank_scale
 
-        # 1. Embedding
-        self.embed = SymmetricNeighborEmbed(d_model)
+        # 1. Embedding: raw input_dim -> d_model, then block attention handles the rest
+        self.embed = SimpleNeighborhoodMLP(input_dim, d_model)
         self.enc_input_proj = nn.Linear(d_model, d_model)
 
         # HODLR Ranks (Ordered Coarse -> Fine)
@@ -323,41 +306,44 @@ class HGT_OL(nn.Module):
         h = self.enc_input_proj(h)
         if _timing is not None: _timing["embed+pos"] = time.time() - t0
 
-        # --- 1. Leaf Head (Extract from full-res length N) ---
-        if _timing is not None: t0 = time.time()
-        num_leaves = N // self.leaf_size
-        h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
-        h_leaves = self.leaf_proj(h_leaves)
-        u_leaf = self.leaf_head(h_leaves)  
-        
-        dense_blocks_out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * torch.exp(self.log_hodlr_scale_leaf)
-
-        diag_A_n = x[..., 3]
-        s = scale_A if scale_A is not None else 1.0
-        if isinstance(s, torch.Tensor):
-            diag_A_real = diag_A_n * s
-        else:
-            diag_A_real = diag_A_n * s
-            
-        jacobi_diag = torch.zeros_like(diag_A_real)
-        mask = diag_A_real.abs() > 1e-6
-        jacobi_diag[mask] = 1.0 / diag_A_real[mask]
-        jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
-        mask_blocks = mask.view(B, num_leaves, self.leaf_size)
-        
-        new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
-        dense_blocks_out = dense_blocks_out + torch.diag_embed(new_diag)
-        if _timing is not None: _timing["leaf_head"] = time.time() - t0
-
         # --- 2. Down-Only HODLR Hierarchy ---
         factors_fine_to_coarse = []
-        
+        dense_blocks_out = None  # Initialize before the loop
+
         for j in range(self.depth):
             if _timing is not None: t0 = time.time()
-            
+
             # Mix spatial information within the current scale
             h = checkpoint(self.enc_blocks[j], h, use_reentrant=True) if self.training else self.enc_blocks[j](h)
-            
+
+            # --- FIX: Extract Leaf Blocks after token mixing at j=0 ---
+            if j == 0:
+                if _timing is not None: t_leaf = time.time()
+                num_leaves = N // self.leaf_size
+                h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
+                h_leaves = self.leaf_proj(h_leaves)
+                u_leaf = self.leaf_head(h_leaves)
+
+                leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * torch.exp(self.log_hodlr_scale_leaf)
+
+                diag_A_n = x[..., 3]
+                s = scale_A if scale_A is not None else 1.0
+                if isinstance(s, torch.Tensor):
+                    diag_A_real = diag_A_n * s
+                else:
+                    diag_A_real = diag_A_n * s
+
+                jacobi_diag = torch.zeros_like(diag_A_real)
+                mask = diag_A_real.abs() > 1e-6
+                jacobi_diag[mask] = 1.0 / diag_A_real[mask]
+                jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
+                mask_blocks = mask.view(B, num_leaves, self.leaf_size)
+
+                new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
+                dense_blocks_out = leaf_base + torch.diag_embed(new_diag)
+                if _timing is not None: _timing["leaf_head"] = time.time() - t_leaf
+            # ----------------------------------------------------------
+
             # Extract factors for this scale
             u_expanded, v_expanded = self.hodlr_heads[j](h)
             rank_j = self.ranks[self.depth - 1 - j]
@@ -452,10 +438,10 @@ def save_weights_to_bytes(model, path, input_dim=None):
     with open(path, 'wb') as f:
         f.write(struct.pack('<ffiiiii', 0.0, 0.0, d_model, nhead, depth, input_dim, max_rank))
         # 1. Embed
-        _write_packed_tensor(f, model.embed.center_proj.weight, transpose=True)
-        _write_packed_tensor(f, model.embed.center_proj.bias, transpose=False)
-        _write_packed_tensor(f, model.embed.neighbor_proj.weight, transpose=True)
-        _write_packed_tensor(f, model.embed.neighbor_proj.bias, transpose=False)
+        _write_packed_tensor(f, model.embed.net[0].weight, transpose=True)
+        _write_packed_tensor(f, model.embed.net[0].bias, transpose=False)
+        _write_packed_tensor(f, model.embed.net[2].weight, transpose=True)
+        _write_packed_tensor(f, model.embed.net[2].bias, transpose=False)
         
         # 2. Encoder input proj 
         _write_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
@@ -521,10 +507,10 @@ def load_hgt_ol_weights_from_bytes(model, path):
         _, _, d_model, nhead, depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
         
         # 1. Embed
-        _read_packed_tensor(f, model.embed.center_proj.weight, transpose=True)
-        _read_packed_tensor(f, model.embed.center_proj.bias, False)
-        _read_packed_tensor(f, model.embed.neighbor_proj.weight, transpose=True)
-        _read_packed_tensor(f, model.embed.neighbor_proj.bias, False)
+        _read_packed_tensor(f, model.embed.net[0].weight, transpose=True)
+        _read_packed_tensor(f, model.embed.net[0].bias, False)
+        _read_packed_tensor(f, model.embed.net[2].weight, transpose=True)
+        _read_packed_tensor(f, model.embed.net[2].bias, False)
         
         # 2. Enc Input Proj
         _read_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
@@ -593,8 +579,31 @@ def _most_recent_run_folder(base_path):
     if not runs: return base
     return runs[0]
 
-def print_diagnostics(model, leaf_blocks, factors, step):
+def print_diagnostics(model, leaf_blocks, factors, step, optimizer=None):
     print(f"\n--- Diagnostics Step {step} ---")
+
+    # --- 1. ACTIVATION NORMS ---
+    if hasattr(model, 'embed') and hasattr(model.embed, 'last_center_norm'):
+        c_norm = model.embed.last_center_norm
+        n_norm = model.embed.last_neighbor_norm
+        ratio = (n_norm / c_norm) if c_norm > 0 else 0
+        print(f"  Embed Norms | Center: {c_norm:.4f} | Neighbor: {n_norm:.4f} | Ratio (N/C): {ratio:.4f}")
+        if ratio < 0.1:
+            print("  ⚠️ WARNING: Neighbor embeddings are an order of magnitude smaller than center embeddings. They are being washed out.")
+
+    # --- 2. GRADIENT MAGNITUDES (only for embedders with center/neighbor split) ---
+    if optimizer is not None and hasattr(model, 'embed') and hasattr(model.embed, 'center_proj') and hasattr(model.embed, 'neighbor_proj'):
+        c_grad = model.embed.center_proj.weight.grad
+        n_grad = model.embed.neighbor_proj.weight.grad
+
+        if c_grad is not None and n_grad is not None:
+            c_g_mean = c_grad.abs().mean().item()
+            n_g_mean = n_grad.abs().mean().item()
+            g_ratio = (n_g_mean / c_g_mean) if c_g_mean > 0 else 0
+            print(f"  Gradients   | Center: {c_g_mean:.2e} | Neighbor: {n_g_mean:.2e} | Ratio (N/C): {g_ratio:.4f}")
+            if g_ratio < 0.05:
+                print("  ⚠️ WARNING: Model is heavily suppressing gradients to the neighbor projection. It is learning to ignore neighbors.")
+
     if hasattr(model, 'log_hodlr_scale_leaf'):
         leaf_s = torch.exp(model.log_hodlr_scale_leaf).item()
         print(f"  Leaf off-diag scale: {leaf_s:.6f}")
@@ -634,7 +643,7 @@ def train_hgt_ol():
     parser.add_argument('--frame', type=int, default=600)
     parser.add_argument('--rank_scale', type=float, default=2.0)
     parser.add_argument('--max_rank', type=int, default=128)
-    parser.add_argument('--d_model', type=int, default=128)
+    parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--viz_limit', type=int, default=300)
     args = parser.parse_args()
 
@@ -740,7 +749,7 @@ def train_hgt_ol():
             model.eval()
             with torch.no_grad():
                 lb_debug, fact_debug = model(x_input, scale_A=scale_A)
-                print_diagnostics(model, lb_debug, fact_debug, step)
+                print_diagnostics(model, lb_debug, fact_debug, step, optimizer)
             model.train()
             
             out_path = script_dir / "model_weights.bytes"
