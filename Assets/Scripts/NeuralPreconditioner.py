@@ -195,16 +195,28 @@ class TransformerBlock(nn.Module):
 
 class SimpleNeighborhoodMLP(nn.Module):
     """Raw 124-dim (center + 24 neighbor slots) -> MLP -> d_model. Block attention does the rest."""
+    CENTER_DIMS = 4   # pos_i (3) + diag_i (1); rest are neighbor slots
+
     def __init__(self, input_dim, d_model):
         super().__init__()
+        self.input_dim = input_dim
         self.net = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
+        # For diagnostics: first-layer contribution norms (center vs neighbor input dims)
+        self.last_center_norm = 0.0
+        self.last_neighbor_norm = 0.0
 
     def forward(self, x):
         # x is (B, N, input_dim) e.g. (B, N, 124)
+        if not self.training:
+            # Stash norms of first-layer contribution from center (0:4) vs neighbor (4:) for diagnostics
+            c_part = F.linear(x[..., :self.CENTER_DIMS], self.net[0].weight[:, :self.CENTER_DIMS])
+            n_part = F.linear(x[..., self.CENTER_DIMS:], self.net[0].weight[:, self.CENTER_DIMS:])
+            self.last_center_norm = c_part.norm(dim=-1).mean().item()
+            self.last_neighbor_norm = n_part.norm(dim=-1).mean().item()
         return self.net(x)
 
 class HODLRHead(nn.Module):
@@ -588,21 +600,36 @@ def print_diagnostics(model, leaf_blocks, factors, step, optimizer=None):
         n_norm = model.embed.last_neighbor_norm
         ratio = (n_norm / c_norm) if c_norm > 0 else 0
         print(f"  Embed Norms | Center: {c_norm:.4f} | Neighbor: {n_norm:.4f} | Ratio (N/C): {ratio:.4f}")
-        if ratio < 0.1:
+        if c_norm > 0 and ratio < 0.1:
             print("  ⚠️ WARNING: Neighbor embeddings are an order of magnitude smaller than center embeddings. They are being washed out.")
 
-    # --- 2. GRADIENT MAGNITUDES (only for embedders with center/neighbor split) ---
-    if optimizer is not None and hasattr(model, 'embed') and hasattr(model.embed, 'center_proj') and hasattr(model.embed, 'neighbor_proj'):
-        c_grad = model.embed.center_proj.weight.grad
-        n_grad = model.embed.neighbor_proj.weight.grad
-
-        if c_grad is not None and n_grad is not None:
-            c_g_mean = c_grad.abs().mean().item()
-            n_g_mean = n_grad.abs().mean().item()
-            g_ratio = (n_g_mean / c_g_mean) if c_g_mean > 0 else 0
-            print(f"  Gradients   | Center: {c_g_mean:.2e} | Neighbor: {n_g_mean:.2e} | Ratio (N/C): {g_ratio:.4f}")
-            if g_ratio < 0.05:
-                print("  ⚠️ WARNING: Model is heavily suppressing gradients to the neighbor projection. It is learning to ignore neighbors.")
+    # --- 2. GRADIENT MAGNITUDES ---
+    if optimizer is not None and hasattr(model, 'embed'):
+        embed = model.embed
+        # SymmetricNeighborEmbed (center_proj / neighbor_proj)
+        if hasattr(embed, 'center_proj') and hasattr(embed, 'neighbor_proj'):
+            c_grad = embed.center_proj.weight.grad
+            n_grad = embed.neighbor_proj.weight.grad
+            if c_grad is not None and n_grad is not None:
+                c_g_mean = c_grad.abs().mean().item()
+                n_g_mean = n_grad.abs().mean().item()
+                g_ratio = (n_g_mean / c_g_mean) if c_g_mean > 0 else 0
+                print(f"  Gradients   | Center: {c_g_mean:.2e} | Neighbor: {n_g_mean:.2e} | Ratio (N/C): {g_ratio:.4f}")
+                if g_ratio < 0.05:
+                    print("  ⚠️ WARNING: Model is heavily suppressing gradients to the neighbor projection. It is learning to ignore neighbors.")
+        # SimpleNeighborhoodMLP: slice first layer by input dims (center 0:4 vs neighbor 4:)
+        elif hasattr(embed, 'net') and len(embed.net) >= 1:
+            w_grad = embed.net[0].weight.grad
+            if w_grad is not None and hasattr(embed, 'CENTER_DIMS'):
+                k = embed.CENTER_DIMS
+                c_grad = w_grad[:, :k]
+                n_grad = w_grad[:, k:]
+                c_g_mean = c_grad.abs().mean().item()
+                n_g_mean = n_grad.abs().mean().item()
+                g_ratio = (n_g_mean / c_g_mean) if c_g_mean > 0 else 0
+                print(f"  Gradients   | Center (input 0:{k}): {c_g_mean:.2e} | Neighbor (input {k}:): {n_g_mean:.2e} | Ratio (N/C): {g_ratio:.4f}")
+                if c_g_mean > 0 and g_ratio < 0.05:
+                    print("  ⚠️ WARNING: Model is heavily suppressing gradients to the neighbor input weights. It is learning to ignore neighbors.")
 
     if hasattr(model, 'log_hodlr_scale_leaf'):
         leaf_s = torch.exp(model.log_hodlr_scale_leaf).item()
