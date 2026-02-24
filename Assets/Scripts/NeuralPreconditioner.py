@@ -32,8 +32,6 @@ def _read_num_nodes(frame_path):
         return nodes_bin.stat().st_size // 64
     return 0
 
-MAX_OFFDIAG_SLOTS = 24  
-
 class FluidGraphDataset:
     def __init__(self, data_folders):
         self.frame_paths = []
@@ -63,12 +61,9 @@ class FluidGraphDataset:
 
         positions = np.asarray(raw_nodes['position'], dtype=np.float32)
         diag_map = np.zeros(num_nodes, dtype=np.float32)
-        row_edges = defaultdict(list)
         for r, c, v in zip(rows, cols, vals):
             if r == c:
                 diag_map[r] = v
-            else:
-                row_edges[r].append((c, v))
 
         pos_scale = float(np.abs(positions).max())
         if pos_scale <= 0.0: pos_scale = 1.0
@@ -78,19 +73,11 @@ class FluidGraphDataset:
         if scale_A <= 0.0: scale_A = 1.0
         diag_map_n = diag_map / scale_A
 
-        n_float = 3 + 1 + MAX_OFFDIAG_SLOTS * 5
+        # Input: only per-node info (position 3 + diagonal 1), no neighbor slots
+        n_float = 4
         x = np.zeros((num_nodes, n_float), dtype=np.float32)
         x[:, :3] = positions_n
         x[:, 3] = diag_map_n
-        for i in range(num_nodes):
-            slots = row_edges.get(i, [])
-            for k, (j, v) in enumerate(slots):
-                if k >= MAX_OFFDIAG_SLOTS: break
-                base = 4 + k * 5
-                delta_idx = float(int(j) - int(i))
-                x[i, base + 0] = math.copysign(math.log1p(abs(delta_idx)), delta_idx)
-                x[i, base + 1:base + 4] = positions_n[j]
-                x[i, base + 4] = v / scale_A
 
         return {
             'x': torch.from_numpy(x).float(),
@@ -176,26 +163,242 @@ class HODLRBlockAttention(nn.Module):
             x_out = x_out[:, :N, :]
         return x_out
 
+
+def build_merged_connectivity(edge_index, edge_values, positions, level, device, dtype=torch.float32, scale_A=None):
+    """
+    At `level` (0 = original), merge edges: (r, c) -> (r // 2^level, c // 2^level).
+    Additively blend edge values for same (i, j). Positions = centroid of original positions per super-node.
+    Returns: merged_edge_index (2, E'), merged_edge_values (E'), merged_positions (N', 3).
+    """
+    if level == 0:
+        return edge_index.to(device), edge_values.to(device), positions.to(device)
+    rows, cols = edge_index[0], edge_index[1]
+    scale = 2 ** level
+    i = (rows // scale).long()
+    j = (cols // scale).long()
+    w = edge_values.to(dtype=dtype)
+    if scale_A is not None and scale_A != 1.0:
+        s = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else float(scale_A)
+        w = w / s
+    agg = defaultdict(lambda: 0.0)
+    for a, b, v in zip(i.tolist(), j.tolist(), w.tolist()):
+        agg[(a, b)] += v
+    if not agg:
+        n_merged = max(positions.shape[0] // scale, 1)
+        pos_flat = positions.to(device=device, dtype=dtype)
+        merged_positions = torch.zeros(n_merged, 3, device=device, dtype=dtype)
+        for idx in range(n_merged):
+            start, end = idx * scale, min((idx + 1) * scale, positions.shape[0])
+            if start < end:
+                merged_positions[idx] = pos_flat[start:end].mean(dim=0)
+        return (
+            torch.zeros(2, 0, dtype=torch.long, device=device),
+            torch.zeros(0, dtype=dtype, device=device),
+            merged_positions,
+        )
+    pairs = list(agg.keys())
+    merged_i = torch.tensor([p[0] for p in pairs], device=device, dtype=torch.long)
+    merged_j = torch.tensor([p[1] for p in pairs], device=device, dtype=torch.long)
+    merged_w = torch.tensor([agg[p] for p in pairs], device=device, dtype=dtype)
+    merged_edge_index = torch.stack([merged_i, merged_j], dim=0)
+    n_merged = positions.shape[0] // scale
+    pos_flat = positions.to(device=device, dtype=dtype)
+    merged_positions = torch.zeros(n_merged, 3, device=device, dtype=dtype)
+    for idx in range(n_merged):
+        start, end = idx * scale, min((idx + 1) * scale, positions.shape[0])
+        if start < end:
+            merged_positions[idx] = pos_flat[start:end].mean(dim=0)
+    return merged_edge_index, merged_w, merged_positions
+
+
+def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, leaf_size, device, dtype=torch.float32):
+    """
+    Build per-block attention mask and edge features for leaf blocks.
+    - positions: (N, 3) normalized; edge_values normalized by scale_A at call site.
+    - Returns: attn_mask (num_blocks, 32, 33), edge_feats (num_blocks, 32, 33, 4).
+      attn_mask[b,i,j]=1 if node i in block b can attend to j (j in 0..31 = node, 32 = block node).
+      edge_feats[b,i,j,:] = (dx, dy, dz, w_norm) for edges; 0 elsewhere. Self and block node get weight 1 in the MLP step.
+    """
+    N = positions.shape[0]
+    num_blocks = N // leaf_size
+    if num_blocks == 0:
+        return None, None
+    rows, cols = edge_index[0], edge_index[1]
+    # Only in-block edges: same block for r and c
+    block_r = rows // leaf_size
+    block_c = cols // leaf_size
+    in_block = (block_r == block_c) & (block_r < num_blocks)
+    r_l, c_l = rows[in_block] % leaf_size, cols[in_block] % leaf_size
+    b_l = block_r[in_block]
+    pos_r = positions[rows[in_block]]
+    pos_c = positions[cols[in_block]]
+    dx = (pos_c - pos_r).to(device=device, dtype=dtype)
+    w = edge_values[in_block].to(device=device, dtype=dtype)
+    if scale_A is not None and scale_A != 1.0:
+        s = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else float(scale_A)
+        w = w / s
+    edge_feats_flat = torch.cat([dx, w.unsqueeze(1)], dim=1)
+
+    attn_mask = torch.zeros(num_blocks, leaf_size, leaf_size + 1, device=device, dtype=dtype)
+    edge_feats = torch.zeros(num_blocks, leaf_size, leaf_size + 1, 4, device=device, dtype=dtype)
+    # Self-attend
+    attn_mask[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device)] = 1.0
+    edge_feats[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device), :] = 0.0  # MLP will not be used; we set weight=1
+    # Block node: all 32 attend to column 32
+    attn_mask[:, :, leaf_size] = 1.0
+    # In-block edges
+    attn_mask[b_l, r_l, c_l] = 1.0
+    edge_feats[b_l, r_l, c_l, :] = edge_feats_flat.to(device)
+    return attn_mask, edge_feats
+
+
+class LeafBlockAttention(nn.Module):
+    """
+    Masked attention within each leaf block of 32 nodes.
+
+    FIXES APPLIED:
+    1. Decoupled Heads: Scores keep head dimension (bnqkh) so heads learn distinct patterns;
+       softmax over keys (dim=3). Previously einsum collapsed heads.
+    2. Linear Edge Bypass: edge_gate projects normalized A_ij to per-head signed weights,
+       added AFTER softmax. Allows negative weights and magnitudes > 1 for inverse/stencil-like ops.
+    """
+    def __init__(self, dim, block_size, num_heads=4):
+        super().__init__()
+        self.dim = dim
+        self.block_size = block_size
+        self.num_heads = num_heads if dim % num_heads == 0 else 1
+        self.head_dim = dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        # Learnable projection for Linear Edge Bypass: scalar edge weight -> per-head signed weight
+        self.edge_gate = nn.Linear(1, self.num_heads)
+        nn.init.normal_(self.edge_gate.weight, std=0.01)
+        nn.init.zeros_(self.edge_gate.bias)
+        self.last_attn_self = 0.0
+        self.last_attn_neighbor = 0.0
+        self.last_attn_block = 0.0
+        self.last_attn_matrix = None
+        self.last_scores_matrix = None
+        self.last_bias_physics_matrix = None
+
+    def forward(self, x, edge_index=None, edge_values=None, positions=None, scale_A=None, save_attention=False):
+        B, N, C = x.shape
+        if edge_index is None or positions is None:
+            return self._forward_dense_fallback(x, B, N, C, save_attention)
+
+        device = x.device
+        dtype = x.dtype
+        pad = 0
+        if N % self.block_size != 0:
+            pad = self.block_size - (N % self.block_size)
+            x = F.pad(x, (0, 0, 0, pad))
+        N_pad = x.shape[1]
+        num_blocks = N_pad // self.block_size
+
+        attn_mask, edge_feats = build_leaf_block_connectivity(
+            edge_index, edge_values, positions, scale_A, self.block_size, device, dtype
+        )
+        if attn_mask is None:
+            return x[:, :N, :] if pad > 0 else x
+
+        x_blk = x.view(B, num_blocks, self.block_size, C)
+        block_node = x_blk.mean(dim=2, keepdim=True)
+        kv = torch.cat([x_blk, block_node], dim=2)
+        qkv_q = self.qkv(x_blk)
+        qkv_kv = self.qkv(kv)
+        q = qkv_q[..., :C]
+        k = qkv_kv[..., C:2*C]
+        v = qkv_kv[..., 2*C:3*C]
+        q = q.view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
+        k = k.view(B, num_blocks, 33, self.num_heads, self.head_dim)
+        v = v.view(B, num_blocks, 33, self.num_heads, self.head_dim)
+
+        # Scores with head dimension preserved: (B, n, 32, 33, H)
+        scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
+
+        w = edge_feats[..., 3].clone()
+        w[:, :, self.block_size] = 1.0
+        w[:, torch.arange(self.block_size, device=device), torch.arange(self.block_size, device=device)] = 1.0
+        bias_physics = w
+        scores = scores + bias_physics.unsqueeze(0).unsqueeze(-1)
+        mask_expanded = attn_mask.unsqueeze(0).unsqueeze(-1)
+        scores = scores.masked_fill(mask_expanded == 0, float('-inf'))
+
+        if save_attention:
+            with torch.no_grad():
+                self.last_scores_matrix = scores.mean(dim=-1)[:, :, :, :self.block_size].cpu().float()
+                self.last_bias_physics_matrix = bias_physics[:, :, :self.block_size].cpu().float()
+
+        attn_probs = F.softmax(scores, dim=3)
+
+        # Linear Edge Bypass: signed, unbounded per-head weights from edge values
+        linear_edge_weights = self.edge_gate(bias_physics.unsqueeze(-1))  # (num_blocks, 32, 33, H)
+        linear_edge_weights = linear_edge_weights.unsqueeze(0).masked_fill(mask_expanded == 0, 0.0)
+
+        combined_weights = attn_probs + linear_edge_weights
+
+        with torch.no_grad():
+            attn_viz = combined_weights.mean(dim=-1)
+            arange = torch.arange(self.block_size, device=attn_viz.device)
+            self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
+            self.last_attn_block = attn_viz[:, :, :, self.block_size].mean().item()
+            to_nodes = attn_viz[:, :, :, :self.block_size].sum(dim=3)
+            self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
+            if save_attention:
+                self.last_attn_matrix = attn_viz[:, :, :, :self.block_size].cpu().float()
+
+        x_out = torch.einsum('bnqkh,bnkhd->bnqhd', combined_weights, v)
+        x_out = x_out.reshape(B, num_blocks, self.block_size, C)
+        x_out = self.proj(x_out.view(B, N_pad, C))
+        if pad > 0:
+            x_out = x_out[:, :N, :]
+        return x_out
+
+    def _forward_dense_fallback(self, x, B, N, C, save_attention):
+        pad = 0
+        if N % self.block_size != 0:
+            pad = self.block_size - (N % self.block_size)
+            x = F.pad(x, (0, 0, 0, pad))
+        N_pad = x.shape[1]
+        num_blocks = N_pad // self.block_size
+        x_blk = x.view(B * num_blocks, self.block_size, C)
+        qkv = self.qkv(x_blk).reshape(B * num_blocks, self.block_size, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        with torch.no_grad():
+            arange = torch.arange(self.block_size, device=attn.device)
+            self.last_attn_self = attn[:, arange, arange].mean().item()
+            self.last_attn_block = 0.0
+            self.last_attn_neighbor = (attn.sum(dim=-1) - attn[:, arange, arange]).mean().item()
+            self.last_scores_matrix = None
+            self.last_bias_physics_matrix = None
+            if save_attention:
+                self.last_attn_matrix = attn.cpu().float()
+        x_out = (attn @ v).transpose(1, 2).reshape(B * num_blocks, self.block_size, C)
+        x_out = self.proj(x_out)
+        x_out = x_out.view(B, N_pad, C)
+        if pad > 0:
+            x_out = x_out[:, :N, :]
+        return x_out
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, block_size, heads=4, mlp_ratio=4.0):
+    """Pre-norm attention with residual: x = x + attn(norm1(x)). No MLP."""
+    def __init__(self, dim, block_size, heads=4, mlp_ratio=4.0, attn_module=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = HODLRBlockAttention(dim, block_size, heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Linear(int(dim * mlp_ratio), dim)
-        )
+        self.attn = attn_module if attn_module is not None else HODLRBlockAttention(dim, block_size, heads)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+    def forward(self, x, edge_index=None, edge_values=None, positions=None, scale_A=None, save_attention=False):
+        x = x + self.attn(self.norm1(x), edge_index=edge_index, edge_values=edge_values, positions=positions, scale_A=scale_A, save_attention=save_attention)
         return x
 
 class SimpleNeighborhoodMLP(nn.Module):
-    """Raw 124-dim (center + 24 neighbor slots) -> MLP -> d_model. Block attention does the rest."""
-    CENTER_DIMS = 4   # pos_i (3) + diag_i (1); rest are neighbor slots
+    """Per-node input (position 3 + diagonal 1) -> MLP -> d_model. Block attention does the rest."""
+    CENTER_DIMS = 4   # pos_i (3) + diag_i (1); no neighbor slots
 
     def __init__(self, input_dim, d_model):
         super().__init__()
@@ -205,18 +408,19 @@ class SimpleNeighborhoodMLP(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
-        # For diagnostics: first-layer contribution norms (center vs neighbor input dims)
         self.last_center_norm = 0.0
         self.last_neighbor_norm = 0.0
 
     def forward(self, x):
-        # x is (B, N, input_dim) e.g. (B, N, 124)
-        if not self.training:
-            # Stash norms of first-layer contribution from center (0:4) vs neighbor (4:) for diagnostics
+        # x is (B, N, input_dim) e.g. (B, N, 4) — node-only features
+        if not self.training and x.shape[-1] >= self.CENTER_DIMS:
             c_part = F.linear(x[..., :self.CENTER_DIMS], self.net[0].weight[:, :self.CENTER_DIMS])
-            n_part = F.linear(x[..., self.CENTER_DIMS:], self.net[0].weight[:, self.CENTER_DIMS:])
             self.last_center_norm = c_part.norm(dim=-1).mean().item()
-            self.last_neighbor_norm = n_part.norm(dim=-1).mean().item()
+            if x.shape[-1] > self.CENTER_DIMS:
+                n_part = F.linear(x[..., self.CENTER_DIMS:], self.net[0].weight[:, self.CENTER_DIMS:])
+                self.last_neighbor_norm = n_part.norm(dim=-1).mean().item()
+            else:
+                self.last_neighbor_norm = 0.0
         return self.net(x)
 
 class HODLRHead(nn.Module):
@@ -229,15 +433,16 @@ class HODLRHead(nn.Module):
     def forward(self, x):
         return self.proj_u(x), self.proj_v(x)
 
-def _print_hodlr_architecture(leaf_size, depth, ranks):
+def _print_hodlr_architecture(leaf_size, depth, ranks, num_layers_per_scale=1):
     lines = [
         "HODLR architecture (Down-Only pass):",
         f"  Leaf:           dense {leaf_size}x{leaf_size} diagonal blocks",
+        f"  Layers/scale:   {num_layers_per_scale} (residual attention blocks)",
     ]
     for j in range(depth):
         level_idx_from_bottom = depth - 1 - j
         rank_j = ranks[level_idx_from_bottom]
-        lines.append(f"  Encoder Step {j}: Length N/{2**j} -> Predicts Level {level_idx_from_bottom} factors (Rank {rank_j})")
+        lines.append(f"  Scale {j}: Length N/{2**j} -> {num_layers_per_scale} layers -> Level {level_idx_from_bottom} factors (Rank {rank_j})")
     print("\n" + "\n".join(lines) + "\n")
 
 # --- 3. The Main Architecture (Down-Only) ---
@@ -257,15 +462,17 @@ class HGT_OL(nn.Module):
                  depth=4,
                  leaf_size=32,
                  max_rank=128,
-                 rank_scale=2.0):
+                 rank_scale=2.0,
+                 num_layers_per_scale=4):
         super().__init__()
         self.d_model = d_model
         self.depth = depth
         self.leaf_size = leaf_size
         self.max_rank = max_rank
         self.rank_scale = rank_scale
+        self.num_layers_per_scale = num_layers_per_scale
 
-        # 1. Embedding: raw input_dim -> d_model, then block attention handles the rest
+        # 1. Embedding: raw input_dim -> d_model
         self.embed = SimpleNeighborhoodMLP(input_dim, d_model)
         self.enc_input_proj = nn.Linear(d_model, d_model)
 
@@ -278,24 +485,24 @@ class HGT_OL(nn.Module):
             r = r if r % 2 == 0 else r + 1
             self.ranks.append(r)
 
-        # 2. Down-Path (Encoder & Heads)
+        # 2. Down-Path: per scale, multiple residual-attention layers; leaf/HODLR/downsample only after last layer
         self.enc_blocks = nn.ModuleList()
         self.down_samples = nn.ModuleList()
         self.hodlr_heads = nn.ModuleList()
 
         for j in range(depth):
-            self.enc_blocks.append(TransformerBlock(d_model, block_size=leaf_size))
+            layers = nn.ModuleList([
+                TransformerBlock(d_model, block_size=leaf_size, attn_module=LeafBlockAttention(d_model, leaf_size, num_heads=4))
+                for _ in range(num_layers_per_scale)
+            ])
+            self.enc_blocks.append(layers)
             self.down_samples.append(nn.Linear(d_model * 2, d_model))
-            
-            # Predict factors for this level. 
-            # j=0 is sequence length N. It predicts the finest off-diagonals (ranks[-1]).
             rank_j = self.ranks[depth - 1 - j]
-            expansion = 2 ** j 
+            expansion = 2 ** j
             self.hodlr_heads.append(HODLRHead(d_model, rank_j * expansion))
 
-        # 3. Leaf Generation (applied to full-res N before downsampling)
-        self.leaf_proj = nn.Linear(d_model, leaf_size)
-        self.leaf_head = nn.Linear(leaf_size, leaf_size)
+        # 3. Leaf Generation (d_model -> leaf block; applied at j=0 after last layer)
+        self.leaf_head = nn.Linear(d_model, leaf_size)
         nn.init.normal_(self.leaf_head.weight, std=0.01)
         nn.init.constant_(self.leaf_head.bias, 0.0)
         
@@ -308,12 +515,13 @@ class HGT_OL(nn.Module):
             nn.init.normal_(head.proj_v.weight, std=0.01)
             nn.init.constant_(head.proj_v.bias, 0.0)
 
-        _print_hodlr_architecture(leaf_size, depth, self.ranks)
+        _print_hodlr_architecture(leaf_size, depth, self.ranks, num_layers_per_scale)
 
-    def forward(self, x, pos=None, scale_A=None, _timing=None):
+    def forward(self, x, pos=None, scale_A=None, edge_index=None, edge_values=None, save_attention=False, _timing=None):
         B, N, _ = x.shape
         if _timing is not None: t0 = time.time()
-        
+        positions = x[..., :3].squeeze(0) if x.dim() == 3 else x[..., :3]
+
         h = self.embed(x)
         h = self.enc_input_proj(h)
         if _timing is not None: _timing["embed+pos"] = time.time() - t0
@@ -322,18 +530,44 @@ class HGT_OL(nn.Module):
         factors_fine_to_coarse = []
         dense_blocks_out = None  # Initialize before the loop
 
+        # Precompute per-level connectivity for masked attention (level j -> sequence length N/2^j)
+        graph_per_level = None
+        if edge_index is not None and edge_values is not None:
+            device = x.device
+            dtype = h.dtype
+            graph_per_level = []
+            for level in range(self.depth):
+                ei_j, ev_j, pos_j = build_merged_connectivity(edge_index, edge_values, positions, level, device, dtype, scale_A=scale_A)
+                graph_per_level.append((ei_j, ev_j, pos_j))
+
         for j in range(self.depth):
             if _timing is not None: t0 = time.time()
 
-            # Mix spatial information within the current scale
-            h = checkpoint(self.enc_blocks[j], h, use_reentrant=True) if self.training else self.enc_blocks[j](h)
+            # Multiple residual-attention layers at this scale; leaf/HODLR/downsample only after last
+            nlay = self.num_layers_per_scale
+            for layer_idx in range(nlay):
+                block = self.enc_blocks[j][layer_idx]
+                save_attn = save_attention and (layer_idx == nlay - 1)
+                if graph_per_level is not None:
+                    ei_j, ev_j, pos_j = graph_per_level[j]
+                    if self.training:
+                        # checkpoint does not forward kwargs in reentrant mode; pass args positionally
+                        h = checkpoint(
+                            block, h, ei_j, ev_j, pos_j, scale_A, save_attn, use_reentrant=True
+                        )
+                    else:
+                        h = block(h, edge_index=ei_j, edge_values=ev_j, positions=pos_j, scale_A=scale_A, save_attention=save_attn)
+                else:
+                    if self.training:
+                        h = checkpoint(block, h, None, None, None, None, save_attn, use_reentrant=True)
+                    else:
+                        h = block(h, save_attention=save_attn)
 
-            # --- FIX: Extract Leaf Blocks after token mixing at j=0 ---
+            # --- After last layer at this scale: extract leaf (j==0), HODLR factors, then downsample ---
             if j == 0:
                 if _timing is not None: t_leaf = time.time()
                 num_leaves = N // self.leaf_size
                 h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
-                h_leaves = self.leaf_proj(h_leaves)
                 u_leaf = self.leaf_head(h_leaves)
 
                 leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * torch.exp(self.log_hodlr_scale_leaf)
@@ -424,9 +658,13 @@ def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32, off_diag_sc
 def read_weights_header(path):
     path = Path(path)
     with open(path, 'rb') as f:
-        header = f.read(28)
-    _, _, d_model, nhead, depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
-    return d_model, nhead, depth, input_dim, max_rank
+        header = f.read(32)
+    if len(header) < 32:
+        _, _, d_model, nhead, depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
+        num_layers_per_scale = 1
+    else:
+        _, _, d_model, nhead, depth, input_dim, max_rank, num_layers_per_scale = struct.unpack('<ffiiiiii', header)
+    return d_model, nhead, depth, input_dim, max_rank, num_layers_per_scale
 
 def _write_packed_tensor(f, param, transpose=False):
     t = param.detach().cpu().float()
@@ -444,11 +682,12 @@ def save_weights_to_bytes(model, path, input_dim=None):
     d_model = model.d_model
     depth = model.depth
     max_rank = model.max_rank
-    if input_dim is None: input_dim = 124  
+    num_layers_per_scale = getattr(model, 'num_layers_per_scale', 1)
+    if input_dim is None: input_dim = 4  
     nhead = 4
     
     with open(path, 'wb') as f:
-        f.write(struct.pack('<ffiiiii', 0.0, 0.0, d_model, nhead, depth, input_dim, max_rank))
+        f.write(struct.pack('<ffiiiiii', 0.0, 0.0, d_model, nhead, depth, input_dim, max_rank, num_layers_per_scale))
         # 1. Embed
         _write_packed_tensor(f, model.embed.net[0].weight, transpose=True)
         _write_packed_tensor(f, model.embed.net[0].bias, transpose=False)
@@ -459,21 +698,18 @@ def save_weights_to_bytes(model, path, input_dim=None):
         _write_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
         _write_packed_tensor(f, model.enc_input_proj.bias, transpose=False)
         
-        # 3. Down Path Iteration
+        # 3. Down Path: per scale, num_layers_per_scale blocks then down + head
         for i in range(model.depth):
-            block = model.enc_blocks[i]
-            _write_packed_tensor(f, block.norm1.weight, False)
-            _write_packed_tensor(f, block.norm1.bias, False)
-            _write_packed_tensor(f, block.attn.qkv.weight, True)
-            _write_packed_tensor(f, block.attn.qkv.bias, False)
-            _write_packed_tensor(f, block.attn.proj.weight, True)
-            _write_packed_tensor(f, block.attn.proj.bias, False)
-            _write_packed_tensor(f, block.norm2.weight, False)
-            _write_packed_tensor(f, block.norm2.bias, False)
-            _write_packed_tensor(f, block.mlp[0].weight, True)
-            _write_packed_tensor(f, block.mlp[0].bias, False)
-            _write_packed_tensor(f, block.mlp[2].weight, True)
-            _write_packed_tensor(f, block.mlp[2].bias, False)
+            for layer_idx in range(num_layers_per_scale):
+                block = model.enc_blocks[i][layer_idx]
+                _write_packed_tensor(f, block.norm1.weight, False)
+                _write_packed_tensor(f, block.norm1.bias, False)
+                _write_packed_tensor(f, block.attn.qkv.weight, True)
+                _write_packed_tensor(f, block.attn.qkv.bias, False)
+                _write_packed_tensor(f, block.attn.proj.weight, True)
+                _write_packed_tensor(f, block.attn.proj.bias, False)
+                _write_packed_tensor(f, block.attn.edge_gate.weight, True)
+                _write_packed_tensor(f, block.attn.edge_gate.bias, False)
             
             down = model.down_samples[i]
             _write_packed_tensor(f, down.weight, True)
@@ -485,9 +721,7 @@ def save_weights_to_bytes(model, path, input_dim=None):
             _write_packed_tensor(f, head.proj_v.weight, True)
             _write_packed_tensor(f, head.proj_v.bias, False)
             
-        # 4. Leaf
-        _write_packed_tensor(f, model.leaf_proj.weight, True)
-        _write_packed_tensor(f, model.leaf_proj.bias, False)
+        # 4. Leaf (leaf_head: d_model -> leaf_size)
         _write_packed_tensor(f, model.leaf_head.weight, True)
         _write_packed_tensor(f, model.leaf_head.bias, False)
         _write_packed_tensor(f, torch.exp(model.log_hodlr_scale_leaf).detach(), False)
@@ -515,8 +749,19 @@ def _read_packed_tensor(f, target_param, transpose=False):
 def load_hgt_ol_weights_from_bytes(model, path):
     path = Path(path)
     with open(path, 'rb') as f:
-        header = f.read(28)
-        _, _, d_model, nhead, depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
+        header = f.read(32)
+        if len(header) < 32:
+            # Old 28-byte format: one layer per scale
+            _, _, d_model, nhead, depth, input_dim, max_rank = struct.unpack('<ffiiiii', header)
+            num_layers_per_scale = 1
+        else:
+            _, _, d_model, nhead, depth, input_dim, max_rank, num_layers_per_scale = struct.unpack('<ffiiiiii', header)
+        model_nlay = getattr(model, 'num_layers_per_scale', 1)
+        if model_nlay < num_layers_per_scale:
+            raise ValueError(
+                f"Checkpoint has num_layers_per_scale={num_layers_per_scale}, model has {model_nlay}; "
+                "model must have >= checkpoint layers per scale."
+            )
         
         # 1. Embed
         _read_packed_tensor(f, model.embed.net[0].weight, transpose=True)
@@ -528,21 +773,18 @@ def load_hgt_ol_weights_from_bytes(model, path):
         _read_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
         _read_packed_tensor(f, model.enc_input_proj.bias, False)
         
-        # 3. Down Path Iteration
+        # 3. Down Path: num_layers_per_scale blocks per scale, then down + head
         for i in range(model.depth):
-            block = model.enc_blocks[i]
-            _read_packed_tensor(f, block.norm1.weight, False)
-            _read_packed_tensor(f, block.norm1.bias, False)
-            _read_packed_tensor(f, block.attn.qkv.weight, True)
-            _read_packed_tensor(f, block.attn.qkv.bias, False)
-            _read_packed_tensor(f, block.attn.proj.weight, True)
-            _read_packed_tensor(f, block.attn.proj.bias, False)
-            _read_packed_tensor(f, block.norm2.weight, False)
-            _read_packed_tensor(f, block.norm2.bias, False)
-            _read_packed_tensor(f, block.mlp[0].weight, True)
-            _read_packed_tensor(f, block.mlp[0].bias, False)
-            _read_packed_tensor(f, block.mlp[2].weight, True)
-            _read_packed_tensor(f, block.mlp[2].bias, False)
+            for layer_idx in range(num_layers_per_scale):
+                block = model.enc_blocks[i][layer_idx]
+                _read_packed_tensor(f, block.norm1.weight, False)
+                _read_packed_tensor(f, block.norm1.bias, False)
+                _read_packed_tensor(f, block.attn.qkv.weight, True)
+                _read_packed_tensor(f, block.attn.qkv.bias, False)
+                _read_packed_tensor(f, block.attn.proj.weight, True)
+                _read_packed_tensor(f, block.attn.proj.bias, False)
+                _read_packed_tensor(f, block.attn.edge_gate.weight, True)
+                _read_packed_tensor(f, block.attn.edge_gate.bias, False)
             
             down = model.down_samples[i]
             _read_packed_tensor(f, down.weight, True)
@@ -554,9 +796,7 @@ def load_hgt_ol_weights_from_bytes(model, path):
             _read_packed_tensor(f, head.proj_v.weight, True)
             _read_packed_tensor(f, head.proj_v.bias, False)
 
-        # 4. Leaf
-        _read_packed_tensor(f, model.leaf_proj.weight, True)
-        _read_packed_tensor(f, model.leaf_proj.bias, False)
+        # 4. Leaf (leaf_head: d_model -> leaf_size)
         _read_packed_tensor(f, model.leaf_head.weight, True)
         _read_packed_tensor(f, model.leaf_head.bias, False)
         
@@ -594,42 +834,16 @@ def _most_recent_run_folder(base_path):
 def print_diagnostics(model, leaf_blocks, factors, step, optimizer=None):
     print(f"\n--- Diagnostics Step {step} ---")
 
-    # --- 1. ACTIVATION NORMS ---
-    if hasattr(model, 'embed') and hasattr(model.embed, 'last_center_norm'):
-        c_norm = model.embed.last_center_norm
-        n_norm = model.embed.last_neighbor_norm
-        ratio = (n_norm / c_norm) if c_norm > 0 else 0
-        print(f"  Embed Norms | Center: {c_norm:.4f} | Neighbor: {n_norm:.4f} | Ratio (N/C): {ratio:.4f}")
-        if c_norm > 0 and ratio < 0.1:
-            print("  ⚠️ WARNING: Neighbor embeddings are an order of magnitude smaller than center embeddings. They are being washed out.")
-
-    # --- 2. GRADIENT MAGNITUDES ---
-    if optimizer is not None and hasattr(model, 'embed'):
-        embed = model.embed
-        # SymmetricNeighborEmbed (center_proj / neighbor_proj)
-        if hasattr(embed, 'center_proj') and hasattr(embed, 'neighbor_proj'):
-            c_grad = embed.center_proj.weight.grad
-            n_grad = embed.neighbor_proj.weight.grad
-            if c_grad is not None and n_grad is not None:
-                c_g_mean = c_grad.abs().mean().item()
-                n_g_mean = n_grad.abs().mean().item()
-                g_ratio = (n_g_mean / c_g_mean) if c_g_mean > 0 else 0
-                print(f"  Gradients   | Center: {c_g_mean:.2e} | Neighbor: {n_g_mean:.2e} | Ratio (N/C): {g_ratio:.4f}")
-                if g_ratio < 0.05:
-                    print("  ⚠️ WARNING: Model is heavily suppressing gradients to the neighbor projection. It is learning to ignore neighbors.")
-        # SimpleNeighborhoodMLP: slice first layer by input dims (center 0:4 vs neighbor 4:)
-        elif hasattr(embed, 'net') and len(embed.net) >= 1:
-            w_grad = embed.net[0].weight.grad
-            if w_grad is not None and hasattr(embed, 'CENTER_DIMS'):
-                k = embed.CENTER_DIMS
-                c_grad = w_grad[:, :k]
-                n_grad = w_grad[:, k:]
-                c_g_mean = c_grad.abs().mean().item()
-                n_g_mean = n_grad.abs().mean().item()
-                g_ratio = (n_g_mean / c_g_mean) if c_g_mean > 0 else 0
-                print(f"  Gradients   | Center (input 0:{k}): {c_g_mean:.2e} | Neighbor (input {k}:): {n_g_mean:.2e} | Ratio (N/C): {g_ratio:.4f}")
-                if c_g_mean > 0 and g_ratio < 0.05:
-                    print("  ⚠️ WARNING: Model is heavily suppressing gradients to the neighbor input weights. It is learning to ignore neighbors.")
+    # --- 1. Leaf attention: self / neighbors / block node (from last layer at scale 0) ---
+    if hasattr(model, 'enc_blocks') and len(model.enc_blocks) > 0:
+        attn_mod = model.enc_blocks[0][-1].attn
+        if hasattr(attn_mod, 'last_attn_self'):
+            s, n, b = attn_mod.last_attn_self, attn_mod.last_attn_neighbor, attn_mod.last_attn_block
+            total = s + n + b
+            if total > 0:
+                print(f"  Attention (leaf) | Self: {s:.4f} | Neighbors: {n:.4f} | Block node: {b:.4f}  (sum={total:.4f})")
+            else:
+                print(f"  Attention (leaf) | Self: {s:.4f} | Neighbors: {n:.4f} | Block node: {b:.4f}")
 
     if hasattr(model, 'log_hodlr_scale_leaf'):
         leaf_s = torch.exp(model.log_hodlr_scale_leaf).item()
@@ -671,7 +885,8 @@ def train_hgt_ol():
     parser.add_argument('--rank_scale', type=float, default=2.0)
     parser.add_argument('--max_rank', type=int, default=128)
     parser.add_argument('--d_model', type=int, default=512)
-    parser.add_argument('--viz_limit', type=int, default=300)
+    parser.add_argument('--viz_limit', type=int, default=150)
+    parser.add_argument('--save_attention', action='store_true', default=True, help='Save leaf attention weights every diagnostic step to debug_attention.pt for InspectModel --debug_attention')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -748,7 +963,9 @@ def train_hgt_ol():
         if scale_A is not None and not isinstance(scale_A, torch.Tensor):
             scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
             
-        leaf_blocks, factors = model(x_input, scale_A=scale_A)
+        edge_index_dev = edge_index_viz.to(device)
+        edge_values_dev = edge_values_viz.to(device)
+        leaf_blocks, factors = model(x_input, scale_A=scale_A, edge_index=edge_index_dev, edge_values=edge_values_dev)
 
         num_probes = args.num_probes
         z = torch.randn(1, n_real, num_probes, device=device)
@@ -775,8 +992,38 @@ def train_hgt_ol():
             print(f"Step {step}: Loss {loss.item():.6f} ({time.time() - step_start:.1f}s elapsed for last 100 steps)")
             model.eval()
             with torch.no_grad():
-                lb_debug, fact_debug = model(x_input, scale_A=scale_A)
+                lb_debug, fact_debug = model(x_input, scale_A=scale_A, edge_index=edge_index_dev, edge_values=edge_values_dev, save_attention=args.save_attention)
                 print_diagnostics(model, lb_debug, fact_debug, step, optimizer)
+            if args.save_attention:
+                blocks_data = []
+                for j in range(model.depth):
+                    attn_mod = model.enc_blocks[j][-1].attn
+                    if not hasattr(attn_mod, 'last_attn_matrix'):
+                        continue
+                    m = attn_mod.last_attn_matrix
+                    if m is None:
+                        continue
+                    attn_blocks = m[0] if m.dim() == 4 else m
+                    attn_np = attn_blocks.numpy() if isinstance(attn_blocks, torch.Tensor) else attn_blocks
+                    scores_np = None
+                    bias_np = None
+                    if hasattr(attn_mod, 'last_scores_matrix') and attn_mod.last_scores_matrix is not None:
+                        s = attn_mod.last_scores_matrix
+                        scores_blocks = s[0] if s.dim() == 4 else s
+                        scores_np = scores_blocks.numpy() if isinstance(scores_blocks, torch.Tensor) else scores_blocks
+                    if hasattr(attn_mod, 'last_bias_physics_matrix') and attn_mod.last_bias_physics_matrix is not None:
+                        b = attn_mod.last_bias_physics_matrix
+                        bias_np = b.numpy() if isinstance(b, torch.Tensor) else b
+                    blocks_data.append({'attn': attn_np, 'scores': scores_np, 'bias_physics': bias_np})
+                if blocks_data:
+                    torch.save({
+                        'blocks': blocks_data,
+                        'depth': model.depth,
+                        'n_real': n_real,
+                        'viz_limit': args.viz_limit,
+                        'step': step,
+                        'leaf_size': model.leaf_size,
+                    }, script_dir / "debug_attention.pt")
             model.train()
             
             out_path = script_dir / "model_weights.bytes"
