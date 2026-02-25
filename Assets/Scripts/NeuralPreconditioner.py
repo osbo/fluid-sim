@@ -9,11 +9,11 @@ import struct
 from pathlib import Path
 import time
 from collections import defaultdict
-from torch.utils.checkpoint import checkpoint
-
 # Set True to print forward-pass diagnostics (same format as LeafOnly). Set True to disable diagnostics/arch prints.
 FORWARD_DEBUG = False
 DISABLE_EXTRA_PRINTS = True
+# Step index (0-based) at which to print full input/output diagnostics for comparison with LeafOnly
+DEBUG_STEP = 99
 
 # --- 0. Dataset (same format as InspectModel: x, edge_index, edge_values, num_nodes) ---
 
@@ -519,10 +519,11 @@ class HGT_OL(nn.Module):
             self.ranks.append(r)
 
         # 2. Down-Path: num_scales = max(1, depth) so depth=0 still has one scale (attention + leaf only)
+        # Creation order matches LeafOnly for depth=0: embed, enc_input_proj, enc_blocks, leaf_head, log_scale
+        # so that same seed gives identical shared weights.
         self.enc_blocks = nn.ModuleList()
         self.down_samples = nn.ModuleList()
         self.hodlr_heads = nn.ModuleList()
-        self.level_gcns = nn.ModuleList()
         num_scales = max(1, depth)
 
         for j in range(num_scales):
@@ -531,20 +532,23 @@ class HGT_OL(nn.Module):
                 for _ in range(num_layers_per_scale)
             ])
             self.enc_blocks.append(layers)
-            self.level_gcns.append(SparsePhysicsGCN(d_model))
             if j < depth:
                 self.down_samples.append(nn.Linear(d_model * 2, d_model))
                 rank_j = self.ranks[depth - 1 - j]
                 expansion = 2 ** j
                 self.hodlr_heads.append(HODLRHead(d_model, rank_j * expansion))
 
-        # 3. Leaf Generation (d_model -> leaf block; applied at j=0 after last layer)
+        # 3. Leaf Generation (same init as LeafOnly; created before level_gcns so RNG order matches)
         self.leaf_head = nn.Linear(d_model, leaf_size)
         nn.init.normal_(self.leaf_head.weight, std=0.01)
         nn.init.constant_(self.leaf_head.bias, 0.0)
-        
         self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
         self.log_hodlr_scales = nn.Parameter(torch.ones(depth) * math.log(1e-2))
+
+        # Level GCNs after leaf (so depth=0 shared path matches LeafOnly RNG)
+        self.level_gcns = nn.ModuleList()
+        for j in range(num_scales):
+            self.level_gcns.append(SparsePhysicsGCN(d_model))
 
         for head in self.hodlr_heads:
             nn.init.normal_(head.proj_u.weight, std=0.01)
@@ -555,18 +559,32 @@ class HGT_OL(nn.Module):
         if not DISABLE_EXTRA_PRINTS:
             _print_hodlr_architecture(leaf_size, depth, self.ranks, num_layers_per_scale)
 
-    def forward(self, x, pos=None, scale_A=None, edge_index=None, edge_values=None, save_attention=False, _timing=None):
+    def forward(self, x, pos=None, scale_A=None, edge_index=None, edge_values=None, save_attention=False, _timing=None, debug_step=False):
         B, N, _ = x.shape
         if _timing is not None: t0 = time.time()
         positions = x[..., :3].squeeze(0) if x.dim() == 3 else x[..., :3]
+
+        if debug_step:
+            _t = x.detach()
+            print(f"[STEP100 HGT_OL] INPUT x: shape={tuple(x.shape)} min={_t.min().item():.6f} max={_t.max().item():.6f} mean={_t.mean().item():.6f} std={_t.std().item():.6f}")
+            print(f"[STEP100 HGT_OL] INPUT x[...,:3] (positions) mean={_t[...,:3].mean().item():.6f} x[...,3] (diag) min={_t[...,3].min().item():.6f} max={_t[...,3].max().item():.6f} mean={_t[...,3].mean().item():.6f}")
+            if edge_index is not None:
+                print(f"[STEP100 HGT_OL] INPUT edge_index shape={tuple(edge_index.shape)} edge_values shape={tuple(edge_values.shape)} mean={edge_values.detach().mean().item():.6f}")
+            print(f"[STEP100 HGT_OL] INPUT scale_A={scale_A if scale_A is None else (scale_A.item() if hasattr(scale_A,'item') else scale_A)}")
 
         if FORWARD_DEBUG:
             print(f"[FWD HGT_OL] x.shape={tuple(x.shape)} positions.shape={tuple(positions.shape)}")
 
         h = self.embed(x, edge_index, edge_values, scale_A)
+        if debug_step:
+            _h = h.detach()
+            print(f"[STEP100 HGT_OL] AFTER EMBED: h.shape={tuple(h.shape)} min={_h.min().item():.6f} max={_h.max().item():.6f} mean={_h.mean().item():.6f} std={_h.std().item():.6f}")
         if FORWARD_DEBUG:
             print(f"[FWD HGT_OL] after embed: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
         h = self.enc_input_proj(h)
+        if debug_step:
+            _h = h.detach()
+            print(f"[STEP100 HGT_OL] AFTER ENC_INPUT_PROJ: h.shape={tuple(h.shape)} mean_abs={_h.abs().mean().item():.6f}")
         if FORWARD_DEBUG:
             print(f"[FWD HGT_OL] after enc_input_proj: h.shape={tuple(h.shape)}")
 
@@ -600,18 +618,12 @@ class HGT_OL(nn.Module):
                 save_attn = save_attention and (layer_idx == nlay - 1)
                 if graph_per_level is not None:
                     ei_j, ev_j, pos_j = graph_per_level[j]
-                    if self.training:
-                        # checkpoint does not forward kwargs in reentrant mode; pass args positionally
-                        h = checkpoint(
-                            block, h, ei_j, ev_j, pos_j, scale_A, save_attn, use_reentrant=False
-                        )
-                    else:
-                        h = block(h, edge_index=ei_j, edge_values=ev_j, positions=pos_j, scale_A=scale_A, save_attention=save_attn)
+                    h = block(h, edge_index=ei_j, edge_values=ev_j, positions=pos_j, scale_A=scale_A, save_attention=save_attn)
                 else:
-                    if self.training:
-                        h = checkpoint(block, h, None, None, None, None, save_attn, use_reentrant=False)
-                    else:
-                        h = block(h, save_attention=save_attn)
+                    h = block(h, save_attention=save_attn)
+                if debug_step and j == 0:
+                    _h = h.detach()
+                    print(f"[STEP100 HGT_OL] AFTER BLOCK {layer_idx} (x + attn): h.shape={tuple(h.shape)} mean_abs={_h.abs().mean().item():.6f}")
                 if FORWARD_DEBUG:
                     print(f"[FWD HGT_OL] after block {j}.{layer_idx}: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
 
@@ -621,8 +633,8 @@ class HGT_OL(nn.Module):
                 num_leaves = N // self.leaf_size
                 h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
                 u_leaf = self.leaf_head(h_leaves)
-
-                leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * torch.exp(self.log_hodlr_scale_leaf)
+                leaf_scale = torch.exp(self.log_hodlr_scale_leaf)
+                leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * leaf_scale
 
                 diag_A_n = x[..., 3]
                 s = scale_A if scale_A is not None else 1.0
@@ -639,6 +651,15 @@ class HGT_OL(nn.Module):
 
                 new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
                 dense_blocks_out = leaf_base + torch.diag_embed(new_diag)
+                if debug_step:
+                    _u = u_leaf.detach()
+                    _lb = leaf_base.detach()
+                    _nd = new_diag.detach()
+                    _db = dense_blocks_out.detach()
+                    print(f"[STEP100 HGT_OL] LEAF: h_leaves.shape={tuple(h_leaves.shape)} u_leaf.shape={tuple(u_leaf.shape)} u_leaf min={_u.min().item():.6f} max={_u.max().item():.6f} mean={_u.mean().item():.6f}")
+                    print(f"[STEP100 HGT_OL] LEAF: exp(log_hodlr_scale_leaf)={leaf_scale.item():.6f} leaf_base.shape={tuple(leaf_base.shape)} min={_lb.min().item():.6f} max={_lb.max().item():.6f} mean={_lb.mean().item():.6f}")
+                    print(f"[STEP100 HGT_OL] JACOBI: diag_A_n min={diag_A_n.detach().min().item():.6f} max={diag_A_n.detach().max().item():.6f} mask.sum()={mask.sum().item()} new_diag min={_nd.min().item():.6f} max={_nd.max().item():.6f} mean={_nd.mean().item():.6f}")
+                    print(f"[STEP100 HGT_OL] OUTPUT dense_blocks: shape={tuple(dense_blocks_out.shape)} min={_db.min().item():.6f} max={_db.max().item():.6f} mean={_db.mean().item():.6f} diag_mean={torch.diagonal(_db[0,0]).mean().item():.6f}")
                 if FORWARD_DEBUG:
                     print(f"[FWD HGT_OL] leaf: h_leaves.shape={tuple(h_leaves.shape)} u_leaf.shape={tuple(u_leaf.shape)} leaf_base_mean={leaf_base.mean().item():.6f} dense_blocks.shape={tuple(dense_blocks_out.shape)}")
                 if _timing is not None: _timing["leaf_head"] = time.time() - t_leaf
@@ -1057,13 +1078,17 @@ def train_hgt_ol():
             
         edge_index_dev = edge_index_viz.to(device)
         edge_values_dev = edge_values_viz.to(device)
-        leaf_blocks, factors = model(x_input, scale_A=scale_A, edge_index=edge_index_dev, edge_values=edge_values_dev)
+        leaf_blocks, factors = model(x_input, scale_A=scale_A, edge_index=edge_index_dev, edge_values=edge_values_dev, debug_step=(step == DEBUG_STEP))
 
-        # Form n_real x n_real block of M by applying preconditioner to identity columns
-        E = torch.zeros(1, N_cur, n_real, device=device, dtype=x_input.dtype)
-        E[0, :n_real, :] = torch.eye(n_real, device=device, dtype=x_input.dtype)
-        M_cols = apply_neural_hodlr(leaf_blocks, factors, E, leaf_size=leaf_size, off_diag_scale=torch.exp(model.log_hodlr_scales))
-        M_block = M_cols[0, :n_real, :]
+        # Form n_real x n_real block of M (same output path as LeafOnly when depth=0 / single leaf)
+        if depth == 0 and len(factors) == 0:
+            # Single leaf: use block directly so loss/grad match LeafOnly exactly
+            M_block = leaf_blocks[0, 0, :n_real, :n_real]
+        else:
+            E = torch.zeros(1, N_cur, n_real, device=device, dtype=x_input.dtype)
+            E[0, :n_real, :] = torch.eye(n_real, device=device, dtype=x_input.dtype)
+            M_cols = apply_neural_hodlr(leaf_blocks, factors, E, leaf_size=leaf_size, off_diag_scale=torch.exp(model.log_hodlr_scales))
+            M_block = M_cols[0, :n_real, :]
 
         A_dense = A_sparse.to_dense().to(device)
         # SAI loss: E_z || M A z - z ||^2 with batch of 32 random vectors (MPS-friendly, no SVD)

@@ -325,10 +325,16 @@ def main():
         if num_nodes_real > N_pad:
             viz_n = min(viz_n, N_pad)
 
-        _scale = torch.exp(model.log_hodlr_scales) if hasattr(model, 'log_hodlr_scales') else (model.hodlr_scale if hasattr(model, 'hodlr_scale') else None)
-        M_neural = get_dense_matrix_from_neural(
-            leaf_blocks_neural, factors_neural, padded_size, n_for_model, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=_scale
-        )
+        # When depth=0 (single leaf), use the same path as LeafOnly: M = leaf_blocks[0,0] directly.
+        # This avoids any column-probing and matches LeafOnly exactly; if M still looks nearly diagonal,
+        # the loaded weights were likely trained before the init/output-path fixes in NeuralPreconditioner.
+        if depth == 0 and len(factors_neural) == 0:
+            M_neural = leaf_blocks_neural[0, 0, :viz_n, :viz_n].cpu().numpy()
+        else:
+            _scale = torch.exp(model.log_hodlr_scales) if hasattr(model, 'log_hodlr_scales') else (model.hodlr_scale if hasattr(model, 'hodlr_scale') else None)
+            M_neural = get_dense_matrix_from_neural(
+                leaf_blocks_neural, factors_neural, padded_size, n_for_model, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=_scale
+            )
 
     # --- MODEL 2: OVERFIT HODLR (Block Diagonal, same structure as Neural) ---
     if SKIP_OVERFIT:

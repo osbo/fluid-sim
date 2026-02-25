@@ -25,6 +25,8 @@ LEAF_SIZE = 32
 
 # Set True to print forward-pass diagnostics (same format as NeuralPreconditioner)
 FORWARD_DEBUG = False
+# Step index (0-based) at which to print full input/output diagnostics for comparison
+DEBUG_STEP = 99
 
 
 class LeafOnlyNet(nn.Module):
@@ -46,7 +48,7 @@ class LeafOnlyNet(nn.Module):
         nn.init.constant_(self.leaf_head.bias, 0.0)
         self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
 
-    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False):
+    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, debug_step=False):
         """
         x: (B, 32, input_dim). Returns leaf_blocks (B, 1, 32, 32).
         """
@@ -55,25 +57,43 @@ class LeafOnlyNet(nn.Module):
         # build_leaf_block_connectivity expects positions (N, 3); x is (B, N, input_dim) so pass (N, 3)
         positions = x[0, :, :3] if x.dim() == 3 else x[:, :3]
 
+        if debug_step:
+            _t = x.detach()
+            print(f"[STEP100 LeafOnly] INPUT x: shape={tuple(x.shape)} min={_t.min().item():.6f} max={_t.max().item():.6f} mean={_t.mean().item():.6f} std={_t.std().item():.6f}")
+            print(f"[STEP100 LeafOnly] INPUT x[...,:3] (positions) mean={_t[...,:3].mean().item():.6f} x[...,3] (diag) min={_t[...,3].min().item():.6f} max={_t[...,3].max().item():.6f} mean={_t[...,3].mean().item():.6f}")
+            if edge_index is not None:
+                print(f"[STEP100 LeafOnly] INPUT edge_index shape={tuple(edge_index.shape)} edge_values shape={tuple(edge_values.shape)} mean={edge_values.detach().mean().item():.6f}")
+            print(f"[STEP100 LeafOnly] INPUT scale_A={scale_A if scale_A is None else (scale_A.item() if hasattr(scale_A,'item') else scale_A)}")
+
         if FORWARD_DEBUG:
             print(f"[FWD LeafOnly] x.shape={tuple(x.shape)} positions.shape={tuple(positions.shape)}")
 
         h = self.embed(x, edge_index, edge_values, scale_A)
+        if debug_step:
+            _h = h.detach()
+            print(f"[STEP100 LeafOnly] AFTER EMBED: h.shape={tuple(h.shape)} min={_h.min().item():.6f} max={_h.max().item():.6f} mean={_h.mean().item():.6f} std={_h.std().item():.6f}")
         if FORWARD_DEBUG:
             print(f"[FWD LeafOnly] after embed: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
         h = self.enc_input_proj(h)
+        if debug_step:
+            _h = h.detach()
+            print(f"[STEP100 LeafOnly] AFTER ENC_INPUT_PROJ: h.shape={tuple(h.shape)} mean_abs={_h.abs().mean().item():.6f}")
         if FORWARD_DEBUG:
             print(f"[FWD LeafOnly] after enc_input_proj: h.shape={tuple(h.shape)}")
 
         for i, block in enumerate(self.blocks):
             h = block(h, edge_index=edge_index, edge_values=edge_values, positions=positions, scale_A=scale_A, save_attention=save_attention)
+            if debug_step:
+                _h = h.detach()
+                print(f"[STEP100 LeafOnly] AFTER BLOCK {i} (x + attn): h.shape={tuple(h.shape)} mean_abs={_h.abs().mean().item():.6f}")
             if FORWARD_DEBUG:
                 print(f"[FWD LeafOnly] after block {i}: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
 
         # Single leaf: (B, 1, 32, d_model) -> leaf_head -> (B, 1, 32, 32)
         h_leaves = h.view(B, 1, self.leaf_size, -1)
         u_leaf = self.leaf_head(h_leaves)  # (B, 1, 32, leaf_size)
-        leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * torch.exp(self.log_hodlr_scale_leaf)
+        leaf_scale = torch.exp(self.log_hodlr_scale_leaf)
+        leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * leaf_scale
 
         # Jacobi diagonal from input diagonal
         diag_A_n = x[..., 3]
@@ -90,6 +110,15 @@ class LeafOnlyNet(nn.Module):
         new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
         dense_blocks = leaf_base + torch.diag_embed(new_diag)
 
+        if debug_step:
+            _u = u_leaf.detach()
+            _lb = leaf_base.detach()
+            _nd = new_diag.detach()
+            _db = dense_blocks.detach()
+            print(f"[STEP100 LeafOnly] LEAF: h_leaves.shape={tuple(h_leaves.shape)} u_leaf.shape={tuple(u_leaf.shape)} u_leaf min={_u.min().item():.6f} max={_u.max().item():.6f} mean={_u.mean().item():.6f}")
+            print(f"[STEP100 LeafOnly] LEAF: exp(log_hodlr_scale_leaf)={leaf_scale.item():.6f} leaf_base.shape={tuple(leaf_base.shape)} min={_lb.min().item():.6f} max={_lb.max().item():.6f} mean={_lb.mean().item():.6f}")
+            print(f"[STEP100 LeafOnly] JACOBI: diag_A_n min={diag_A_n.detach().min().item():.6f} max={diag_A_n.detach().max().item():.6f} mask.sum()={mask.sum().item()} new_diag min={_nd.min().item():.6f} max={_nd.max().item():.6f} mean={_nd.mean().item():.6f}")
+            print(f"[STEP100 LeafOnly] OUTPUT dense_blocks: shape={tuple(dense_blocks.shape)} min={_db.min().item():.6f} max={_db.max().item():.6f} mean={_db.mean().item():.6f} diag_mean={torch.diagonal(_db[0,0]).mean().item():.6f}")
         if FORWARD_DEBUG:
             print(f"[FWD LeafOnly] leaf: h_leaves.shape={tuple(h_leaves.shape)} u_leaf.shape={tuple(u_leaf.shape)} leaf_base_mean={leaf_base.mean().item():.6f} dense_blocks.shape={tuple(dense_blocks.shape)}")
             print(f"[FWD LeafOnly] return dense_blocks.shape={tuple(dense_blocks.shape)}")
@@ -295,7 +324,7 @@ def train_leaf_only():
     batch_vectors = 32  # SAI loss: batch of 32 random vectors for stochastic trace estimation
     for step in range(args.steps):
         optimizer.zero_grad()
-        leaf_blocks = model(x_input, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A)
+        leaf_blocks = model(x_input, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, debug_step=(step == DEBUG_STEP))
         M_block = leaf_blocks[0, 0]  # (32, 32)
         # SAI loss: E_z || M A z - z ||^2 with batch of 32 vectors (all ops MPS-friendly, no SVD)
         Z = torch.randn(n, batch_vectors, device=device, dtype=x_input.dtype)
