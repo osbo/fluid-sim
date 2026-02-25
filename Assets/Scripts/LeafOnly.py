@@ -18,9 +18,13 @@ from NeuralPreconditioner import (
     LeafBlockAttention,
     TransformerBlock,
     PhysicsAwareEmbedding,
+    _most_recent_run_folder,
 )
 
 LEAF_SIZE = 32
+
+# Set True to print forward-pass diagnostics (same format as NeuralPreconditioner)
+FORWARD_DEBUG = False
 
 
 class LeafOnlyNet(nn.Module):
@@ -48,13 +52,23 @@ class LeafOnlyNet(nn.Module):
         """
         B, N, _ = x.shape
         assert N == self.leaf_size, f"LeafOnly expects exactly {self.leaf_size} nodes, got {N}"
-        positions = x[..., :3]
+        # build_leaf_block_connectivity expects positions (N, 3); x is (B, N, input_dim) so pass (N, 3)
+        positions = x[0, :, :3] if x.dim() == 3 else x[:, :3]
+
+        if FORWARD_DEBUG:
+            print(f"[FWD LeafOnly] x.shape={tuple(x.shape)} positions.shape={tuple(positions.shape)}")
 
         h = self.embed(x, edge_index, edge_values, scale_A)
+        if FORWARD_DEBUG:
+            print(f"[FWD LeafOnly] after embed: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
         h = self.enc_input_proj(h)
+        if FORWARD_DEBUG:
+            print(f"[FWD LeafOnly] after enc_input_proj: h.shape={tuple(h.shape)}")
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             h = block(h, edge_index=edge_index, edge_values=edge_values, positions=positions, scale_A=scale_A, save_attention=save_attention)
+            if FORWARD_DEBUG:
+                print(f"[FWD LeafOnly] after block {i}: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
 
         # Single leaf: (B, 1, 32, d_model) -> leaf_head -> (B, 1, 32, 32)
         h_leaves = h.view(B, 1, self.leaf_size, -1)
@@ -75,6 +89,10 @@ class LeafOnlyNet(nn.Module):
         mask_blocks = mask.view(B, 1, self.leaf_size)
         new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
         dense_blocks = leaf_base + torch.diag_embed(new_diag)
+
+        if FORWARD_DEBUG:
+            print(f"[FWD LeafOnly] leaf: h_leaves.shape={tuple(h_leaves.shape)} u_leaf.shape={tuple(u_leaf.shape)} leaf_base_mean={leaf_base.mean().item():.6f} dense_blocks.shape={tuple(dense_blocks.shape)}")
+            print(f"[FWD LeafOnly] return dense_blocks.shape={tuple(dense_blocks.shape)}")
 
         return dense_blocks  # (B, 1, 32, 32)
 
@@ -228,6 +246,7 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=3)
     parser.add_argument('--frame', type=int, default=600)
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
+    parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -238,9 +257,12 @@ def train_leaf_only():
     data_path = Path(args.data_folder)
     if not data_path.exists():
         raise SystemExit(f"Data folder not found: {data_path}")
-    dataset = FluidGraphDataset([data_path])
+    run_folder = _most_recent_run_folder(data_path)
+    if run_folder != data_path:
+        print(f"  [startup] Using most recent run: {run_folder.name}")
+    dataset = FluidGraphDataset([run_folder])
     if len(dataset) == 0:
-        raise SystemExit("No frames found.")
+        raise SystemExit(f"No frames found under {run_folder}")
     frame_idx = min(args.frame, len(dataset) - 1)
     batch = dataset[frame_idx]
 
@@ -263,10 +285,11 @@ def train_leaf_only():
     else:
         A_dense = A_sparse.to(device).to_dense()
 
+    torch.manual_seed(args.seed)
     model = LeafOnlyNet(input_dim=4, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    print(f"LeafOnly: first {n} nodes, {edge_index.shape[1]} edges, {args.num_layers} layers, d_model={args.d_model}")
+    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, first {n} nodes, {edge_index.shape[1]} edges, {args.num_layers} layers, d_model={args.d_model}, seed={args.seed}")
 
     model.train()
     batch_vectors = 32  # SAI loss: batch of 32 random vectors for stochastic trace estimation
