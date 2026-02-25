@@ -11,6 +11,10 @@ import time
 from collections import defaultdict
 from torch.utils.checkpoint import checkpoint
 
+# Set True to print forward-pass diagnostics (same format as LeafOnly). Set True to disable diagnostics/arch prints.
+FORWARD_DEBUG = False
+DISABLE_EXTRA_PRINTS = True
+
 # --- 0. Dataset (same format as InspectModel: x, edge_index, edge_values, num_nodes) ---
 
 NODE_DTYPE = np.dtype([
@@ -505,7 +509,7 @@ class HGT_OL(nn.Module):
         self.embed = PhysicsAwareEmbedding(input_dim, d_model)
         self.enc_input_proj = nn.Linear(d_model, d_model)
 
-        # HODLR Ranks (Ordered Coarse -> Fine)
+        # HODLR Ranks (Ordered Coarse -> Fine); empty when depth=0
         self.ranks = []
         for i in range(depth):
             level_idx_from_bottom = depth - 1 - i
@@ -514,23 +518,25 @@ class HGT_OL(nn.Module):
             r = r if r % 2 == 0 else r + 1
             self.ranks.append(r)
 
-        # 2. Down-Path: per scale, level GCN then multiple residual-attention layers; leaf/HODLR/downsample after last layer
+        # 2. Down-Path: num_scales = max(1, depth) so depth=0 still has one scale (attention + leaf only)
         self.enc_blocks = nn.ModuleList()
         self.down_samples = nn.ModuleList()
         self.hodlr_heads = nn.ModuleList()
         self.level_gcns = nn.ModuleList()
+        num_scales = max(1, depth)
 
-        for j in range(depth):
+        for j in range(num_scales):
             layers = nn.ModuleList([
                 TransformerBlock(d_model, block_size=leaf_size, attn_module=LeafBlockAttention(d_model, leaf_size, num_heads=4))
                 for _ in range(num_layers_per_scale)
             ])
             self.enc_blocks.append(layers)
-            self.down_samples.append(nn.Linear(d_model * 2, d_model))
             self.level_gcns.append(SparsePhysicsGCN(d_model))
-            rank_j = self.ranks[depth - 1 - j]
-            expansion = 2 ** j
-            self.hodlr_heads.append(HODLRHead(d_model, rank_j * expansion))
+            if j < depth:
+                self.down_samples.append(nn.Linear(d_model * 2, d_model))
+                rank_j = self.ranks[depth - 1 - j]
+                expansion = 2 ** j
+                self.hodlr_heads.append(HODLRHead(d_model, rank_j * expansion))
 
         # 3. Leaf Generation (d_model -> leaf block; applied at j=0 after last layer)
         self.leaf_head = nn.Linear(d_model, leaf_size)
@@ -546,32 +552,40 @@ class HGT_OL(nn.Module):
             nn.init.normal_(head.proj_v.weight, std=0.01)
             nn.init.constant_(head.proj_v.bias, 0.0)
 
-        _print_hodlr_architecture(leaf_size, depth, self.ranks, num_layers_per_scale)
+        if not DISABLE_EXTRA_PRINTS:
+            _print_hodlr_architecture(leaf_size, depth, self.ranks, num_layers_per_scale)
 
     def forward(self, x, pos=None, scale_A=None, edge_index=None, edge_values=None, save_attention=False, _timing=None):
         B, N, _ = x.shape
         if _timing is not None: t0 = time.time()
         positions = x[..., :3].squeeze(0) if x.dim() == 3 else x[..., :3]
 
+        if FORWARD_DEBUG:
+            print(f"[FWD HGT_OL] x.shape={tuple(x.shape)} positions.shape={tuple(positions.shape)}")
+
         h = self.embed(x, edge_index, edge_values, scale_A)
+        if FORWARD_DEBUG:
+            print(f"[FWD HGT_OL] after embed: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
         h = self.enc_input_proj(h)
-        if _timing is not None: _timing["embed+pos"] = time.time() - t0
+        if FORWARD_DEBUG:
+            print(f"[FWD HGT_OL] after enc_input_proj: h.shape={tuple(h.shape)}")
 
         # --- 2. Down-Only HODLR Hierarchy ---
         factors_fine_to_coarse = []
         dense_blocks_out = None  # Initialize before the loop
 
         # Precompute per-level connectivity for masked attention and level GCNs
+        num_scales = max(1, self.depth)
         graph_per_level = None
         if edge_index is not None and edge_values is not None:
             device = x.device
             dtype = h.dtype
             graph_per_level = []
-            for level in range(self.depth):
+            for level in range(num_scales):
                 ei_j, ev_j, pos_j = build_merged_connectivity(edge_index, edge_values, positions, level, device, dtype, scale_A=scale_A)
                 graph_per_level.append((ei_j, ev_j, pos_j))
 
-        for j in range(self.depth):
+        for j in range(num_scales):
             if _timing is not None: t0 = time.time()
 
             # Hierarchical physics: GCN at this scale (j=0 already done in embed)
@@ -589,15 +603,17 @@ class HGT_OL(nn.Module):
                     if self.training:
                         # checkpoint does not forward kwargs in reentrant mode; pass args positionally
                         h = checkpoint(
-                            block, h, ei_j, ev_j, pos_j, scale_A, save_attn, use_reentrant=True
+                            block, h, ei_j, ev_j, pos_j, scale_A, save_attn, use_reentrant=False
                         )
                     else:
                         h = block(h, edge_index=ei_j, edge_values=ev_j, positions=pos_j, scale_A=scale_A, save_attention=save_attn)
                 else:
                     if self.training:
-                        h = checkpoint(block, h, None, None, None, None, save_attn, use_reentrant=True)
+                        h = checkpoint(block, h, None, None, None, None, save_attn, use_reentrant=False)
                     else:
                         h = block(h, save_attention=save_attn)
+                if FORWARD_DEBUG:
+                    print(f"[FWD HGT_OL] after block {j}.{layer_idx}: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
 
             # --- After last layer at this scale: extract leaf (j==0), HODLR factors, then downsample ---
             if j == 0:
@@ -623,28 +639,29 @@ class HGT_OL(nn.Module):
 
                 new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
                 dense_blocks_out = leaf_base + torch.diag_embed(new_diag)
+                if FORWARD_DEBUG:
+                    print(f"[FWD HGT_OL] leaf: h_leaves.shape={tuple(h_leaves.shape)} u_leaf.shape={tuple(u_leaf.shape)} leaf_base_mean={leaf_base.mean().item():.6f} dense_blocks.shape={tuple(dense_blocks_out.shape)}")
                 if _timing is not None: _timing["leaf_head"] = time.time() - t_leaf
             # ----------------------------------------------------------
 
-            # Extract factors for this scale
-            u_expanded, v_expanded = self.hodlr_heads[j](h)
-            rank_j = self.ranks[self.depth - 1 - j]
-            
-            # View mathematically unfolds the (R * 2^j) dimension out over the sequence 
-            # turning shape (B, N/2^j, R*2^j) into the perfect (B, N, R) needed for HODLR
-            u = u_expanded.view(B, N, rank_j)
-            v = v_expanded.view(B, N, rank_j)
-            factors_fine_to_coarse.append((u, v))
+            # Extract factors and downsample only when we have HODLR levels (depth > 0)
+            if j < self.depth:
+                u_expanded, v_expanded = self.hodlr_heads[j](h)
+                rank_j = self.ranks[self.depth - 1 - j]
+                u = u_expanded.view(B, N, rank_j)
+                v = v_expanded.view(B, N, rank_j)
+                factors_fine_to_coarse.append((u, v))
+                B_h, n_curr, c_curr = h.shape
+                h_reshaped = h.view(B_h, n_curr // 2, 2 * c_curr)
+                h = self.down_samples[j](h_reshaped)
 
-            # Downsample for the next, coarser scale
-            B_h, n_curr, c_curr = h.shape
-            h_reshaped = h.view(B_h, n_curr // 2, 2 * c_curr)
-            h = self.down_samples[j](h_reshaped)
-            
             if _timing is not None: _timing[f"enc_{j}"] = time.time() - t0
 
         # HODLR requires ordered from Coarse -> Fine. Reverse the extracted list!
         factors_levels = factors_fine_to_coarse[::-1]
+
+        if FORWARD_DEBUG:
+            print(f"[FWD HGT_OL] return dense_blocks.shape={tuple(dense_blocks_out.shape) if dense_blocks_out is not None else None} factors_len={len(factors_levels)}")
 
         return dense_blocks_out, factors_levels
 
@@ -744,8 +761,9 @@ def save_weights_to_bytes(model, path, input_dim=None):
         _write_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
         _write_packed_tensor(f, model.enc_input_proj.bias, transpose=False)
         
-        # 3. Down Path: per scale, level_gcn then num_layers_per_scale blocks then down + head
-        for i in range(model.depth):
+        # 3. Down Path: num_scales = max(1, depth); per scale: level_gcn + enc_blocks; down + head only when depth > 0
+        num_scales = max(1, model.depth)
+        for i in range(num_scales):
             gcn = model.level_gcns[i]
             _write_packed_tensor(f, gcn.linear_self.weight, transpose=True)
             _write_packed_tensor(f, gcn.linear_self.bias, transpose=False)
@@ -765,16 +783,15 @@ def save_weights_to_bytes(model, path, input_dim=None):
                 _write_packed_tensor(f, block.attn.proj.bias, False)
                 _write_packed_tensor(f, block.attn.edge_gate.weight, True)
                 _write_packed_tensor(f, block.attn.edge_gate.bias, False)
-            
-            down = model.down_samples[i]
-            _write_packed_tensor(f, down.weight, True)
-            _write_packed_tensor(f, down.bias, False)
-            
-            head = model.hodlr_heads[i]
-            _write_packed_tensor(f, head.proj_u.weight, True)
-            _write_packed_tensor(f, head.proj_u.bias, False)
-            _write_packed_tensor(f, head.proj_v.weight, True)
-            _write_packed_tensor(f, head.proj_v.bias, False)
+            if i < model.depth:
+                down = model.down_samples[i]
+                _write_packed_tensor(f, down.weight, True)
+                _write_packed_tensor(f, down.bias, False)
+                head = model.hodlr_heads[i]
+                _write_packed_tensor(f, head.proj_u.weight, True)
+                _write_packed_tensor(f, head.proj_u.bias, False)
+                _write_packed_tensor(f, head.proj_v.weight, True)
+                _write_packed_tensor(f, head.proj_v.bias, False)
             
         # 4. Leaf (leaf_head: d_model -> leaf_size)
         _write_packed_tensor(f, model.leaf_head.weight, True)
@@ -838,8 +855,9 @@ def load_hgt_ol_weights_from_bytes(model, path):
         _read_packed_tensor(f, model.enc_input_proj.weight, transpose=True)
         _read_packed_tensor(f, model.enc_input_proj.bias, False)
         
-        # 3. Down Path: level_gcn then num_layers_per_scale blocks per scale, then down + head
-        for i in range(model.depth):
+        # 3. Down Path: num_scales = max(1, depth); per scale: level_gcn + enc_blocks; down + head only when depth > 0
+        num_scales = max(1, model.depth)
+        for i in range(num_scales):
             gcn = model.level_gcns[i]
             _read_packed_tensor(f, gcn.linear_self.weight, transpose=True)
             _read_packed_tensor(f, gcn.linear_self.bias, False)
@@ -859,16 +877,15 @@ def load_hgt_ol_weights_from_bytes(model, path):
                 _read_packed_tensor(f, block.attn.proj.bias, False)
                 _read_packed_tensor(f, block.attn.edge_gate.weight, True)
                 _read_packed_tensor(f, block.attn.edge_gate.bias, False)
-            
-            down = model.down_samples[i]
-            _read_packed_tensor(f, down.weight, True)
-            _read_packed_tensor(f, down.bias, False)
-            
-            head = model.hodlr_heads[i]
-            _read_packed_tensor(f, head.proj_u.weight, True)
-            _read_packed_tensor(f, head.proj_u.bias, False)
-            _read_packed_tensor(f, head.proj_v.weight, True)
-            _read_packed_tensor(f, head.proj_v.bias, False)
+            if i < model.depth:
+                down = model.down_samples[i]
+                _read_packed_tensor(f, down.weight, True)
+                _read_packed_tensor(f, down.bias, False)
+                head = model.hodlr_heads[i]
+                _read_packed_tensor(f, head.proj_u.weight, True)
+                _read_packed_tensor(f, head.proj_u.bias, False)
+                _read_packed_tensor(f, head.proj_v.weight, True)
+                _read_packed_tensor(f, head.proj_v.bias, False)
 
         # 4. Leaf (leaf_head: d_model -> leaf_size)
         _read_packed_tensor(f, model.leaf_head.weight, True)
@@ -894,8 +911,8 @@ def load_hgt_ol_weights_from_bytes(model, path):
 # --- 5. Training Loop ---
 
 def _pad_to_hodlr_size(n_real, leaf_size=32):
-    num_blocks_min = (n_real + leaf_size - 1) // leaf_size
-    depth = max(1, int(math.ceil(math.log2(num_blocks_min))))
+    num_blocks_min = max(1, (n_real + leaf_size - 1) // leaf_size)
+    depth = int(math.ceil(math.log2(num_blocks_min)))
     return leaf_size * (2 ** depth)
 
 def _most_recent_run_folder(base_path):
@@ -959,6 +976,7 @@ def train_hgt_ol():
     parser.add_argument('--max_rank', type=int, default=128)
     parser.add_argument('--d_model', type=int, default=128)
     parser.add_argument('--viz_limit', type=int, default=32)
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for init; use same as LeafOnly for comparable runs')
     parser.add_argument('--save_attention', action='store_true', default=True, help='Save leaf attention weights every diagnostic step to debug_attention.pt for InspectModel --debug_attention')
     args = parser.parse_args()
 
@@ -993,6 +1011,7 @@ def train_hgt_ol():
     print(f"  [startup] load frame {frame_idx} + compute N_pad/depth: {time.time()-t0:.2f}s")
 
     t0 = time.time()
+    torch.manual_seed(args.seed)
     model = HGT_OL(
         input_dim=input_dim, d_model=d_model, depth=depth, leaf_size=leaf_size,
         max_rank=args.max_rank, rank_scale=args.rank_scale,
@@ -1003,7 +1022,7 @@ def train_hgt_ol():
     model = model.to(device)
     print(f"  [startup] model.to(device): {time.time()-t0:.2f}s")
 
-    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, num_nodes={n_real}, N_pad={N_pad}, depth={depth}, d_model={d_model}")
+    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, num_nodes={n_real}, N_pad={N_pad}, depth={depth}, d_model={d_model}, seed={args.seed}")
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
@@ -1067,7 +1086,8 @@ def train_hgt_ol():
             model.eval()
             with torch.no_grad():
                 lb_debug, fact_debug = model(x_input, scale_A=scale_A, edge_index=edge_index_dev, edge_values=edge_values_dev, save_attention=args.save_attention)
-                print_diagnostics(model, lb_debug, fact_debug, step, optimizer)
+                if not DISABLE_EXTRA_PRINTS:
+                    print_diagnostics(model, lb_debug, fact_debug, step, optimizer)
             if args.save_attention:
                 blocks_data = []
                 for j in range(model.depth):
