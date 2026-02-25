@@ -958,7 +958,7 @@ def train_hgt_ol():
     parser.add_argument('--rank_scale', type=float, default=2.0)
     parser.add_argument('--max_rank', type=int, default=128)
     parser.add_argument('--d_model', type=int, default=128)
-    parser.add_argument('--viz_limit', type=int, default=150)
+    parser.add_argument('--viz_limit', type=int, default=32)
     parser.add_argument('--save_attention', action='store_true', default=True, help='Save leaf attention weights every diagnostic step to debug_attention.pt for InspectModel --debug_attention')
     args = parser.parse_args()
 
@@ -1047,11 +1047,13 @@ def train_hgt_ol():
         M_block = M_cols[0, :n_real, :]
 
         A_dense = A_sparse.to_dense().to(device)
-        AM = A_dense @ M_block
-
-        # Loss = condition number of A*M (2-norm: ratio of largest to smallest singular value)
-        s = torch.linalg.svdvals(AM)
-        loss = s[0] / s[-1].clamp(min=1e-10)
+        # SAI loss: E_z || M A z - z ||^2 with batch of 32 random vectors (MPS-friendly, no SVD)
+        batch_vectors = 32
+        Z = torch.randn(n_real, batch_vectors, device=device, dtype=x_input.dtype)
+        AZ = A_dense @ Z
+        MAZ = M_block @ AZ
+        residual = MAZ - Z
+        loss = (residual ** 2).mean()
         loss.backward()
 
         if args.max_grad_norm > 0:
@@ -1061,7 +1063,7 @@ def train_hgt_ol():
 
         if step % 100 == 0:
             t_interval_start = time.time()
-            print(f"Step {step}: Cond(A·M) {loss.item():.4f} ({time.time() - step_start:.1f}s elapsed for last 100 steps)")
+            print(f"Step {step}: SAI loss (E||MAz-z||²) {loss.item():.6f} ({time.time() - step_start:.1f}s elapsed for last 100 steps)")
             model.eval()
             with torch.no_grad():
                 lb_debug, fact_debug = model(x_input, scale_A=scale_A, edge_index=edge_index_dev, edge_values=edge_values_dev, save_attention=args.save_attention)

@@ -34,6 +34,12 @@ from NeuralPreconditioner import (
     read_weights_header,
     load_hgt_ol_weights_from_bytes,
 )
+from LeafOnly import (
+    LeafOnlyNet,
+    read_leaf_only_header,
+    load_leaf_only_weights,
+    LEAF_SIZE,
+)
 
 # --- 1. Overfit Baseline (Dense 32x32 leaf blocks, like Neural) ---
 
@@ -200,14 +206,27 @@ def main():
     parser.add_argument('--max_depth', type=int, default=10)
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Path to save plot image (default: script_dir/inspect_model_plot.png)')
-    parser.add_argument('--viz_limit', type=int, default=150,
+    parser.add_argument('--viz_limit', type=int, default=32,
                         help="Max size for dense M reconstruction and viz (reduces AMG work). Use 0 for full N.")
+    parser.add_argument('--leaf_only', default=True, action='store_true',
+                        help='Use LeafOnly model and show only the first 32x32 leaf (overrides viz_limit to 32).')
+    parser.add_argument('--no_leaf_only', dest='leaf_only', action='store_false',
+                        help='Use full HGT_OL model and --viz_limit as given.')
+    parser.add_argument('--leaf_only_weights', type=str, default=None,
+                        help='Path to LeafOnly weights (default: script_dir/leaf_only_weights.bytes).')
     parser.add_argument('--debug_attention', default=True, action='store_true',
                         help='Show leaf attention heatmap in top right (requires debug_attention.pt from training with --save_attention).')
     parser.add_argument('--overfit', action='store_true',
                         help='Enable Overfit HODLR baseline training and its graphs (disabled by default).')
     args = parser.parse_args()
     SKIP_OVERFIT = not args.overfit
+
+    # When leaf_only mode: force viz to first 32x32 leaf only for comparison
+    if args.leaf_only:
+        viz_limit_effective = LEAF_SIZE
+        print(f"Leaf-only mode: viz_limit overridden to {viz_limit_effective} (first leaf only).")
+    else:
+        viz_limit_effective = args.viz_limit
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available(): device = torch.device('mps')
@@ -233,66 +252,83 @@ def main():
     n = num_nodes_real
     A_viz = A_sparse_cpu.to_dense().numpy()
 
-    # --- MODEL 1: HGT_OL (Neural Preconditioner) ---
-    # HGT_OL expects 4-dim node features (position 3 + diagonal 1) from FluidGraphDataset.
-    print("\n1. Loading and running HGT_OL (neural preconditioner)...")
     leaf_size = 32
-    d_model_h, nhead, depth_file, input_dim_file, max_rank_file, num_layers_per_scale = read_weights_header(Path(args.weights))
-    d_model = args.d_model if args.d_model is not None else d_model_h
-    if args.d_model is not None:
-        print(f"  Using d_model={d_model} (override; header had {d_model_h})")
-    depth = depth_file
-    if x.shape[-1] != 4:
-        raise SystemExit(f"Neural model expects 4-dim input (position + diagonal); got {x.shape[-1]}. Use FluidGraphDataset with the same feature layout.")
-    # Use N_pad from the saved model (leaf_size * 2^depth) so sequence length matches training
-    N_pad = leaf_size * (2 ** depth)
-    padded_size = N_pad
-    # Match training: training uses min(num_nodes, viz_limit) nodes; cap so cond(AM) is comparable to training log
-    if num_nodes_real > N_pad:
-        print(f"  Model expects N_pad={N_pad} (trained on smaller system); using first {N_pad} nodes of data.")
-    viz_limit_for_forward = args.viz_limit if args.viz_limit > 0 else num_nodes_real
-    n_for_model = min(num_nodes_real, N_pad, viz_limit_for_forward)
-    if n_for_model < min(num_nodes_real, N_pad):
-        print(f"  Neural forward uses n_for_model={n_for_model} (viz_limit) so Cond(AM) matches training.")
-    rank_scale = 2.0  # must match training; not stored in header
-    model = HGT_OL(
-        input_dim=input_dim_file,
-        d_model=d_model,
-        depth=depth,
-        leaf_size=leaf_size,
-        max_rank=max_rank_file,
-        rank_scale=rank_scale,
-        num_layers_per_scale=num_layers_per_scale,
-    ).to(device)
-    load_hgt_ol_weights_from_bytes(model, Path(args.weights))
-
-    # Feed first n_for_model nodes and pad to N_pad
-    x_padded = x[:, :n_for_model, :].clone()
-    if n_for_model < N_pad:
-        x_padded = F.pad(x_padded, (0, 0, 0, N_pad - n_for_model), value=0.0)
-    scale_A = batch.get('scale_A')
-    if scale_A is not None and not isinstance(scale_A, torch.Tensor):
-        scale_A = torch.tensor(scale_A, device=device, dtype=x_padded.dtype)
-    # Edge list for leaf masked attention (only edges within first n_for_model nodes)
-    ei = batch['edge_index']
-    em = (ei[0] < n_for_model) & (ei[1] < n_for_model)
-    edge_index_model = ei[:, em].to(device)
-    edge_values_model = batch['edge_values'][em].to(device)
-    with torch.no_grad():
-        leaf_blocks_neural, factors_neural = model(x_padded, scale_A=scale_A, edge_index=edge_index_model, edge_values=edge_values_model)
-
-    print(f"  HGT_OL inference: padded_size={padded_size}, depth={depth}")
-
-    viz_n = (args.viz_limit if args.viz_limit > 0 else n)
+    viz_n = (viz_limit_effective if viz_limit_effective > 0 else n)
     viz_n = min(viz_n, n)
-    # When model was trained on smaller system, only visualize up to N_pad
-    if num_nodes_real > N_pad:
-        viz_n = min(viz_n, N_pad)
 
-    _scale = torch.exp(model.log_hodlr_scales) if hasattr(model, 'log_hodlr_scales') else (model.hodlr_scale if hasattr(model, 'hodlr_scale') else None)
-    M_neural = get_dense_matrix_from_neural(
-        leaf_blocks_neural, factors_neural, padded_size, n_for_model, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=_scale
-    )
+    if args.leaf_only:
+        # --- MODEL 1: LeafOnly (single 32x32 leaf) ---
+        leaf_only_weights_path = Path(args.leaf_only_weights) if args.leaf_only_weights else script_dir / "leaf_only_weights.bytes"
+        print("\n1. Loading and running LeafOnly (first leaf only)...")
+        if not leaf_only_weights_path.exists():
+            raise SystemExit(f"Leaf-only weights not found: {leaf_only_weights_path}. Run LeafOnly.py first (e.g. python LeafOnly.py).")
+        d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo = read_leaf_only_header(leaf_only_weights_path)
+        model_leaf = LeafOnlyNet(input_dim=input_dim_lo, d_model=d_model_lo, leaf_size=LEAF_SIZE, num_layers=num_layers_lo).to(device)
+        load_leaf_only_weights(model_leaf, leaf_only_weights_path)
+        x_leaf = x[:, :LEAF_SIZE, :].clone()
+        ei = batch['edge_index']
+        em = (ei[0] < LEAF_SIZE) & (ei[1] < LEAF_SIZE)
+        edge_index_leaf = ei[:, em].to(device)
+        edge_values_leaf = batch['edge_values'][em].to(device)
+        scale_A = batch.get('scale_A')
+        if scale_A is not None and not isinstance(scale_A, torch.Tensor):
+            scale_A = torch.tensor(scale_A, device=device, dtype=x_leaf.dtype)
+        with torch.no_grad():
+            leaf_blocks_leaf = model_leaf(x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A)
+        M_neural = leaf_blocks_leaf[0, 0].cpu().numpy()  # (32, 32)
+        print(f"  LeafOnly inference: single leaf {LEAF_SIZE}x{LEAF_SIZE}")
+    else:
+        # --- MODEL 1: HGT_OL (Neural Preconditioner) ---
+        print("\n1. Loading and running HGT_OL (neural preconditioner)...")
+        d_model_h, nhead, depth_file, input_dim_file, max_rank_file, num_layers_per_scale = read_weights_header(Path(args.weights))
+        d_model = args.d_model if args.d_model is not None else d_model_h
+        if args.d_model is not None:
+            print(f"  Using d_model={d_model} (override; header had {d_model_h})")
+        depth = depth_file
+        if x.shape[-1] != 4:
+            raise SystemExit(f"Neural model expects 4-dim input (position + diagonal); got {x.shape[-1]}. Use FluidGraphDataset with the same feature layout.")
+        N_pad = leaf_size * (2 ** depth)
+        padded_size = N_pad
+        if num_nodes_real > N_pad:
+            print(f"  Model expects N_pad={N_pad} (trained on smaller system); using first {N_pad} nodes of data.")
+        viz_limit_for_forward = args.viz_limit if args.viz_limit > 0 else num_nodes_real
+        n_for_model = min(num_nodes_real, N_pad, viz_limit_for_forward)
+        if n_for_model < min(num_nodes_real, N_pad):
+            print(f"  Neural forward uses n_for_model={n_for_model} (viz_limit) so Cond(AM) matches training.")
+        rank_scale = 2.0
+        model = HGT_OL(
+            input_dim=input_dim_file,
+            d_model=d_model,
+            depth=depth,
+            leaf_size=leaf_size,
+            max_rank=max_rank_file,
+            rank_scale=rank_scale,
+            num_layers_per_scale=num_layers_per_scale,
+        ).to(device)
+        load_hgt_ol_weights_from_bytes(model, Path(args.weights))
+
+        x_padded = x[:, :n_for_model, :].clone()
+        if n_for_model < N_pad:
+            x_padded = F.pad(x_padded, (0, 0, 0, N_pad - n_for_model), value=0.0)
+        scale_A = batch.get('scale_A')
+        if scale_A is not None and not isinstance(scale_A, torch.Tensor):
+            scale_A = torch.tensor(scale_A, device=device, dtype=x_padded.dtype)
+        ei = batch['edge_index']
+        em = (ei[0] < n_for_model) & (ei[1] < n_for_model)
+        edge_index_model = ei[:, em].to(device)
+        edge_values_model = batch['edge_values'][em].to(device)
+        with torch.no_grad():
+            leaf_blocks_neural, factors_neural = model(x_padded, scale_A=scale_A, edge_index=edge_index_model, edge_values=edge_values_model)
+
+        print(f"  HGT_OL inference: padded_size={padded_size}, depth={depth}")
+
+        if num_nodes_real > N_pad:
+            viz_n = min(viz_n, N_pad)
+
+        _scale = torch.exp(model.log_hodlr_scales) if hasattr(model, 'log_hodlr_scales') else (model.hodlr_scale if hasattr(model, 'hodlr_scale') else None)
+        M_neural = get_dense_matrix_from_neural(
+            leaf_blocks_neural, factors_neural, padded_size, n_for_model, device, leaf_size=leaf_size, viz_limit=viz_n, use_neural_apply=True, off_diag_scale=_scale
+        )
 
     # --- MODEL 2: OVERFIT HODLR (Block Diagonal, same structure as Neural) ---
     if SKIP_OVERFIT:
@@ -333,7 +369,7 @@ def main():
         debug_path = script_dir / "debug_attention.pt"
         if debug_path.exists():
             try:
-                data = torch.load(debug_path, map_location='cpu')
+                data = torch.load(debug_path, map_location='cpu', weights_only=False)
                 blocks_data = data.get('blocks', [])
                 if not blocks_data:
                     blocks_data = [{'attn': data['attn_blocks'], 'scores': None, 'bias_physics': None}]
@@ -384,9 +420,10 @@ def main():
     diag_ainv = np.diag(A_inv_viz)
     print(f"\nTrue inverse A^{{-1}} diagonal (viz {viz_n}x{viz_n}): min={diag_ainv.min():.6f}, max={diag_ainv.max():.6f}, mean={diag_ainv.mean():.6f}, std={diag_ainv.std():.6f}")
 
+    neural_label = "LeafOnly" if args.leaf_only else "Neural"
     matrices = {
         "A (Input)": A_viz_n,
-        "Neural M": M_neural_n,
+        f"{neural_label} M": M_neural_n,
         "Overfit M": M_overfit_n,
         "AMG M": M_amg_n
     }
@@ -394,7 +431,7 @@ def main():
     leaf_size = 32
 
     amg_label = "AMG (disabled)" if SKIP_AMG else "AMG"
-    methods = [("Neural", M_neural_n)]
+    methods = [(neural_label, M_neural_n)]
     if not SKIP_OVERFIT:
         methods.append(("Overfit", M_overfit_n))
     methods.append((amg_label, M_amg_n))
