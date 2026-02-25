@@ -173,46 +173,45 @@ def build_merged_connectivity(edge_index, edge_values, positions, level, device,
     At `level` (0 = original), merge edges: (r, c) -> (r // 2^level, c // 2^level).
     Additively blend edge values for same (i, j). Positions = centroid of original positions per super-node.
     Returns: merged_edge_index (2, E'), merged_edge_values (E'), merged_positions (N', 3).
+    Vectorized for level>0 to avoid Python-loop bottlenecks (LeafOnly never calls this).
     """
     if level == 0:
         return edge_index.to(device), edge_values.to(device), positions.to(device)
     rows, cols = edge_index[0], edge_index[1]
     scale = 2 ** level
-    i = (rows // scale).long()
-    j = (cols // scale).long()
-    w = edge_values.to(dtype=dtype)
+    i = (rows // scale).long().to(device)
+    j = (cols // scale).long().to(device)
+    w = edge_values.to(device=device, dtype=dtype)
     if scale_A is not None and scale_A != 1.0:
         s = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else float(scale_A)
         w = w / s
-    agg = defaultdict(lambda: 0.0)
-    for a, b, v in zip(i.tolist(), j.tolist(), w.tolist()):
-        agg[(a, b)] += v
-    if not agg:
-        n_merged = max(positions.shape[0] // scale, 1)
-        pos_flat = positions.to(device=device, dtype=dtype)
-        merged_positions = torch.zeros(n_merged, 3, device=device, dtype=dtype)
-        for idx in range(n_merged):
-            start, end = idx * scale, min((idx + 1) * scale, positions.shape[0])
-            if start < end:
-                merged_positions[idx] = pos_flat[start:end].mean(dim=0)
-        return (
-            torch.zeros(2, 0, dtype=torch.long, device=device),
-            torch.zeros(0, dtype=dtype, device=device),
-            merged_positions,
-        )
-    pairs = list(agg.keys())
-    merged_i = torch.tensor([p[0] for p in pairs], device=device, dtype=torch.long)
-    merged_j = torch.tensor([p[1] for p in pairs], device=device, dtype=torch.long)
-    merged_w = torch.tensor([agg[p] for p in pairs], device=device, dtype=dtype)
-    merged_edge_index = torch.stack([merged_i, merged_j], dim=0)
-    n_merged = positions.shape[0] // scale
+    n_merged = max(positions.shape[0] // scale, 1)
     pos_flat = positions.to(device=device, dtype=dtype)
+
+    # Vectorized edge aggregation: unique (i,j) and sum weights via scatter_add
+    pair_flat = i * (n_merged + 1) + j  # unique linear index per (i,j) for i,j in [0, n_merged)
+    pair_flat = pair_flat.clamp(max=n_merged * (n_merged + 1) - 1)
+    unq, inv = torch.unique(pair_flat, return_inverse=True)
+    merged_w = torch.zeros(unq.shape[0], device=device, dtype=dtype)
+    merged_w.scatter_add_(0, inv, w)
+    merged_i = (unq // (n_merged + 1)).long()
+    merged_j = (unq % (n_merged + 1)).long()
+    merged_edge_index = torch.stack([merged_i, merged_j], dim=0)
+    merged_edge_values = merged_w
+
+    # Vectorized position centroids: one bucket per super-node, then mean
+    bucket = torch.arange(positions.shape[0], device=device, dtype=torch.long) // scale
+    bucket = bucket.clamp(max=n_merged - 1)
     merged_positions = torch.zeros(n_merged, 3, device=device, dtype=dtype)
-    for idx in range(n_merged):
-        start, end = idx * scale, min((idx + 1) * scale, positions.shape[0])
-        if start < end:
-            merged_positions[idx] = pos_flat[start:end].mean(dim=0)
-    return merged_edge_index, merged_w, merged_positions
+    one = torch.ones(positions.shape[0], 1, device=device, dtype=dtype)
+    for c in range(3):
+        merged_positions[:, c].scatter_add_(0, bucket, pos_flat[:, c])
+    counts = torch.zeros(n_merged, device=device, dtype=dtype)
+    counts.scatter_add_(0, bucket, one.squeeze(-1))
+    counts = counts.clamp(min=1e-8)
+    merged_positions = merged_positions / counts.unsqueeze(-1)
+
+    return merged_edge_index, merged_edge_values, merged_positions
 
 
 def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, leaf_size, device, dtype=torch.float32):
@@ -505,9 +504,15 @@ class HGT_OL(nn.Module):
         self.rank_scale = rank_scale
         self.num_layers_per_scale = num_layers_per_scale
 
-        # 1. Embedding: lift + physics GCN (graph at full resolution)
-        self.embed = PhysicsAwareEmbedding(input_dim, d_model)
-        self.enc_input_proj = nn.Linear(d_model, d_model)
+        # 1. Scale-0 leaf path: use LeafCore from LeafOnly (single source of truth for embed, blocks, leaf_head)
+        from LeafOnly import LeafCore
+        self.leaf_core = LeafCore(
+            input_dim=input_dim,
+            d_model=d_model,
+            leaf_size=leaf_size,
+            num_layers=num_layers_per_scale,
+            num_heads=4,
+        )
 
         # HODLR Ranks (Ordered Coarse -> Fine); empty when depth=0
         self.ranks = []
@@ -518,34 +523,27 @@ class HGT_OL(nn.Module):
             r = r if r % 2 == 0 else r + 1
             self.ranks.append(r)
 
-        # 2. Down-Path: num_scales = max(1, depth) so depth=0 still has one scale (attention + leaf only)
-        # Creation order matches LeafOnly for depth=0: embed, enc_input_proj, enc_blocks, leaf_head, log_scale
-        # so that same seed gives identical shared weights.
-        self.enc_blocks = nn.ModuleList()
+        # 2. Down-Path: enc_blocks only for scales j>=1 (scale 0 is leaf_core); level_gcns, down_samples, hodlr_heads
+        self._enc_blocks_rest = nn.ModuleList()
         self.down_samples = nn.ModuleList()
         self.hodlr_heads = nn.ModuleList()
         num_scales = max(1, depth)
 
-        for j in range(num_scales):
+        for j in range(1, num_scales):
             layers = nn.ModuleList([
                 TransformerBlock(d_model, block_size=leaf_size, attn_module=LeafBlockAttention(d_model, leaf_size, num_heads=4))
                 for _ in range(num_layers_per_scale)
             ])
-            self.enc_blocks.append(layers)
-            if j < depth:
-                self.down_samples.append(nn.Linear(d_model * 2, d_model))
-                rank_j = self.ranks[depth - 1 - j]
-                expansion = 2 ** j
-                self.hodlr_heads.append(HODLRHead(d_model, rank_j * expansion))
+            self._enc_blocks_rest.append(layers)
+        for j in range(depth):
+            self.down_samples.append(nn.Linear(d_model * 2, d_model))
+            rank_j = self.ranks[depth - 1 - j]
+            expansion = 2 ** j
+            self.hodlr_heads.append(HODLRHead(d_model, rank_j * expansion))
 
-        # 3. Leaf Generation (same init as LeafOnly; created before level_gcns so RNG order matches)
-        self.leaf_head = nn.Linear(d_model, leaf_size)
-        nn.init.normal_(self.leaf_head.weight, std=0.01)
-        nn.init.constant_(self.leaf_head.bias, 0.0)
-        self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
         self.log_hodlr_scales = nn.Parameter(torch.ones(depth) * math.log(1e-2))
 
-        # Level GCNs after leaf (so depth=0 shared path matches LeafOnly RNG)
+        # Level GCNs (one per scale; scale 0 unused in forward but kept for save/load)
         self.level_gcns = nn.ModuleList()
         for j in range(num_scales):
             self.level_gcns.append(SparsePhysicsGCN(d_model))
@@ -558,6 +556,35 @@ class HGT_OL(nn.Module):
 
         if not DISABLE_EXTRA_PRINTS:
             _print_hodlr_architecture(leaf_size, depth, self.ranks, num_layers_per_scale)
+
+    @property
+    def embed(self):
+        return self.leaf_core.embed
+
+    @property
+    def enc_input_proj(self):
+        return self.leaf_core.enc_input_proj
+
+    @property
+    def leaf_head(self):
+        return self.leaf_core.leaf_head
+
+    @property
+    def log_hodlr_scale_leaf(self):
+        return self.leaf_core.log_hodlr_scale_leaf
+
+    @property
+    def enc_blocks(self):
+        """Scale 0 = leaf_core.blocks; scales 1+ = self._enc_blocks. Indexed as enc_blocks[0] for scale 0, enc_blocks[j] for scale j."""
+        class _EncBlocksView:
+            def __init__(self, leaf_core_blocks, enc_blocks_list):
+                self._leaf = leaf_core_blocks
+                self._rest = enc_blocks_list
+            def __getitem__(self, i):
+                return self._leaf if i == 0 else self._rest[i - 1]
+            def __len__(self):
+                return 1 + len(self._rest)
+        return _EncBlocksView(self.leaf_core.blocks, self._enc_blocks_rest)
 
     def forward(self, x, pos=None, scale_A=None, edge_index=None, edge_values=None, save_attention=False, _timing=None, debug_step=False):
         B, N, _ = x.shape
@@ -575,95 +602,75 @@ class HGT_OL(nn.Module):
         if FORWARD_DEBUG:
             print(f"[FWD HGT_OL] x.shape={tuple(x.shape)} positions.shape={tuple(positions.shape)}")
 
-        h = self.embed(x, edge_index, edge_values, scale_A)
+        # --- Scale 0: LeafCore (same as LeafOnly) ---
+        num_scales = max(1, self.depth)
+        graph_per_level = None
+        if edge_index is not None and edge_values is not None:
+            device = x.device
+            dtype = x.dtype
+            graph_per_level = []
+            for level in range(num_scales):
+                ei_j, ev_j, pos_j = build_merged_connectivity(edge_index, edge_values, positions, level, device, dtype, scale_A=scale_A)
+                graph_per_level.append((ei_j, ev_j, pos_j))
+
+        factors_fine_to_coarse = []
+        dense_blocks_out = None
+
+        h = self.leaf_core.embed(x, edge_index, edge_values, scale_A)
         if debug_step:
             _h = h.detach()
             print(f"[STEP100 HGT_OL] AFTER EMBED: h.shape={tuple(h.shape)} min={_h.min().item():.6f} max={_h.max().item():.6f} mean={_h.mean().item():.6f} std={_h.std().item():.6f}")
         if FORWARD_DEBUG:
             print(f"[FWD HGT_OL] after embed: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
-        h = self.enc_input_proj(h)
+        h = self.leaf_core.enc_input_proj(h)
         if debug_step:
             _h = h.detach()
             print(f"[STEP100 HGT_OL] AFTER ENC_INPUT_PROJ: h.shape={tuple(h.shape)} mean_abs={_h.abs().mean().item():.6f}")
         if FORWARD_DEBUG:
             print(f"[FWD HGT_OL] after enc_input_proj: h.shape={tuple(h.shape)}")
 
-        # --- 2. Down-Only HODLR Hierarchy ---
-        factors_fine_to_coarse = []
-        dense_blocks_out = None  # Initialize before the loop
-
-        # Precompute per-level connectivity for masked attention and level GCNs
-        num_scales = max(1, self.depth)
-        graph_per_level = None
-        if edge_index is not None and edge_values is not None:
-            device = x.device
-            dtype = h.dtype
-            graph_per_level = []
-            for level in range(num_scales):
-                ei_j, ev_j, pos_j = build_merged_connectivity(edge_index, edge_values, positions, level, device, dtype, scale_A=scale_A)
-                graph_per_level.append((ei_j, ev_j, pos_j))
-
         for j in range(num_scales):
             if _timing is not None: t0 = time.time()
 
-            # Hierarchical physics: GCN at this scale (j=0 already done in embed)
             if graph_per_level is not None and j > 0:
                 ei_j, ev_j, pos_j = graph_per_level[j]
                 h = self.level_gcns[j](h, ei_j, ev_j, scale_A)
 
-            # Multiple residual-attention layers at this scale; leaf/HODLR/downsample only after last
             nlay = self.num_layers_per_scale
-            for layer_idx in range(nlay):
-                block = self.enc_blocks[j][layer_idx]
-                save_attn = save_attention and (layer_idx == nlay - 1)
-                if graph_per_level is not None:
-                    ei_j, ev_j, pos_j = graph_per_level[j]
-                    h = block(h, edge_index=ei_j, edge_values=ev_j, positions=pos_j, scale_A=scale_A, save_attention=save_attn)
-                else:
-                    h = block(h, save_attention=save_attn)
-                if debug_step and j == 0:
-                    _h = h.detach()
-                    print(f"[STEP100 HGT_OL] AFTER BLOCK {layer_idx} (x + attn): h.shape={tuple(h.shape)} mean_abs={_h.abs().mean().item():.6f}")
-                if FORWARD_DEBUG:
-                    print(f"[FWD HGT_OL] after block {j}.{layer_idx}: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
-
-            # --- After last layer at this scale: extract leaf (j==0), HODLR factors, then downsample ---
             if j == 0:
+                # Scale 0: use LeafCore blocks (same as LeafOnly)
+                for layer_idx, block in enumerate(self.leaf_core.blocks):
+                    save_attn = save_attention and (layer_idx == nlay - 1)
+                    if graph_per_level is not None:
+                        ei_j, ev_j, pos_j = graph_per_level[0]
+                        h = block(h, edge_index=ei_j, edge_values=ev_j, positions=pos_j, scale_A=scale_A, save_attention=save_attn)
+                    else:
+                        h = block(h, save_attention=save_attn)
+                    if debug_step:
+                        _h = h.detach()
+                        print(f"[STEP100 HGT_OL] AFTER BLOCK {layer_idx} (x + attn): h.shape={tuple(h.shape)} mean_abs={_h.abs().mean().item():.6f}")
+                    if FORWARD_DEBUG:
+                        print(f"[FWD HGT_OL] after block 0.{layer_idx}: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
                 if _timing is not None: t_leaf = time.time()
-                num_leaves = N // self.leaf_size
-                h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
-                u_leaf = self.leaf_head(h_leaves)
-                leaf_scale = torch.exp(self.log_hodlr_scale_leaf)
-                leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * leaf_scale
-
-                diag_A_n = x[..., 3]
-                s = scale_A if scale_A is not None else 1.0
-                if isinstance(s, torch.Tensor):
-                    diag_A_real = diag_A_n * s
-                else:
-                    diag_A_real = diag_A_n * s
-
-                jacobi_diag = torch.zeros_like(diag_A_real)
-                mask = diag_A_real.abs() > 1e-6
-                jacobi_diag[mask] = 1.0 / diag_A_real[mask]
-                jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
-                mask_blocks = mask.view(B, num_leaves, self.leaf_size)
-
-                new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
-                dense_blocks_out = leaf_base + torch.diag_embed(new_diag)
+                dense_blocks_out = self.leaf_core.get_leaf_blocks(h, x, scale_A)
                 if debug_step:
-                    _u = u_leaf.detach()
-                    _lb = leaf_base.detach()
-                    _nd = new_diag.detach()
                     _db = dense_blocks_out.detach()
-                    print(f"[STEP100 HGT_OL] LEAF: h_leaves.shape={tuple(h_leaves.shape)} u_leaf.shape={tuple(u_leaf.shape)} u_leaf min={_u.min().item():.6f} max={_u.max().item():.6f} mean={_u.mean().item():.6f}")
-                    print(f"[STEP100 HGT_OL] LEAF: exp(log_hodlr_scale_leaf)={leaf_scale.item():.6f} leaf_base.shape={tuple(leaf_base.shape)} min={_lb.min().item():.6f} max={_lb.max().item():.6f} mean={_lb.mean().item():.6f}")
-                    print(f"[STEP100 HGT_OL] JACOBI: diag_A_n min={diag_A_n.detach().min().item():.6f} max={diag_A_n.detach().max().item():.6f} mask.sum()={mask.sum().item()} new_diag min={_nd.min().item():.6f} max={_nd.max().item():.6f} mean={_nd.mean().item():.6f}")
                     print(f"[STEP100 HGT_OL] OUTPUT dense_blocks: shape={tuple(dense_blocks_out.shape)} min={_db.min().item():.6f} max={_db.max().item():.6f} mean={_db.mean().item():.6f} diag_mean={torch.diagonal(_db[0,0]).mean().item():.6f}")
                 if FORWARD_DEBUG:
-                    print(f"[FWD HGT_OL] leaf: h_leaves.shape={tuple(h_leaves.shape)} u_leaf.shape={tuple(u_leaf.shape)} leaf_base_mean={leaf_base.mean().item():.6f} dense_blocks.shape={tuple(dense_blocks_out.shape)}")
+                    print(f"[FWD HGT_OL] leaf: dense_blocks.shape={tuple(dense_blocks_out.shape)}")
                 if _timing is not None: _timing["leaf_head"] = time.time() - t_leaf
-            # ----------------------------------------------------------
+            else:
+                # Scales j>=1: enc_blocks[j-1]
+                for layer_idx in range(nlay):
+                    block = self._enc_blocks_rest[j - 1][layer_idx]
+                    save_attn = save_attention and (layer_idx == nlay - 1)
+                    if graph_per_level is not None:
+                        ei_j, ev_j, pos_j = graph_per_level[j]
+                        h = block(h, edge_index=ei_j, edge_values=ev_j, positions=pos_j, scale_A=scale_A, save_attention=save_attn)
+                    else:
+                        h = block(h, save_attention=save_attn)
+                    if FORWARD_DEBUG:
+                        print(f"[FWD HGT_OL] after block {j}.{layer_idx}: h.shape={tuple(h.shape)} h_mean_abs={h.abs().mean().item():.6f}")
 
             # Extract factors and downsample only when we have HODLR levels (depth > 0)
             if j < self.depth:
@@ -794,8 +801,9 @@ def save_weights_to_bytes(model, path, input_dim=None):
             _write_packed_tensor(f, gcn.update_gate[0].bias, transpose=False)
             _write_packed_tensor(f, gcn.update_gate[2].weight, transpose=True)
             _write_packed_tensor(f, gcn.update_gate[2].bias, transpose=False)
+            blocks = model.leaf_core.blocks if i == 0 else model._enc_blocks_rest[i - 1]
             for layer_idx in range(num_layers_per_scale):
-                block = model.enc_blocks[i][layer_idx]
+                block = blocks[layer_idx]
                 _write_packed_tensor(f, block.norm1.weight, False)
                 _write_packed_tensor(f, block.norm1.bias, False)
                 _write_packed_tensor(f, block.attn.qkv.weight, True)
@@ -814,10 +822,10 @@ def save_weights_to_bytes(model, path, input_dim=None):
                 _write_packed_tensor(f, head.proj_v.weight, True)
                 _write_packed_tensor(f, head.proj_v.bias, False)
             
-        # 4. Leaf (leaf_head: d_model -> leaf_size)
-        _write_packed_tensor(f, model.leaf_head.weight, True)
-        _write_packed_tensor(f, model.leaf_head.bias, False)
-        _write_packed_tensor(f, torch.exp(model.log_hodlr_scale_leaf).detach(), False)
+        # 3. Leaf (leaf_core.leaf_head + scale)
+        _write_packed_tensor(f, model.leaf_core.leaf_head.weight, True)
+        _write_packed_tensor(f, model.leaf_core.leaf_head.bias, False)
+        _write_packed_tensor(f, torch.exp(model.leaf_core.log_hodlr_scale_leaf).detach(), False)
         _write_packed_tensor(f, torch.exp(model.log_hodlr_scales).detach(), False)
 
 def _read_packed_tensor(f, target_param, transpose=False):
@@ -908,14 +916,13 @@ def load_hgt_ol_weights_from_bytes(model, path):
                 _read_packed_tensor(f, head.proj_v.weight, True)
                 _read_packed_tensor(f, head.proj_v.bias, False)
 
-        # 4. Leaf (leaf_head: d_model -> leaf_size)
-        _read_packed_tensor(f, model.leaf_head.weight, True)
-        _read_packed_tensor(f, model.leaf_head.bias, False)
-        
+        # 3. Leaf (leaf_core.leaf_head + scale)
+        _read_packed_tensor(f, model.leaf_core.leaf_head.weight, True)
+        _read_packed_tensor(f, model.leaf_core.leaf_head.bias, False)
         _hodlr_leaf = torch.empty(1)
         _read_packed_tensor(f, _hodlr_leaf, False)
         with torch.no_grad():
-            model.log_hodlr_scale_leaf.copy_(torch.log(_hodlr_leaf.clamp(min=1e-10)).to(model.log_hodlr_scale_leaf.device))
+            model.leaf_core.log_hodlr_scale_leaf.copy_(torch.log(_hodlr_leaf.clamp(min=1e-10)).to(model.leaf_core.log_hodlr_scale_leaf.device))
             
         depth = model.depth
         level_bytes = 2 * (depth + (1 if depth % 2 else 0))
@@ -926,7 +933,7 @@ def load_hgt_ol_weights_from_bytes(model, path):
                 model.log_hodlr_scales.copy_(torch.log(torch.from_numpy(level_scales).clamp(min=1e-10).to(model.log_hodlr_scales.device)))
         else:
             with torch.no_grad():
-                model.log_hodlr_scales.copy_(torch.ones(depth, device=model.log_hodlr_scales.device) * model.log_hodlr_scale_leaf.item())
+                model.log_hodlr_scales.copy_(torch.ones(depth, device=model.log_hodlr_scales.device) * model.leaf_core.log_hodlr_scale_leaf.item())
     print(f"Loaded HGT_OL weights from {path}")
 
 # --- 5. Training Loop ---
