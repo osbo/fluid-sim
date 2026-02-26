@@ -44,7 +44,7 @@ public class TrainingDataRecorder : MonoBehaviour
     }
 
     public void SaveFrame(ComputeBuffer nodes, ComputeBuffer neighbors, ComputeBuffer divergence, ComputeBuffer pressure,
-        ComputeBuffer rowIndices, ComputeBuffer colIndices, ComputeBuffer csrValues, int totalNNZ,
+        ComputeBuffer diffusionGradient, ComputeBuffer rowIndices, ComputeBuffer colIndices, ComputeBuffer csrValues, int totalNNZ,
         int numNodes, int minLayer, int maxLayer, float gravity, int numParticles, int maxCgIterations, float convergenceThreshold, float frameRate,
         Vector3 simulationBoundsMin, Vector3 simulationBoundsMax, Vector3 fluidInitialBoundsMin, Vector3 fluidInitialBoundsMax)
     {
@@ -86,6 +86,9 @@ public class TrainingDataRecorder : MonoBehaviour
         SaveBuffer(divergence, numNodes, sizeof(float), Path.Combine(framePath, "divergence.bin"));
         // Pressure buffer: 1 float per node = 4 bytes
         SaveBuffer(pressure, numNodes, sizeof(float), Path.Combine(framePath, "pressure.bin"));
+        // Diffusion gradient: float3 per node = 12 bytes
+        if (diffusionGradient != null)
+            SaveBuffer(diffusionGradient, numNodes, 3 * sizeof(float), Path.Combine(framePath, "diffusion_gradient.bin"));
 
         // Save the Sparse Graph (Edge Index)
         // We save exactly totalNNZ elements. Stride is sizeof(uint) = 4.

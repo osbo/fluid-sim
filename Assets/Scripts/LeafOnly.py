@@ -61,6 +61,8 @@ class FluidGraphDataset:
         vals = np.fromfile(frame_path / "A_values.bin", dtype=np.float32)
 
         positions = np.asarray(raw_nodes['position'], dtype=np.float32)
+        layer = np.asarray(raw_nodes['layer'], dtype=np.float32)
+        mass = np.asarray(raw_nodes['mass'], dtype=np.float32)
         diag_map = np.zeros(num_nodes, dtype=np.float32)
         for r, c, v in zip(rows, cols, vals):
             if r == c:
@@ -70,14 +72,32 @@ class FluidGraphDataset:
         if pos_scale <= 0.0: pos_scale = 1.0
         positions_n = positions / pos_scale
 
+        # 2^layer (no normalization); matches ApplyPressureGradient scale exp2((float)node.layer)
+        layer_val = np.exp2(layer)
+
+        mass_max = float(np.max(mass))
+        if mass_max <= 1e-9: mass_max = 1.0
+        mass_n = mass / mass_max
+
         scale_A = float(np.abs(vals).max())
         if scale_A <= 0.0: scale_A = 1.0
         diag_map_n = diag_map / scale_A
 
-        n_float = 4
+        # Diffusion gradient: float3 per node (points toward fluid bulk, away from free surface)
+        dg_path = frame_path / "diffusion_gradient.bin"
+        if dg_path.exists():
+            diffusion_grad = np.fromfile(dg_path, dtype=np.float32).reshape(num_nodes, 3)
+        else:
+            diffusion_grad = np.zeros((num_nodes, 3), dtype=np.float32)
+
+        # Input: position (3) + layer (1) + mass (1) + diffusion_gradient (3) + diagonal (1) = 9
+        n_float = 9
         x = np.zeros((num_nodes, n_float), dtype=np.float32)
         x[:, :3] = positions_n
-        x[:, 3] = diag_map_n
+        x[:, 3] = layer_val
+        x[:, 4] = mass_n
+        x[:, 5:8] = diffusion_grad
+        x[:, 8] = diag_map_n
 
         return {
             'x': torch.from_numpy(x).float(),
@@ -142,6 +162,30 @@ class PhysicsAwareEmbedding(nn.Module):
 
 # --- Leaf block connectivity and attention ---
 
+def build_leaf_block_physics_bias(edge_index, edge_values, scale_A, leaf_size, device, dtype=torch.float32, num_nodes=None):
+    """Build per-block (num_blocks, leaf_size, leaf_size) physics bias from A-matrix edges. 1 on diagonal, 0 off-edges, edge value on edges. No mask, no global node. num_nodes: if provided (e.g. N_pad), num_blocks = num_nodes // leaf_size."""
+    rows, cols = edge_index[0], edge_index[1]
+    N_infer = int(max(rows.max().item(), cols.max().item()) + 1) if rows.numel() else 0
+    N = num_nodes if num_nodes is not None else N_infer
+    num_blocks = N // leaf_size
+    if num_blocks == 0:
+        return None
+    block_r = rows // leaf_size
+    block_c = cols // leaf_size
+    in_block = (block_r == block_c) & (block_r < num_blocks)
+    r_l = rows[in_block] % leaf_size
+    c_l = cols[in_block] % leaf_size
+    b_l = block_r[in_block]
+    w = edge_values[in_block].to(device=device, dtype=dtype)
+    if scale_A is not None and scale_A != 1.0:
+        s = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else float(scale_A)
+        w = w / s
+    bias = torch.zeros(num_blocks, leaf_size, leaf_size, device=device, dtype=dtype)
+    bias[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device)] = 1.0
+    bias[b_l, r_l, c_l] = w
+    return bias
+
+
 def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, leaf_size, device, dtype=torch.float32):
     """Build per-block attention mask and edge features for leaf blocks."""
     N = positions.shape[0]
@@ -173,11 +217,12 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, l
     return attn_mask, edge_feats
 
 class LeafBlockAttention(nn.Module):
-    """Masked attention within each leaf block of 32 nodes."""
-    def __init__(self, dim, block_size, num_heads=2):
+    """Attention within each leaf block. mask_attention=True: 33 nodes (32+global), -inf mask. mask_attention=False: dense 32x32, physics bias only."""
+    def __init__(self, dim, block_size, num_heads=2, mask_attention=True):
         super().__init__()
         self.dim = dim
         self.block_size = block_size
+        self.mask_attention = mask_attention
         self.num_heads = num_heads if dim % num_heads == 0 else 1
         self.head_dim = dim // self.num_heads
         self.scale = self.head_dim ** -0.5
@@ -193,9 +238,9 @@ class LeafBlockAttention(nn.Module):
         self.last_scores_matrix = None
         self.last_bias_physics_matrix = None
 
-    def forward(self, x, edge_index=None, edge_values=None, positions=None, scale_A=None, save_attention=False, attn_mask=None, edge_feats=None):
+    def forward(self, x, edge_index=None, edge_values=None, positions=None, scale_A=None, save_attention=False, attn_mask=None, edge_feats=None, physics_bias=None):
         B, N, C = x.shape
-        if edge_index is None or positions is None:
+        if edge_index is None or (self.mask_attention and positions is None):
             return self._forward_dense_fallback(x, B, N, C, save_attention)
 
         device = x.device
@@ -206,6 +251,10 @@ class LeafBlockAttention(nn.Module):
             x = F.pad(x, (0, 0, 0, pad))
         N_pad = x.shape[1]
         num_blocks = N_pad // self.block_size
+        x_blk = x.view(B, num_blocks, self.block_size, C)
+
+        if not self.mask_attention:
+            return self._forward_unmasked_32(x_blk, B, N_pad, N, pad, num_blocks, device, dtype, edge_index, edge_values, scale_A, save_attention, physics_bias, N_pad)
 
         if attn_mask is None or edge_feats is None:
             attn_mask, edge_feats = build_leaf_block_connectivity(
@@ -214,7 +263,6 @@ class LeafBlockAttention(nn.Module):
         if attn_mask is None:
             return x[:, :N, :] if pad > 0 else x
 
-        x_blk = x.view(B, num_blocks, self.block_size, C)
         block_node = x_blk.mean(dim=2, keepdim=True)
         kv = torch.cat([x_blk, block_node], dim=2)
         qkv_q = self.qkv(x_blk)
@@ -223,8 +271,8 @@ class LeafBlockAttention(nn.Module):
         k = qkv_kv[..., C:2*C]
         v = qkv_kv[..., 2*C:3*C]
         q = q.view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
-        k = k.view(B, num_blocks, 33, self.num_heads, self.head_dim)
-        v = v.view(B, num_blocks, 33, self.num_heads, self.head_dim)
+        k = k.view(B, num_blocks, self.block_size + 1, self.num_heads, self.head_dim)
+        v = v.view(B, num_blocks, self.block_size + 1, self.num_heads, self.head_dim)
 
         scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
 
@@ -265,6 +313,41 @@ class LeafBlockAttention(nn.Module):
             x_out = x_out[:, :N, :]
         return x_out
 
+    def _forward_unmasked_32(self, x_blk, B, N_pad, N_orig, pad, num_blocks, device, dtype, edge_index, edge_values, scale_A, save_attention, physics_bias=None, num_nodes=None):
+        """Dense 32x32 attention; physics bias only, no -inf mask. No global node."""
+        C = x_blk.shape[-1]
+        if physics_bias is None:
+            physics_bias = build_leaf_block_physics_bias(edge_index, edge_values, scale_A, self.block_size, device, dtype, num_nodes=num_nodes or N_pad)
+        if physics_bias is None:
+            physics_bias = torch.eye(self.block_size, device=device, dtype=dtype).unsqueeze(0).expand(num_blocks, -1, -1)
+        qkv = self.qkv(x_blk)
+        q, k, v = qkv[..., :C], qkv[..., C:2*C], qkv[..., 2*C:3*C]
+        q = q.view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
+        k = k.view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
+        v = v.view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
+        scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
+        scores = scores + physics_bias.unsqueeze(0).unsqueeze(-1)
+        attn_probs = F.softmax(scores, dim=3)
+        linear_edge_weights = self.edge_gate(physics_bias.unsqueeze(-1)).unsqueeze(0)
+        combined_weights = attn_probs + linear_edge_weights
+        with torch.no_grad():
+            attn_viz = combined_weights.mean(dim=-1)
+            arange = torch.arange(self.block_size, device=attn_viz.device)
+            self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
+            self.last_attn_block = 0.0
+            to_nodes = attn_viz.sum(dim=3)
+            self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
+            self.last_scores_matrix = None
+            self.last_bias_physics_matrix = physics_bias.cpu().float() if save_attention else None
+            if save_attention:
+                self.last_attn_matrix = attn_viz[:, :, :, :].cpu().float()
+        x_out = torch.einsum('bnqkh,bnkhd->bnqhd', combined_weights, v)
+        x_out = x_out.reshape(B, num_blocks, self.block_size, C)
+        x_out = self.proj(x_out.view(B, N_pad, C))
+        if pad > 0:
+            x_out = x_out[:, :N_orig, :]
+        return x_out
+
     def _forward_dense_fallback(self, x, B, N, C, save_attention):
         pad = 0
         if N % self.block_size != 0:
@@ -301,17 +384,17 @@ class TransformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.attn = attn_module
 
-    def forward(self, x, edge_index=None, edge_values=None, positions=None, scale_A=None, save_attention=False, attn_mask=None, edge_feats=None):
+    def forward(self, x, edge_index=None, edge_values=None, positions=None, scale_A=None, save_attention=False, attn_mask=None, edge_feats=None, physics_bias=None):
         x = x + self.attn(
             self.norm1(x), edge_index=edge_index, edge_values=edge_values, positions=positions,
-            scale_A=scale_A, save_attention=save_attention, attn_mask=attn_mask, edge_feats=edge_feats
+            scale_A=scale_A, save_attention=save_attention, attn_mask=attn_mask, edge_feats=edge_feats, physics_bias=physics_bias
         )
         return x
 
 def _most_recent_run_folder(base_path):
     base = Path(base_path)
     if not base.exists(): return base
-    runs = sorted(base.glob("Run_*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    runs = sorted([p for p in base.glob("Run_*") if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
     if not runs: return base
     return runs[0]
 
@@ -421,16 +504,18 @@ def print_hodlr_structure(n_nodes, leaf_size=LEAF_SIZE, rank_base=RANK_BASE_LEVE
 class LeafCore(nn.Module):
     """
     Shared leaf path: embed -> enc_input_proj -> transformer blocks (leaf attention) -> leaf_head -> U@U.T + Jacobi diag.
-    Supports any N divisible by leaf_size (used by both LeafOnlyNet and HGT_OL scale 0).
+    Input x: (B, N, 9) = position (3), layer (1), mass (1), diffusion_gradient (3), diagonal (1). Supports any N divisible by leaf_size.
+    mask_attention=True: 33-node masked attention (slow). mask_attention=False: dense 32x32, no mask (fast).
     Output shape: (B, num_leaves, leaf_size, leaf_size).
     """
-    def __init__(self, input_dim=4, d_model=128, leaf_size=32, num_layers=3, num_heads=4):
+    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, mask_attention=True):
         super().__init__()
         self.leaf_size = leaf_size
+        self.mask_attention = mask_attention
         self.embed = PhysicsAwareEmbedding(input_dim, d_model)
         self.enc_input_proj = nn.Linear(d_model, d_model)
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, block_size=leaf_size, attn_module=LeafBlockAttention(d_model, leaf_size, num_heads=num_heads))
+            TransformerBlock(d_model, block_size=leaf_size, attn_module=LeafBlockAttention(d_model, leaf_size, num_heads=num_heads, mask_attention=mask_attention))
             for _ in range(num_layers)
         ])
         self.leaf_head = nn.Linear(d_model, leaf_size)
@@ -439,14 +524,14 @@ class LeafCore(nn.Module):
         self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
 
     def get_leaf_blocks(self, h, x, scale_A=None):
-        """From encoder output h (B, N, d_model) and input x (B, N, 4), compute dense leaf blocks (B, num_leaves, leaf_size, leaf_size)."""
+        """From encoder output h (B, N, d_model) and input x (B, N, input_dim), compute dense leaf blocks (B, num_leaves, leaf_size, leaf_size). Diag from x[..., 8]."""
         B, N, _ = h.shape
         num_leaves = N // self.leaf_size
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
         u_leaf = self.leaf_head(h_leaves)
         leaf_scale = torch.exp(self.log_hodlr_scale_leaf)
         leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * leaf_scale
-        diag_A_n = x[..., 3]
+        diag_A_n = x[..., 8]
         s = scale_A if scale_A is not None else 1.0
         if isinstance(s, torch.Tensor):
             diag_A_real = diag_A_n * s
@@ -466,17 +551,19 @@ class LeafCore(nn.Module):
         positions = x[0, :, :3] if x.dim() == 3 else x[:, :3]
         h = self.embed(x, edge_index, edge_values, scale_A)
         h = self.enc_input_proj(h)
-        # Build leaf connectivity once and reuse across blocks (same graph every layer)
-        attn_mask, edge_feats = None, None
-        if edge_index is not None and edge_values is not None and positions is not None:
+        attn_mask, edge_feats, physics_bias = None, None, None
+        if edge_index is not None and edge_values is not None:
             device, dtype = x.device, x.dtype
-            attn_mask, edge_feats = build_leaf_block_connectivity(
-                edge_index, edge_values, positions, scale_A, self.leaf_size, device, dtype
-            )
+            if self.mask_attention and positions is not None:
+                attn_mask, edge_feats = build_leaf_block_connectivity(
+                    edge_index, edge_values, positions, scale_A, self.leaf_size, device, dtype
+                )
+            else:
+                physics_bias = build_leaf_block_physics_bias(edge_index, edge_values, scale_A, self.leaf_size, device, dtype, num_nodes=x.shape[1])
         for i, block in enumerate(self.blocks):
             h = block(
                 h, edge_index=edge_index, edge_values=edge_values, positions=positions,
-                scale_A=scale_A, save_attention=save_attention, attn_mask=attn_mask, edge_feats=edge_feats
+                scale_A=scale_A, save_attention=save_attention, attn_mask=attn_mask, edge_feats=edge_feats, physics_bias=physics_bias
             )
         return h
 
@@ -540,11 +627,11 @@ class LeafOnlyNet(nn.Module):
     Wrapper around LeafCore with HODLR off-diagonals. N must equal n_nodes (divisible by leaf_size).
     Outputs (diag_blocks, off_diag_list); off_diag_list is empty list when n_nodes has only one block.
     """
-    def __init__(self, input_dim=4, d_model=128, leaf_size=32, num_layers=3, num_heads=4, n_nodes=512, rank_base=RANK_BASE_LEVEL1):
+    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, n_nodes=512, rank_base=RANK_BASE_LEVEL1, mask_attention=True):
         super().__init__()
         self.leaf_size = leaf_size
         self.n_nodes = n_nodes
-        self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads)
+        self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention)
         self.off_diag_struct = build_hodlr_off_diag_structure(n_nodes, leaf_size, rank_base)
         if self.off_diag_struct:
             self.log_off_diag_scale = nn.Parameter(torch.ones(1) * math.log(1e-2))
@@ -667,7 +754,7 @@ def read_leaf_only_header(path):
     return d_model, leaf_size, input_dim, num_layers, num_heads
 
 
-def save_leaf_only_weights(model, path, input_dim=4):
+def save_leaf_only_weights(model, path, input_dim=9):
     path = Path(path)
     d_model = model.embed.lift[0].weight.shape[0]
     num_heads = model.blocks[0].attn.num_heads if model.blocks else 4
@@ -832,8 +919,10 @@ def train_leaf_only():
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
+    parser.add_argument('--mask_attention', type=bool, default=True, help='Use -inf masked attention (masked 33-node); faster. Default is dense 32x32, no mask (no global node).')
     parser.add_argument('--print_timing', action='store_true', help='On step 200, print detailed timing of each training substep')
     args = parser.parse_args()
+    mask_attention = args.mask_attention
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available():
@@ -888,13 +977,13 @@ def train_leaf_only():
 
     torch.manual_seed(args.seed)
     model = LeafOnlyNet(
-        input_dim=4, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
-        num_heads=args.num_heads, n_nodes=n_pad,
+        input_dim=9, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
+        num_heads=args.num_heads, n_nodes=n_pad, mask_attention=mask_attention,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     print_hodlr_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
-    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, first {n} nodes (padded to {n_pad}, {num_leaves} leaves), {edge_index.shape[1]} edges, {args.num_layers} layers, d_model={args.d_model}, num_heads={args.num_heads}, seed={args.seed}")
+    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, first {n} nodes (padded to {n_pad}, {num_leaves} leaves), {edge_index.shape[1]} edges, {args.num_layers} layers, d_model={args.d_model}, num_heads={args.num_heads}, mask_attention={mask_attention}, seed={args.seed}")
 
     model.train()
     batch_vectors = max(1, int(round(n_pad ** 0.5)))  # SAI loss: batch size = sqrt(view_size) for stochastic trace estimation
@@ -980,10 +1069,10 @@ def train_leaf_only():
             elapsed = time.perf_counter() - t_start
             steps_in_period = step + 1 if step == 0 else print_interval
             print(f"Step {step}: SAI loss (E||MAz-z||²) {loss.item():.6f}  (last {steps_in_period} steps: {elapsed:.3f}s)")
-            save_leaf_only_weights(model, args.save, input_dim=4)
+            save_leaf_only_weights(model, args.save, input_dim=9)
             t_start = time.perf_counter()
 
-    save_leaf_only_weights(model, args.save, input_dim=4)
+    save_leaf_only_weights(model, args.save, input_dim=9)
     print(f"Saved to {args.save}")
 
 

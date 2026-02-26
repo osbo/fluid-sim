@@ -64,6 +64,8 @@ class FluidGraphDataset:
         vals = np.fromfile(frame_path / "A_values.bin", dtype=np.float32)
 
         positions = np.asarray(raw_nodes['position'], dtype=np.float32)
+        layer = np.asarray(raw_nodes['layer'], dtype=np.float32)
+        mass = np.asarray(raw_nodes['mass'], dtype=np.float32)
         diag_map = np.zeros(num_nodes, dtype=np.float32)
         for r, c, v in zip(rows, cols, vals):
             if r == c:
@@ -73,15 +75,24 @@ class FluidGraphDataset:
         if pos_scale <= 0.0: pos_scale = 1.0
         positions_n = positions / pos_scale
 
+        # 2^layer (no normalization); matches ApplyPressureGradient scale exp2((float)node.layer)
+        layer_val = np.exp2(layer)
+
+        mass_max = float(np.max(mass))
+        if mass_max <= 1e-9: mass_max = 1.0
+        mass_n = mass / mass_max
+
         scale_A = float(np.abs(vals).max())
         if scale_A <= 0.0: scale_A = 1.0
         diag_map_n = diag_map / scale_A
 
-        # Input: only per-node info (position 3 + diagonal 1), no neighbor slots
-        n_float = 4
+        # Input: position (3) + layer (1) + mass (1) + diagonal (1) = 6
+        n_float = 6
         x = np.zeros((num_nodes, n_float), dtype=np.float32)
         x[:, :3] = positions_n
-        x[:, 3] = diag_map_n
+        x[:, 3] = layer_val
+        x[:, 4] = mass_n
+        x[:, 5] = diag_map_n
 
         return {
             'x': torch.from_numpy(x).float(),
@@ -764,7 +775,7 @@ def save_weights_to_bytes(model, path, input_dim=None):
     depth = model.depth
     max_rank = model.max_rank
     num_layers_per_scale = getattr(model, 'num_layers_per_scale', 1)
-    if input_dim is None: input_dim = 4  
+    if input_dim is None: input_dim = 6  
     nhead = 4
     
     with open(path, 'wb') as f:
