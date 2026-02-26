@@ -126,9 +126,9 @@ class SparsePhysicsGCN(nn.Module):
         x_flat = x.squeeze(0) if B == 1 else x.view(B * N, C)
 
         row, col = edge_index[0], edge_index[1]
-        w = edge_values.clone()
+        w = edge_values.clone().to(x.dtype)
         if scale_A is not None and scale_A != 1.0:
-            s = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else float(scale_A)
+            s = scale_A.to(x.dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=w.device, dtype=x.dtype)
             w = w / s
 
         neighbor_features = self.linear_neighbor(x_flat)
@@ -169,8 +169,10 @@ class PhysicsAwareEmbedding(nn.Module):
 def build_leaf_block_physics_bias(edge_index, edge_values, scale_A, leaf_size, device, dtype=torch.float32, num_nodes=None):
     """Build per-block (num_blocks, leaf_size, leaf_size) physics bias from A-matrix edges. 1 on diagonal, 0 off-edges, edge value on edges. No mask, no global node. num_nodes: if provided (e.g. N_pad), num_blocks = num_nodes // leaf_size."""
     rows, cols = edge_index[0], edge_index[1]
-    N_infer = int(max(rows.max().item(), cols.max().item()) + 1) if rows.numel() else 0
-    N = num_nodes if num_nodes is not None else N_infer
+    if num_nodes is not None:
+        N = num_nodes
+    else:
+        N = int(max(rows.max().item(), cols.max().item()) + 1) if rows.numel() else 0
     num_blocks = N // leaf_size
     if num_blocks == 0:
         return None
@@ -182,7 +184,7 @@ def build_leaf_block_physics_bias(edge_index, edge_values, scale_A, leaf_size, d
     b_l = block_r[in_block]
     w = edge_values[in_block].to(device=device, dtype=dtype)
     if scale_A is not None and scale_A != 1.0:
-        s = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else float(scale_A)
+        s = scale_A.to(device=device, dtype=dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=device, dtype=dtype)
         w = w / s
     bias = torch.zeros(num_blocks, leaf_size, leaf_size, device=device, dtype=dtype)
     bias[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device)] = 1.0
@@ -207,7 +209,7 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, l
     dx = (pos_c - pos_r).to(device=device, dtype=dtype)
     w = edge_values[in_block].to(device=device, dtype=dtype)
     if scale_A is not None and scale_A != 1.0:
-        s = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else float(scale_A)
+        s = scale_A.to(device=device, dtype=dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=device, dtype=dtype)
         w = w / s
     edge_feats_flat = torch.cat([dx, w.unsqueeze(1)], dim=1)
 
@@ -304,15 +306,16 @@ class LeafBlockAttention(nn.Module):
 
         combined_weights = attn_probs + linear_edge_weights
 
-        with torch.no_grad():
-            attn_viz = combined_weights.mean(dim=-1)
-            arange = torch.arange(self.block_size, device=attn_viz.device)
-            self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
-            self.last_attn_block = attn_viz[:, :, :, self.block_size].mean().item()
-            to_nodes = attn_viz[:, :, :, :self.block_size].sum(dim=3)
-            self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
-            if save_attention:
-                self.last_attn_matrix = attn_viz[:, :, :, :self.block_size].cpu().float()
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                attn_viz = combined_weights.mean(dim=-1)
+                arange = torch.arange(self.block_size, device=attn_viz.device)
+                self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
+                self.last_attn_block = attn_viz[:, :, :, self.block_size].mean().item()
+                to_nodes = attn_viz[:, :, :, :self.block_size].sum(dim=3)
+                self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
+                if save_attention:
+                    self.last_attn_matrix = attn_viz[:, :, :, :self.block_size].cpu().float()
 
         x_out = torch.einsum('bnqkh,bnkhd->bnqhd', combined_weights, v)
         x_out = x_out.reshape(B, num_blocks, self.block_size, C)
@@ -344,15 +347,16 @@ class LeafBlockAttention(nn.Module):
         attn_probs = F.softmax(scores, dim=3)
         linear_edge_weights = self.edge_gate(bias_physics.unsqueeze(-1)).unsqueeze(0).masked_fill(mask_expanded == 0, 0.0)
         combined_weights = attn_probs + linear_edge_weights
-        with torch.no_grad():
-            attn_viz = combined_weights.mean(dim=-1)
-            arange = torch.arange(self.block_size, device=attn_viz.device)
-            self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
-            self.last_attn_block = 0.0
-            to_nodes = attn_viz.sum(dim=3)
-            self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
-            if save_attention:
-                self.last_attn_matrix = attn_viz.cpu().float()
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                attn_viz = combined_weights.mean(dim=-1)
+                arange = torch.arange(self.block_size, device=attn_viz.device)
+                self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
+                self.last_attn_block = 0.0
+                to_nodes = attn_viz.sum(dim=3)
+                self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
+                if save_attention:
+                    self.last_attn_matrix = attn_viz.cpu().float()
         x_out = torch.einsum('bnqkh,bnkhd->bnqhd', combined_weights, v)
         x_out = x_out.reshape(B, num_blocks, self.block_size, C)
         x_out = self.proj(x_out.view(B, N_pad, C))
@@ -375,17 +379,18 @@ class LeafBlockAttention(nn.Module):
         attn_probs = F.softmax(scores, dim=3)
         linear_edge_weights = self.edge_gate(physics_bias.unsqueeze(-1)).unsqueeze(0)
         combined_weights = attn_probs + linear_edge_weights
-        with torch.no_grad():
-            attn_viz = combined_weights.mean(dim=-1)
-            arange = torch.arange(self.block_size, device=attn_viz.device)
-            self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
-            self.last_attn_block = 0.0
-            to_nodes = attn_viz.sum(dim=3)
-            self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
-            self.last_scores_matrix = None
-            self.last_bias_physics_matrix = physics_bias.cpu().float() if save_attention else None
-            if save_attention:
-                self.last_attn_matrix = attn_viz[:, :, :, :].cpu().float()
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                attn_viz = combined_weights.mean(dim=-1)
+                arange = torch.arange(self.block_size, device=attn_viz.device)
+                self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
+                self.last_attn_block = 0.0
+                to_nodes = attn_viz.sum(dim=3)
+                self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
+                self.last_scores_matrix = None
+                self.last_bias_physics_matrix = physics_bias.cpu().float() if save_attention else None
+                if save_attention:
+                    self.last_attn_matrix = attn_viz[:, :, :, :].cpu().float()
         x_out = torch.einsum('bnqkh,bnkhd->bnqhd', combined_weights, v)
         x_out = x_out.reshape(B, num_blocks, self.block_size, C)
         x_out = self.proj(x_out.view(B, N_pad, C))
@@ -406,15 +411,16 @@ class LeafBlockAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-        with torch.no_grad():
-            arange = torch.arange(self.block_size, device=attn.device)
-            self.last_attn_self = attn[:, arange, arange].mean().item()
-            self.last_attn_block = 0.0
-            self.last_attn_neighbor = (attn.sum(dim=-1) - attn[:, arange, arange]).mean().item()
-            self.last_scores_matrix = None
-            self.last_bias_physics_matrix = None
-            if save_attention:
-                self.last_attn_matrix = attn.cpu().float()
+        if not torch.compiler.is_compiling():
+            with torch.no_grad():
+                arange = torch.arange(self.block_size, device=attn.device)
+                self.last_attn_self = attn[:, arange, arange].mean().item()
+                self.last_attn_block = 0.0
+                self.last_attn_neighbor = (attn.sum(dim=-1) - attn[:, arange, arange]).mean().item()
+                self.last_scores_matrix = None
+                self.last_bias_physics_matrix = None
+                if save_attention:
+                    self.last_attn_matrix = attn.cpu().float()
         x_out = (attn @ v).transpose(1, 2).reshape(B * num_blocks, self.block_size, C)
         x_out = self.proj(x_out)
         x_out = x_out.view(B, N_pad, C)
@@ -755,14 +761,12 @@ def apply_block_structured_M(diag_blocks, off_diag_list, x, off_diag_struct, lea
     """
     Apply SPD block-structured M to x. Diagonal from diag_blocks; off-diagonals from off_diag_list
     using off_diag_struct (list of row_start, row_end, col_start, col_end, side, rank).
+    Diagonal applied in one batched einsum (no Python loop over leaves).
     """
     B, N, K = x.shape
     num_leaves = N // leaf_size
     x_blk = x.view(B, num_leaves, leaf_size, K)
-    out = torch.zeros_like(x)
-    for b in range(num_leaves):
-        r0, r1 = b * leaf_size, (b + 1) * leaf_size
-        out[:, r0:r1] = torch.matmul(diag_blocks[:, b], x_blk[:, b])
+    out = torch.einsum('blij,bljk->blik', diag_blocks, x_blk).reshape(B, N, K)
     for idx, spec in enumerate(off_diag_struct):
         U, V = off_diag_list[idx]   # (B, side, rank)
         rs, re = spec["row_start"], spec["row_end"]
@@ -1015,6 +1019,8 @@ def train_leaf_only():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available():
         device = torch.device('mps')
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
     print(f"Using device: {device}")
 
     data_path = Path(args.data_folder)
@@ -1068,6 +1074,7 @@ def train_leaf_only():
         input_dim=9, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
         num_heads=args.num_heads, n_nodes=n_pad, mask_attention=True, use_global_node=use_global_node, use_gcn=use_gcn,
     ).to(device)
+    model = torch.compile(model)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     print_hodlr_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
