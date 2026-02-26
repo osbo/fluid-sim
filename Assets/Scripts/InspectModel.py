@@ -189,6 +189,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available():
         device = torch.device('mps')
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
     print(f"Using device: {device}")
 
     print(f"Loading data from {data_folder}")
@@ -228,6 +230,7 @@ def main():
         input_dim=input_dim_lo, d_model=d_model_lo, leaf_size=LEAF_SIZE, num_layers=num_layers_lo,
         num_heads=num_heads_lo, n_nodes=n_pad, use_gcn=bool(use_gcn_lo),
     ).to(device)
+    model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
 
     x_leaf = x[:, :n_requested, :].clone()
@@ -241,7 +244,9 @@ def main():
         scale_A = torch.tensor(scale_A, device=device, dtype=x_leaf.dtype)
 
     with torch.no_grad():
-        _ = model_leaf(x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A)
+        # Warm up inference (torch.compile + CUDA): run a few forwards and sync so we don't time compilation
+        for _ in range(200):
+            _ = model_leaf(x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A)
         if device.type == 'cuda':
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -252,18 +257,21 @@ def main():
             torch.cuda.synchronize()
         inference_ms = (time.perf_counter() - t0) * 1000
     num_leaves = n_pad // LEAF_SIZE
-    M_neural = np.zeros((n_pad, n_pad), dtype=np.float64)
+    # Build dense M on GPU to avoid CPU-GPU sync in a loop (keeps inference timing accurate)
+    M_neural_gpu = torch.zeros((n_pad, n_pad), dtype=torch.float32, device=device)
     for b in range(num_leaves):
         r0, r1 = b * LEAF_SIZE, (b + 1) * LEAF_SIZE
-        M_neural[r0:r1, r0:r1] = diag_blocks[0, b].cpu().numpy()
+        M_neural_gpu[r0:r1, r0:r1] = diag_blocks[0, b]
     if off_diag_list and getattr(model_leaf, 'off_diag_struct', None):
         for idx, spec in enumerate(model_leaf.off_diag_struct):
-            U = off_diag_list[idx][0][0].cpu().numpy()
-            V = off_diag_list[idx][1][0].cpu().numpy()
+            U = off_diag_list[idx][0][0]   # (1, side, rank)
+            V = off_diag_list[idx][1][0]
             rs, re = spec["row_start"], spec["row_end"]
             cs, ce = spec["col_start"], spec["col_end"]
-            M_neural[rs:re, cs:ce] = U @ V.T
-            M_neural[cs:ce, rs:re] = V @ U.T
+            UVt = (U @ V.T).squeeze(0)
+            VUt = (V @ U.T).squeeze(0)
+            M_neural_gpu[rs:re, cs:ce] = UVt
+            M_neural_gpu[cs:ce, rs:re] = VUt
     print(f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} M")
 
     # AMG on the same n_pad x n_pad block (CPU)
@@ -281,7 +289,7 @@ def main():
     # All solves use the subset block A_viz_n (viz_n x viz_n), not the full dataset A.
     A_viz_n = A_viz[:viz_n, :viz_n]
     assert A_viz_n.shape[0] == viz_n and A_viz_n.shape[1] == viz_n, "Solve must be on subset A (viz_n x viz_n)"
-    M_neural_n = M_neural[:viz_n, :viz_n]
+    M_gpu = M_neural_gpu[:viz_n, :viz_n]
     M_amg_n = M_amg[:viz_n, :viz_n]
 
     # PCG solve A x = b on block A_viz_n (viz_n x viz_n)
@@ -303,9 +311,7 @@ def main():
     total_none_gpu_ms = setup_none_ms + solve_none_gpu_ms
     total_none_cpu_ms = setup_none_ms + solve_none_cpu_ms
 
-    # SAI training minimizes || M A z - z ||^2, so M ≈ A^{-1}. Apply z = M@r. Use dense M@r (one matvec) for speed;
-    # block-structured apply_block_structured_M does 15+ small kernels per apply and is ~10x slower per iteration.
-    M_gpu = torch.from_numpy(M_neural_n).float().to(device)
+    # SAI training minimizes || M A z - z ||^2, so M ≈ A^{-1}. Apply z = M@r. M_gpu already on device.
     with torch.no_grad():
         def apply_M_neural(r):
             return M_gpu @ r
@@ -406,6 +412,8 @@ def main():
     print(f"Condition number (block A): {cond_A:.2e}")
     print(f"Leaf boundaries: every {LEAF_SIZE}")
 
+    # Convert to NumPy only for plotting
+    M_neural_n = M_gpu.cpu().numpy()
     methods = [("LeafOnly", M_neural_n), ("AMG", M_amg_n)]
     n_cols = 4
     n_rows = 1 + len(methods)
