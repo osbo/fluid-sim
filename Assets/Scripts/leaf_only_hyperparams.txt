@@ -1,0 +1,306 @@
+# LeafOnly hyperparameter log
+# Record: hyperparams, loss profile (key steps + final), LeafOnly timing and PCG performance only.
+
+Format:
+  - Hyperparams: view_size, steps, lr, d_model, num_layers, num_heads, max_grad_norm, RANK_BASE_LEVEL1, leaf_size.
+  - Loss: values at steps 0, 100, 200, 500, 1k, 2k, 5k, 10k (and final).
+  - Timing: LeafOnly training (step-200 breakdown); LeafOnly PCG (InspectModel: inference, solve, iters, total).
+
+================================================================================
+Entry 1 — default 256 view, 10k steps
+================================================================================
+Hyperparams:
+  view_size: 256
+  steps: 10000
+  lr: 1e-3
+  d_model: 128
+  num_layers: 3
+  num_heads: 4
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 20
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1197
+  step  100: 0.1198
+  step  200: 0.1098
+  step  500: 0.0883
+  step 1000: 0.0632
+  step 2000: 0.0507
+  step 5000: 0.0401
+  step 9900: 0.0408  (final ~0.04)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.17, forward: 8.73, sample Z: 0.06, A@Z: 0.06, apply M: 1.68,
+  residual+loss: 0.36, backward: 12.95, clip_grad_norm: 0.64, optimizer.step: 1.08
+  total: 25.74 ms
+
+LeafOnly PCG (InspectModel, viz 256, tol=1e-8):
+  inference: 8.53 ms, solve: 1.19 ms, 9 iters, total: 9.72 ms
+
+================================================================================
+Entry 2 — d_model 32 (same view/steps/lr, lighter model)
+================================================================================
+Hyperparams:
+  view_size: 256
+  steps: 10000
+  lr: 1e-3
+  d_model: 32
+  num_layers: 3
+  num_heads: 4
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 20
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1203
+  step  100: 0.1208
+  step  200: 0.1147
+  step  500: 0.1037
+  step 1000: 0.0920
+  step 2000: 0.0871
+  step 5000: 0.0603
+  step 9900: 0.0546  (final ~0.055)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.10, forward: 4.90, sample Z: 0.04, A@Z: 0.04, apply M: 0.98,
+  residual+loss: 0.19, backward: 8.48, clip_grad_norm: 0.42, optimizer.step: 0.61
+  total: 15.77 ms
+
+LeafOnly PCG (InspectModel, viz 256, tol=1e-8):
+  inference: 4.74 ms, solve: 1.41 ms, 11 iters, total: 6.15 ms
+
+================================================================================
+Entry 3 — d_model 64 (working baseline; not the limit but known-good)
+================================================================================
+Hyperparams:
+  view_size: 256
+  steps: 10000
+  lr: 1e-3
+  d_model: 64
+  num_layers: 3
+  num_heads: 4
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 20
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1206
+  step  100: 0.1196
+  step  200: 0.1095
+  step  500: 0.0957
+  step 1000: 0.0762
+  step 2000: 0.0633
+  step 5000: 0.0430
+  step 9900: 0.0414  (final ~0.041)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.10, forward: 4.98, sample Z: 0.04, A@Z: 0.04, apply M: 1.00,
+  residual+loss: 0.20, backward: 8.54, clip_grad_norm: 0.43, optimizer.step: 0.63
+  total: 15.95 ms
+
+LeafOnly PCG (InspectModel, viz 256, tol=1e-8):
+  inference: 5.24 ms, solve: 1.99 ms, 9 iters, total: 7.23 ms
+
+================================================================================
+Entry 4 — d_model 64, num_heads 2
+================================================================================
+Hyperparams:
+  view_size: 256
+  steps: 10000
+  lr: 1e-3
+  d_model: 64
+  num_layers: 3
+  num_heads: 2
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 20
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1204
+  step  100: 0.1197
+  step  200: 0.1114
+  step  500: 0.0987
+  step 1000: 0.0813
+  step 2000: 0.0693
+  step 5000: 0.0491
+  step 9900: 0.0428  (final ~0.043)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.11, forward: 4.87, sample Z: 0.05, A@Z: 0.04, apply M: 1.00,
+  residual+loss: 0.22, backward: 8.72, clip_grad_norm: 0.43, optimizer.step: 0.62
+  total: 16.06 ms
+
+LeafOnly PCG (InspectModel, viz 256, tol=1e-8):
+  inference: 5.66 ms, solve: 1.41 ms, 10 iters, total: 7.07 ms
+
+================================================================================
+Entry 5 — d_model 64, num_heads 2, num_layers 1
+================================================================================
+Hyperparams:
+  view_size: 256
+  steps: 10000
+  lr: 1e-3
+  d_model: 64
+  num_layers: 1
+  num_heads: 2
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 20
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1207
+  step  100: 0.1204
+  step  200: 0.1128
+  step  500: 0.1075
+  step 1000: 0.0971
+  step 2000: 0.0926
+  step 5000: 0.0619
+  step 9900: 0.0498  (final ~0.050)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.08, forward: 3.79, sample Z: 0.04, A@Z: 0.04, apply M: 1.00,
+  residual+loss: 0.21, backward: 7.38, clip_grad_norm: 0.37, optimizer.step: 0.53
+  total: 13.43 ms
+
+LeafOnly PCG (InspectModel, viz 256, tol=1e-8):
+  inference: 3.72 ms, solve: 1.39 ms, 11 iters, total: 5.10 ms
+
+================================================================================
+Entry 6 — d_model 64, num_heads 2, num_layers 1, RANK_BASE_LEVEL1 8
+================================================================================
+Hyperparams:
+  view_size: 256
+  steps: 10000
+  lr: 1e-3
+  d_model: 64
+  num_layers: 1
+  num_heads: 2
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 8
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1207
+  step  100: 0.1208
+  step  200: 0.1139
+  step  500: 0.1083
+  step 1000: 0.0995
+  step 2000: 0.0960
+  step 5000: 0.0645
+  step 9900: 0.0538  (final ~0.054)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.08, forward: 3.70, sample Z: 0.04, A@Z: 0.04, apply M: 0.98,
+  residual+loss: 0.18, backward: 7.27, clip_grad_norm: 0.36, optimizer.step: 0.52
+  total: 13.16 ms
+
+LeafOnly PCG (InspectModel, viz 256, tol=1e-8):
+  inference: 3.71 ms, solve: 1.64 ms, 11 iters, total: 5.35 ms
+
+================================================================================
+Entry 7 — d_model 64, num_heads 2, num_layers 1, RANK_BASE_LEVEL1 32
+================================================================================
+Hyperparams:
+  view_size: 256
+  steps: 10000
+  lr: 1e-3
+  d_model: 64
+  num_layers: 1
+  num_heads: 2
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 32
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1207
+  step  100: 0.1187
+  step  200: 0.1128
+  step  500: 0.1068
+  step 1000: 0.0970
+  step 2000: 0.0910
+  step 5000: 0.0618
+  step 9900: 0.0502  (final ~0.050)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.19, forward: 6.97, sample Z: 0.06, A@Z: 0.06, apply M: 1.62,
+  residual+loss: 0.25, backward: 9.88, clip_grad_norm: 0.45, optimizer.step: 0.61
+  total: 20.09 ms
+
+LeafOnly PCG (InspectModel, viz 256, tol=1e-8):
+  inference: 3.57 ms, solve: 1.49 ms, 11 iters, total: 5.06 ms
+
+================================================================================
+Entry 8 — view_size 1024, 2 layers, d_model 64, num_heads 2
+================================================================================
+Hyperparams:
+  view_size: 1024
+  steps: 10000
+  lr: 1e-3
+  d_model: 64
+  num_layers: 2
+  num_heads: 2
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 16
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12; 32 leaves, 6669 edges)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1270
+  step  100: 0.1245
+  step  200: 0.1213
+  step  500: 0.1182
+  step 1000: 0.1130
+  step 2000: 0.1052
+  step 5000: 0.0915
+  step 9900: 0.0820  (final ~0.082)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.11, forward: 10.37, sample Z: 0.04, A@Z: 0.04, apply M: 3.92,
+  residual+loss: 0.77, backward: 28.85, clip_grad_norm: 1.92, optimizer.step: 0.73
+  total: 46.74 ms
+
+LeafOnly PCG (InspectModel, viz 1024, tol=1e-8):
+  inference: 9.21 ms, solve: 2.01 ms, 16 iters, total: 11.22 ms
+
+================================================================================
+Entry 9 — view_size 512, 2 layers, d_model 64, num_heads 2, RANK_BASE_LEVEL1 16
+================================================================================
+Hyperparams:
+  view_size: 512
+  steps: 10000
+  lr: 1e-3
+  d_model: 64
+  num_layers: 2
+  num_heads: 2
+  max_grad_norm: 1.0
+  RANK_BASE_LEVEL1: 16
+  leaf_size: 32
+  (frame 600, Run_2026-01-26_00-04-12; 16 leaves, 3227 edges)
+
+Loss profile (SAI E||MAz-z||²):
+  step    0: 0.1260
+  step  100: 0.1276
+  step  200: 0.1203
+  step  500: 0.1138
+  step 1000: 0.1076
+  step 2000: 0.0993
+  step 5000: 0.0758
+  step 9900: 0.0645  (final ~0.064)
+
+Step 200 detailed timing (ms):
+  zero_grad: 0.10, forward: 6.19, sample Z: 0.04, A@Z: 0.03, apply M: 1.99,
+  residual+loss: 0.32, backward: 15.34, clip_grad_norm: 0.45, optimizer.step: 0.63
+  total: 25.10 ms
+
+LeafOnly PCG (InspectModel, viz 512, tol=1e-8):
+  inference: 5.48 ms, solve: 1.70 ms, 12 iters, total: 7.17 ms
+
+================================================================================
