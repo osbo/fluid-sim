@@ -221,10 +221,12 @@ def main():
     print("\nLeafOnly (GPU)...")
     if not leaf_only_weights_path.exists():
         raise SystemExit(f"Leaf-only weights not found: {leaf_only_weights_path}. Run LeafOnly.py first.")
-    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, num_heads_lo = read_leaf_only_header(leaf_only_weights_path)
+    header_lo = read_leaf_only_header(leaf_only_weights_path)
+    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, num_heads_lo = header_lo[:5]
+    use_gcn_lo = header_lo[5] if len(header_lo) > 5 else True  # old checkpoints have no use_gcn → True
     model_leaf = LeafOnlyNet(
         input_dim=input_dim_lo, d_model=d_model_lo, leaf_size=LEAF_SIZE, num_layers=num_layers_lo,
-        num_heads=num_heads_lo, n_nodes=n_pad,
+        num_heads=num_heads_lo, n_nodes=n_pad, use_gcn=bool(use_gcn_lo),
     ).to(device)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
 
