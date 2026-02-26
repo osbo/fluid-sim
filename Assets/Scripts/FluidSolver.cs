@@ -341,6 +341,7 @@ public partial class FluidSimulator : MonoBehaviour
                 neighborsBuffer,
                 divergenceBuffer,
                 pressureBuffer,
+                diffusionGradientBuffer,
                 csrRowIndices,
                 csrColIndices,
                 csrValues,
