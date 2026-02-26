@@ -143,21 +143,25 @@ class SparsePhysicsGCN(nn.Module):
         return out.unsqueeze(0) if B == 1 else out.view(B, N, C)
 
 class PhysicsAwareEmbedding(nn.Module):
-    """Lift 4D input to d_model and run one physics-weighted message pass (GCN) with the graph."""
-    def __init__(self, input_dim, d_model):
+    """Lift 4D input to d_model; when use_gcn=True run exactly 2 physics-weighted message passes (GCN) with the graph."""
+    NUM_GCN_LAYERS = 2
+
+    def __init__(self, input_dim, d_model, use_gcn=True):
         super().__init__()
+        self.use_gcn = use_gcn
         self.lift = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
-        self.gcn = SparsePhysicsGCN(d_model)
+        self.gcn = nn.ModuleList([SparsePhysicsGCN(d_model) for _ in range(self.NUM_GCN_LAYERS)]) if use_gcn else None
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x, edge_index=None, edge_values=None, scale_A=None):
         h = self.lift(x)
-        if edge_index is not None and edge_values is not None:
-            h = self.gcn(h, edge_index, edge_values, scale_A)
+        if self.use_gcn and self.gcn is not None and edge_index is not None and edge_values is not None:
+            for gcn_layer in self.gcn:
+                h = gcn_layer(h, edge_index, edge_values, scale_A)
         return self.norm(h)
 
 # --- Leaf block connectivity and attention ---
@@ -549,12 +553,12 @@ class LeafCore(nn.Module):
     mask_attention=True: -inf masked attention; use_global_node=True adds 33rd node. mask_attention=False: dense 32x32, no mask.
     Output shape: (B, num_leaves, leaf_size, leaf_size).
     """
-    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, mask_attention=True, use_global_node=True):
+    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, mask_attention=True, use_global_node=True, use_gcn=True):
         super().__init__()
         self.leaf_size = leaf_size
         self.mask_attention = mask_attention
         self.use_global_node = use_global_node
-        self.embed = PhysicsAwareEmbedding(input_dim, d_model)
+        self.embed = PhysicsAwareEmbedding(input_dim, d_model, use_gcn=use_gcn)
         self.enc_input_proj = nn.Linear(d_model, d_model)
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, block_size=leaf_size, attn_module=LeafBlockAttention(d_model, leaf_size, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node))
@@ -669,11 +673,11 @@ class LeafOnlyNet(nn.Module):
     Wrapper around LeafCore with HODLR off-diagonals. N must equal n_nodes (divisible by leaf_size).
     Outputs (diag_blocks, off_diag_list); off_diag_list is empty list when n_nodes has only one block.
     """
-    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, n_nodes=512, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=True):
+    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, n_nodes=512, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=True, use_gcn=True):
         super().__init__()
         self.leaf_size = leaf_size
         self.n_nodes = n_nodes
-        self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node)
+        self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn)
         self.off_diag_struct = build_hodlr_off_diag_structure(n_nodes, leaf_size, rank_base)
         if self.off_diag_struct:
             self.log_off_diag_scale = nn.Parameter(torch.ones(1) * math.log(1e-2))
@@ -784,37 +788,52 @@ def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None):
 
 # --- Save / Load (for InspectModel) ---
 
-LEAF_ONLY_HEADER_BYTES = 20  # d_model, leaf_size, input_dim, num_layers, num_heads
+LEAF_ONLY_HEADER_BYTES_OLD = 20   # d_model, leaf_size, input_dim, num_layers, num_heads
+LEAF_ONLY_HEADER_BYTES_V2 = 24    # + use_gcn (int)
+LEAF_ONLY_HEADER_BYTES = 28       # + num_gcn_layers (int); when use_gcn, 1 or 2
 
 def read_leaf_only_header(path):
     path = Path(path)
     with open(path, 'rb') as f:
         header = f.read(LEAF_ONLY_HEADER_BYTES)
-    if len(header) < LEAF_ONLY_HEADER_BYTES:
+    if len(header) < LEAF_ONLY_HEADER_BYTES_OLD:
         raise ValueError("LeafOnly weights file too short")
+    if len(header) >= LEAF_ONLY_HEADER_BYTES:
+        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers = struct.unpack('<iiiiiii', header)
+        return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, LEAF_ONLY_HEADER_BYTES
+    if len(header) >= LEAF_ONLY_HEADER_BYTES_V2:
+        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn = struct.unpack('<iiiiii', header)
+        return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, 1, LEAF_ONLY_HEADER_BYTES_V2  # 1 GCN layer in old files
     d_model, leaf_size, input_dim, num_layers, num_heads = struct.unpack('<iiiii', header)
-    return d_model, leaf_size, input_dim, num_layers, num_heads
+    return d_model, leaf_size, input_dim, num_layers, num_heads, 1, 1, LEAF_ONLY_HEADER_BYTES_OLD  # use_gcn=1, 1 layer for oldest files
 
+
+def _write_gcn_layer(f, gcn_layer):
+    _write_packed_tensor(f, gcn_layer.linear_self.weight.detach().cpu().float(), transpose=True)
+    _write_packed_tensor(f, gcn_layer.linear_self.bias.detach().cpu().float(), transpose=False)
+    _write_packed_tensor(f, gcn_layer.linear_neighbor.weight.detach().cpu().float(), transpose=True)
+    _write_packed_tensor(f, gcn_layer.linear_neighbor.bias.detach().cpu().float(), transpose=False)
+    _write_packed_tensor(f, gcn_layer.update_gate[0].weight.detach().cpu().float(), transpose=True)
+    _write_packed_tensor(f, gcn_layer.update_gate[0].bias.detach().cpu().float(), transpose=False)
+    _write_packed_tensor(f, gcn_layer.update_gate[2].weight.detach().cpu().float(), transpose=True)
+    _write_packed_tensor(f, gcn_layer.update_gate[2].bias.detach().cpu().float(), transpose=False)
 
 def save_leaf_only_weights(model, path, input_dim=9):
     path = Path(path)
     d_model = model.embed.lift[0].weight.shape[0]
     num_heads = model.blocks[0].attn.num_heads if model.blocks else 4
+    use_gcn = model.embed.gcn is not None
+    num_gcn_layers = len(model.embed.gcn) if use_gcn else 0
     with open(path, 'wb') as f:
-        f.write(struct.pack('<iiiii', d_model, model.leaf_size, input_dim, len(model.blocks), num_heads))
-        # Embed: lift, gcn, norm
+        f.write(struct.pack('<iiiiiii', d_model, model.leaf_size, input_dim, len(model.blocks), num_heads, int(use_gcn), num_gcn_layers))
+        # Embed: lift, [gcn layers if use_gcn], norm
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.embed.lift[0].bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.embed.lift[2].weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.embed.lift[2].bias.detach().cpu().float(), transpose=False)
-        _write_packed_tensor(f, model.embed.gcn.linear_self.weight.detach().cpu().float(), transpose=True)
-        _write_packed_tensor(f, model.embed.gcn.linear_self.bias.detach().cpu().float(), transpose=False)
-        _write_packed_tensor(f, model.embed.gcn.linear_neighbor.weight.detach().cpu().float(), transpose=True)
-        _write_packed_tensor(f, model.embed.gcn.linear_neighbor.bias.detach().cpu().float(), transpose=False)
-        _write_packed_tensor(f, model.embed.gcn.update_gate[0].weight.detach().cpu().float(), transpose=True)
-        _write_packed_tensor(f, model.embed.gcn.update_gate[0].bias.detach().cpu().float(), transpose=False)
-        _write_packed_tensor(f, model.embed.gcn.update_gate[2].weight.detach().cpu().float(), transpose=True)
-        _write_packed_tensor(f, model.embed.gcn.update_gate[2].bias.detach().cpu().float(), transpose=False)
+        if use_gcn:
+            for gcn_layer in model.embed.gcn:
+                _write_gcn_layer(f, gcn_layer)
         _write_packed_tensor(f, model.embed.norm.weight.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.embed.norm.bias.detach().cpu().float(), transpose=False)
         # enc_input_proj
@@ -864,12 +883,26 @@ def _write_packed_tensor(f, param, transpose=False):
         f.write(np.zeros(1, dtype=np.float16).tobytes())
 
 
+def _read_gcn_layer_into(f, gcn_layer, read_tensor):
+    _read_into(f, gcn_layer.linear_self.weight, read_tensor, transpose=True)
+    _read_into(f, gcn_layer.linear_self.bias, read_tensor, transpose=False)
+    _read_into(f, gcn_layer.linear_neighbor.weight, read_tensor, transpose=True)
+    _read_into(f, gcn_layer.linear_neighbor.bias, read_tensor, transpose=False)
+    _read_into(f, gcn_layer.update_gate[0].weight, read_tensor, transpose=True)
+    _read_into(f, gcn_layer.update_gate[0].bias, read_tensor, transpose=False)
+    _read_into(f, gcn_layer.update_gate[2].weight, read_tensor, transpose=True)
+    _read_into(f, gcn_layer.update_gate[2].bias, read_tensor, transpose=False)
+
 def load_leaf_only_weights(model, path):
     import numpy as np
     path = Path(path)
-    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, _ = read_leaf_only_header(path)
+    result = read_leaf_only_header(path)
+    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, _num_heads_lo, use_gcn_file, num_gcn_layers_file, header_bytes = result
     if model.leaf_size != leaf_size_lo or len(model.blocks) != num_layers_lo:
         raise ValueError(f"Checkpoint leaf_size={leaf_size_lo} num_layers={num_layers_lo} != model {model.leaf_size} {len(model.blocks)}")
+    has_gcn = model.embed.gcn is not None
+    if has_gcn and not use_gcn_file:
+        raise ValueError("Checkpoint was saved without GCN (use_gcn=False); cannot load into model with use_gcn=True.")
 
     def read_tensor(f, shape, transpose=False):
         num_elements = int(torch.Size(shape).numel())
@@ -886,21 +919,32 @@ def load_leaf_only_weights(model, path):
             data_fp32 = data_fp32.view(shape)
         return data_fp32
 
+    def skip_tensor(f, shape, transpose=False):
+        read_tensor(f, shape, transpose=transpose)
+
+    def skip_gcn_layer(f, d_model):
+        skip_tensor(f, (d_model, d_model), transpose=True)
+        skip_tensor(f, (d_model,), transpose=False)
+        skip_tensor(f, (d_model, d_model), transpose=True)
+        skip_tensor(f, (d_model,), transpose=False)
+        skip_tensor(f, (d_model, d_model * 2), transpose=True)
+        skip_tensor(f, (d_model,), transpose=False)
+        skip_tensor(f, (d_model, d_model), transpose=True)
+        skip_tensor(f, (d_model,), transpose=False)
+
     with open(path, 'rb') as f:
-        f.seek(LEAF_ONLY_HEADER_BYTES)
-        # Embed
+        f.seek(header_bytes)
+        # Embed: lift, [gcn layers if use_gcn_file], norm
         _read_into(f, model.embed.lift[0].weight, read_tensor, transpose=True)
         _read_into(f, model.embed.lift[0].bias, read_tensor, transpose=False)
         _read_into(f, model.embed.lift[2].weight, read_tensor, transpose=True)
         _read_into(f, model.embed.lift[2].bias, read_tensor, transpose=False)
-        _read_into(f, model.embed.gcn.linear_self.weight, read_tensor, transpose=True)
-        _read_into(f, model.embed.gcn.linear_self.bias, read_tensor, transpose=False)
-        _read_into(f, model.embed.gcn.linear_neighbor.weight, read_tensor, transpose=True)
-        _read_into(f, model.embed.gcn.linear_neighbor.bias, read_tensor, transpose=False)
-        _read_into(f, model.embed.gcn.update_gate[0].weight, read_tensor, transpose=True)
-        _read_into(f, model.embed.gcn.update_gate[0].bias, read_tensor, transpose=False)
-        _read_into(f, model.embed.gcn.update_gate[2].weight, read_tensor, transpose=True)
-        _read_into(f, model.embed.gcn.update_gate[2].bias, read_tensor, transpose=False)
+        if has_gcn and use_gcn_file:
+            for i in range(min(num_gcn_layers_file, len(model.embed.gcn))):
+                _read_gcn_layer_into(f, model.embed.gcn[i], read_tensor)
+        elif not has_gcn and use_gcn_file:
+            for _ in range(num_gcn_layers_file):
+                skip_gcn_layer(f, d_model_lo)
         _read_into(f, model.embed.norm.weight, read_tensor, transpose=False)
         _read_into(f, model.embed.norm.bias, read_tensor, transpose=False)
         _read_into(f, model.enc_input_proj.weight, read_tensor, transpose=True)
@@ -962,9 +1006,11 @@ def train_leaf_only():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
     parser.add_argument('--use_global_node', type=bool, default=True, help='When True, use 33rd global node per block. When False, masked attention on 32x32 only.')
+    parser.add_argument('--use_gcn', type=bool, default=True, help='When True, run SparsePhysicsGCN before transformer blocks (graph message passing). When False, raw inputs pass through lift only.')
     parser.add_argument('--print_timing', type=bool, default=True, help='On step 200, print detailed timing of each training substep')
     args = parser.parse_args()
     use_global_node = args.use_global_node
+    use_gcn = args.use_gcn
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available():
@@ -1020,12 +1066,12 @@ def train_leaf_only():
     torch.manual_seed(args.seed)
     model = LeafOnlyNet(
         input_dim=9, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
-        num_heads=args.num_heads, n_nodes=n_pad, mask_attention=True, use_global_node=use_global_node,
+        num_heads=args.num_heads, n_nodes=n_pad, mask_attention=True, use_global_node=use_global_node, use_gcn=use_gcn,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     print_hodlr_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
-    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, first {n} nodes (padded to {n_pad}, {num_leaves} leaves), {edge_index.shape[1]} edges, {args.num_layers} layers, d_model={args.d_model}, num_heads={args.num_heads}, use_global_node={use_global_node}, seed={args.seed}")
+    print(f"Ready: {run_folder.name} frame_{frame_idx:04d}, first {n} nodes (padded to {n_pad}, {num_leaves} leaves), {edge_index.shape[1]} edges, {args.num_layers} layers, d_model={args.d_model}, num_heads={args.num_heads}, use_global_node={use_global_node}, use_gcn={use_gcn}, seed={args.seed}")
 
     model.train()
     batch_vectors = max(1, int(round(n_pad ** 0.5)))  # SAI loss: batch size = sqrt(view_size) for stochastic trace estimation
