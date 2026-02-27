@@ -1126,6 +1126,8 @@ def train_leaf_only():
     batch_vectors = max(1, int(round(n_pad ** 0.5)))  # SAI loss: batch size = sqrt(view_size) for stochastic trace estimation
     print_interval = 100
     t_start = time.perf_counter()
+    t_start_train = t_start  # for running average (never reset)
+    t_start_avg = None  # set at step 200; avg 100 steps uses only time from step 200 onward
 
     def _sync():
         if device.type == 'cuda':
@@ -1208,7 +1210,16 @@ def train_leaf_only():
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t_start
             steps_in_period = step + 1 if step == 0 else print_interval
-            print(f"Step {step}: SAI loss (E||MAz-z||²) {loss.item():.6f}  (last {steps_in_period} steps: {elapsed:.3f}s)")
+            if step >= 200:
+                now = time.perf_counter()
+                if step == 200:
+                    t_start_avg = now
+                    avg_per_100 = elapsed
+                else:
+                    avg_per_100 = (now - t_start_avg) * 100 / (step - 200)
+                print(f"Step {step}: SAI loss (E||MAz-z||²) {loss.item():.6f}  (last {steps_in_period} steps: {elapsed:.3f}s, avg 100 steps: {avg_per_100:.3f}s)")
+            else:
+                print(f"Step {step}: SAI loss (E||MAz-z||²) {loss.item():.6f}  (last {steps_in_period} steps: {elapsed:.3f}s)")
             save_leaf_only_weights(model, args.save, input_dim=9)
             t_start = time.perf_counter()
 
