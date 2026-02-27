@@ -457,7 +457,7 @@ def next_valid_size(n, leaf_size=LEAF_SIZE):
 RANK_BASE_LEVEL1 = 16
 OFF_DIAG_SUPER = 32  
 
-def _rank_for_side(side, rank_base=RANK_BASE_LEVEL1, min_rank=4, max_rank=128):
+def _rank_for_side(side, rank_base=RANK_BASE_LEVEL1, min_rank=4, max_rank=512):
     r = rank_base * ((side / 32.0) ** (2.0 / 3.0))
     r = max(min_rank, min(max_rank, int(round(r))))
     return r if r % 2 == 0 else r + 1  
@@ -592,7 +592,7 @@ class LeafCore(nn.Module):
 
 
 class UniversalOffDiagBlock(nn.Module):
-    def __init__(self, d_model, max_rank=128):
+    def __init__(self, d_model, max_rank=512):
         super().__init__()
         self.n_super = OFF_DIAG_SUPER
         self.max_rank = max_rank
@@ -668,7 +668,7 @@ class LeafOnlyNet(nn.Module):
         self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn)
         self.log_off_diag_scale = nn.Parameter(torch.ones(1) * math.log(1e-2))
         
-        self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=128)
+        self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=512)
         self.off_diag_struct = []
 
     @property
@@ -1038,12 +1038,13 @@ def train_leaf_only():
     target_sizes = []
     if args.mixed_sizes:
         print("  [startup] Mixed sizes enabled. Building discrete sub-graph cache...")
-        MAX_MIXED_SIZE = 8192  # Limit this to keep training steps fast
+        MIN_MIXED_SIZE = 4096   # Min size (inclusive)
+        MAX_MIXED_SIZE = 4096  # Max size (inclusive); lower to keep training steps fast
         base_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
         for s in base_sizes:
-            if s <= MAX_MIXED_SIZE and s < num_nodes_real:
+            if MIN_MIXED_SIZE <= s <= MAX_MIXED_SIZE and s < num_nodes_real:
                 target_sizes.append(s)
-        if num_nodes_real <= MAX_MIXED_SIZE:
+        if MIN_MIXED_SIZE <= num_nodes_real <= MAX_MIXED_SIZE:
             target_sizes.append(num_nodes_real)
     else:
         target_sizes = [num_nodes_real if args.view_size == 0 else max(LEAF_SIZE * 2, args.view_size)]
@@ -1090,7 +1091,7 @@ def train_leaf_only():
             batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE
         )
         
-        batch_vectors = max(1, int(round(n_pad ** 0.5)))
+        batch_vectors = max(128, int(round(n_pad ** 0.5)))
         
         training_contexts.append({
             'n_pad': n_pad, 'n_orig': n, 'num_leaves': n_pad // LEAF_SIZE,
@@ -1116,7 +1117,7 @@ def train_leaf_only():
         else:
             # NOTE: torch.compile will re-compile the kernel the first time it sees each unique graph size.
             # Expect the first ~5 steps to be slow as it compiles the discrete sizes, then it will fly.
-            model = torch.compile(model)
+            model = torch.compile(model, dynamic=True)
         
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     print_hodlr_structure(max_n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
