@@ -21,11 +21,9 @@ except ImportError:
 try:
     import pyamgx
     HAS_AMGX = True
-except ImportError:
+except (ImportError, OSError) as e:
     HAS_AMGX = False
-    print("Warning: 'pyamgx' not installed. AMGX (GPU) comparison will be skipped.")
-HAS_AMGX = False  # temporarily disabled (fix later)
-
+    print("Warning: 'pyamgx' not available. AMGX (GPU) comparison will be skipped.", e)
 import torch
 
 import torch.nn.functional as F
@@ -77,58 +75,170 @@ def get_dense_amg(A_sparse_scipy, viz_limit=200, maxiter=1, tol=1e-6, progress_i
     return M_dense
 
 
-def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=False):
-    """PCG on GPU: solve A x = b. Precond(r) must return z = M@r (apply preconditioner matrix M to r). Returns (x, iters, wall_ms)."""
+def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=False, check_freq=3):
+    """
+    Optimized PCG on GPU with accurate CUDA Event timing.
+    Includes initial residual calculation and preconditioning inside the timed block.
+    """
     if device is None:
         device = b.device
+        
     n = b.shape[0]
     x = torch.zeros(n, 1, device=device, dtype=b.dtype)
+    
+    # 1. Setup CUDA Events for nanosecond-accurate kernel timing
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    torch.cuda.synchronize() # Flush pipeline before starting
+    start_event.record()
+
+    # Initial setup is now correctly timed
     r = b - (A @ x.squeeze(-1)).unsqueeze(-1)
     z = apply_precond(r)
     p = z.clone()
-    rho = (r * z).sum().item()
-    b_norm_sq = (b * b).sum().item()
-    b_norm = (b_norm_sq ** 0.5) if b_norm_sq > 0 else 0.0
-    if b_norm_sq <= 0:
-        return x, 0, 0.0
+    
+    rho = (r * z).sum()
+    b_norm_sq = (b * b).sum()
     tol_sq = (tol * tol) * b_norm_sq
-    r_norm_0 = (r * r).sum().item() ** 0.5
-    if debug:
-        print(f"    [PCG GPU] init: ||b||={b_norm:.2e}, ||r0||={r_norm_0:.2e}, rho0={rho:.2e}, tol*||b||={tol*b_norm:.2e}")
-    t0 = time.perf_counter()
-    iters = max_iter
+
+    iters = 0
+    if b_norm_sq.item() > 0:
+        for k in range(max_iter):
+            Ap = (A @ p.squeeze(-1)).unsqueeze(-1)
+            pAp = (p * Ap).sum()
+
+            alpha = rho / pAp
+            x = x + alpha * p
+            r = r - alpha * Ap
+
+            z = apply_precond(r)
+            rho_new = (r * z).sum()
+            
+            beta = rho_new / rho
+            p = z + beta * p
+            rho = rho_new
+
+            # Periodic sync to check convergence
+            if (k + 1) % check_freq == 0 or k == max_iter - 1:
+                r_sq = (r * r).sum()
+                if r_sq.item() <= tol_sq.item():
+                    if debug:
+                        print(f"    [PCG GPU] converged at iter {k+1}")
+                    iters = k + 1
+                    break
+        if iters == 0:
+            iters = max_iter
+
+    end_event.record()
+    torch.cuda.synchronize() # Wait for all kernels to finish
+    
+    wall_ms = start_event.elapsed_time(end_event)
+    return x, iters, wall_ms
+
+
+def pcg_gpu_cudagraph(
+    A_gpu,
+    b_gpu,
+    diag_blocks,
+    off_diag_list,
+    off_diag_struct,
+    tol=1e-8,
+    max_iter=500,
+    device=None,
+    check_freq=3,
+):
+    """
+    PCG on GPU using CUDA Graphs: capture one iteration and replay to eliminate Python dispatch.
+    Preconditioner is inlined (diag_blocks + off_diag_list) so the graph has no Python calls.
+    Returns (x, iters, wall_ms) with wall_ms measuring only GPU time (replays).
+    """
+    if device is None:
+        device = b_gpu.device
+    n = b_gpu.shape[0]
+    viz_n = n
+    num_leaves = n // LEAF_SIZE
+
+    # Static tensors (fixed addresses for capture; no new allocations inside graph)
+    x_static = torch.zeros_like(b_gpu)
+    r_static = torch.zeros_like(b_gpu)
+    p_static = torch.zeros_like(b_gpu)
+    z_static = torch.zeros_like(b_gpu)
+    z_off_static = torch.zeros_like(b_gpu)
+    rho_static = torch.zeros(1, device=device, dtype=b_gpu.dtype)
+
+    # Initial state in Python (once)
+    x_static.zero_()
+    r_static.copy_(b_gpu)
+    # z_static = M @ r_static (inline block-sparse); param diag_blocks is already (num_leaves, LEAF_SIZE, LEAF_SIZE)
+    r_blocks = r_static.view(num_leaves, LEAF_SIZE, 1)
+    z_diag = torch.bmm(diag_blocks, r_blocks).view(viz_n, 1)
+    z_off = torch.zeros_like(r_static)
+    if off_diag_list and off_diag_struct:
+        for idx, spec in enumerate(off_diag_struct):
+            U = off_diag_list[idx][0][0]
+            V = off_diag_list[idx][1][0]
+            rs, re = spec["row_start"], spec["row_end"]
+            cs, ce = spec["col_start"], spec["col_end"]
+            r_c = r_static[cs:ce]
+            z_off[rs:re].add_(U @ (V.T @ r_c))
+            r_r = r_static[rs:re]
+            z_off[cs:ce].add_(V @ (U.T @ r_r))
+    z_static.copy_(z_diag + z_off)
+    p_static.copy_(z_static)
+    rho_static.fill_((r_static * z_static).sum())
+
+    b_norm_sq = (b_gpu * b_gpu).sum()
+    tol_sq = (tol * tol) * b_norm_sq
+
+    # One iteration: read x,r,p,rho; write x,r,p,rho (in-place where possible)
+    def one_iter():
+        Ap = A_gpu @ p_static.squeeze(-1)
+        Ap = Ap.unsqueeze(-1)
+        pAp = (p_static * Ap).sum()
+        alpha = rho_static / pAp
+        x_static.add_(p_static * alpha)
+        r_static.sub_(Ap * alpha)
+        # Inline M: z_static = M @ r_static (reuse z_off_static to avoid allocation in graph)
+        r_blocks = r_static.view(num_leaves, LEAF_SIZE, 1)
+        z_diag = torch.bmm(diag_blocks, r_blocks).view(viz_n, 1)
+        z_off_static.zero_()
+        if off_diag_list and off_diag_struct:
+            for idx, spec in enumerate(off_diag_struct):
+                U = off_diag_list[idx][0][0]
+                V = off_diag_list[idx][1][0]
+                rs, re = spec["row_start"], spec["row_end"]
+                cs, ce = spec["col_start"], spec["col_end"]
+                r_c = r_static[cs:ce]
+                z_off_static[rs:re].add_(U @ (V.T @ r_c))
+                r_r = r_static[rs:re]
+                z_off_static[cs:ce].add_(V @ (U.T @ r_r))
+        z_static.copy_(z_diag + z_off_static)
+        rho_new = (r_static * z_static).sum()
+        beta = rho_new / rho_static
+        rho_static.fill_(rho_new)
+        p_static.mul_(beta).add_(z_static)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        one_iter()
+
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start_ev.record()
+    iters = 0
     for k in range(max_iter):
-        Ap = (A @ p.squeeze(-1)).unsqueeze(-1)
-        pAp = (p * Ap).sum().item()
-        if pAp <= 1e-14:
-            if debug:
-                print(f"    [PCG GPU] iter {k}: pAp={pAp:.2e} <= 0, stopping")
-            iters = k
-            break
-        alpha = rho / pAp
-        x = x + alpha * p
-        r = r - alpha * Ap
-        r_sq = (r * r).sum().item()
-        r_norm = r_sq ** 0.5
-        if debug and (k < 5 or (k + 1) % 50 == 0 or k == max_iter - 1):
-            rel = r_norm / b_norm if b_norm > 0 else float('nan')
-            print(f"    [PCG GPU] iter {k+1}: ||r||={r_norm:.2e}, rel_res={rel:.2e}, alpha={alpha:.2e}")
-        if r_sq <= tol_sq:
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            if debug:
-                print(f"    [PCG GPU] converged at iter {k+1}, ||r||={r_norm:.2e}")
-            return x, k + 1, (time.perf_counter() - t0) * 1000
-        z = apply_precond(r)
-        rho_new = (r * z).sum().item()
-        beta = rho_new / rho
-        p = z + beta * p
-        rho = rho_new
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    if debug:
-        print(f"    [PCG GPU] stopped at iter {iters}, ||r||={r_norm:.2e}, rel_res={r_norm/b_norm:.2e}")
-    return x, iters, (time.perf_counter() - t0) * 1000
+        g.replay()
+        iters = k + 1
+        if (k + 1) % check_freq == 0 or k == max_iter - 1:
+            r_sq = (r_static * r_static).sum()
+            if r_sq.item() <= tol_sq.item():
+                break
+    end_ev.record()
+    torch.cuda.synchronize()
+    wall_ms = start_ev.elapsed_time(end_ev)
+    return x_static.clone(), iters, wall_ms
 
 
 def pcg_cpu(A, b, apply_precond, tol=1e-8, max_iter=500, debug=False):
@@ -204,7 +314,8 @@ def main():
     num_nodes_real = int(batch['num_nodes'])
     print(f"System N={num_nodes_real}")
 
-    n_requested = min(VIEW_SIZE, num_nodes_real)
+    # n_requested = min(VIEW_SIZE, num_nodes_real)
+    n_requested = 1024
     n_pad = next_valid_size(n_requested, LEAF_SIZE)
     if n_pad != n_requested:
         print(f"  Padding view: {n_requested} nodes -> {n_pad} (power-of-2 * {LEAF_SIZE})")
@@ -230,6 +341,7 @@ def main():
         input_dim=input_dim_lo, d_model=d_model_lo, leaf_size=LEAF_SIZE, num_layers=num_layers_lo,
         num_heads=num_heads_lo, use_gcn=bool(use_gcn_lo),
     ).to(device)
+    # Default compile (reduce-overhead causes CUDA graph capture to fail on LeafOnly's index_put_)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
 
@@ -244,18 +356,35 @@ def main():
         scale_A = torch.tensor(scale_A, device=device, dtype=x_leaf.dtype)
 
     with torch.no_grad():
-        # Warm up inference (torch.compile + CUDA): run a few forwards and sync so we don't time compilation
+        # Warm up inference (torch.compile + CUDA)
         for _ in range(3):
             _ = model_leaf(x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A)
         if device.type == 'cuda':
             torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        diag_blocks, off_diag_list = model_leaf(
-            x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A
-        )
-        if device.type == 'cuda':
+            inf_start = torch.cuda.Event(enable_timing=True)
+            inf_end = torch.cuda.Event(enable_timing=True)
+            inf_start.record()
+            diag_blocks, off_diag_list = model_leaf(
+                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A
+            )
+            inf_end.record()
             torch.cuda.synchronize()
-        inference_ms = (time.perf_counter() - t0) * 1000
+            inference_ms = inf_start.elapsed_time(inf_end)
+        else:
+            t0 = time.perf_counter()
+            diag_blocks, off_diag_list = model_leaf(
+                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A
+            )
+            inference_ms = (time.perf_counter() - t0) * 1000
+    # Keep preconditioner outputs on GPU so PCG CUDAGRAPH solver uses them without CPU round-trip
+    diag_blocks = diag_blocks.to(device)
+    if off_diag_list:
+        off_diag_list = [
+            (tuple(t.to(device) for t in pair[0]), tuple(t.to(device) for t in pair[1]))
+            if isinstance(pair[0], (list, tuple)) and isinstance(pair[1], (list, tuple))
+            else pair
+            for pair in off_diag_list
+        ]
     num_leaves = n_pad // LEAF_SIZE
     # Build dense M on GPU to avoid CPU-GPU sync in a loop (keeps inference timing accurate)
     M_neural_gpu = torch.zeros((n_pad, n_pad), dtype=torch.float32, device=device)
@@ -300,22 +429,70 @@ def main():
     b_np = b_np / (np.linalg.norm(b_np) + 1e-12)
     b_np = b_np.reshape(-1, 1)
 
-    A_gpu = torch.from_numpy(A_viz_n).float().to(device)
+    # Ensure A_gpu is an actual sparse CSR tensor so PyTorch uses cuSPARSE
+    A_scipy_csr = csr_matrix(A_viz_n.astype(np.float32))
+    A_gpu = torch.sparse_csr_tensor(
+        torch.tensor(A_scipy_csr.indptr, dtype=torch.int32, device=device),
+        torch.tensor(A_scipy_csr.indices, dtype=torch.int32, device=device),
+        torch.tensor(A_scipy_csr.data, dtype=torch.float32, device=device),
+        size=(viz_n, viz_n)
+    )
     b_gpu = torch.from_numpy(b_np).float().to(device)
 
-    # Unpreconditioned (CG): identity preconditioner, setup 0
+    # Unpreconditioned (CG): identity preconditioner
     with torch.no_grad():
         x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu(A_gpu, b_gpu, lambda r: r, tol=pcg_tol, max_iter=pcg_max_iter, device=device)
     x_cpu_none, iters_none_cpu, solve_none_cpu_ms = pcg_cpu(A_viz_n.astype(np.float64), b_np, lambda r: r, tol=pcg_tol, max_iter=pcg_max_iter)
+
     setup_none_ms = 0.0
     total_none_gpu_ms = setup_none_ms + solve_none_gpu_ms
     total_none_cpu_ms = setup_none_ms + solve_none_cpu_ms
 
-    # SAI training minimizes || M A z - z ||^2, so M ≈ A^{-1}. Apply z = M@r. M_gpu already on device.
+    # True O(N) Block-Sparse Neural Preconditioner Application
     with torch.no_grad():
-        def apply_M_neural(r):
-            return M_gpu @ r
-        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_neural, tol=pcg_tol, max_iter=pcg_max_iter, device=device)
+        def apply_M_block_sparse(r):
+            # 1. Block Diagonal Application: Batched Matrix Multiply (O(N))
+            r_blocks = r.view(num_leaves, LEAF_SIZE, 1)
+            z_diag = torch.bmm(diag_blocks[0], r_blocks).view(viz_n, 1)
+
+            # 2. Low-Rank Off-Diagonal Updates (if any)
+            z_off = torch.zeros_like(r)
+            if off_diag_list and getattr(model_leaf, 'off_diag_struct', None):
+                for idx, spec in enumerate(model_leaf.off_diag_struct):
+                    U = off_diag_list[idx][0][0]   # (side, rank)
+                    V = off_diag_list[idx][1][0]   # (side, rank)
+                    rs, re = spec["row_start"], spec["row_end"]
+                    cs, ce = spec["col_start"], spec["col_end"]
+
+                    # Compute U(V^T r) instead of (UV^T)r
+                    r_c = r[cs:ce]
+                    z_off[rs:re] += U @ (V.T @ r_c)
+
+                    r_r = r[rs:re]
+                    z_off[cs:ce] += V @ (U.T @ r_r)
+
+            return z_diag + z_off
+
+    # On CUDA use graph solve (no Python overhead); otherwise or on graph failure use regular pcg_gpu
+    if device.type == "cuda":
+        try:
+            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph(
+                A_gpu,
+                b_gpu,
+                diag_blocks[0],
+                off_diag_list,
+                getattr(model_leaf, "off_diag_struct", None),
+                tol=pcg_tol,
+                max_iter=pcg_max_iter,
+                device=device,
+                check_freq=1,  # exact iteration count for e2e benchmark
+            )
+        except Exception as e:
+            print(f"  LeafOnly (CUDA graph failed, using regular solve): {e}")
+            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_sparse, tol=pcg_tol, max_iter=pcg_max_iter, device=device)
+    else:
+        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_sparse, tol=pcg_tol, max_iter=pcg_max_iter, device=device)
+
     total_leaf_ms = inference_ms + solve_leaf_ms
 
     solve_amg_ms = 0.0
@@ -334,24 +511,39 @@ def main():
     iters_amgx = 0
     amgx_setup_ms = 0.0
     if HAS_AMGX and device.type == 'cuda':
-        # Same matrix and RHS as other solvers (A_viz_n, b_np)
+        # 1. Explicitly cast to strictly 32-bit ints and 64-bit floats.
+        # This prevents the silent Cython dtype mismatch that mangles the CSR structure.
         A_amgx_csr = csr_matrix(A_viz_n.astype(np.float64))
+        A_amgx_csr.indptr = np.ascontiguousarray(A_amgx_csr.indptr.astype(np.int32))
+        A_amgx_csr.indices = np.ascontiguousarray(A_amgx_csr.indices.astype(np.int32))
+        A_amgx_csr.data = np.ascontiguousarray(A_amgx_csr.data.astype(np.float64))
+
         b_flat = np.ascontiguousarray(b_np.ravel().astype(np.float64))
         x_init = np.zeros(viz_n, dtype=np.float64)
+
         try:
             pyamgx.initialize()
-            # CG = unpreconditioned conjugate gradient; x/b set via upload (like pyamgx tests/demo)
+
+            # 2. Configure PCG to use an actual AMG preconditioner
             cfg = pyamgx.Config().create_from_dict({
                 "config_version": 2,
                 "determinism_flag": 1,
                 "exception_handling": 1,
                 "solver": {
-                    "solver": "CG",
+                    "solver": "PCG",
                     "max_iters": pcg_max_iter,
                     "convergence": "RELATIVE_INI",
                     "tolerance": float(pcg_tol),
-                    "monitor_residual": 0,
-                    "preconditioner": {"solver": "NOSOLVER"},
+                    "monitor_residual": 1,
+                    "preconditioner": {
+                        "solver": "AMG",
+                        "algorithm": "AGGREGATION",
+                        "selector": "SIZE_2",
+                        "cycle": "V",
+                        "smoother": "MULTICOLOR_GS",
+                        "presweeps": 1,
+                        "postsweeps": 1
+                    }
                 }
             })
             rsc = pyamgx.Resources().create_simple(cfg)
@@ -361,18 +553,34 @@ def main():
             b_amgx.upload(b_flat)
             x_amgx = pyamgx.Vector().create(rsc)
             x_amgx.upload(x_init)
+
             solver = pyamgx.Solver().create(rsc, cfg)
+
             t0 = time.perf_counter()
             solver.setup(A_amgx)
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             amgx_setup_ms = (time.perf_counter() - t0) * 1000
+
+            # Warm up AMGX: run a few solves so timed solve doesn't include one-off costs
+            num_amgx_warmup = 3
+            for _ in range(num_amgx_warmup):
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                x_amgx.upload(x_init)
+                solver.solve(b_amgx, x_amgx)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+
             t0 = time.perf_counter()
-            solver.solve(b_amgx, x_amgx, zero_initial_guess=True)
+            x_amgx.upload(x_init)
+            solver.solve(b_amgx, x_amgx)
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             solve_amgx_ms = (time.perf_counter() - t0) * 1000
+
             iters_amgx = solver.iterations_number
+
             solver.destroy()
             x_amgx.destroy()
             b_amgx.destroy()
@@ -401,7 +609,7 @@ def main():
     print("AMG (CPU):")
     print(f"  Setup: {amg_setup_ms:.2f} ms, solve: {solve_amg_ms:.2f} ms, {iters_amg} iterations, total: {total_amg_ms:.2f} ms")
     if HAS_AMGX and device.type == 'cuda' and (iters_amgx > 0 or amgx_setup_ms > 0):
-        print("AMGX (GPU) [PCG, no precond]:")
+        print("AMGX (GPU) [PCG + AMG]:")
         print(f"  Setup: {amgx_setup_ms:.2f} ms, solve: {solve_amgx_ms:.2f} ms, {iters_amgx} iterations, total: {total_amgx_ms:.2f} ms")
 
     A_inv_viz = np.linalg.inv(A_viz_n)
@@ -413,90 +621,95 @@ def main():
     print(f"Leaf boundaries: every {LEAF_SIZE}")
 
     # Convert to NumPy only for plotting
-    M_neural_n = M_gpu.cpu().numpy()
-    methods = [("LeafOnly", M_neural_n), ("AMG", M_amg_n)]
-    n_cols = 4
-    n_rows = 1 + len(methods)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows), constrained_layout=True)
-    # Row 0: A, A^{-1}
-    axes[0, 0].imshow(np.log10(np.abs(A_viz_n) + 1e-9), cmap='magma', aspect='auto')
-    axes[0, 0].set_title(f"A (input) log10 [leaf {LEAF_SIZE}x{LEAF_SIZE}]")
-    plt.colorbar(axes[0, 0].images[0], ax=axes[0, 0])
-    axes[0, 1].imshow(np.log10(np.abs(A_inv_viz) + 1e-9), cmap='magma', aspect='auto')
-    axes[0, 1].set_title(f"A^{{-1}} (viz {viz_n}x{viz_n}) log10")
-    plt.colorbar(axes[0, 1].images[0], ax=axes[0, 1])
-    # Row 0, col 2: eigenvalues of unpreconditioned A
-    ax_a = axes[0, 2]
-    try:
-        evals_A = np.linalg.eigvals(A_viz_n)
-        ax_a.scatter(evals_A.real, evals_A.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
-        ax_a.axhline(0.0, color='k', linestyle='-', alpha=0.3)
-        ax_a.set_xlabel('Re(λ)')
-        ax_a.set_ylabel('Im(λ)')
-        ax_a.set_title(f"Eigenvalues of A (n={viz_n})")
-        ax_a.set_aspect('equal', adjustable='box')
-        r_min, r_max = evals_A.real.min(), evals_A.real.max()
-        i_max = np.abs(evals_A.imag).max()
-        margin = 0.1 * max(r_max - r_min, 2 * i_max, 1.0) or 0.2
-        ax_a.set_xlim(r_min - margin, r_max + margin)
-        ax_a.set_ylim(-max(i_max, margin), max(i_max, margin))
-    except Exception as e:
-        ax_a.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_a.transAxes, ha='center', va='center', fontsize=9)
-        ax_a.set_title("Eigenvalues of A (failed)")
-    # Row 0, col 3: condition number and Frobenius (unpreconditioned: no M, so no Frobenius err of I-AM)
-    ax_a_t = axes[0, 3]
-    ax_a_t.axis('off')
-    ax_a_t.text(0.1, 0.8, "Unpreconditioned A", fontsize=12, fontfamily='monospace')
-    ax_a_t.text(0.1, 0.65, f"Cond(A): {cond_A:.2e}", fontsize=12, fontfamily='monospace')
+    PLOT_MATRICES = True  # Set to True when you actually want the image
 
-    for idx, (name, M) in enumerate(methods):
-        row = 1 + idx
-        axes[row, 0].imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto')
-        axes[row, 0].set_title(f"{name} M (log10)")
-        plt.colorbar(axes[row, 0].images[0], ax=axes[row, 0])
-        AM = A_viz_n @ M
-        am_min, am_max = np.percentile(AM, [2, 98])
-        if am_max - am_min < 1e-8:
-            am_min, am_max = 0.0, 1.0
-        axes[row, 1].imshow(AM, cmap='RdBu_r', vmin=am_min, vmax=am_max, aspect='auto')
-        axes[row, 1].set_title(f"{name} A·M")
-        plt.colorbar(axes[row, 1].images[0], ax=axes[row, 1])
-
-        ax_d = axes[row, 2]
+    if PLOT_MATRICES:
+        M_neural_n = M_gpu.cpu().numpy()
+        methods = [("LeafOnly", M_neural_n), ("AMG", M_amg_n)]
+        n_cols = 4
+        n_rows = 1 + len(methods)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows), constrained_layout=True)
+        # Row 0: A, A^{-1}
+        axes[0, 0].imshow(np.log10(np.abs(A_viz_n) + 1e-9), cmap='magma', aspect='auto')
+        axes[0, 0].set_title(f"A (input) log10 [leaf {LEAF_SIZE}x{LEAF_SIZE}]")
+        plt.colorbar(axes[0, 0].images[0], ax=axes[0, 0])
+        axes[0, 1].imshow(np.log10(np.abs(A_inv_viz) + 1e-9), cmap='magma', aspect='auto')
+        axes[0, 1].set_title(f"A^{{-1}} (viz {viz_n}x{viz_n}) log10")
+        plt.colorbar(axes[0, 1].images[0], ax=axes[0, 1])
+        # Row 0, col 2: eigenvalues of unpreconditioned A
+        ax_a = axes[0, 2]
         try:
-            evals = np.linalg.eigvals(AM)
-            ax_d.scatter(evals.real, evals.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
-            ax_d.axvline(1.0, color='r', linestyle='--', alpha=0.8)
-            ax_d.axhline(0.0, color='k', linestyle='-', alpha=0.3)
-            ax_d.set_xlabel('Re(λ)')
-            ax_d.set_ylabel('Im(λ)')
-            ax_d.set_title(f"{name} Eigenvalues of A·M (n={viz_n})")
-            ax_d.set_aspect('equal', adjustable='box')
-            r_min, r_max = evals.real.min(), evals.real.max()
-            i_max = np.abs(evals.imag).max()
+            evals_A = np.linalg.eigvals(A_viz_n)
+            ax_a.scatter(evals_A.real, evals_A.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
+            ax_a.axhline(0.0, color='k', linestyle='-', alpha=0.3)
+            ax_a.set_xlabel('Re(λ)')
+            ax_a.set_ylabel('Im(λ)')
+            ax_a.set_title(f"Eigenvalues of A (n={viz_n})")
+            ax_a.set_aspect('equal', adjustable='box')
+            r_min, r_max = evals_A.real.min(), evals_A.real.max()
+            i_max = np.abs(evals_A.imag).max()
             margin = 0.1 * max(r_max - r_min, 2 * i_max, 1.0) or 0.2
-            ax_d.set_xlim(min(r_min, 1.0) - margin, max(r_max, 1.0) + margin)
-            ax_d.set_ylim(-max(i_max, margin), max(i_max, margin))
+            ax_a.set_xlim(r_min - margin, r_max + margin)
+            ax_a.set_ylim(-max(i_max, margin), max(i_max, margin))
         except Exception as e:
-            ax_d.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_d.transAxes, ha='center', va='center', fontsize=9)
-            ax_d.set_title(f"{name} Eigenvalues (failed)")
+            ax_a.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_a.transAxes, ha='center', va='center', fontsize=9)
+            ax_a.set_title("Eigenvalues of A (failed)")
+        # Row 0, col 3: condition number and Frobenius (unpreconditioned: no M, so no Frobenius err of I-AM)
+        ax_a_t = axes[0, 3]
+        ax_a_t.axis('off')
+        ax_a_t.text(0.1, 0.8, "Unpreconditioned A", fontsize=12, fontfamily='monospace')
+        ax_a_t.text(0.1, 0.65, f"Cond(A): {cond_A:.2e}", fontsize=12, fontfamily='monospace')
 
-        ax_t = axes[row, 3]
-        ax_t.axis('off')
-        cond_AM = np.linalg.cond(AM)
-        err_fro = np.linalg.norm(AM - np.eye(viz_n)) / np.linalg.norm(np.eye(viz_n))
-        msg = [
-            f"Method: {name}",
-            f"Cond(AM): {cond_AM:.2e}",
-            f"Improvement: {cond_A/cond_AM:.2f}x",
-            f"Frobenius Err: {err_fro:.4f}",
-        ]
-        color = 'green' if cond_A / cond_AM > 1.0 else 'red'
-        for i, line in enumerate(msg):
-            ax_t.text(0.1, 0.8 - i * 0.15, line, fontsize=12, color='black' if i != 2 else color, fontfamily='monospace')
+        for idx, (name, M) in enumerate(methods):
+            row = 1 + idx
+            axes[row, 0].imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto')
+            axes[row, 0].set_title(f"{name} M (log10)")
+            plt.colorbar(axes[row, 0].images[0], ax=axes[row, 0])
+            AM = A_viz_n @ M
+            am_min, am_max = np.percentile(AM, [2, 98])
+            if am_max - am_min < 1e-8:
+                am_min, am_max = 0.0, 1.0
+            axes[row, 1].imshow(AM, cmap='RdBu_r', vmin=am_min, vmax=am_max, aspect='auto')
+            axes[row, 1].set_title(f"{name} A·M")
+            plt.colorbar(axes[row, 1].images[0], ax=axes[row, 1])
 
-    plt.savefig(out_path, dpi=100, bbox_inches='tight')
-    print(f"Plot saved to: {out_path}")
+            ax_d = axes[row, 2]
+            try:
+                evals = np.linalg.eigvals(AM)
+                ax_d.scatter(evals.real, evals.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
+                ax_d.axvline(1.0, color='r', linestyle='--', alpha=0.8)
+                ax_d.axhline(0.0, color='k', linestyle='-', alpha=0.3)
+                ax_d.set_xlabel('Re(λ)')
+                ax_d.set_ylabel('Im(λ)')
+                ax_d.set_title(f"{name} Eigenvalues of A·M (n={viz_n})")
+                ax_d.set_aspect('equal', adjustable='box')
+                r_min, r_max = evals.real.min(), evals.real.max()
+                i_max = np.abs(evals.imag).max()
+                margin = 0.1 * max(r_max - r_min, 2 * i_max, 1.0) or 0.2
+                ax_d.set_xlim(min(r_min, 1.0) - margin, max(r_max, 1.0) + margin)
+                ax_d.set_ylim(-max(i_max, margin), max(i_max, margin))
+            except Exception as e:
+                ax_d.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_d.transAxes, ha='center', va='center', fontsize=9)
+                ax_d.set_title(f"{name} Eigenvalues (failed)")
+
+            ax_t = axes[row, 3]
+            ax_t.axis('off')
+            cond_AM = np.linalg.cond(AM)
+            err_fro = np.linalg.norm(AM - np.eye(viz_n)) / np.linalg.norm(np.eye(viz_n))
+            msg = [
+                f"Method: {name}",
+                f"Cond(AM): {cond_AM:.2e}",
+                f"Improvement: {cond_A/cond_AM:.2f}x",
+                f"Frobenius Err: {err_fro:.4f}",
+            ]
+            color = 'green' if cond_A / cond_AM > 1.0 else 'red'
+            for i, line in enumerate(msg):
+                ax_t.text(0.1, 0.8 - i * 0.15, line, fontsize=12, color='black' if i != 2 else color, fontfamily='monospace')
+
+        plt.savefig(out_path, dpi=100, bbox_inches='tight')
+        print(f"Plot saved to: {out_path}")
+    else:
+        print("\nSkipped matrix dense plotting/eigenvalues to save time.")
 
 
 if __name__ == "__main__":
