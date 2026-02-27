@@ -245,7 +245,7 @@ def main():
 
     with torch.no_grad():
         # Warm up inference (torch.compile + CUDA): run a few forwards and sync so we don't time compilation
-        for _ in range(200):
+        for _ in range(3):
             _ = model_leaf(x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A)
         if device.type == 'cuda':
             torch.cuda.synchronize()
