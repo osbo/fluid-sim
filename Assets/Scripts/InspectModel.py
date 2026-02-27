@@ -228,7 +228,7 @@ def main():
     use_gcn_lo = header_lo[5] if len(header_lo) > 5 else True  # old checkpoints have no use_gcn → True
     model_leaf = LeafOnlyNet(
         input_dim=input_dim_lo, d_model=d_model_lo, leaf_size=LEAF_SIZE, num_layers=num_layers_lo,
-        num_heads=num_heads_lo, n_nodes=n_pad, use_gcn=bool(use_gcn_lo),
+        num_heads=num_heads_lo, use_gcn=bool(use_gcn_lo),
     ).to(device)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
