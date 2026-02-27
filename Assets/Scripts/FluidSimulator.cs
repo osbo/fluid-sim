@@ -457,6 +457,7 @@ public partial class FluidSimulator : MonoBehaviour
         Debug.Log($"Frame {frameNumber} Summary:\n" +
                  $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Avg Frame Time: {averageFrameTimeMs:F2} ms\n" +
+                 $"• # Nodes: {numNodes}\n" +
                  $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
