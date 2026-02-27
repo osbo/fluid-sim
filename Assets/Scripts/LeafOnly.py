@@ -105,6 +105,7 @@ class FluidGraphDataset:
             'edge_values': torch.from_numpy(vals.copy()),
             'num_nodes': int(num_nodes),
             'scale_A': scale_A,
+            'frame_path': str(frame_path),
         }
 
 # --- Embedding and graph layers ---
@@ -718,40 +719,43 @@ class LeafOnlyNet(nn.Module):
     def log_hodlr_scale_leaf(self):
         return self.core.log_hodlr_scale_leaf
 
-    def _off_diag(self, h, edge_index):
-        """h (B, N, d_model), edge_index (2, E). Return list of (U, V) per off_diag_struct; U,V shape (B, side, rank)."""
+    def _off_diag(self, h, edge_index, precomputed_masks=None):
+        """h (B, N, d_model), edge_index (2, E). Return list of (U, V) per off_diag_struct; U,V shape (B, side, rank). Use precomputed_masks if provided, else compute dynamically (inference)."""
         B, N, C = h.shape
         scale = torch.exp(self.log_off_diag_scale)
-        # Reuse connectivity masks across steps when the same graph is used (e.g. fixed batch training)
-        cache_id = id(edge_index)
-        if getattr(self, "_off_diag_mask_cache_id", None) != cache_id:
-            self._off_diag_mask_cache = [
-                build_off_diag_super_connectivity(
-                    edge_index, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
-                    h.device, self.leaf_size
-                )
-                for spec in self.off_diag_struct
-            ]
-            self._off_diag_mask_cache_id = cache_id
+        if precomputed_masks is not None:
+            mask_list = precomputed_masks
+        else:
+            cache_id = id(edge_index)
+            if getattr(self, "_off_diag_mask_cache_id", None) != cache_id:
+                self._off_diag_mask_cache = [
+                    build_off_diag_super_connectivity(
+                        edge_index, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
+                        h.device, self.leaf_size
+                    )
+                    for spec in self.off_diag_struct
+                ]
+                self._off_diag_mask_cache_id = cache_id
+            mask_list = self._off_diag_mask_cache
         result = []
         for idx, spec in enumerate(self.off_diag_struct):
             rs, re = spec["row_start"], spec["row_end"]
             cs, ce = spec["col_start"], spec["col_end"]
-            h_row = h[:, rs:re]   # (B, side, d_model)
-            h_col = h[:, cs:ce]   # (B, side, d_model)
-            mask = self._off_diag_mask_cache[idx]
-            level_module = self.off_diag_levels[spec["level"] - 1]  # level is 1-based
+            h_row = h[:, rs:re]
+            h_col = h[:, cs:ce]
+            mask = mask_list[idx]
+            level_module = self.off_diag_levels[spec["level"] - 1]
             U, V = level_module(h_row, h_col, mask, scale)
             result.append((U, V))
         return result
 
-    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False):
+    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_masks=None):
         B, N, _ = x.shape
         assert N % self.leaf_size == 0, f"LeafOnly expects N divisible by leaf_size {self.leaf_size}, got {N}"
         if self.off_diag_struct and N == self.n_nodes:
             h = self.core.forward_features(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention)
             diag_blocks = self.core.get_leaf_blocks(h, x, scale_A)
-            off_diag_list = self._off_diag(h, edge_index)
+            off_diag_list = self._off_diag(h, edge_index, precomputed_masks=precomputed_masks)
             return (diag_blocks, off_diag_list)
         diag_blocks = self.core(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention)
         return (diag_blocks, [])
@@ -994,6 +998,39 @@ def _read_into(f, param, read_fn, transpose=False):
         param.copy_(t)
 
 
+# Global RAM cache for off-diag masks (frame_path key -> list of bool tensors)
+RAM_MASK_CACHE = {}
+
+
+def get_or_compute_masks(frame_path_str, edge_index, off_diag_struct, device, leaf_size=LEAF_SIZE):
+    """Fetches masks from RAM, then disk, or computes and saves them. Returns list of (n_super, n_super) bool tensors on device."""
+    if not off_diag_struct:
+        return []
+    frame_path = Path(frame_path_str)
+    num_blocks = len(off_diag_struct)
+    n_super = OFF_DIAG_SUPER
+    cache_key = f"{frame_path.name}_b{num_blocks}"
+    bin_path = frame_path / f"off_diag_masks_b{num_blocks}.bin"
+    if cache_key in RAM_MASK_CACHE:
+        return RAM_MASK_CACHE[cache_key]
+    if bin_path.exists():
+        flat_data = np.fromfile(bin_path, dtype=np.uint8).reshape(num_blocks, n_super, n_super)
+        masks = [torch.from_numpy(flat_data[i].copy()).to(device=device, dtype=torch.bool) for i in range(num_blocks)]
+        RAM_MASK_CACHE[cache_key] = masks
+        return masks
+    masks = [
+        build_off_diag_super_connectivity(
+            edge_index, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
+            device, leaf_size
+        )
+        for spec in off_diag_struct
+    ]
+    masks_np = np.stack([m.cpu().numpy().astype(np.uint8) for m in masks])
+    masks_np.tofile(bin_path)
+    RAM_MASK_CACHE[cache_key] = masks
+    return masks
+
+
 def train_leaf_only():
     parser = argparse.ArgumentParser()
     script_dir = Path(__file__).resolve().parent
@@ -1074,7 +1111,12 @@ def train_leaf_only():
         input_dim=9, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
         num_heads=args.num_heads, n_nodes=n_pad, mask_attention=True, use_global_node=use_global_node, use_gcn=use_gcn,
     ).to(device)
-    model = torch.compile(model)
+    precomputed_masks = get_or_compute_masks(
+        batch['frame_path'], edge_index, model.off_diag_struct, device, LEAF_SIZE
+    )
+    # MPS has a 31 constant-buffer limit; Inductor backward can exceed it. Compile only on CUDA.
+    if device.type == 'cuda':
+        model = torch.compile(model)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     print_hodlr_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
@@ -1101,7 +1143,10 @@ def train_leaf_only():
             _sync()
             t_zero = time.perf_counter() - t0
             t0 = time.perf_counter()
-        diag_blocks, off_diag_list = model(x_input, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A)
+        diag_blocks, off_diag_list = model(
+            x_input, edge_index=edge_index, edge_values=edge_values,
+            scale_A=scale_A, precomputed_masks=precomputed_masks
+        )
         if do_timing:
             _sync()
             t_forward = time.perf_counter() - t0
