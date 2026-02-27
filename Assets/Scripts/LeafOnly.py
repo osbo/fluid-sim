@@ -466,10 +466,9 @@ def next_valid_size(n, leaf_size=LEAF_SIZE):
     while p < num_blocks:
         p *= 2
     return p * leaf_size
-# Rank for smallest off-diagonal (side=32); larger blocks scale as rank_base * (side/32)^(2/3).
+
 RANK_BASE_LEVEL1 = 16
 OFF_DIAG_SUPER = 32  # Off-diagonal attention is always over 32 super-nodes per side (each = group of side/32 tokens).
-
 
 def _rank_for_side(side, rank_base=RANK_BASE_LEVEL1, min_rank=4, max_rank=128):
     """Rank for off-diagonal block of side length `side`; scale n^(2/3) with base 20 at side 32."""
@@ -626,78 +625,100 @@ class LeafCore(nn.Module):
         return self.get_leaf_blocks(h, x, scale_A)
 
 
-class OffDiagBlock(nn.Module):
+class UniversalOffDiagBlock(nn.Module):
     """
-    Off-diagonal block with 32x32 masked attention. Super-nodes are downsampled for attention;
-    connectivity is logical-OR over original edges. Rows of U/V use original per-token h so we
-    get (B, side, rank) without upsampling: U[i] = proj_U(concat(h_row[i], row_super[i//g])).
+    Scale-invariant off-diagonal block using Scale Conditioning and Matryoshka Parameter Slicing.
+    Weights are perfectly continuous across scales without dropping condition number reduction.
     """
-    def __init__(self, d_model, side, rank):
+    def __init__(self, d_model, max_rank=128):
         super().__init__()
-        self.side = side
-        self.rank = rank
         self.n_super = OFF_DIAG_SUPER
-        self.group_size = side // self.n_super  # 1, 2, or 4
-        self.attn_q = nn.Linear(d_model, d_model)
-        self.attn_k = nn.Linear(d_model, d_model)
-        self.attn_v = nn.Linear(d_model, d_model)
-        # Per-row from original token + super-node summary (no upsampling)
-        self.proj_U = nn.Linear(2 * d_model, rank)
-        self.proj_V = nn.Linear(2 * d_model, rank)
-        for m in (self.attn_q, self.attn_k, self.attn_v, self.proj_U, self.proj_V):
+        self.max_rank = max_rank
+
+        # Scale Conditioning: Q, K, V accept an extra scalar dimension for log2(side/32)
+        self.attn_q = nn.Linear(d_model + 1, d_model)
+        self.attn_k = nn.Linear(d_model + 1, d_model)
+        self.attn_v = nn.Linear(d_model + 1, d_model)
+        
+        # Matryoshka Parameters: Single maximum-rank matrix to be sliced dynamically
+        self.W_U = nn.Parameter(torch.randn(max_rank, 2 * d_model))
+        self.b_U = nn.Parameter(torch.zeros(max_rank))
+        self.W_V = nn.Parameter(torch.randn(max_rank, 2 * d_model))
+        self.b_V = nn.Parameter(torch.zeros(max_rank))
+        
+        for m in (self.attn_q, self.attn_k, self.attn_v):
             nn.init.normal_(m.weight, std=0.01)
             nn.init.zeros_(m.bias)
+            
+        nn.init.normal_(self.W_U, std=0.01)
+        nn.init.normal_(self.W_V, std=0.01)
         self._scale_attn = d_model ** -0.5
 
-    def forward(self, h_row, h_col, mask, scale):
-        # h_row (B, side, d_model), h_col (B, side, d_model); mask (32, 32) bool
+    def forward(self, h_row, h_col, mask, scale, rank):
         B = h_row.shape[0]
-        g = self.group_size
-        down_row = h_row.view(B, self.n_super, g, -1).mean(dim=2)   # (B, 32, d_model)
-        down_col = h_col.view(B, self.n_super, g, -1).mean(dim=2)   # (B, 32, d_model)
-        Q = self.attn_q(down_row)
-        K = self.attn_k(down_col)
-        V = self.attn_v(down_col)
+        side = h_row.shape[1]
+        g = side // self.n_super
+        
+        down_row = h_row.view(B, self.n_super, g, -1).mean(dim=2)
+        down_col = h_col.view(B, self.n_super, g, -1).mean(dim=2)
+        
+        # Inject scale conditioning explicitly so attention matrix shifts behavior per level
+        scale_val = math.log2(max(1.0, side / float(self.n_super)))
+        scale_tensor = torch.full((B, self.n_super, 1), scale_val, device=h_row.device, dtype=h_row.dtype)
+        
+        down_row_cond = torch.cat([down_row, scale_tensor], dim=-1)
+        down_col_cond = torch.cat([down_col, scale_tensor], dim=-1)
+        
+        Q = self.attn_q(down_row_cond)
+        K = self.attn_k(down_col_cond)
+        V = self.attn_v(down_col_cond)
+        
         scores = (Q @ K.transpose(-2, -1)) * self._scale_attn
-        scores = scores.masked_fill(~mask.unsqueeze(0), float('-inf'))  # (1,32,32) mask on (B,32,32)
+        scores = scores.masked_fill(~mask.unsqueeze(0), float('-inf'))
         attn_probs = F.softmax(scores, dim=-1)
-        row_out = (attn_probs @ V).reshape(B, self.n_super, -1)   # (B, 32, d_model)
-        # Expand super-node output to side: row_out_expanded[i] = row_out[i//g]
-        row_out_expanded = row_out.repeat_interleave(g, dim=1)   # (B, side, d_model)
-        down_col_expanded = down_col.repeat_interleave(g, dim=1)   # (B, side, d_model)
-        # Ensure 3D for cat (avoid 3/4 dim mismatch from any broadcast)
+        row_out = (attn_probs @ V).reshape(B, self.n_super, -1)
+        
+        row_out_expanded = row_out.repeat_interleave(g, dim=1)
+        down_col_expanded = down_col.repeat_interleave(g, dim=1)
+        
         h_row_3 = h_row.reshape(B, -1, h_row.shape[-1])
         row_exp_3 = row_out_expanded.reshape(B, -1, row_out_expanded.shape[-1])
         h_col_3 = h_col.reshape(B, -1, h_col.shape[-1])
         col_exp_3 = down_col_expanded.reshape(B, -1, down_col_expanded.shape[-1])
-        U = self.proj_U(torch.cat([h_row_3, row_exp_3], dim=-1))   # (B, side, rank)
-        V = self.proj_V(torch.cat([h_col_3, col_exp_3], dim=-1))   # (B, side, rank)
+        
+        features_U = torch.cat([h_row_3, row_exp_3], dim=-1)
+        features_V = torch.cat([h_col_3, col_exp_3], dim=-1)
+        
+        # Matryoshka Slicing: Only compute matrix multiplication for the requested rank.
+        # This completely guarantees 0 wasted FLOPs while preserving parameter uniqueness.
+        safe_rank = min(rank, self.max_rank)
+        W_U_sliced = self.W_U[:safe_rank, :]
+        b_U_sliced = self.b_U[:safe_rank]
+        W_V_sliced = self.W_V[:safe_rank, :]
+        b_V_sliced = self.b_V[:safe_rank]
+        
+        U = F.linear(features_U, W_U_sliced, b_U_sliced)
+        V = F.linear(features_V, W_V_sliced, b_V_sliced)
+        
         return U * scale, V * scale
 
 
 class LeafOnlyNet(nn.Module):
     """
-    Wrapper around LeafCore with HODLR off-diagonals. N must equal n_nodes (divisible by leaf_size).
-    Outputs (diag_blocks, off_diag_list); off_diag_list is empty list when n_nodes has only one block.
+    Wrapper around LeafCore with HODLR off-diagonals. N must be divisible by leaf_size.
+    Outputs (diag_blocks, off_diag_list); off_diag_list is empty list when N has only one block.
+    Tree is built dynamically from N; one UniversalOffDiagBlock handles all ranks via Matryoshka slicing.
     """
-    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, n_nodes=512, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=True, use_gcn=True):
+    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=True, use_gcn=True):
         super().__init__()
         self.leaf_size = leaf_size
-        self.n_nodes = n_nodes
+        self.rank_base = rank_base
         self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn)
-        self.off_diag_struct = build_hodlr_off_diag_structure(n_nodes, leaf_size, rank_base)
-        if self.off_diag_struct:
-            self.log_off_diag_scale = nn.Parameter(torch.ones(1) * math.log(1e-2))
-            # One OffDiagBlock per HODLR level (all blocks at same scale share QKV)
-            by_level = {s["level"]: (s["side"], s["rank"]) for s in self.off_diag_struct}
-            self.off_diag_levels = nn.ModuleList([
-                OffDiagBlock(d_model, side, rank)
-                for _level in sorted(by_level.keys())
-                for (side, rank) in [by_level[_level]]
-            ])
-        else:
-            self.off_diag_levels = []
-            self.log_off_diag_scale = None
+        self.log_off_diag_scale = nn.Parameter(torch.ones(1) * math.log(1e-2))
+        
+        # Initialize Universal block with max_rank=128 (matches highest _rank_for_side output constraint)
+        self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=128)
+        self.off_diag_struct = []
 
     @property
     def embed(self):
@@ -719,8 +740,7 @@ class LeafOnlyNet(nn.Module):
     def log_hodlr_scale_leaf(self):
         return self.core.log_hodlr_scale_leaf
 
-    def _off_diag(self, h, edge_index, precomputed_masks=None):
-        """h (B, N, d_model), edge_index (2, E). Return list of (U, V) per off_diag_struct; U,V shape (B, side, rank). Use precomputed_masks if provided, else compute dynamically (inference)."""
+    def _off_diag(self, h, edge_index, current_struct, precomputed_masks=None):
         B, N, C = h.shape
         scale = torch.exp(self.log_off_diag_scale)
         if precomputed_masks is not None:
@@ -733,31 +753,32 @@ class LeafOnlyNet(nn.Module):
                         edge_index, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
                         h.device, self.leaf_size
                     )
-                    for spec in self.off_diag_struct
+                    for spec in current_struct
                 ]
                 self._off_diag_mask_cache_id = cache_id
             mask_list = self._off_diag_mask_cache
+
         result = []
-        for idx, spec in enumerate(self.off_diag_struct):
+        for idx, spec in enumerate(current_struct):
             rs, re = spec["row_start"], spec["row_end"]
             cs, ce = spec["col_start"], spec["col_end"]
-            h_row = h[:, rs:re]
-            h_col = h[:, cs:ce]
-            mask = mask_list[idx]
-            level_module = self.off_diag_levels[spec["level"] - 1]
-            U, V = level_module(h_row, h_col, mask, scale)
+            U, V = self.universal_off_diag(h[:, rs:re], h[:, cs:ce], mask_list[idx], scale, rank=spec["rank"])
             result.append((U, V))
         return result
 
     def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_masks=None):
         B, N, _ = x.shape
         assert N % self.leaf_size == 0, f"LeafOnly expects N divisible by leaf_size {self.leaf_size}, got {N}"
-        if self.off_diag_struct and N == self.n_nodes:
-            h = self.core.forward_features(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention)
-            diag_blocks = self.core.get_leaf_blocks(h, x, scale_A)
-            off_diag_list = self._off_diag(h, edge_index, precomputed_masks=precomputed_masks)
+
+        current_struct = build_hodlr_off_diag_structure(N, self.leaf_size, self.rank_base)
+        self.off_diag_struct = current_struct
+
+        h = self.core.forward_features(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention)
+        diag_blocks = self.core.get_leaf_blocks(h, x, scale_A)
+
+        if current_struct:
+            off_diag_list = self._off_diag(h, edge_index, current_struct, precomputed_masks=precomputed_masks)
             return (diag_blocks, off_diag_list)
-        diag_blocks = self.core(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention)
         return (diag_blocks, [])
 
 
@@ -861,20 +882,22 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.leaf_head.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.leaf_head.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, torch.exp(model.log_hodlr_scale_leaf).detach().cpu().float(), transpose=False)
-        # Off-diagonal: sentinel then OffDiagBlocks (downsampled or full-res) + scale
-        if getattr(model, 'off_diag_levels', None) and len(model.off_diag_levels) > 0:
-            f.write(struct.pack('<II', 0xFFFFFFFF, 0))
-            for blk in model.off_diag_levels:
-                _write_packed_tensor(f, blk.attn_q.weight.detach().cpu().float(), transpose=True)
-                _write_packed_tensor(f, blk.attn_q.bias.detach().cpu().float(), transpose=False)
-                _write_packed_tensor(f, blk.attn_k.weight.detach().cpu().float(), transpose=True)
-                _write_packed_tensor(f, blk.attn_k.bias.detach().cpu().float(), transpose=False)
-                _write_packed_tensor(f, blk.attn_v.weight.detach().cpu().float(), transpose=True)
-                _write_packed_tensor(f, blk.attn_v.bias.detach().cpu().float(), transpose=False)
-                _write_packed_tensor(f, blk.proj_U.weight.detach().cpu().float(), transpose=True)
-                _write_packed_tensor(f, blk.proj_U.bias.detach().cpu().float(), transpose=False)
-                _write_packed_tensor(f, blk.proj_V.weight.detach().cpu().float(), transpose=True)
-                _write_packed_tensor(f, blk.proj_V.bias.detach().cpu().float(), transpose=False)
+        
+        # Off-diagonal: sentinel then Matryoshka parameters + scale
+        if getattr(model, 'universal_off_diag', None) is not None:
+            f.write(struct.pack('<II', 0xFFFFFFFC, 0)) # New sentinel for Matryoshka architecture
+            blk = model.universal_off_diag
+            _write_packed_tensor(f, blk.attn_q.weight.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, blk.attn_q.bias.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, blk.attn_k.weight.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, blk.attn_k.bias.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, blk.attn_v.weight.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, blk.attn_v.bias.detach().cpu().float(), transpose=False)
+            
+            _write_packed_tensor(f, blk.W_U.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, blk.b_U.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, blk.W_V.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, blk.b_V.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, torch.exp(model.log_off_diag_scale).detach().cpu().float(), transpose=False)
 
 
@@ -971,25 +994,29 @@ def load_leaf_only_weights(model, path):
         scale = read_tensor(f, (1,), transpose=False).to(model.log_hodlr_scale_leaf.device)
         with torch.no_grad():
             model.log_hodlr_scale_leaf.copy_(torch.log(scale.clamp(min=1e-12)))
-        # Optional off-diagonal section: sentinel (8 bytes) then blocks + scale
+        
         extra = f.read(8)
         if len(extra) == 8:
             sentinel, _ = struct.unpack('<II', extra)
-            if sentinel == 0xFFFFFFFF and getattr(model, 'off_diag_levels', None) and len(model.off_diag_levels) > 0:
-                for blk in model.off_diag_levels:
-                    _read_into(f, blk.attn_q.weight, read_tensor, transpose=True)
-                    _read_into(f, blk.attn_q.bias, read_tensor, transpose=False)
-                    _read_into(f, blk.attn_k.weight, read_tensor, transpose=True)
-                    _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
-                    _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
-                    _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
-                    _read_into(f, blk.proj_U.weight, read_tensor, transpose=True)
-                    _read_into(f, blk.proj_U.bias, read_tensor, transpose=False)
-                    _read_into(f, blk.proj_V.weight, read_tensor, transpose=True)
-                    _read_into(f, blk.proj_V.bias, read_tensor, transpose=False)
+            if sentinel == 0xFFFFFFFC and getattr(model, 'universal_off_diag', None) is not None:
+                blk = model.universal_off_diag
+                _read_into(f, blk.attn_q.weight, read_tensor, transpose=True)
+                _read_into(f, blk.attn_q.bias, read_tensor, transpose=False)
+                _read_into(f, blk.attn_k.weight, read_tensor, transpose=True)
+                _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
+                _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
+                _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
+                
+                _read_into(f, blk.W_U, read_tensor, transpose=True)
+                _read_into(f, blk.b_U, read_tensor, transpose=False)
+                _read_into(f, blk.W_V, read_tensor, transpose=True)
+                _read_into(f, blk.b_V, read_tensor, transpose=False)
+                
                 scale_off = read_tensor(f, (1,), transpose=False).to(model.log_off_diag_scale.device)
                 with torch.no_grad():
                     model.log_off_diag_scale.copy_(torch.log(scale_off.clamp(min=1e-12)))
+            elif sentinel == 0xFFFFFFFF or sentinel == 0xFFFFFFFD:
+                raise ValueError("Attempted to load an older discrete/hypernetwork checkpoint into Matryoshka version. Clear checkpoint file.")
 
 
 def _read_into(f, param, read_fn, transpose=False):
@@ -1035,11 +1062,11 @@ def train_leaf_only():
     parser = argparse.ArgumentParser()
     script_dir = Path(__file__).resolve().parent
     default_data = script_dir.parent / "StreamingAssets" / "TestData"
-    parser.add_argument('--steps', type=int, default=10000)
+    parser.add_argument('--steps', type=int, default=20000)
     parser.add_argument('--data_folder', type=str, default=str(default_data))
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--d_model', type=int, default=64)
+    parser.add_argument('--d_model', type=int, default=256)
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600)
@@ -1107,13 +1134,19 @@ def train_leaf_only():
     A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
 
     torch.manual_seed(args.seed)
+    
+    # Instantiate with rank_base (not n_nodes). 
     model = LeafOnlyNet(
         input_dim=9, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
-        num_heads=args.num_heads, n_nodes=n_pad, mask_attention=True, use_global_node=use_global_node, use_gcn=use_gcn,
+        num_heads=args.num_heads, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=use_global_node, use_gcn=use_gcn,
     ).to(device)
+    
+    # Pre-compute the dummy struct so mask cache initializes correctly
+    dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
     precomputed_masks = get_or_compute_masks(
-        batch['frame_path'], edge_index, model.off_diag_struct, device, LEAF_SIZE
+        batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE
     )
+    
     # MPS has a 31 constant-buffer limit; Inductor backward can exceed it. Compile only on CUDA.
     if device.type == 'cuda':
         model = torch.compile(model)
