@@ -77,7 +77,7 @@ def get_dense_amg(A_sparse_scipy, viz_limit=200, maxiter=1, tol=1e-6, progress_i
 
 def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=False, check_freq=3):
     """
-    Optimized PCG on GPU with accurate CUDA Event timing.
+    Optimized PCG on GPU with accurate CUDA Event timing (CUDA) or wall-clock (MPS).
     Includes initial residual calculation and preconditioning inside the timed block.
     """
     if device is None:
@@ -86,12 +86,16 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
     n = b.shape[0]
     x = torch.zeros(n, 1, device=device, dtype=b.dtype)
     
-    # 1. Setup CUDA Events for nanosecond-accurate kernel timing
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    
-    torch.cuda.synchronize() # Flush pipeline before starting
-    start_event.record()
+    # Timing: CUDA Events on CUDA, wall-clock on MPS/CPU
+    if device.type == "cuda":
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start_event.record()
+    else:
+        if device.type == "mps":
+            torch.mps.synchronize()
+        t0 = time.perf_counter()
 
     # Initial setup is now correctly timed
     r = b - (A @ x.squeeze(-1)).unsqueeze(-1)
@@ -130,10 +134,14 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
         if iters == 0:
             iters = max_iter
 
-    end_event.record()
-    torch.cuda.synchronize() # Wait for all kernels to finish
-    
-    wall_ms = start_event.elapsed_time(end_event)
+    if device.type == "cuda":
+        end_event.record()
+        torch.cuda.synchronize()
+        wall_ms = start_event.elapsed_time(end_event)
+    else:
+        if device.type == "mps":
+            torch.mps.synchronize()
+        wall_ms = (time.perf_counter() - t0) * 1000
     return x, iters, wall_ms
 
 
@@ -315,7 +323,7 @@ def main():
     print(f"System N={num_nodes_real}")
 
     # n_requested = min(VIEW_SIZE, num_nodes_real)
-    n_requested = 4096
+    n_requested = 512
     n_pad = next_valid_size(n_requested, LEAF_SIZE)
     if n_pad != n_requested:
         print(f"  Padding view: {n_requested} nodes -> {n_pad} (power-of-2 * {LEAF_SIZE})")
@@ -429,14 +437,17 @@ def main():
     b_np = b_np / (np.linalg.norm(b_np) + 1e-12)
     b_np = b_np.reshape(-1, 1)
 
-    # Ensure A_gpu is an actual sparse CSR tensor so PyTorch uses cuSPARSE
+    # On CUDA use sparse CSR (cuSPARSE); MPS does not support sparse_csr_tensor so use dense
     A_scipy_csr = csr_matrix(A_viz_n.astype(np.float32))
-    A_gpu = torch.sparse_csr_tensor(
-        torch.tensor(A_scipy_csr.indptr, dtype=torch.int32, device=device),
-        torch.tensor(A_scipy_csr.indices, dtype=torch.int32, device=device),
-        torch.tensor(A_scipy_csr.data, dtype=torch.float32, device=device),
-        size=(viz_n, viz_n)
-    )
+    if device.type == "cuda":
+        A_gpu = torch.sparse_csr_tensor(
+            torch.tensor(A_scipy_csr.indptr, dtype=torch.int32, device=device),
+            torch.tensor(A_scipy_csr.indices, dtype=torch.int32, device=device),
+            torch.tensor(A_scipy_csr.data, dtype=torch.float32, device=device),
+            size=(viz_n, viz_n),
+        )
+    else:
+        A_gpu = torch.from_numpy(A_viz_n.astype(np.float32)).to(device)
     b_gpu = torch.from_numpy(b_np).float().to(device)
 
     # Unpreconditioned (CG): identity preconditioner
