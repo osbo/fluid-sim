@@ -70,9 +70,8 @@ class FluidGraphDataset:
             if r == c:
                 diag_map[r] = v
 
-        pos_scale = float(np.abs(positions).max())
-        if pos_scale <= 0.0: pos_scale = 1.0
-        positions_n = positions / pos_scale
+        # Fixed scale for positions (preserves physical scale invariance across frames)
+        positions_n = positions / 1024.0
 
         layer_val = np.exp2(layer)
 
@@ -1038,8 +1037,8 @@ def train_leaf_only():
     target_sizes = []
     if args.mixed_sizes:
         print("  [startup] Mixed sizes enabled. Building discrete sub-graph cache...")
-        MIN_MIXED_SIZE = 4096   # Min size (inclusive)
-        MAX_MIXED_SIZE = 4096  # Max size (inclusive); lower to keep training steps fast
+        MIN_MIXED_SIZE = 512   # Min size (inclusive)
+        MAX_MIXED_SIZE = 512  # Max size (inclusive); lower to keep training steps fast
         base_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
         for s in base_sizes:
             if MIN_MIXED_SIZE <= s <= MAX_MIXED_SIZE and s < num_nodes_real:
