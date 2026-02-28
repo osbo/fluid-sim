@@ -1000,7 +1000,9 @@ def train_leaf_only():
     parser.add_argument('--d_model', type=int, default=256)
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
-    parser.add_argument('--frame', type=int, default=600)
+    parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
+    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all). Default: True.')
+    parser.add_argument('--num_frames', type=int, default=10, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
@@ -1028,77 +1030,94 @@ def train_leaf_only():
     dataset = FluidGraphDataset([run_folder])
     if len(dataset) == 0:
         raise SystemExit(f"No frames found under {run_folder}")
-    frame_idx = min(args.frame, len(dataset) - 1)
-    batch = dataset[frame_idx]
 
-    num_nodes_real = int(batch['num_nodes'])
-    
-    # 1. Determine the sizes we will train on
-    target_sizes = []
-    if args.mixed_sizes:
-        print("  [startup] Mixed sizes enabled. Building discrete sub-graph cache...")
-        MIN_MIXED_SIZE = 512   # Min size (inclusive)
-        MAX_MIXED_SIZE = 512  # Max size (inclusive); lower to keep training steps fast
-        base_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
-        for s in base_sizes:
-            if MIN_MIXED_SIZE <= s <= MAX_MIXED_SIZE and s < num_nodes_real:
-                target_sizes.append(s)
-        if MIN_MIXED_SIZE <= num_nodes_real <= MAX_MIXED_SIZE:
-            target_sizes.append(num_nodes_real)
+    # Which frames to use: single frame (default) or random sample / all
+    if args.use_single_frame:
+        frame_idx = min(args.frame, len(dataset) - 1)
+        frame_indices = [frame_idx]
+        print(f"  [startup] Using single frame index {frame_idx} (--use_single_frame True, --frame {args.frame})")
     else:
-        target_sizes = [num_nodes_real if args.view_size == 0 else max(LEAF_SIZE * 2, args.view_size)]
-
-    # 2. Pre-extract and cache all sub-graphs to completely bypass CPU/slicing overhead during training
-    training_contexts = []
-    seen_pads = set()
-    
-    for n in target_sizes:
-        n_pad = next_valid_size(n, LEAF_SIZE)
-        if n_pad in seen_pads: 
-            continue
-        seen_pads.add(n_pad)
-        
-        x_full = batch['x']
-        x_input = x_full[:n].unsqueeze(0).to(device)
-        if n_pad > n:
-            x_input = F.pad(x_input, (0, 0, 0, n_pad - n), value=0.0)
-            
-        rows, cols = batch['edge_index'][0], batch['edge_index'][1]
-        mask = (rows < n) & (cols < n)
-        edge_index = batch['edge_index'][:, mask].to(device)
-        edge_values = batch['edge_values'][mask].to(device)
-        
-        scale_A = batch.get('scale_A')
-        if scale_A is not None and not isinstance(scale_A, torch.Tensor):
-            scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
-            
-        A_indices = batch['edge_index'][:, mask]
-        A_vals = batch['edge_values'][mask]
-        A_sparse = torch.sparse_coo_tensor(A_indices, A_vals, (n, n)).coalesce()
-        
-        if device.type == 'mps':
-            A_small = A_sparse.to_dense().to(device)
+        rng = random.Random(args.seed)
+        if args.num_frames <= 0:
+            frame_indices = list(range(len(dataset)))
+            print(f"  [startup] Using all {len(frame_indices)} frames (--num_frames 0)")
         else:
-            A_small = A_sparse.to(device).to_dense()
-            
-        A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
-        A_dense[:n, :n] = A_small
-        A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
-        
-        dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
-        precomputed_masks = get_or_compute_masks(
-            batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE
-        )
-        
-        batch_vectors = max(128, int(round(n_pad ** 0.5)))
-        
-        training_contexts.append({
-            'n_pad': n_pad, 'n_orig': n, 'num_leaves': n_pad // LEAF_SIZE,
-            'x_input': x_input, 'edge_index': edge_index, 'edge_values': edge_values,
-            'scale_A': scale_A, 'A_dense': A_dense, 'precomputed_masks': precomputed_masks,
-            'batch_vectors': batch_vectors
-        })
-        print(f"    Cached context: n={n} padded to {n_pad} ({n_pad // LEAF_SIZE} leaves)")
+            n_sample = min(args.num_frames, len(dataset))
+            frame_indices = sorted(rng.sample(range(len(dataset)), n_sample))
+            print(f"  [startup] Random sample of {n_sample} frames (--num_frames {args.num_frames})")
+
+    MIN_MIXED_SIZE = 256
+    MAX_MIXED_SIZE = 256
+    base_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
+
+    # Pre-extract and cache sub-graphs from every frame (sizes unchanged)
+    training_contexts = []
+    for frame_idx in frame_indices:
+        batch = dataset[frame_idx]
+        num_nodes_real = int(batch['num_nodes'])
+
+        if args.mixed_sizes:
+            target_sizes = []
+            for s in base_sizes:
+                if MIN_MIXED_SIZE <= s <= MAX_MIXED_SIZE and s <= num_nodes_real:
+                    target_sizes.append(s)
+            if MIN_MIXED_SIZE <= num_nodes_real <= MAX_MIXED_SIZE:
+                target_sizes.append(num_nodes_real)
+            target_sizes = sorted(set(target_sizes))
+        else:
+            target_sizes = [num_nodes_real if args.view_size == 0 else max(LEAF_SIZE * 2, args.view_size)]
+            if target_sizes[0] > num_nodes_real:
+                continue
+
+        for n in target_sizes:
+            if n > num_nodes_real:
+                continue
+            n_pad = next_valid_size(n, LEAF_SIZE)
+
+            x_full = batch['x']
+            x_input = x_full[:n].unsqueeze(0).to(device)
+            if n_pad > n:
+                x_input = F.pad(x_input, (0, 0, 0, n_pad - n), value=0.0)
+
+            rows, cols = batch['edge_index'][0], batch['edge_index'][1]
+            mask = (rows < n) & (cols < n)
+            edge_index = batch['edge_index'][:, mask].to(device)
+            edge_values = batch['edge_values'][mask].to(device)
+
+            scale_A = batch.get('scale_A')
+            if scale_A is not None and not isinstance(scale_A, torch.Tensor):
+                scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
+
+            A_indices = batch['edge_index'][:, mask]
+            A_vals = batch['edge_values'][mask]
+            A_sparse = torch.sparse_coo_tensor(A_indices, A_vals, (n, n)).coalesce()
+
+            if device.type == 'mps':
+                A_small = A_sparse.to_dense().to(device)
+            else:
+                A_small = A_sparse.to(device).to_dense()
+
+            A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
+            A_dense[:n, :n] = A_small
+            A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
+
+            dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
+            precomputed_masks = get_or_compute_masks(
+                batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE
+            )
+
+            batch_vectors = max(128, int(round(n_pad ** 0.5)))
+
+            training_contexts.append({
+                'n_pad': n_pad, 'n_orig': n, 'num_leaves': n_pad // LEAF_SIZE,
+                'x_input': x_input, 'edge_index': edge_index, 'edge_values': edge_values,
+                'scale_A': scale_A, 'A_dense': A_dense, 'precomputed_masks': precomputed_masks,
+                'batch_vectors': batch_vectors
+            })
+
+    if len(training_contexts) == 0:
+        raise SystemExit("No valid (frame, size) pairs: ensure frames have at least MIN_MIXED_SIZE nodes.")
+    print(f"  [startup] Cached {len(training_contexts)} training contexts")
 
     torch.manual_seed(args.seed)
     
