@@ -1001,8 +1001,8 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all). Default: True.')
-    parser.add_argument('--num_frames', type=int, default=10, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
+    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all). Default: True.')
+    parser.add_argument('--num_frames', type=int, default=100, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
@@ -1010,6 +1010,7 @@ def train_leaf_only():
     parser.add_argument('--use_gcn', type=bool, default=True, help='When True, run SparsePhysicsGCN before transformer blocks (graph message passing). When False, raw inputs pass through lift only.')
     parser.add_argument('--print_timing', type=bool, default=True, help='On step 200, print detailed timing of each training substep')
     parser.add_argument('--mixed_sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance.')
+    parser.add_argument('--continue_training', action='store_true', help='Load initial weights from the saved .bytes file (--save) and continue training from that state.')
     args = parser.parse_args()
     use_global_node = args.use_global_node
     use_gcn = args.use_gcn
@@ -1136,7 +1137,15 @@ def train_leaf_only():
             # NOTE: torch.compile will re-compile the kernel the first time it sees each unique graph size.
             # Expect the first ~5 steps to be slow as it compiles the discrete sizes, then it will fly.
             model = torch.compile(model, dynamic=True)
-        
+
+    if args.continue_training:
+        save_path = Path(args.save)
+        if save_path.exists():
+            load_leaf_only_weights(model, args.save)
+            print(f"  [startup] continue_training: Loaded initial state from {args.save}")
+        else:
+            raise SystemExit(f"--continue_training given but save file not found: {args.save}")
+
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     print_hodlr_structure(max_n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
     
