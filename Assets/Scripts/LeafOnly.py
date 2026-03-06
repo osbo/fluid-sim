@@ -228,7 +228,7 @@ class LeafBlockAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
-        self.edge_gate = nn.Linear(1, self.num_heads)
+        self.edge_gate = nn.Linear(4, self.num_heads)  # dx, dy, dz, w
         nn.init.normal_(self.edge_gate.weight, std=0.01)
         nn.init.zeros_(self.edge_gate.bias)
         self.last_attn_self = 0.0
@@ -279,11 +279,13 @@ class LeafBlockAttention(nn.Module):
 
         scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
 
-        w = edge_feats[..., 3].clone()
-        w[:, :, self.block_size] = 1.0
-        w[:, torch.arange(self.block_size, device=device), torch.arange(self.block_size, device=device)] = 1.0
-        bias_physics = w
-        scores = scores + bias_physics.unsqueeze(0).unsqueeze(-1)
+        bias_physics = edge_feats[..., :4].clone()
+        bias_physics[:, :, self.block_size, :] = 0.0
+        bias_physics[:, :, self.block_size, 3] = 1.0
+        arange = torch.arange(self.block_size, device=device)
+        bias_physics[:, arange, arange, :] = 0.0
+        bias_physics[:, arange, arange, 3] = 1.0
+        scores = scores + bias_physics[..., 3:4].unsqueeze(0)
         mask_expanded = attn_mask.unsqueeze(0).unsqueeze(-1)
         scores = scores.masked_fill(mask_expanded == 0, float('-inf'))
 
@@ -294,7 +296,7 @@ class LeafBlockAttention(nn.Module):
 
         attn_probs = F.softmax(scores, dim=3)
 
-        linear_edge_weights = self.edge_gate(bias_physics.unsqueeze(-1))
+        linear_edge_weights = self.edge_gate(bias_physics)
         linear_edge_weights = linear_edge_weights.unsqueeze(0).masked_fill(mask_expanded == 0, 0.0)
 
         combined_weights = attn_probs + linear_edge_weights
@@ -326,10 +328,11 @@ class LeafBlockAttention(nn.Module):
         k = qkv[..., C:2*C].view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
         v = qkv[..., 2*C:3*C].view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
         scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
-        w = edge_feats[..., 3].clone()
-        w[:, torch.arange(self.block_size, device=device), torch.arange(self.block_size, device=device)] = 1.0
-        bias_physics = w
-        scores = scores + bias_physics.unsqueeze(0).unsqueeze(-1)
+        bias_physics = edge_feats[..., :4].clone()
+        arange = torch.arange(self.block_size, device=device)
+        bias_physics[:, arange, arange, :] = 0.0
+        bias_physics[:, arange, arange, 3] = 1.0
+        scores = scores + bias_physics[..., 3:4].unsqueeze(0)
         mask_expanded = attn_mask.unsqueeze(0).unsqueeze(-1)
         scores = scores.masked_fill(mask_expanded == 0, float('-inf'))
         if save_attention:
@@ -337,7 +340,7 @@ class LeafBlockAttention(nn.Module):
                 self.last_scores_matrix = scores.mean(dim=-1).cpu().float()
                 self.last_bias_physics_matrix = bias_physics.cpu().float()
         attn_probs = F.softmax(scores, dim=3)
-        linear_edge_weights = self.edge_gate(bias_physics.unsqueeze(-1)).unsqueeze(0).masked_fill(mask_expanded == 0, 0.0)
+        linear_edge_weights = self.edge_gate(bias_physics).unsqueeze(0).masked_fill(mask_expanded == 0, 0.0)
         combined_weights = attn_probs + linear_edge_weights
         if not torch.compiler.is_compiling():
             with torch.no_grad():
@@ -366,9 +369,14 @@ class LeafBlockAttention(nn.Module):
         k = k.view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
         v = v.view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
         scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
-        scores = scores + physics_bias.unsqueeze(0).unsqueeze(-1)
+        physics_bias_4d = torch.zeros(num_blocks, self.block_size, self.block_size, 4, device=device, dtype=dtype)
+        physics_bias_4d[..., 3] = physics_bias
+        arange = torch.arange(self.block_size, device=device)
+        physics_bias_4d[:, arange, arange, :] = 0.0
+        physics_bias_4d[:, arange, arange, 3] = 1.0
+        scores = scores + physics_bias_4d[..., 3:4].unsqueeze(0)
         attn_probs = F.softmax(scores, dim=3)
-        linear_edge_weights = self.edge_gate(physics_bias.unsqueeze(-1)).unsqueeze(0)
+        linear_edge_weights = self.edge_gate(physics_bias_4d).unsqueeze(0)
         combined_weights = attn_probs + linear_edge_weights
         if not torch.compiler.is_compiling():
             with torch.no_grad():
@@ -596,9 +604,10 @@ class UniversalOffDiagBlock(nn.Module):
         self.n_super = OFF_DIAG_SUPER
         self.max_rank = max_rank
 
-        self.attn_q = nn.Linear(d_model + 1, d_model)
-        self.attn_k = nn.Linear(d_model + 1, d_model)
-        self.attn_v = nn.Linear(d_model + 1, d_model)
+        # d_model + 1 (scale) + 3 (dx) + 1 (dist) = d_model + 5
+        self.attn_q = nn.Linear(d_model + 5, d_model)
+        self.attn_k = nn.Linear(d_model + 5, d_model)
+        self.attn_v = nn.Linear(d_model + 5, d_model)
         
         self.W_U = nn.Parameter(torch.randn(max_rank, 2 * d_model))
         self.b_U = nn.Parameter(torch.zeros(max_rank))
@@ -613,20 +622,26 @@ class UniversalOffDiagBlock(nn.Module):
         nn.init.normal_(self.W_V, std=0.01)
         self._scale_attn = d_model ** -0.5
 
-    def forward(self, h_row, h_col, mask, scale, rank):
+    def forward(self, h_row, h_col, pos_row, pos_col, mask, scale, rank):
         B = h_row.shape[0]
         side = h_row.shape[1]
         g = side // self.n_super
-        
+
         down_row = h_row.view(B, self.n_super, g, -1).mean(dim=2)
         down_col = h_col.view(B, self.n_super, g, -1).mean(dim=2)
-        
+
+        # Downsample positions (average physical location of the block)
+        down_pos_row = pos_row.view(B, self.n_super, g, -1).mean(dim=2)
+        down_pos_col = pos_col.view(B, self.n_super, g, -1).mean(dim=2)
+        delta_x = down_pos_col - down_pos_row
+        dist = torch.norm(delta_x, dim=-1, keepdim=True).clamp(min=1e-8)
+
         scale_val = math.log2(max(1.0, side / float(self.n_super)))
         scale_tensor = torch.full((B, self.n_super, 1), scale_val, device=h_row.device, dtype=h_row.dtype)
-        
-        down_row_cond = torch.cat([down_row, scale_tensor], dim=-1)
-        down_col_cond = torch.cat([down_col, scale_tensor], dim=-1)
-        
+
+        down_row_cond = torch.cat([down_row, scale_tensor, delta_x, dist], dim=-1)
+        down_col_cond = torch.cat([down_col, scale_tensor, -delta_x, dist], dim=-1)
+
         Q = self.attn_q(down_row_cond)
         K = self.attn_k(down_col_cond)
         V = self.attn_v(down_col_cond)
@@ -665,8 +680,12 @@ class LeafOnlyNet(nn.Module):
         self.leaf_size = leaf_size
         self.rank_base = rank_base
         self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn)
-        self.log_off_diag_scale = nn.Parameter(torch.ones(1) * math.log(1e-2))
-        
+        # level_scale_params = [log(base_scale), log(decay_rate)]
+        # Physics prior: base scale ~1e-2, decays by ~0.5x each level down the tree
+        self.level_scale_params = nn.Parameter(
+            torch.tensor([math.log(1e-2), math.log(0.5)])
+        )
+
         self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=512)
         self.off_diag_struct = []
 
@@ -690,9 +709,8 @@ class LeafOnlyNet(nn.Module):
     def log_hodlr_scale_leaf(self):
         return self.core.log_hodlr_scale_leaf
 
-    def _off_diag(self, h, edge_index, current_struct, precomputed_masks=None):
+    def _off_diag(self, h, x, edge_index, current_struct, precomputed_masks=None):
         B, N, C = h.shape
-        scale = torch.exp(self.log_off_diag_scale)
         if precomputed_masks is not None:
             mask_list = precomputed_masks
         else:
@@ -712,7 +730,19 @@ class LeafOnlyNet(nn.Module):
         for idx, spec in enumerate(current_struct):
             rs, re = spec["row_start"], spec["row_end"]
             cs, ce = spec["col_start"], spec["col_end"]
-            U, V = self.universal_off_diag(h[:, rs:re], h[:, cs:ce], mask_list[idx], scale, rank=spec["rank"])
+
+            # Evaluate continuous scale function: log_scale = p[0] + (L - 1) * p[1]
+            L = torch.tensor(spec["level"], dtype=h.dtype, device=h.device)
+            log_scale = self.level_scale_params[0] + (L - 1.0) * self.level_scale_params[1]
+            scale = torch.exp(log_scale)
+
+            pos_row = x[:, rs:re, :3]
+            pos_col = x[:, cs:ce, :3]
+
+            U, V = self.universal_off_diag(
+                h[:, rs:re], h[:, cs:ce], pos_row, pos_col,
+                mask_list[idx], scale, rank=spec["rank"]
+            )
             result.append((U, V))
         return result
 
@@ -727,7 +757,7 @@ class LeafOnlyNet(nn.Module):
         diag_blocks = self.core.get_leaf_blocks(h, x, scale_A)
 
         if current_struct:
-            off_diag_list = self._off_diag(h, edge_index, current_struct, precomputed_masks=precomputed_masks)
+            off_diag_list = self._off_diag(h, x, edge_index, current_struct, precomputed_masks=precomputed_masks)
             return (diag_blocks, off_diag_list)
         return (diag_blocks, [])
 
@@ -837,7 +867,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, blk.b_U.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.W_V.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.b_V.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, torch.exp(model.log_off_diag_scale).detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, model.level_scale_params.detach().cpu().float(), transpose=False)
 
 def _write_packed_tensor(f, param, transpose=False):
     import numpy as np
@@ -948,9 +978,9 @@ def load_leaf_only_weights(model, path):
                 _read_into(f, blk.W_V, read_tensor, transpose=True)
                 _read_into(f, blk.b_V, read_tensor, transpose=False)
                 
-                scale_off = read_tensor(f, (1,), transpose=False).to(model.log_off_diag_scale.device)
+                scale_params = read_tensor(f, (2,), transpose=False).to(model.level_scale_params.device)
                 with torch.no_grad():
-                    model.log_off_diag_scale.copy_(torch.log(scale_off.clamp(min=1e-12)))
+                    model.level_scale_params.copy_(scale_params)
             elif sentinel == 0xFFFFFFFF or sentinel == 0xFFFFFFFD:
                 raise ValueError("Attempted to load an older discrete/hypernetwork checkpoint into Matryoshka version. Clear checkpoint file.")
 
@@ -1001,7 +1031,7 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all). Default: True.')
+    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all). Default: True.')
     parser.add_argument('--num_frames', type=int, default=100, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
@@ -1079,6 +1109,10 @@ def train_leaf_only():
             x_input = x_full[:n].unsqueeze(0).to(device)
             if n_pad > n:
                 x_input = F.pad(x_input, (0, 0, 0, n_pad - n), value=0.0)
+            # Mean-center the active nodes (ignoring padded zeros)
+            active_pos = x_input[0, :n, :3]
+            centroid = active_pos.mean(dim=0, keepdim=True)
+            x_input[0, :n, :3] = active_pos - centroid
 
             rows, cols = batch['edge_index'][0], batch['edge_index'][1]
             mask = (rows < n) & (cols < n)
