@@ -12,6 +12,7 @@ import math
 import argparse
 import struct
 import random
+from collections import deque
 from pathlib import Path
 import time
 
@@ -162,6 +163,8 @@ class PhysicsAwareEmbedding(nn.Module):
         return self.norm(h)
 
 # --- Leaf block connectivity and attention ---
+# Masked attention within each leaf block: 1 = self + 1-hop only; 2 = up to 2-hop; etc.
+ATTENTION_HOPS = 1
 
 def build_leaf_block_physics_bias(edge_index, edge_values, scale_A, leaf_size, device, dtype=torch.float32, num_nodes=None):
     rows, cols = edge_index[0], edge_index[1]
@@ -187,7 +190,7 @@ def build_leaf_block_physics_bias(edge_index, edge_values, scale_A, leaf_size, d
     bias[b_l, r_l, c_l] = w
     return bias
 
-def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, leaf_size, device, dtype=torch.float32):
+def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS):
     N = positions.shape[0]
     num_blocks = N // leaf_size
     if num_blocks == 0:
@@ -207,13 +210,23 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, l
         w = w / s
     edge_feats_flat = torch.cat([dx, w.unsqueeze(1)], dim=1)
 
+    # Batched adjacency (num_blocks, leaf_size, leaf_size) from in-block edges
+    adj = torch.zeros(num_blocks, leaf_size, leaf_size, device=device, dtype=dtype)
+    if b_l.numel() > 0:
+        adj[b_l, r_l, c_l] = 1.0
+    # n-hop mask = I + A + A^2 + ... + A^num_hops (powers of adjacency within leaf)
+    reachable = torch.eye(leaf_size, device=device, dtype=dtype).unsqueeze(0).expand(num_blocks, -1, -1).clone()
+    cur = adj.clone()
+    for _ in range(num_hops):
+        reachable = (reachable + cur).clamp(0.0, 1.0)
+        cur = torch.bmm(cur, adj)
     attn_mask = torch.zeros(num_blocks, leaf_size, leaf_size + 1, device=device, dtype=dtype)
-    edge_feats = torch.zeros(num_blocks, leaf_size, leaf_size + 1, 4, device=device, dtype=dtype)
-    attn_mask[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device)] = 1.0
-    edge_feats[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device), :] = 0.0
+    attn_mask[:, :, :leaf_size] = reachable
     attn_mask[:, :, leaf_size] = 1.0
-    attn_mask[b_l, r_l, c_l] = 1.0
-    edge_feats[b_l, r_l, c_l, :] = edge_feats_flat.to(device)
+    edge_feats = torch.zeros(num_blocks, leaf_size, leaf_size + 1, 4, device=device, dtype=dtype)
+    edge_feats[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device), :] = 0.0
+    if b_l.numel() > 0:
+        edge_feats[b_l, r_l, c_l, :] = edge_feats_flat.to(device)
     return attn_mask, edge_feats
 
 class LeafBlockAttention(nn.Module):
@@ -550,6 +563,7 @@ class LeafCore(nn.Module):
         nn.init.normal_(self.leaf_head.weight, std=0.01)
         nn.init.constant_(self.leaf_head.bias, 0.0)
         self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
+        self.log_jacobi_scale_leaf = nn.Parameter(torch.ones(1) * math.log(0.64))  # scale for Jacobi diagonal; 0.64 default
 
     def get_leaf_blocks(self, h, x, scale_A=None):
         B, N, _ = h.shape
@@ -570,9 +584,10 @@ class LeafCore(nn.Module):
         jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
         mask_blocks = mask.view(B, num_leaves, self.leaf_size)
         new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
-        return leaf_base + torch.diag_embed(new_diag)
+        jacobi_scale = torch.exp(self.log_jacobi_scale_leaf)
+        return leaf_base + torch.diag_embed(new_diag * jacobi_scale)
 
-    def forward_features(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False):
+    def forward_features(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_leaf_connectivity=None):
         B, N, _ = x.shape
         positions = x[0, :, :3] if x.dim() == 3 else x[:, :3]
         h = self.embed(x, edge_index, edge_values, scale_A)
@@ -581,9 +596,12 @@ class LeafCore(nn.Module):
         if edge_index is not None and edge_values is not None:
             device, dtype = x.device, x.dtype
             if self.mask_attention and positions is not None:
-                attn_mask, edge_feats = build_leaf_block_connectivity(
-                    edge_index, edge_values, positions, scale_A, self.leaf_size, device, dtype
-                )
+                if precomputed_leaf_connectivity is not None:
+                    attn_mask, edge_feats = precomputed_leaf_connectivity
+                else:
+                    attn_mask, edge_feats = build_leaf_block_connectivity(
+                        edge_index, edge_values, positions, scale_A, self.leaf_size, device, dtype, num_hops=ATTENTION_HOPS
+                    )
             else:
                 physics_bias = build_leaf_block_physics_bias(edge_index, edge_values, scale_A, self.leaf_size, device, dtype, num_nodes=x.shape[1])
         for i, block in enumerate(self.blocks):
@@ -671,9 +689,9 @@ class UniversalOffDiagBlock(nn.Module):
         U_raw = F.linear(features_U, W_U_sliced, b_U_sliced)
         V_raw = F.linear(features_V, W_V_sliced, b_V_sliced)
         
-        # 1. Counteract rank inflation (Scaled Dot-Product style)
+        # Counteract rank inflation (Scaled Dot-Product style)
         rank_scale = math.sqrt(safe_rank)
-        # 2. Combine with the learned physical scale; split evenly across U and V
+        # Combine with the learned physical scale, split evenly across U and V
         unified_scalar = torch.sqrt(scale / rank_scale)
         return U_raw * unified_scalar, V_raw * unified_scalar
 
@@ -749,14 +767,14 @@ class LeafOnlyNet(nn.Module):
             result.append((U, V))
         return result
 
-    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_masks=None):
+    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_masks=None, precomputed_leaf_connectivity=None):
         B, N, _ = x.shape
         assert N % self.leaf_size == 0, f"LeafOnly expects N divisible by leaf_size {self.leaf_size}, got {N}"
 
         current_struct = build_hodlr_off_diag_structure(N, self.leaf_size, self.rank_base)
         self.off_diag_struct = current_struct
 
-        h = self.core.forward_features(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention)
+        h = self.core.forward_features(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention, precomputed_leaf_connectivity=precomputed_leaf_connectivity)
         diag_blocks = self.core.get_leaf_blocks(h, x, scale_A)
 
         if current_struct:
@@ -855,6 +873,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.leaf_head.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.leaf_head.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, torch.exp(model.log_hodlr_scale_leaf).detach().cpu().float(), transpose=False)
+        _write_packed_tensor(f, torch.exp(model.core.log_jacobi_scale_leaf).detach().cpu().float(), transpose=False)
         
         if getattr(model, 'universal_off_diag', None) is not None:
             f.write(struct.pack('<II', 0xFFFFFFFC, 0)) 
@@ -963,6 +982,9 @@ def load_leaf_only_weights(model, path):
         scale = read_tensor(f, (1,), transpose=False).to(model.log_hodlr_scale_leaf.device)
         with torch.no_grad():
             model.log_hodlr_scale_leaf.copy_(torch.log(scale.clamp(min=1e-12)))
+        jacobi_scale = read_tensor(f, (1,), transpose=False).to(model.core.log_jacobi_scale_leaf.device)
+        with torch.no_grad():
+            model.core.log_jacobi_scale_leaf.copy_(torch.log(jacobi_scale.clamp(min=1e-12)))
         
         extra = f.read(8)
         if len(extra) == 8:
@@ -1143,6 +1165,11 @@ def train_leaf_only():
             precomputed_masks = get_or_compute_masks(
                 batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE
             )
+            positions_ctx = x_input[0, :n, :3]
+            leaf_attn_mask, leaf_edge_feats = build_leaf_block_connectivity(
+                edge_index, edge_values, positions_ctx, scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
+            )
+            precomputed_leaf_connectivity = (leaf_attn_mask, leaf_edge_feats)
 
             batch_vectors = max(128, int(round(n_pad ** 0.5)))
 
@@ -1150,6 +1177,7 @@ def train_leaf_only():
                 'n_pad': n_pad, 'n_orig': n, 'num_leaves': n_pad // LEAF_SIZE,
                 'x_input': x_input, 'edge_index': edge_index, 'edge_values': edge_values,
                 'scale_A': scale_A, 'A_dense': A_dense, 'precomputed_masks': precomputed_masks,
+                'precomputed_leaf_connectivity': precomputed_leaf_connectivity,
                 'batch_vectors': batch_vectors
             })
 
@@ -1188,6 +1216,7 @@ def train_leaf_only():
     
     model.train()
     print_interval = 100
+    loss_history = deque(maxlen=print_interval)
     t_start = time.perf_counter()
     t_start_train = t_start
     t_start_avg = None
@@ -1208,6 +1237,7 @@ def train_leaf_only():
         scale_A = ctx['scale_A']
         A_dense = ctx['A_dense']
         pre_masks = ctx['precomputed_masks']
+        pre_leaf = ctx['precomputed_leaf_connectivity']
         n_pad = ctx['n_pad']
         n_orig = ctx['n_orig']
         batch_vectors = ctx['batch_vectors']
@@ -1225,7 +1255,7 @@ def train_leaf_only():
 
         diag_blocks, off_diag_list = model(
             x_input, edge_index=edge_index, edge_values=edge_values,
-            scale_A=scale_A, precomputed_masks=pre_masks
+            scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf
         )
         if do_timing:
             _sync()
@@ -1259,6 +1289,7 @@ def train_leaf_only():
             
         residual = MAZ - Z
         loss = (residual ** 2).mean()
+        loss_history.append(loss.item())
         if do_timing:
             _sync()
             t_loss = time.perf_counter() - t0
@@ -1294,7 +1325,7 @@ def train_leaf_only():
                 attn = [p for n, p in all_names if 'blocks' in n]
                 leaf = [p for n, p in all_names if 'leaf_head' in n and 'leaf_scale' not in n]
                 off = [p for n, p in all_names if 'universal_off_diag' in n]
-                scale = [p for n, p in all_names if 'log_hodlr_scale_leaf' in n or 'level_scale_params' in n]
+                scale = [p for n, p in all_names if 'log_hodlr_scale_leaf' in n or 'log_jacobi_scale_leaf' in n or 'level_scale_params' in n]
                 return gcn, attn, leaf, off, scale
             _gcn, _attn, _leaf, _off, _scale = _get_param_lists()
             log_gcn = _grad_norm(_gcn)
@@ -1304,6 +1335,7 @@ def train_leaf_only():
             log_scale = _grad_norm(_scale)
             log_tot = _grad_norm(list(model.parameters()))
             s_leaf = torch.exp(model.core.log_hodlr_scale_leaf).item()
+            s_jacobi = torch.exp(model.core.log_jacobi_scale_leaf).item()
             l0, l1 = model.level_scale_params.detach().cpu().tolist()
             ng, hg, nzg, mg = _grad_stats(_gcn)
             na, ha, nza, ma = _grad_stats(_attn)
@@ -1341,9 +1373,16 @@ def train_leaf_only():
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t_start
             steps_in_period = step + 1 if step == 0 else print_interval
-            extra = f" gGCN={log_gcn:.2e} gAttn={log_attn:.2e} gLeaf={log_leaf:.2e} gOff={log_off:.2e} gScl={log_scale:.2e} gTot={log_tot:.2e} sLeaf={s_leaf:.3e} lvl=({l0:.2f},{l1:.2f})"
+            extra = f" gGCN={log_gcn:.2e} gAttn={log_attn:.2e} gLeaf={log_leaf:.2e} gOff={log_off:.2e} gScl={log_scale:.2e} gTot={log_tot:.2e} sLeaf={s_leaf:.3e} sJ={s_jacobi:.3f} lvl=({l0:.2f},{l1:.2f})"
             nz_str = f" nzG={nzg}/{ng} nzA={nza}/{na} nzL={nzl}/{nl} nzO={nzo}/{no} nzS={nzsc}/{nsc}"
             max_str = f" mxG={mg:.1e} mxA={ma:.1e} mxL={ml:.1e} mxO={mo:.1e} mxS={msc:.1e}"
+            n = len(loss_history)
+            if n > 0:
+                arr = np.array(loss_history)
+                loss_avg, loss_std = float(arr.mean()), float(arr.std())
+                loss_str = f"Loss avg={loss_avg:.4f} ± {loss_std:.4f}"
+            else:
+                loss_str = f"Loss {loss.item():.6f}"
             if step >= 200:
                 now = time.perf_counter()
                 if step == 200:
@@ -1351,10 +1390,10 @@ def train_leaf_only():
                     avg_per_100 = elapsed
                 else:
                     avg_per_100 = (now - t_start_avg) * 100 / (step - 200)
-                print(f"{step:05d}: Loss {loss.item():.6f}  ({elapsed:.3f}s, avg: {avg_per_100:.3f}s){extra}")
+                print(f"{step:05d}: {loss_str}  ({elapsed:.3f}s, avg: {avg_per_100:.3f}s){extra}")
                 print(f"       rOff={_ratio_off:.3f}{nz_str}{max_str}")
             else:
-                print(f"{step:05d}: Loss {loss.item():.6f}  ({elapsed:.3f}s){extra}")
+                print(f"{step:05d}: {loss_str}  ({elapsed:.3f}s){extra}")
                 print(f"       rOff={_ratio_off:.3f}{nz_str}{max_str}")
             
             if step > 0 and step % (print_interval * 10) == 0:
