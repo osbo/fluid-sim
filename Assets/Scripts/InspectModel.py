@@ -702,18 +702,28 @@ def main():
     if PLOT_MATRICES:
         M_neural_n = M_gpu.cpu().numpy()
         methods = [("LeafOnly", M_neural_n), ("AMG", M_amg_n)]
-        n_cols = 4
+        n_cols = 5
         n_rows = 1 + len(methods)
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows), constrained_layout=True)
+
+        # Shared color scale for A^{-1}, LeafOnly M, and AMG M (log10 magnitude)
+        log_ainv = np.log10(np.abs(A_inv_viz) + 1e-9)
+        log_m_leaf = np.log10(np.abs(M_neural_n) + 1e-9)
+        log_m_amg = np.log10(np.abs(M_amg_n) + 1e-9)
+        vmin_log = min(log_ainv.min(), log_m_leaf.min(), log_m_amg.min())
+        vmax_log = max(log_ainv.max(), log_m_leaf.max(), log_m_amg.max())
+
         # Row 0: A, A^{-1}
         axes[0, 0].imshow(np.log10(np.abs(A_viz_n) + 1e-9), cmap='magma', aspect='auto')
         axes[0, 0].set_title(f"A (input) log10 [leaf {LEAF_SIZE}x{LEAF_SIZE}]")
         plt.colorbar(axes[0, 0].images[0], ax=axes[0, 0])
-        axes[0, 1].imshow(np.log10(np.abs(A_inv_viz) + 1e-9), cmap='magma', aspect='auto')
+        im_ainv = axes[0, 1].imshow(log_ainv, cmap='magma', aspect='auto', vmin=vmin_log, vmax=vmax_log)
         axes[0, 1].set_title(f"A^{{-1}} (viz {viz_n}x{viz_n}) log10")
-        plt.colorbar(axes[0, 1].images[0], ax=axes[0, 1])
-        # Row 0, col 2: eigenvalues of unpreconditioned A
-        ax_a = axes[0, 2]
+        plt.colorbar(im_ainv, ax=axes[0, 1])
+        # Row 0, col 2: empty (no A·M for unpreconditioned)
+        axes[0, 2].axis('off')
+        # Row 0, col 3: eigenvalues of unpreconditioned A (align with method rows)
+        ax_a = axes[0, 3]
         try:
             evals_A = np.linalg.eigvals(A_viz_n)
             ax_a.scatter(evals_A.real, evals_A.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
@@ -730,26 +740,32 @@ def main():
         except Exception as e:
             ax_a.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_a.transAxes, ha='center', va='center', fontsize=9)
             ax_a.set_title("Eigenvalues of A (failed)")
-        # Row 0, col 3: condition number and Frobenius (unpreconditioned: no M, so no Frobenius err of I-AM)
-        ax_a_t = axes[0, 3]
+        # Row 0, col 4: condition number (align with method rows text)
+        ax_a_t = axes[0, 4]
         ax_a_t.axis('off')
         ax_a_t.text(0.1, 0.8, "Unpreconditioned A", fontsize=12, fontfamily='monospace')
         ax_a_t.text(0.1, 0.65, f"Cond(A): {cond_A:.2e}", fontsize=12, fontfamily='monospace')
 
         for idx, (name, M) in enumerate(methods):
             row = 1 + idx
-            axes[row, 0].imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto')
+            im_m = axes[row, 0].imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto', vmin=vmin_log, vmax=vmax_log)
             axes[row, 0].set_title(f"{name} M (log10)")
-            plt.colorbar(axes[row, 0].images[0], ax=axes[row, 0])
+            plt.colorbar(im_m, ax=axes[row, 0])
+            # |M - A^{-1}| (absolute error), log10 to show detail
+            abs_err = np.abs(M - A_inv_viz)
+            log_err = np.log10(abs_err + 1e-12)
+            im_diff = axes[row, 1].imshow(log_err, cmap='magma', aspect='auto')
+            axes[row, 1].set_title(f"{name} |M − A^{{-1}}| (log10)")
+            plt.colorbar(im_diff, ax=axes[row, 1])
             AM = A_viz_n @ M
             am_min, am_max = np.percentile(AM, [2, 98])
             if am_max - am_min < 1e-8:
                 am_min, am_max = 0.0, 1.0
-            axes[row, 1].imshow(AM, cmap='RdBu_r', vmin=am_min, vmax=am_max, aspect='auto')
-            axes[row, 1].set_title(f"{name} A·M")
-            plt.colorbar(axes[row, 1].images[0], ax=axes[row, 1])
+            axes[row, 2].imshow(AM, cmap='RdBu_r', vmin=am_min, vmax=am_max, aspect='auto')
+            axes[row, 2].set_title(f"{name} A·M")
+            plt.colorbar(axes[row, 2].images[0], ax=axes[row, 2])
 
-            ax_d = axes[row, 2]
+            ax_d = axes[row, 3]
             try:
                 evals = np.linalg.eigvals(AM)
                 ax_d.scatter(evals.real, evals.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
@@ -768,7 +784,7 @@ def main():
                 ax_d.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_d.transAxes, ha='center', va='center', fontsize=9)
                 ax_d.set_title(f"{name} Eigenvalues (failed)")
 
-            ax_t = axes[row, 3]
+            ax_t = axes[row, 4]
             ax_t.axis('off')
             cond_AM = np.linalg.cond(AM)
             err_fro = np.linalg.norm(AM - np.eye(viz_n)) / np.linalg.norm(np.eye(viz_n))
