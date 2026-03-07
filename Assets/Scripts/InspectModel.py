@@ -40,6 +40,70 @@ from LeafOnly import (
 )
 
 
+def print_hodlr_m_stats(diag_blocks, off_diag_list, off_diag_struct, model_leaf=None):
+    """Print per-level statistics of the neural M (diag + off-diag by HODLR level) for normalized*scale analysis."""
+    import math
+    # --- Level 0: diagonal blocks ---
+    d = diag_blocks.detach()
+    if d.dim() == 3:
+        d = d.unsqueeze(0)
+    B, num_leaves, L, _ = d.shape
+    frobs = (d ** 2).sum(dim=(-2, -1)).sqrt()
+    flat = d.reshape(-1)
+    print("\n  [HODLR M stats] Level 0 (diagonal blocks)")
+    print(f"    shape {tuple(d.shape)}, leaf_size={L}")
+    print(f"    Frobenius per block: mean={frobs.mean().item():.6f} std={frobs.std().item():.6f} min={frobs.min().item():.6f} max={frobs.max().item():.6f}")
+    print(f"    elements: mean={flat.mean().item():.6e} std={flat.std().item():.6e} min={flat.min().item():.6e} max={flat.max().item():.6e}")
+
+    if not off_diag_list or not off_diag_struct:
+        return
+    by_level = {}
+    for idx, spec in enumerate(off_diag_struct):
+        L = spec["level"]
+        by_level.setdefault(L, []).append((idx, spec))
+
+    level_scale_params = getattr(model_leaf, "level_scale_params", None)
+    for level in sorted(by_level.keys()):
+        entries = by_level[level]
+        scales = []
+        u_frobs, v_frobs, block_frobs = [], [], []
+        block_means, block_stds, block_mins, block_maxs = [], [], [], []
+        for idx, spec in entries:
+            U = off_diag_list[idx][0]
+            V = off_diag_list[idx][1]
+            if isinstance(U, (list, tuple)):
+                U, V = U[0], V[0]
+            U = U.detach().float()
+            V = V.detach().float()
+            if U.dim() == 3:
+                U, V = U[0], V[0]
+            side, rank = U.shape[0], U.shape[1]
+            uv = U @ V.T
+            u_frobs.append(U.norm().item())
+            v_frobs.append(V.norm().item())
+            block_frobs.append(uv.norm().item())
+            flat_uv = uv.reshape(-1)
+            block_means.append(flat_uv.mean().item())
+            block_stds.append(flat_uv.std().item())
+            block_mins.append(flat_uv.min().item())
+            block_maxs.append(flat_uv.max().item())
+        scale_str = ""
+        if level_scale_params is not None:
+            p = level_scale_params.detach().cpu()
+            log_scale = (p[0] + (level - 1.0) * p[1]).item()
+            scale_val = math.exp(log_scale)
+            scale_str = f" scale(level)={scale_val:.6e} (log={log_scale:.4f})"
+        n_blk = len(entries)
+        rs, re = entries[0][1]["row_start"], entries[0][1]["row_end"]
+        side = re - rs
+        rk = entries[0][1]["rank"]
+        print(f"\n  [HODLR M stats] Level {level} (off-diag) n_blocks={n_blk} side={side} rank={rk}{scale_str}")
+        print(f"    U Frobenius: mean={np.mean(u_frobs):.6f} std={np.std(u_frobs):.6f}")
+        print(f"    V Frobenius: mean={np.mean(v_frobs):.6f} std={np.std(v_frobs):.6f}")
+        print(f"    UV^T block Frobenius: mean={np.mean(block_frobs):.6f} std={np.std(block_frobs):.6f}")
+        print(f"    UV^T elements: mean={np.mean(block_means):.6e} std={np.mean(block_stds):.6e} min={np.min(block_mins):.6e} max={np.max(block_maxs):.6e}")
+
+
 def _amg_solver(A_sparse_scipy):
     """Build AMG hierarchy only (setup). Returns solver or None if no pyamg."""
     if not HAS_AMG:
@@ -410,6 +474,7 @@ def main():
             M_neural_gpu[rs:re, cs:ce] = UVt
             M_neural_gpu[cs:ce, rs:re] = VUt
     print(f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} M")
+    print_hodlr_m_stats(diag_blocks, off_diag_list, getattr(model_leaf, "off_diag_struct", None), model_leaf)
 
     # AMG on the same n_pad x n_pad block (CPU)
     A_scipy = csr_matrix(A_viz.astype(np.float64))

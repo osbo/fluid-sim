@@ -668,10 +668,19 @@ class UniversalOffDiagBlock(nn.Module):
         W_V_sliced = self.W_V[:safe_rank, :]
         b_V_sliced = self.b_V[:safe_rank]
         
-        U = F.linear(features_U, W_U_sliced, b_U_sliced)
-        V = F.linear(features_V, W_V_sliced, b_V_sliced)
+        U_raw = F.linear(features_U, W_U_sliced, b_U_sliced)
+        V_raw = F.linear(features_V, W_V_sliced, b_V_sliced)
         
-        return U * scale, V * scale
+        U_dir = F.normalize(U_raw, p=2, dim=-1, eps=1e-8)
+        V_dir = F.normalize(V_raw, p=2, dim=-1, eps=1e-8)
+        
+        U_mag = torch.norm(U_raw, p=2, dim=-1, keepdim=True)
+        V_mag = torch.norm(V_raw, p=2, dim=-1, keepdim=True)
+        
+        unified_mag_U = U_mag * torch.sqrt(scale)
+        unified_mag_V = V_mag * torch.sqrt(scale)
+        
+        return U_dir * unified_mag_U, V_dir * unified_mag_V
 
 
 class LeafOnlyNet(nn.Module):
@@ -680,10 +689,9 @@ class LeafOnlyNet(nn.Module):
         self.leaf_size = leaf_size
         self.rank_base = rank_base
         self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn)
-        # level_scale_params = [log(base_scale), log(decay_rate)]
-        # Physics prior: base scale ~1e-2, decays by ~0.5x each level down the tree
+        # level_scale_params = [log(base_scale), decay_per_level]; init near observed settling
         self.level_scale_params = nn.Parameter(
-            torch.tensor([math.log(1e-2), math.log(0.5)])
+            torch.tensor([math.log(1e-2), -0.83])
         )
 
         self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=512)
@@ -1032,7 +1040,7 @@ def train_leaf_only():
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
     parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all). Default: True.')
-    parser.add_argument('--num_frames', type=int, default=100, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
+    parser.add_argument('--num_frames', type=int, default=30, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
@@ -1219,7 +1227,7 @@ def train_leaf_only():
             _sync()
             t_zero = time.perf_counter() - t0
             t0 = time.perf_counter()
-            
+
         diag_blocks, off_diag_list = model(
             x_input, edge_index=edge_index, edge_values=edge_values,
             scale_A=scale_A, precomputed_masks=pre_masks
@@ -1244,6 +1252,11 @@ def train_leaf_only():
             t0 = time.perf_counter()
             
         MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
+        if step % print_interval == 0:
+            MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE)
+            _norm_diag = MAZ_diag_only.norm().item()
+            _norm_off = (MAZ - MAZ_diag_only).norm().item()
+            _ratio_off = _norm_off / (_norm_diag + 1e-12)
         if do_timing:
             _sync()
             t_apply_m = time.perf_counter() - t0
@@ -1261,7 +1274,48 @@ def train_leaf_only():
             _sync()
             t_backward = time.perf_counter() - t0
             t0 = time.perf_counter()
-            
+
+        if step % print_interval == 0:
+            def _grad_norm(params):
+                t = 0.0
+                for p in params:
+                    if p.grad is not None:
+                        t += p.grad.data.pow(2).sum().item()
+                return t ** 0.5
+            def _grad_stats(params, thresh=1e-10):
+                n, has_grad, nz, mx = len(params), 0, 0, 0.0
+                for p in params:
+                    if p.grad is not None:
+                        has_grad += 1
+                        g = p.grad.data
+                        nrm = g.pow(2).sum().item() ** 0.5
+                        if nrm > thresh:
+                            nz += 1
+                        mx = max(mx, g.abs().max().item())
+                return n, has_grad, nz, mx
+            def _get_param_lists():
+                all_names = list(model.named_parameters())
+                gcn = [p for n, p in all_names if 'embed' in n and 'blocks' not in n and 'leaf_head' not in n]
+                attn = [p for n, p in all_names if 'blocks' in n]
+                leaf = [p for n, p in all_names if 'leaf_head' in n and 'leaf_scale' not in n]
+                off = [p for n, p in all_names if 'universal_off_diag' in n]
+                scale = [p for n, p in all_names if 'log_hodlr_scale_leaf' in n or 'level_scale_params' in n]
+                return gcn, attn, leaf, off, scale
+            _gcn, _attn, _leaf, _off, _scale = _get_param_lists()
+            log_gcn = _grad_norm(_gcn)
+            log_attn = _grad_norm(_attn)
+            log_leaf = _grad_norm(_leaf)
+            log_off = _grad_norm(_off)
+            log_scale = _grad_norm(_scale)
+            log_tot = _grad_norm(list(model.parameters()))
+            s_leaf = torch.exp(model.core.log_hodlr_scale_leaf).item()
+            l0, l1 = model.level_scale_params.detach().cpu().tolist()
+            ng, hg, nzg, mg = _grad_stats(_gcn)
+            na, ha, nza, ma = _grad_stats(_attn)
+            nl, hl, nzl, ml = _grad_stats(_leaf)
+            no, ho, nzo, mo = _grad_stats(_off)
+            nsc, hsc, nzsc, msc = _grad_stats(_scale)
+
         if args.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         if do_timing:
@@ -1292,6 +1346,9 @@ def train_leaf_only():
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t_start
             steps_in_period = step + 1 if step == 0 else print_interval
+            extra = f" gGCN={log_gcn:.2e} gAttn={log_attn:.2e} gLeaf={log_leaf:.2e} gOff={log_off:.2e} gScl={log_scale:.2e} gTot={log_tot:.2e} sLeaf={s_leaf:.3e} lvl=({l0:.2f},{l1:.2f})"
+            nz_str = f" nzG={nzg}/{ng} nzA={nza}/{na} nzL={nzl}/{nl} nzO={nzo}/{no} nzS={nzsc}/{nsc}"
+            max_str = f" mxG={mg:.1e} mxA={ma:.1e} mxL={ml:.1e} mxO={mo:.1e} mxS={msc:.1e}"
             if step >= 200:
                 now = time.perf_counter()
                 if step == 200:
@@ -1299,9 +1356,11 @@ def train_leaf_only():
                     avg_per_100 = elapsed
                 else:
                     avg_per_100 = (now - t_start_avg) * 100 / (step - 200)
-                print(f"Step {step:05d}: SAI loss {loss.item():.6f} | n={n_pad:04d} (last {steps_in_period} steps: {elapsed:.3f}s, avg 100: {avg_per_100:.3f}s)")
+                print(f"{step:05d}: Loss {loss.item():.6f}  ({elapsed:.3f}s, avg: {avg_per_100:.3f}s){extra}")
+                print(f"       rOff={_ratio_off:.3f}{nz_str}{max_str}")
             else:
-                print(f"Step {step:05d}: SAI loss {loss.item():.6f} | n={n_pad:04d} (last {steps_in_period} steps: {elapsed:.3f}s)")
+                print(f"{step:05d}: Loss {loss.item():.6f}  ({elapsed:.3f}s){extra}")
+                print(f"       rOff={_ratio_off:.3f}{nz_str}{max_str}")
             
             if step > 0 and step % (print_interval * 10) == 0:
                 save_leaf_only_weights(model, args.save, input_dim=9)
