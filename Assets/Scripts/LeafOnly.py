@@ -671,16 +671,11 @@ class UniversalOffDiagBlock(nn.Module):
         U_raw = F.linear(features_U, W_U_sliced, b_U_sliced)
         V_raw = F.linear(features_V, W_V_sliced, b_V_sliced)
         
-        U_dir = F.normalize(U_raw, p=2, dim=-1, eps=1e-8)
-        V_dir = F.normalize(V_raw, p=2, dim=-1, eps=1e-8)
-        
-        U_mag = torch.norm(U_raw, p=2, dim=-1, keepdim=True)
-        V_mag = torch.norm(V_raw, p=2, dim=-1, keepdim=True)
-        
-        unified_mag_U = U_mag * torch.sqrt(scale)
-        unified_mag_V = V_mag * torch.sqrt(scale)
-        
-        return U_dir * unified_mag_U, V_dir * unified_mag_V
+        # 1. Counteract rank inflation (Scaled Dot-Product style)
+        rank_scale = math.sqrt(safe_rank)
+        # 2. Combine with the learned physical scale; split evenly across U and V
+        unified_scalar = torch.sqrt(scale / rank_scale)
+        return U_raw * unified_scalar, V_raw * unified_scalar
 
 
 class LeafOnlyNet(nn.Module):
