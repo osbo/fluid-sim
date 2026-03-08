@@ -499,7 +499,8 @@ def next_valid_size(n, leaf_size=LEAF_SIZE):
     return p * leaf_size
 
 RANK_BASE_LEVEL1 = 16
-OFF_DIAG_SUPER = 32  
+OFF_DIAG_SUPER = 32
+GLOBAL_FEATURES_DIM = 12  # dataset global_features vector for scale predictor  
 
 def _rank_for_side(side, rank_base=RANK_BASE_LEVEL1, min_rank=4, max_rank=512):
     r = rank_base * ((side / 32.0) ** (2.0 / 3.0))
@@ -595,13 +596,16 @@ class LeafCore(nn.Module):
         self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(7e-3))
         self.log_jacobi_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1.5))  # only used when use_jacobi=True
 
-    def get_leaf_blocks(self, h, x, scale_A=None):
+    def get_leaf_blocks(self, h, x, scale_A=None, log_hodlr_scale=None, log_jacobi_scale=None):
         B, N, _ = h.shape
         num_leaves = N // self.leaf_size
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
         # 1. Base SPSD matrix
         u_leaf = self.leaf_head(h_leaves)
-        leaf_scale = torch.exp(self.log_hodlr_scale_leaf)
+        if log_hodlr_scale is not None:
+            leaf_scale = torch.exp(log_hodlr_scale).view(B, 1, 1, 1)
+        else:
+            leaf_scale = torch.exp(self.log_hodlr_scale_leaf)
         leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * leaf_scale
         if not self.use_jacobi:
             return leaf_base
@@ -619,7 +623,10 @@ class LeafCore(nn.Module):
         mask_blocks = mask.view(B, num_leaves, self.leaf_size)
         new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
         # 3. Apply the local gating (Sigmoid(0)=0.5 * 2.0 = 1.0 neutral)
-        jacobi_scale = torch.exp(self.log_jacobi_scale_leaf)
+        if log_jacobi_scale is not None:
+            jacobi_scale = torch.exp(log_jacobi_scale).view(B, 1, 1)
+        else:
+            jacobi_scale = torch.exp(self.log_jacobi_scale_leaf)
         j_gate = torch.sigmoid(self.jacobi_gate(h_leaves)).squeeze(-1)
         self._last_j_gate = j_gate.detach()  # for logging open/closed %
         local_jacobi_diag = new_diag * j_gate * jacobi_scale * 2.0
@@ -749,6 +756,14 @@ class LeafOnlyNet(nn.Module):
         self.level_scale_params = nn.Parameter(
             torch.tensor([-4.88, -0.77])
         )
+        # Scale predictor: input = [global_features (12), h.mean(1) (d_model)] -> [log_hodlr, log_jacobi, level_p0, level_p1]
+        scale_input_dim = GLOBAL_FEATURES_DIM + d_model
+        self.scale_head = nn.Linear(scale_input_dim, 4)
+        with torch.no_grad():
+            self.scale_head.bias.copy_(torch.tensor([
+                math.log(7e-3), math.log(1.5), -4.88, -0.77
+            ], dtype=self.scale_head.bias.dtype))
+            self.scale_head.weight.zero_()
 
         self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=512)
         self.off_diag_struct = []
@@ -773,10 +788,14 @@ class LeafOnlyNet(nn.Module):
     def log_hodlr_scale_leaf(self):
         return self.core.log_hodlr_scale_leaf
 
-    def _off_diag(self, h, x, edge_index, current_struct, precomputed_masks=None):
+    def _off_diag(self, h, x, edge_index, current_struct, precomputed_masks=None, level_p0=None, level_p1=None):
         B, N, C = h.shape
-        level_p0 = self.level_scale_params[0]
-        level_p1 = self.level_scale_params[1]
+        if level_p0 is not None and level_p1 is not None:
+            level_p0 = level_p0.view(B, 1)
+            level_p1 = level_p1.view(B, 1)
+        else:
+            level_p0 = self.level_scale_params[0].view(1, 1).expand(B, 1)
+            level_p1 = self.level_scale_params[1].view(1, 1).expand(B, 1)
 
         # 1. Fetch or compute masks
         if precomputed_masks is not None:
@@ -849,7 +868,7 @@ class LeafOnlyNet(nn.Module):
 
         return result
 
-    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_masks=None, precomputed_leaf_connectivity=None):
+    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_masks=None, precomputed_leaf_connectivity=None, global_features=None):
         B, N, _ = x.shape
         assert N % self.leaf_size == 0, f"LeafOnly expects N divisible by leaf_size {self.leaf_size}, got {N}"
 
@@ -857,10 +876,22 @@ class LeafOnlyNet(nn.Module):
         self.off_diag_struct = current_struct
 
         h = self.core.forward_features(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention, precomputed_leaf_connectivity=precomputed_leaf_connectivity)
-        diag_blocks = self.core.get_leaf_blocks(h, x, scale_A)
+        if global_features is not None:
+            gf = global_features if global_features.dim() == 2 else global_features.unsqueeze(0)
+        else:
+            gf = torch.zeros(B, GLOBAL_FEATURES_DIM, device=h.device, dtype=h.dtype)
+        scale_input = torch.cat([gf, h.mean(dim=1)], dim=-1)
+        scale_params = self.scale_head(scale_input)
+        self._last_scale_params = scale_params.detach()
+        log_hodlr = scale_params[:, 0:1]
+        log_jacobi = scale_params[:, 1:2]
+        level_p0 = scale_params[:, 2:3]
+        level_p1 = scale_params[:, 3:4]
+
+        diag_blocks = self.core.get_leaf_blocks(h, x, scale_A, log_hodlr_scale=log_hodlr, log_jacobi_scale=log_jacobi)
 
         if current_struct:
-            off_diag_list = self._off_diag(h, x, edge_index, current_struct, precomputed_masks=precomputed_masks)
+            off_diag_list = self._off_diag(h, x, edge_index, current_struct, precomputed_masks=precomputed_masks, level_p0=level_p0, level_p1=level_p1)
             return (diag_blocks, off_diag_list)
         return (diag_blocks, [])
 
@@ -963,11 +994,17 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, block.attn.edge_gate.bias.detach().cpu().float(), False)
         _write_packed_tensor(f, model.leaf_head.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.leaf_head.bias.detach().cpu().float(), transpose=False)
-        _write_packed_tensor(f, torch.exp(model.log_hodlr_scale_leaf).detach().cpu().float(), transpose=False)
+        if hasattr(model, 'scale_head'):
+            _write_packed_tensor(f, torch.exp(model.scale_head.bias[0:1]).detach().cpu().float(), transpose=False)
+        else:
+            _write_packed_tensor(f, torch.exp(model.log_hodlr_scale_leaf).detach().cpu().float(), transpose=False)
         if use_jacobi:
             _write_packed_tensor(f, model.core.jacobi_gate.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, model.core.jacobi_gate.bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, torch.exp(model.core.log_jacobi_scale_leaf).detach().cpu().float(), transpose=False)
+            if hasattr(model, 'scale_head'):
+                _write_packed_tensor(f, torch.exp(model.scale_head.bias[1:2]).detach().cpu().float(), transpose=False)
+            else:
+                _write_packed_tensor(f, torch.exp(model.core.log_jacobi_scale_leaf).detach().cpu().float(), transpose=False)
         
         if getattr(model, 'universal_off_diag', None) is not None:
             f.write(struct.pack('<II', 0xFFFFFFFC, 0)) 
@@ -983,7 +1020,14 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, blk.b_U.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.W_V.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.b_V.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, model.level_scale_params.detach().cpu().float(), transpose=False)
+            if hasattr(model, 'scale_head'):
+                _write_packed_tensor(f, model.scale_head.bias[2:4].detach().cpu().float(), transpose=False)
+            else:
+                _write_packed_tensor(f, model.level_scale_params.detach().cpu().float(), transpose=False)
+        if hasattr(model, 'scale_head'):
+            f.write(struct.pack('<II', 0xFFFFFFFB, 1))  # version 1 = scale_head input 12+d_model
+            _write_packed_tensor(f, model.scale_head.weight.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, model.scale_head.bias.detach().cpu().float(), transpose=False)
 
 def _write_packed_tensor(f, param, transpose=False):
     import numpy as np
@@ -1083,6 +1127,7 @@ def load_leaf_only_weights(model, path):
             with torch.no_grad():
                 model.core.log_jacobi_scale_leaf.copy_(torch.log(jacobi_scale.clamp(min=1e-12)))
         
+        scale_head_loaded = False
         extra = f.read(8)
         if len(extra) == 8:
             sentinel, _ = struct.unpack('<II', extra)
@@ -1105,6 +1150,31 @@ def load_leaf_only_weights(model, path):
                     model.level_scale_params.copy_(scale_params)
             elif sentinel == 0xFFFFFFFF or sentinel == 0xFFFFFFFD:
                 raise ValueError("Attempted to load an older discrete/hypernetwork checkpoint into Matryoshka version. Clear checkpoint file.")
+            extra2 = f.read(8)
+            if len(extra2) == 8:
+                sentinel2, scale_head_version = struct.unpack('<II', extra2)
+                if sentinel2 == 0xFFFFFFFB and hasattr(model, 'scale_head'):
+                    if scale_head_version >= 1:
+                        _read_into(f, model.scale_head.weight, read_tensor, transpose=True)
+                        _read_into(f, model.scale_head.bias, read_tensor, transpose=False)
+                    else:
+                        w_old = read_tensor(f, (4, d_model_lo), transpose=True).to(model.scale_head.weight.device)
+                        b_old = read_tensor(f, (4,), transpose=False).to(model.scale_head.bias.device)
+                        with torch.no_grad():
+                            model.scale_head.weight.data[:, :GLOBAL_FEATURES_DIM].zero_()
+                            model.scale_head.weight.data[:, GLOBAL_FEATURES_DIM:].copy_(w_old)
+                            model.scale_head.bias.copy_(b_old)
+                    scale_head_loaded = True
+
+    if hasattr(model, 'scale_head') and not scale_head_loaded:
+        with torch.no_grad():
+            model.scale_head.bias.data[0].copy_(model.log_hodlr_scale_leaf.squeeze())
+            if getattr(model.core, 'use_jacobi', True):
+                model.scale_head.bias.data[1].copy_(model.core.log_jacobi_scale_leaf.squeeze())
+            else:
+                model.scale_head.bias.data[1].copy_(torch.tensor(math.log(1.5), device=model.scale_head.bias.device, dtype=model.scale_head.bias.dtype))
+            model.scale_head.bias.data[2].copy_(model.level_scale_params[0])
+            model.scale_head.bias.data[3].copy_(model.level_scale_params[1])
 
 def _read_into(f, param, read_fn, transpose=False):
     t = read_fn(f, param.shape, transpose=transpose).to(param.device)
@@ -1153,7 +1223,7 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
+    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
     parser.add_argument('--num_frames', type=int, default=30, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
@@ -1380,9 +1450,11 @@ def train_leaf_only():
             if do_timing:
                 _sync()
                 t0 = time.perf_counter()
+            global_feat = ctx.get('global_features')
             diag_blocks, off_diag_list = model(
                 x_input, edge_index=edge_index, edge_values=edge_values,
-                scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf
+                scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
+                global_features=global_feat
             )
             if do_timing:
                 _sync()
@@ -1467,7 +1539,9 @@ def train_leaf_only():
                 attn = [p for n, p in all_names if 'blocks' in n]
                 leaf = [p for n, p in all_names if 'leaf_head' in n and 'leaf_scale' not in n]
                 off = [p for n, p in all_names if 'universal_off_diag' in n]
-                scale = [p for n, p in all_names if 'log_hodlr_scale_leaf' in n or ('log_jacobi_scale_leaf' in n and getattr(model.core, 'use_jacobi', True)) or 'level_scale_params' in n]
+                scale = [p for n, p in all_names if 'scale_head' in n]
+                if not scale:
+                    scale = [p for n, p in all_names if 'log_hodlr_scale_leaf' in n or ('log_jacobi_scale_leaf' in n and getattr(model.core, 'use_jacobi', True)) or 'level_scale_params' in n]
                 return gcn, attn, leaf, off, scale
             _gcn, _attn, _leaf, _off, _scale = _get_param_lists()
             log_gcn = _grad_norm(_gcn)
@@ -1476,9 +1550,15 @@ def train_leaf_only():
             log_off = _grad_norm(_off)
             log_scale = _grad_norm(_scale)
             log_tot = _grad_norm(list(model.parameters()))
-            s_leaf = torch.exp(model.core.log_hodlr_scale_leaf).item()
-            s_jacobi = torch.exp(model.core.log_jacobi_scale_leaf).item() if getattr(model.core, 'use_jacobi', True) else 0.0
-            l0, l1 = model.level_scale_params.detach().cpu().tolist()
+            if hasattr(model, '_last_scale_params') and model._last_scale_params is not None:
+                sp = model._last_scale_params
+                s_leaf = torch.exp(sp[:, 0].mean()).item()
+                s_jacobi = torch.exp(sp[:, 1].mean()).item() if getattr(model.core, 'use_jacobi', True) else 0.0
+                l0, l1 = sp[:, 2].mean().item(), sp[:, 3].mean().item()
+            else:
+                s_leaf = torch.exp(model.core.log_hodlr_scale_leaf).item()
+                s_jacobi = torch.exp(model.core.log_jacobi_scale_leaf).item() if getattr(model.core, 'use_jacobi', True) else 0.0
+                l0, l1 = model.level_scale_params.detach().cpu().tolist()
             ng, hg, nzg, mg = _grad_stats(_gcn)
             na, ha, nza, ma = _grad_stats(_attn)
             nl, hl, nzl, ml = _grad_stats(_leaf)
@@ -1596,20 +1676,13 @@ def evaluate_gradient_interference(args):
         print(f"Evaluating across {n_sample} random frames")
 
     # 3. Define Parameter Groups to Analyze
-    # Isolating the scale factors helps track if they are fighting the structural updates
-    def _scale_params(m):
-        scale_list = [m.log_hodlr_scale_leaf, m.level_scale_params]
-        if getattr(m.core, 'use_jacobi', True) and hasattr(m.core, 'log_jacobi_scale_leaf'):
-            scale_list.append(m.core.log_jacobi_scale_leaf)
-        return [p for p in scale_list if p is not None]
-
     param_groups = {
         'Input Embeddings (Lift)': lambda m: list(m.embed.lift.parameters()),
         'Neighbor Impact (GCN)': lambda m: list(m.embed.gcn.parameters()) if m.embed.gcn else [],
         'Transformer Attention': lambda m: [p for b in m.blocks for p in b.parameters()],
         'Off-Diagonal Routing': lambda m: list(m.universal_off_diag.parameters()),
         'Diagonal Leaf Head': lambda m: list(m.core.leaf_head.parameters()),
-        'Scale Factors': _scale_params,
+        'Scale head (predicted)': lambda m: list(m.scale_head.parameters()) if getattr(m, 'scale_head', None) is not None else [],
     }
 
     group_gradients = {name: [] for name in param_groups.keys()}
@@ -1652,9 +1725,15 @@ def evaluate_gradient_interference(args):
 
         # Forward Pass
         model.zero_grad()
+        global_feat = batch.get('global_features')
+        if global_feat is not None:
+            global_feat = global_feat.to(device)
+            if global_feat.dim() == 1:
+                global_feat = global_feat.unsqueeze(0)
         diag_blocks, off_diag_list = model(
             x_input, edge_index=edge_index, edge_values=edge_values,
-            scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf
+            scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
+            global_features=global_feat
         )
 
         # Compute Loss
