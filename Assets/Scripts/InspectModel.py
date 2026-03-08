@@ -778,6 +778,17 @@ def main():
         ax_a_t.text(0.1, 0.8, "Unpreconditioned A", fontsize=12, fontfamily='monospace')
         ax_a_t.text(0.1, 0.65, f"Cond(A): {cond_A:.2e}", fontsize=12, fontfamily='monospace')
 
+        # Shared color scale for all A·M (log10 |·|) panels
+        am_log_min, am_log_max = None, None
+        for _name, M in methods:
+            AM = A_viz_n @ M
+            am_abs_log = np.log10(np.abs(AM) + 1e-9)
+            lo, hi = am_abs_log.min(), am_abs_log.max()
+            am_log_min = lo if am_log_min is None else min(am_log_min, lo)
+            am_log_max = hi if am_log_max is None else max(am_log_max, hi)
+        if am_log_min is None:
+            am_log_min, am_log_max = -8.0, 0.0
+
         for idx, (name, M) in enumerate(methods):
             row = 1 + idx
             im_m = axes[row, 0].imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto', vmin=vmin_log, vmax=vmax_log)
@@ -790,12 +801,11 @@ def main():
             axes[row, 1].set_title(f"{name} |M − A^{{-1}}| (log10)")
             plt.colorbar(im_diff, ax=axes[row, 1])
             AM = A_viz_n @ M
-            am_min, am_max = np.percentile(AM, [2, 98])
-            if am_max - am_min < 1e-8:
-                am_min, am_max = 0.0, 1.0
-            axes[row, 2].imshow(AM, cmap='RdBu_r', vmin=am_min, vmax=am_max, aspect='auto')
-            axes[row, 2].set_title(f"{name} A·M")
-            plt.colorbar(axes[row, 2].images[0], ax=axes[row, 2])
+            # Absolute value, same colormap and shared scale as the other A·M panel(s)
+            am_abs_log = np.log10(np.abs(AM) + 1e-9)
+            im_am = axes[row, 2].imshow(am_abs_log, cmap='magma', aspect='auto', vmin=am_log_min, vmax=am_log_max)
+            axes[row, 2].set_title(f"{name} A·M (log10 |·|)")
+            plt.colorbar(im_am, ax=axes[row, 2])
 
             ax_d = axes[row, 3]
             try:

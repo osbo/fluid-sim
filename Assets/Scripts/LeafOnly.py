@@ -77,7 +77,8 @@ class FluidGraphDataset:
 
         # Fixed absolute scale for positions
         positions_n = positions / 1024.0
-        layer_val = np.exp2(layer)
+        # Layer: keep it linear/ordinal for the MLP instead of exponential
+        layer_n = layer / 4.0
 
         scale_A = float(np.abs(vals).max())
         if scale_A <= 0.0:
@@ -89,33 +90,30 @@ class FluidGraphDataset:
         else:
             diffusion_grad = np.zeros((num_nodes, 3), dtype=np.float32)
 
-        # Robust Frame-Local Z-Score Normalization
-        mass_mu, mass_std = float(np.mean(mass)), float(np.std(mass))
-        mass_n = (mass - mass_mu) / (mass_std if mass_std > 1e-6 else 1.0)
+        # --- PHYSICS-PRESERVING NORMALIZATION ---
+        # 1. Diag Map: Must be scaled IDENTICALLY to the edge values to preserve the condition number
+        diag_map_n = diag_map / scale_A
 
-        diag_mu, diag_std = float(np.mean(diag_map)), float(np.std(diag_map))
-        diag_map_n = (diag_map - diag_mu) / (diag_std if diag_std > 1e-6 else 1.0)
+        # 2. SymLog Normalization for heavy-tailed features: sign(x) * log(1 + |x|)
+        # This crushes outliers but leaves 0.0 as exactly 0.0.
+        mass_n = np.sign(mass) * np.log1p(np.abs(mass))
+        diffusion_grad_n = np.sign(diffusion_grad) * np.log1p(np.abs(diffusion_grad))
 
-        diff_mu = np.mean(diffusion_grad, axis=0)
-        diff_std = np.std(diffusion_grad, axis=0)
-        diff_std_safe = np.where(diff_std > 1e-6, diff_std, 1.0)
-        diffusion_grad_n = (diffusion_grad - diff_mu) / diff_std_safe
-
-        # Pack absolute frame statistics for the global Scale MLP
+        # 3. Global Features for the Scale Predictor (keeping length 12 to match your MLP)
+        diff_mag = np.linalg.norm(diffusion_grad_n, axis=1)
         global_features = np.array([
             math.log2(max(1, num_nodes)),
-            math.log(max(1e-6, scale_A)),
-            mass_mu, mass_std,
-            diag_mu, diag_std,
-            diff_mu[0], diff_std[0],
-            diff_mu[1], diff_std[1],
-            diff_mu[2], diff_std[2],
+            math.log10(max(1e-6, scale_A)),
+            float(np.mean(mass_n)), float(np.std(mass_n)),
+            float(np.mean(diag_map_n)), float(np.std(diag_map_n)),
+            float(np.mean(diff_mag)), float(np.std(diff_mag)),
+            0.0, 0.0, 0.0, 0.0,  # Padding
         ], dtype=np.float32)
 
         n_float = 9
         x = np.zeros((num_nodes, n_float), dtype=np.float32)
         x[:, :3] = positions_n
-        x[:, 3] = layer_val
+        x[:, 3] = layer_n
         x[:, 4] = mass_n
         x[:, 5:8] = diffusion_grad_n
         x[:, 8] = diag_map_n
@@ -1155,8 +1153,8 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
-    parser.add_argument('--num_frames', type=int, default=100, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
+    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
+    parser.add_argument('--num_frames', type=int, default=30, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
