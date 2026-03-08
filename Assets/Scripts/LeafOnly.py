@@ -3,6 +3,10 @@ LeafOnly: train HODLR-style block preconditioner (32x32 diagonal leaves + off-di
 Attention is within each 32-node block. Run with python3 LeafOnly.py; view_size defaults to 512.
 Add --mixed_sizes to train on dynamically varying block sizes for scale invariance.
 """
+import warnings
+# Suppress deprecation from torch._inductor (torch.compile path); fixed in newer PyTorch
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch._inductor")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -142,13 +146,16 @@ class SparsePhysicsGCN(nn.Module):
         return out.unsqueeze(0) if B == 1 else out.view(B, N, C)
 
 class PhysicsAwareEmbedding(nn.Module):
+    """Lift uses only x[:, 3:] (no absolute coords) for translation/rotation invariance."""
     NUM_GCN_LAYERS = 2
+    LIFT_FEATURES = 6  # layer, mass, diffusion_grad(3), diag — excludes x[:, :3]
 
     def __init__(self, input_dim, d_model, use_gcn=True):
         super().__init__()
         self.use_gcn = use_gcn
+        lift_in = self.LIFT_FEATURES  # drop absolute coords from lift
         self.lift = nn.Sequential(
-            nn.Linear(input_dim, d_model),
+            nn.Linear(lift_in, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
@@ -156,7 +163,7 @@ class PhysicsAwareEmbedding(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x, edge_index=None, edge_values=None, scale_A=None):
-        h = self.lift(x)
+        h = self.lift(x[..., 3:])  # no absolute coords: layer, mass, diffusion_grad, diag only
         if self.use_gcn and self.gcn is not None and edge_index is not None and edge_values is not None:
             for gcn_layer in self.gcn:
                 h = gcn_layer(h, edge_index, edge_values, scale_A)
@@ -461,7 +468,7 @@ def _most_recent_run_folder(base_path):
     return runs[0]
 
 LEAF_SIZE = 32
-VIEW_SIZE = 512
+VIEW_SIZE = 0
 
 def next_valid_size(n, leaf_size=LEAF_SIZE):
     if n <= 0:
@@ -548,11 +555,12 @@ def print_hodlr_structure(n_nodes, leaf_size=LEAF_SIZE, rank_base=RANK_BASE_LEVE
 
 
 class LeafCore(nn.Module):
-    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, mask_attention=True, use_global_node=True, use_gcn=True):
+    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, mask_attention=True, use_global_node=True, use_gcn=True, use_jacobi=True):
         super().__init__()
         self.leaf_size = leaf_size
         self.mask_attention = mask_attention
         self.use_global_node = use_global_node
+        self.use_jacobi = use_jacobi
         self.embed = PhysicsAwareEmbedding(input_dim, d_model, use_gcn=use_gcn)
         self.enc_input_proj = nn.Linear(d_model, d_model)
         self.blocks = nn.ModuleList([
@@ -562,16 +570,24 @@ class LeafCore(nn.Module):
         self.leaf_head = nn.Linear(d_model, leaf_size)
         nn.init.normal_(self.leaf_head.weight, std=0.01)
         nn.init.constant_(self.leaf_head.bias, 0.0)
+        # Local gate for the Jacobi diagonal (Sigmoid(0) = 0.5 → neutral multiplier 1.0 with * 2.0)
+        self.jacobi_gate = nn.Linear(d_model, 1)
+        nn.init.normal_(self.jacobi_gate.weight, std=0.01)
+        nn.init.constant_(self.jacobi_gate.bias, 0.0)
         self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
-        self.log_jacobi_scale_leaf = nn.Parameter(torch.ones(1) * math.log(0.64))  # scale for Jacobi diagonal; 0.64 default
+        self.log_jacobi_scale_leaf = nn.Parameter(torch.ones(1) * math.log(0.64))  # only used when use_jacobi=True
 
     def get_leaf_blocks(self, h, x, scale_A=None):
         B, N, _ = h.shape
         num_leaves = N // self.leaf_size
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
+        # 1. Base SPSD matrix
         u_leaf = self.leaf_head(h_leaves)
         leaf_scale = torch.exp(self.log_hodlr_scale_leaf)
         leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2)) * leaf_scale
+        if not self.use_jacobi:
+            return leaf_base
+        # 2. Extract and format the true Jacobi diagonal
         diag_A_n = x[..., 8]
         s = scale_A if scale_A is not None else 1.0
         if isinstance(s, torch.Tensor):
@@ -584,8 +600,12 @@ class LeafCore(nn.Module):
         jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
         mask_blocks = mask.view(B, num_leaves, self.leaf_size)
         new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
+        # 3. Apply the local gating (Sigmoid(0)=0.5 * 2.0 = 1.0 neutral)
         jacobi_scale = torch.exp(self.log_jacobi_scale_leaf)
-        return leaf_base + torch.diag_embed(new_diag * jacobi_scale)
+        j_gate = torch.sigmoid(self.jacobi_gate(h_leaves)).squeeze(-1)
+        self._last_j_gate = j_gate.detach()  # for logging open/closed %
+        local_jacobi_diag = new_diag * j_gate * jacobi_scale * 2.0
+        return leaf_base + torch.diag_embed(local_jacobi_diag)
 
     def forward_features(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_leaf_connectivity=None):
         B, N, _ = x.shape
@@ -697,11 +717,11 @@ class UniversalOffDiagBlock(nn.Module):
 
 
 class LeafOnlyNet(nn.Module):
-    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=True, use_gcn=True):
+    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=True, use_gcn=True, use_jacobi=True):
         super().__init__()
         self.leaf_size = leaf_size
         self.rank_base = rank_base
-        self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn)
+        self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn, use_jacobi=use_jacobi)
         # level_scale_params = [log(base_scale), decay_per_level]; init near observed settling
         self.level_scale_params = nn.Parameter(
             torch.tensor([math.log(1e-2), -0.83])
@@ -812,24 +832,31 @@ def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None):
 
 # --- Save / Load ---
 
-LEAF_ONLY_HEADER_BYTES_OLD = 20   
-LEAF_ONLY_HEADER_BYTES_V2 = 24    
-LEAF_ONLY_HEADER_BYTES = 28       
+LEAF_ONLY_HEADER_BYTES_OLD = 20
+LEAF_ONLY_HEADER_BYTES_V2 = 24
+LEAF_ONLY_HEADER_BYTES = 28
+LEAF_ONLY_HEADER_BYTES_V3 = 32   # + format_version (1=no jacobi in scale section, 2=jacobi present)
 
 def read_leaf_only_header(path):
     path = Path(path)
     with open(path, 'rb') as f:
-        header = f.read(LEAF_ONLY_HEADER_BYTES)
+        header = f.read(LEAF_ONLY_HEADER_BYTES_V3)
     if len(header) < LEAF_ONLY_HEADER_BYTES_OLD:
         raise ValueError("LeafOnly weights file too short")
     if len(header) >= LEAF_ONLY_HEADER_BYTES:
-        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers = struct.unpack('<iiiiiii', header)
-        return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, LEAF_ONLY_HEADER_BYTES
+        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers = struct.unpack('<iiiiiii', header[:LEAF_ONLY_HEADER_BYTES])
+        format_version = struct.unpack('<i', header[LEAF_ONLY_HEADER_BYTES:LEAF_ONLY_HEADER_BYTES_V3])[0] if len(header) >= LEAF_ONLY_HEADER_BYTES_V3 else 1
+        if format_version not in (1, 2):
+            format_version = 1
+            header_bytes = LEAF_ONLY_HEADER_BYTES
+        else:
+            header_bytes = LEAF_ONLY_HEADER_BYTES_V3
+        return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, format_version, header_bytes
     if len(header) >= LEAF_ONLY_HEADER_BYTES_V2:
-        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn = struct.unpack('<iiiiii', header)
-        return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, 1, LEAF_ONLY_HEADER_BYTES_V2  
-    d_model, leaf_size, input_dim, num_layers, num_heads = struct.unpack('<iiiii', header)
-    return d_model, leaf_size, input_dim, num_layers, num_heads, 1, 1, LEAF_ONLY_HEADER_BYTES_OLD  
+        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn = struct.unpack('<iiiiii', header[:LEAF_ONLY_HEADER_BYTES_V2])
+        return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, 1, 1, LEAF_ONLY_HEADER_BYTES_V2
+    d_model, leaf_size, input_dim, num_layers, num_heads = struct.unpack('<iiiii', header[:LEAF_ONLY_HEADER_BYTES_OLD])
+    return d_model, leaf_size, input_dim, num_layers, num_heads, 1, 1, 1, LEAF_ONLY_HEADER_BYTES_OLD  
 
 
 def _write_gcn_layer(f, gcn_layer):
@@ -848,8 +875,10 @@ def save_leaf_only_weights(model, path, input_dim=9):
     num_heads = model.blocks[0].attn.num_heads if model.blocks else 4
     use_gcn = model.embed.gcn is not None
     num_gcn_layers = len(model.embed.gcn) if use_gcn else 0
+    use_jacobi = getattr(model.core, 'use_jacobi', True)
+    format_version = 2 if use_jacobi else 1
     with open(path, 'wb') as f:
-        f.write(struct.pack('<iiiiiii', d_model, model.leaf_size, input_dim, len(model.blocks), num_heads, int(use_gcn), num_gcn_layers))
+        f.write(struct.pack('<iiiiiiii', d_model, model.leaf_size, input_dim, len(model.blocks), num_heads, int(use_gcn), num_gcn_layers, format_version))
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.embed.lift[0].bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.embed.lift[2].weight.detach().cpu().float(), transpose=True)
@@ -873,7 +902,10 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.leaf_head.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.leaf_head.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, torch.exp(model.log_hodlr_scale_leaf).detach().cpu().float(), transpose=False)
-        _write_packed_tensor(f, torch.exp(model.core.log_jacobi_scale_leaf).detach().cpu().float(), transpose=False)
+        if use_jacobi:
+            _write_packed_tensor(f, model.core.jacobi_gate.weight.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, model.core.jacobi_gate.bias.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, torch.exp(model.core.log_jacobi_scale_leaf).detach().cpu().float(), transpose=False)
         
         if getattr(model, 'universal_off_diag', None) is not None:
             f.write(struct.pack('<II', 0xFFFFFFFC, 0)) 
@@ -917,7 +949,7 @@ def load_leaf_only_weights(model, path):
     import numpy as np
     path = Path(path)
     result = read_leaf_only_header(path)
-    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, _num_heads_lo, use_gcn_file, num_gcn_layers_file, header_bytes = result
+    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, _num_heads_lo, use_gcn_file, num_gcn_layers_file, format_version, header_bytes = result
     if model.leaf_size != leaf_size_lo or len(model.blocks) != num_layers_lo:
         raise ValueError(f"Checkpoint leaf_size={leaf_size_lo} num_layers={num_layers_lo} != model {model.leaf_size} {len(model.blocks)}")
     has_gcn = model.embed.gcn is not None
@@ -982,9 +1014,12 @@ def load_leaf_only_weights(model, path):
         scale = read_tensor(f, (1,), transpose=False).to(model.log_hodlr_scale_leaf.device)
         with torch.no_grad():
             model.log_hodlr_scale_leaf.copy_(torch.log(scale.clamp(min=1e-12)))
-        jacobi_scale = read_tensor(f, (1,), transpose=False).to(model.core.log_jacobi_scale_leaf.device)
-        with torch.no_grad():
-            model.core.log_jacobi_scale_leaf.copy_(torch.log(jacobi_scale.clamp(min=1e-12)))
+        if format_version >= 2 and getattr(model.core, 'use_jacobi', True):
+            _read_into(f, model.core.jacobi_gate.weight, read_tensor, transpose=True)
+            _read_into(f, model.core.jacobi_gate.bias, read_tensor, transpose=False)
+            jacobi_scale = read_tensor(f, (1,), transpose=False).to(model.core.log_jacobi_scale_leaf.device)
+            with torch.no_grad():
+                model.core.log_jacobi_scale_leaf.copy_(torch.log(jacobi_scale.clamp(min=1e-12)))
         
         extra = f.read(8)
         if len(extra) == 8:
@@ -1057,14 +1092,15 @@ def train_leaf_only():
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
     parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all). Default: True.')
-    parser.add_argument('--num_frames', type=int, default=30, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
+    parser.add_argument('--num_frames', type=int, default=100, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
     parser.add_argument('--use_global_node', type=bool, default=True, help='When True, use 33rd global node per block. When False, masked attention on 32x32 only.')
     parser.add_argument('--use_gcn', type=bool, default=True, help='When True, run SparsePhysicsGCN before transformer blocks (graph message passing). When False, raw inputs pass through lift only.')
     parser.add_argument('--print_timing', type=bool, default=True, help='On step 200, print detailed timing of each training substep')
-    parser.add_argument('--mixed_sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance.')
+    parser.add_argument('--mixed_sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance. Default False = train on whole matrix per frame.')
+    parser.add_argument('--contexts_per_step', type=int, default=1, help='Gradient accumulation: number of random cached contexts per optimizer step.')
     parser.add_argument('--continue_training', action='store_true', help='Load initial weights from the saved .bytes file (--save) and continue training from that state.')
     args = parser.parse_args()
     use_global_node = args.use_global_node
@@ -1102,8 +1138,8 @@ def train_leaf_only():
             frame_indices = sorted(rng.sample(range(len(dataset)), n_sample))
             print(f"  [startup] Random sample of {n_sample} frames (--num_frames {args.num_frames})")
 
-    MIN_MIXED_SIZE = 256
-    MAX_MIXED_SIZE = 256
+    MIN_MIXED_SIZE = 4096
+    MAX_MIXED_SIZE = 4096
     base_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
 
     # Pre-extract and cache sub-graphs from every frame (sizes unchanged)
@@ -1165,7 +1201,8 @@ def train_leaf_only():
             precomputed_masks = get_or_compute_masks(
                 batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE
             )
-            positions_ctx = x_input[0, :n, :3]
+            # Use n_pad positions so num_blocks = n_pad//leaf_size matches forward (x.shape[1] == n_pad)
+            positions_ctx = x_input[0, :n_pad, :3]
             leaf_attn_mask, leaf_edge_feats = build_leaf_block_connectivity(
                 edge_index, edge_values, positions_ctx, scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
             )
@@ -1184,6 +1221,8 @@ def train_leaf_only():
     if len(training_contexts) == 0:
         raise SystemExit("No valid (frame, size) pairs: ensure frames have at least MIN_MIXED_SIZE nodes.")
     print(f"  [startup] Cached {len(training_contexts)} training contexts")
+    contexts_per_step = max(1, int(args.contexts_per_step))
+    print(f"  [startup] contexts_per_step = {contexts_per_step} (gradient accumulation)")
 
     torch.manual_seed(args.seed)
     
@@ -1195,13 +1234,11 @@ def train_leaf_only():
     ).to(device)
     
     if device.type == 'cuda':
-        # if args.mixed_sizes:
-        if False:
-            print("  [startup] mixed_sizes active: Disabling torch.compile to avoid dynamic shape gridlock.")
-        else:
-            # NOTE: torch.compile will re-compile the kernel the first time it sees each unique graph size.
-            # Expect the first ~5 steps to be slow as it compiles the discrete sizes, then it will fly.
-            model = torch.compile(model, dynamic=True)
+        # dynamic=True causes dynamo to use symbolic dims (s0//32 vs s7) that don't unify in attention
+        # (scores + bias_physics), leading to shape errors. Use dynamic=False so we trace with concrete
+        # shapes; each distinct graph size recompiles once.
+        # NOTE: First step(s) per unique size will be slow while compiling, then it will fly.
+        model = torch.compile(model, dynamic=False)
 
     if args.continue_training:
         save_path = Path(args.save)
@@ -1228,78 +1265,109 @@ def train_leaf_only():
     TIMING_STEP = 200
     for step in range(args.steps):
         do_timing = args.print_timing and (step == TIMING_STEP - 1)
-
-        # Randomly select a cached graph size for this step
-        ctx = random.choice(training_contexts)
-        x_input = ctx['x_input']
-        edge_index = ctx['edge_index']
-        edge_values = ctx['edge_values']
-        scale_A = ctx['scale_A']
-        A_dense = ctx['A_dense']
-        pre_masks = ctx['precomputed_masks']
-        pre_leaf = ctx['precomputed_leaf_connectivity']
-        n_pad = ctx['n_pad']
-        n_orig = ctx['n_orig']
-        batch_vectors = ctx['batch_vectors']
+        do_log = (step % print_interval == 0)
+        step_loss_sum = 0.0
+        ratio_off_sum = 0.0
+        ratio_off_count = 0
 
         if do_timing:
             _sync()
             t0 = time.perf_counter()
-            print(f"\n--- Timing triggered on size n={n_orig} (padded to {n_pad}) ---")
+            print(f"\n--- Timing triggered on step {TIMING_STEP} (contexts_per_step={contexts_per_step}) ---")
             
         optimizer.zero_grad()
         if do_timing:
             _sync()
             t_zero = time.perf_counter() - t0
-            t0 = time.perf_counter()
+            t_forward = 0.0
+            t_sample_z = 0.0
+            t_az = 0.0
+            t_apply_m = 0.0
+            t_loss = 0.0
+            t_backward = 0.0
+            n_orig_t, n_pad_t = None, None
 
-        diag_blocks, off_diag_list = model(
-            x_input, edge_index=edge_index, edge_values=edge_values,
-            scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf
-        )
-        if do_timing:
-            _sync()
-            t_forward = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            
-        # SAI loss: E_z || M A z - z ||^2
-        Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
-        Z[:, n_orig:, :] = 0.0
-        if do_timing:
-            _sync()
-            t_sample_z = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            
-        AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-        if do_timing:
-            _sync()
-            t_az = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            
-        MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
-        if step % print_interval == 0:
-            MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE)
-            _norm_diag = MAZ_diag_only.norm().item()
-            _norm_off = (MAZ - MAZ_diag_only).norm().item()
-            _ratio_off = _norm_off / (_norm_diag + 1e-12)
-        if do_timing:
-            _sync()
-            t_apply_m = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            
-        residual = MAZ - Z
-        loss = (residual ** 2).mean()
-        loss_history.append(loss.item())
-        if do_timing:
-            _sync()
-            t_loss = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            
-        loss.backward()
-        if do_timing:
-            _sync()
-            t_backward = time.perf_counter() - t0
-            t0 = time.perf_counter()
+        for micro in range(contexts_per_step):
+            # Randomly select a cached graph size for this micro-batch
+            ctx = random.choice(training_contexts)
+            x_input = ctx['x_input']
+            edge_index = ctx['edge_index']
+            edge_values = ctx['edge_values']
+            scale_A = ctx['scale_A']
+            A_dense = ctx['A_dense']
+            pre_masks = ctx['precomputed_masks']
+            pre_leaf = ctx['precomputed_leaf_connectivity']
+            n_pad = ctx['n_pad']
+            n_orig = ctx['n_orig']
+            batch_vectors = ctx['batch_vectors']
+            if do_timing and micro == 0:
+                n_orig_t, n_pad_t = n_orig, n_pad
+
+            if do_timing:
+                _sync()
+                t0 = time.perf_counter()
+            diag_blocks, off_diag_list = model(
+                x_input, edge_index=edge_index, edge_values=edge_values,
+                scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf
+            )
+            if do_timing:
+                _sync()
+                t_forward += time.perf_counter() - t0
+
+            if do_timing:
+                _sync()
+                t0 = time.perf_counter()
+            # SAI loss: E_z || M A z - z ||^2
+            Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
+            Z[:, n_orig:, :] = 0.0
+            if do_timing:
+                _sync()
+                t_sample_z += time.perf_counter() - t0
+
+            if do_timing:
+                _sync()
+                t0 = time.perf_counter()
+            AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
+            if do_timing:
+                _sync()
+                t_az += time.perf_counter() - t0
+
+            if do_timing:
+                _sync()
+                t0 = time.perf_counter()
+            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
+            if do_log:
+                MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE)
+                _norm_diag = MAZ_diag_only.norm().item()
+                _norm_off = (MAZ - MAZ_diag_only).norm().item()
+                ratio_off_sum += _norm_off / (_norm_diag + 1e-12)
+                ratio_off_count += 1
+            if do_timing:
+                _sync()
+                t_apply_m += time.perf_counter() - t0
+
+            if do_timing:
+                _sync()
+                t0 = time.perf_counter()
+            residual = MAZ - Z
+            raw_loss = (residual ** 2).mean()
+            step_loss_sum += raw_loss.item()
+            loss = raw_loss / contexts_per_step
+            if do_timing:
+                _sync()
+                t_loss += time.perf_counter() - t0
+
+            if do_timing:
+                _sync()
+                t0 = time.perf_counter()
+            loss.backward()
+            if do_timing:
+                _sync()
+                t_backward += time.perf_counter() - t0
+
+        step_loss = step_loss_sum / contexts_per_step
+        loss_history.append(step_loss)
+        _ratio_off = (ratio_off_sum / ratio_off_count) if ratio_off_count > 0 else 0.0
 
         if step % print_interval == 0:
             def _grad_norm(params):
@@ -1325,7 +1393,7 @@ def train_leaf_only():
                 attn = [p for n, p in all_names if 'blocks' in n]
                 leaf = [p for n, p in all_names if 'leaf_head' in n and 'leaf_scale' not in n]
                 off = [p for n, p in all_names if 'universal_off_diag' in n]
-                scale = [p for n, p in all_names if 'log_hodlr_scale_leaf' in n or 'log_jacobi_scale_leaf' in n or 'level_scale_params' in n]
+                scale = [p for n, p in all_names if 'log_hodlr_scale_leaf' in n or ('log_jacobi_scale_leaf' in n and getattr(model.core, 'use_jacobi', True)) or 'level_scale_params' in n]
                 return gcn, attn, leaf, off, scale
             _gcn, _attn, _leaf, _off, _scale = _get_param_lists()
             log_gcn = _grad_norm(_gcn)
@@ -1335,7 +1403,7 @@ def train_leaf_only():
             log_scale = _grad_norm(_scale)
             log_tot = _grad_norm(list(model.parameters()))
             s_leaf = torch.exp(model.core.log_hodlr_scale_leaf).item()
-            s_jacobi = torch.exp(model.core.log_jacobi_scale_leaf).item()
+            s_jacobi = torch.exp(model.core.log_jacobi_scale_leaf).item() if getattr(model.core, 'use_jacobi', True) else 0.0
             l0, l1 = model.level_scale_params.detach().cpu().tolist()
             ng, hg, nzg, mg = _grad_stats(_gcn)
             na, ha, nza, ma = _grad_stats(_attn)
@@ -1355,6 +1423,8 @@ def train_leaf_only():
             _sync()
             t_optim = time.perf_counter() - t0
             total = t_zero + t_forward + t_sample_z + t_az + t_apply_m + t_loss + t_backward + t_clip + t_optim
+            if n_orig_t is not None and n_pad_t is not None:
+                print(f"  first micro-batch size: n={n_orig_t} (padded to {n_pad_t})")
             print(f"--- Step {TIMING_STEP} detailed timing (ms) ---")
             print(f"  zero_grad:        {t_zero*1000:8.2f}")
             print(f"  model forward:    {t_forward*1000:8.2f}")
@@ -1373,16 +1443,23 @@ def train_leaf_only():
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t_start
             steps_in_period = step + 1 if step == 0 else print_interval
-            extra = f" gGCN={log_gcn:.2e} gAttn={log_attn:.2e} gLeaf={log_leaf:.2e} gOff={log_off:.2e} gScl={log_scale:.2e} gTot={log_tot:.2e} sLeaf={s_leaf:.3e} sJ={s_jacobi:.3f} lvl=({l0:.2f},{l1:.2f})"
+            jstr = f" sJ={s_jacobi:.3f}" if getattr(model.core, 'use_jacobi', True) else ""
+            extra = f" gGCN={log_gcn:.2e} gAttn={log_attn:.2e} gLeaf={log_leaf:.2e} gOff={log_off:.2e} gScl={log_scale:.2e} gTot={log_tot:.2e} sLeaf={s_leaf:.3e}{jstr} lvl=({l0:.2f},{l1:.2f})"
             nz_str = f" nzG={nzg}/{ng} nzA={nza}/{na} nzL={nzl}/{nl} nzO={nzo}/{no} nzS={nzsc}/{nsc}"
             max_str = f" mxG={mg:.1e} mxA={ma:.1e} mxL={ml:.1e} mxO={mo:.1e} mxS={msc:.1e}"
+            gate_str = ""
+            if getattr(model.core, "use_jacobi", False) and getattr(model.core, "_last_j_gate", None) is not None:
+                jg = model.core._last_j_gate
+                g_mean = jg.mean().item()
+                g_var = jg.var().item()
+                gate_str = f" gAvg={g_mean:.3f} gVar={g_var:.3f}"
             n = len(loss_history)
             if n > 0:
                 arr = np.array(loss_history)
                 loss_avg, loss_std = float(arr.mean()), float(arr.std())
                 loss_str = f"Loss avg={loss_avg:.4f} ± {loss_std:.4f}"
             else:
-                loss_str = f"Loss {loss.item():.6f}"
+                loss_str = f"Loss {step_loss:.6f}"
             if step >= 200:
                 now = time.perf_counter()
                 if step == 200:
@@ -1391,10 +1468,10 @@ def train_leaf_only():
                 else:
                     avg_per_100 = (now - t_start_avg) * 100 / (step - 200)
                 print(f"{step:05d}: {loss_str}  ({elapsed:.3f}s, avg: {avg_per_100:.3f}s){extra}")
-                print(f"       rOff={_ratio_off:.3f}{nz_str}{max_str}")
+                print(f"       rOff={_ratio_off:.3f}{nz_str}{max_str}{gate_str}")
             else:
                 print(f"{step:05d}: {loss_str}  ({elapsed:.3f}s){extra}")
-                print(f"       rOff={_ratio_off:.3f}{nz_str}{max_str}")
+                print(f"       rOff={_ratio_off:.3f}{nz_str}{max_str}{gate_str}")
             
             if step > 0 and step % (print_interval * 10) == 0:
                 save_leaf_only_weights(model, args.save, input_dim=9)
