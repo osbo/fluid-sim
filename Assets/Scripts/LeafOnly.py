@@ -660,10 +660,17 @@ class UniversalOffDiagBlock(nn.Module):
         self.attn_q = nn.Linear(d_model + 5, d_model)
         self.attn_k = nn.Linear(d_model + 5, d_model)
         self.attn_v = nn.Linear(d_model + 5, d_model)
-        
-        self.W_U = nn.Parameter(torch.randn(max_rank, 2 * d_model))
+        # FiLM: context [scale, delta_x, dist] (5) -> (gamma, beta) to modulate features before shared W_U/W_V (multiplicative + additive)
+        self._proj_in_dim = 2 * d_model
+        self._film_context_dim = 5
+        self.film_layer = nn.Linear(self._film_context_dim, 2 * self._proj_in_dim)
+        with torch.no_grad():
+            self.film_layer.weight.zero_()
+            self.film_layer.bias.zero_()
+            self.film_layer.bias[: self._proj_in_dim].fill_(1.0)
+        self.W_U = nn.Parameter(torch.randn(max_rank, self._proj_in_dim))
         self.b_U = nn.Parameter(torch.zeros(max_rank))
-        self.W_V = nn.Parameter(torch.randn(max_rank, 2 * d_model))
+        self.W_V = nn.Parameter(torch.randn(max_rank, self._proj_in_dim))
         self.b_V = nn.Parameter(torch.zeros(max_rank))
         
         for m in (self.attn_q, self.attn_k, self.attn_v):
@@ -708,23 +715,31 @@ class UniversalOffDiagBlock(nn.Module):
         
         row_out_expanded = row_out.repeat_interleave(g, dim=1)
         down_col_expanded = down_col.repeat_interleave(g, dim=1)
-        
+
         h_row_3 = h_row.reshape(B, -1, h_row.shape[-1])
         row_exp_3 = row_out_expanded.reshape(B, -1, row_out_expanded.shape[-1])
         h_col_3 = h_col.reshape(B, -1, h_col.shape[-1])
         col_exp_3 = down_col_expanded.reshape(B, -1, down_col_expanded.shape[-1])
-        
+
         features_U = torch.cat([h_row_3, row_exp_3], dim=-1)
         features_V = torch.cat([h_col_3, col_exp_3], dim=-1)
-        
+
+        context = torch.cat([scale_tensor, delta_x, dist], dim=-1)
+        film_out = self.film_layer(context)
+        gamma, beta = film_out.chunk(2, dim=-1)
+        gamma = gamma.repeat_interleave(g, dim=1)
+        beta = beta.repeat_interleave(g, dim=1)
+        features_U_mod = gamma * features_U + beta
+        features_V_mod = gamma * features_V + beta
+
         safe_rank = min(rank, self.max_rank)
         W_U_sliced = self.W_U[:safe_rank, :]
         b_U_sliced = self.b_U[:safe_rank]
         W_V_sliced = self.W_V[:safe_rank, :]
         b_V_sliced = self.b_V[:safe_rank]
         
-        U_raw = F.linear(features_U, W_U_sliced, b_U_sliced)
-        V_raw = F.linear(features_V, W_V_sliced, b_V_sliced)
+        U_raw = F.linear(features_U_mod, W_U_sliced, b_U_sliced)
+        V_raw = F.linear(features_V_mod, W_V_sliced, b_V_sliced)
         # Variance control only (no learned scale)
         rank_scale = math.sqrt(safe_rank)
         unified_scalar = 1.0 / rank_scale
@@ -840,16 +855,25 @@ class LeafOnlyNet(nn.Module):
 
 
 def apply_block_structured_M(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE):
+    return apply_block_structured_M_with_levels(
+        diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size, levels_to_include=None
+    )
+
+
+def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, levels_to_include=None):
+    """Apply M: diagonal always; off-diagonal only for levels in levels_to_include (None = all)."""
     B, N, K = x.shape
     num_leaves = N // leaf_size
     x_blk = x.view(B, num_leaves, leaf_size, K)
     out = torch.einsum('blij,bljk->blik', diag_blocks, x_blk).reshape(B, N, K)
     for idx, spec in enumerate(off_diag_struct):
-        U, V = off_diag_list[idx]   
+        if levels_to_include is not None and spec["level"] not in levels_to_include:
+            continue
+        U, V = off_diag_list[idx]
         rs, re = spec["row_start"], spec["row_end"]
         cs, ce = spec["col_start"], spec["col_end"]
-        x_col = x[:, cs:ce]   
-        x_row = x[:, rs:re]   
+        x_col = x[:, cs:ce]
+        x_row = x[:, rs:re]
         out[:, rs:re] = out[:, rs:re] + torch.matmul(U, torch.matmul(V.transpose(1, 2), x_col))
         out[:, cs:ce] = out[:, cs:ce] + torch.matmul(V, torch.matmul(U.transpose(1, 2), x_row))
     return out
@@ -882,7 +906,7 @@ def read_leaf_only_header(path):
     if len(header) >= LEAF_ONLY_HEADER_BYTES:
         d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers = struct.unpack('<iiiiiii', header[:LEAF_ONLY_HEADER_BYTES])
         format_version = struct.unpack('<i', header[LEAF_ONLY_HEADER_BYTES:LEAF_ONLY_HEADER_BYTES_V3])[0] if len(header) >= LEAF_ONLY_HEADER_BYTES_V3 else 1
-        if format_version not in (1, 2, 3):
+        if format_version not in (1, 2, 3, 4, 5):
             format_version = 1
             header_bytes = LEAF_ONLY_HEADER_BYTES
         else:
@@ -912,7 +936,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
     use_gcn = model.embed.gcn is not None
     num_gcn_layers = len(model.embed.gcn) if use_gcn else 0
     use_jacobi = getattr(model.core, 'use_jacobi', True)
-    format_version = 3  # v3: no global scales (leaf_head + jacobi_gate only; off_diag no level_scale_params)
+    format_version = 5  # v5: off_diag FiLM (gamma, beta) + W_U/W_V 2*d_model; v4: concat +5; v3: no global scales
     with open(path, 'wb') as f:
         f.write(struct.pack('<iiiiiiii', d_model, model.leaf_size, input_dim, len(model.blocks), num_heads, int(use_gcn), num_gcn_layers, format_version))
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
@@ -949,6 +973,8 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, blk.attn_k.bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.attn_v.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.attn_v.bias.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, blk.film_layer.weight.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, blk.film_layer.bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.W_U.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.b_U.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.W_V.detach().cpu().float(), transpose=True)
@@ -1060,10 +1086,27 @@ def load_leaf_only_weights(model, path):
                 _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
                 _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
                 _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
-                _read_into(f, blk.W_U, read_tensor, transpose=True)
-                _read_into(f, blk.b_U, read_tensor, transpose=False)
-                _read_into(f, blk.W_V, read_tensor, transpose=True)
-                _read_into(f, blk.b_V, read_tensor, transpose=False)
+                if format_version >= 5:
+                    _read_into(f, blk.film_layer.weight, read_tensor, transpose=True)
+                    _read_into(f, blk.film_layer.bias, read_tensor, transpose=False)
+                    _read_into(f, blk.W_U, read_tensor, transpose=True)
+                    _read_into(f, blk.b_U, read_tensor, transpose=False)
+                    _read_into(f, blk.W_V, read_tensor, transpose=True)
+                    _read_into(f, blk.b_V, read_tensor, transpose=False)
+                else:
+                    w_in_dim_file = (2 * d_model_lo + 5) if format_version >= 4 else (2 * d_model_lo)
+                    w_u_loaded = read_tensor(f, (blk.W_U.shape[0], w_in_dim_file), transpose=True).to(blk.W_U.device)
+                    _read_into(f, blk.b_U, read_tensor, transpose=False)
+                    w_v_loaded = read_tensor(f, (blk.W_V.shape[0], w_in_dim_file), transpose=True).to(blk.W_V.device)
+                    _read_into(f, blk.b_V, read_tensor, transpose=False)
+                    with torch.no_grad():
+                        copy_len = min(w_in_dim_file, blk.W_U.shape[1])
+                        blk.W_U.data[:, :copy_len].copy_(w_u_loaded[:, :copy_len])
+                        if blk.W_U.shape[1] > w_in_dim_file:
+                            blk.W_U.data[:, w_in_dim_file:].zero_()
+                        blk.W_V.data[:, :copy_len].copy_(w_v_loaded[:, :copy_len])
+                        if blk.W_V.shape[1] > w_in_dim_file:
+                            blk.W_V.data[:, w_in_dim_file:].zero_()
                 if format_version < 3:
                     skip_tensor(f, (2,), transpose=False)
             elif sentinel == 0xFFFFFFFF or sentinel == 0xFFFFFFFD:
@@ -1126,8 +1169,8 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
-    parser.add_argument('--num_frames', type=int, default=30, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
+    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
+    parser.add_argument('--num_frames', type=int, default=50, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
@@ -1137,7 +1180,7 @@ def train_leaf_only():
     parser.add_argument('--mixed_sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance. Default False = train on whole matrix per frame.')
     parser.add_argument('--contexts_per_step', type=int, default=1, help='Gradient accumulation: number of random cached contexts per optimizer step.')
     parser.add_argument('--continue_training', action='store_true', help='Load initial weights from the saved .bytes file (--save) and continue training from that state.')
-    parser.add_argument('--evaluate_gradients', action='store_true', help='Run gradient interference analysis then exit (uses same data config as training).')
+    parser.add_argument('--evaluate_gradients', action='store_true', help='Run gradient interference analysis (includes HODLR level analysis) then exit.')
     args = parser.parse_args()
     use_global_node = args.use_global_node
     use_gcn = args.use_gcn
@@ -1690,6 +1733,116 @@ def evaluate_gradient_interference(args):
         print(f"  log2(N), log(scale_A), mass_mu, mass_std, diag_mu, diag_std, diff_mu/std(3): {gf_mean.tolist()}")
         print(f"  stds: {gf_std.tolist()}")
         print("-" * 40)
+
+    # 6. HODLR Level Analysis (cross-level gradient, per-level residual waterfall, basis overlap) on first frame
+    frame_idx = frame_indices[0]
+    batch = dataset[frame_idx]
+    n_orig = int(batch['num_nodes'])
+    n_pad = next_valid_size(n_orig, LEAF_SIZE)
+    x_input = batch['x'][:n_orig].unsqueeze(0).to(device)
+    if n_pad > n_orig:
+        x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
+    x_input[0, :n_orig, :3] = x_input[0, :n_orig, :3] - x_input[0, :n_orig, :3].mean(dim=0, keepdim=True)
+    rows, cols = batch['edge_index'][0], batch['edge_index'][1]
+    mask = (rows < n_orig) & (cols < n_orig)
+    edge_index = batch['edge_index'][:, mask].to(device)
+    edge_values = batch['edge_values'][mask].to(device)
+    scale_A = batch.get('scale_A')
+    if scale_A is not None and not isinstance(scale_A, torch.Tensor):
+        scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
+    A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
+    A_small = A_sparse.to_dense().to(device) if device.type == 'mps' else A_sparse.to(device).to_dense()
+    A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
+    A_dense[:n_orig, :n_orig] = A_small
+    A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
+    dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
+    pre_masks = get_or_compute_masks(batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE)
+    pre_leaf = build_leaf_block_connectivity(
+        edge_index, edge_values, x_input[0, :n_pad, :3], scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
+    )
+    model.zero_grad()
+    diag_blocks, off_diag_list = model(
+        x_input, edge_index=edge_index, edge_values=edge_values,
+        scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf
+    )
+    struct_list = model.off_diag_struct
+    levels = sorted(set(s["level"] for s in struct_list)) if struct_list else []
+    if not levels:
+        print("\n(Skipping HODLR level analysis: no off-diagonal levels for this graph size.)")
+    else:
+        level_min, level_max = levels[0], levels[-1]
+        batch_vectors = max(128, int(round(n_pad ** 0.5)))
+        Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
+        Z[:, n_orig:, :] = 0.0
+        AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
+        MAz = apply_block_structured_M(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE)
+        residual = (MAz - Z).detach()
+
+        print("\n=== Cross-Level Gradient Interference (W_U, W_V) ===")
+        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min})
+        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max})
+        loss_L1 = residual.flatten().dot(M_L1.flatten())
+        loss_L1.backward(retain_graph=True)
+        grad_W_U_L1 = model.universal_off_diag.W_U.grad.clone() if model.universal_off_diag.W_U.grad is not None else torch.zeros_like(model.universal_off_diag.W_U)
+        grad_W_V_L1 = model.universal_off_diag.W_V.grad.clone() if model.universal_off_diag.W_V.grad is not None else torch.zeros_like(model.universal_off_diag.W_V)
+        model.zero_grad()
+        loss_Lmax = residual.flatten().dot(M_Lmax.flatten())
+        loss_Lmax.backward()
+        grad_W_U_Lmax = model.universal_off_diag.W_U.grad.clone() if model.universal_off_diag.W_U.grad is not None else torch.zeros_like(model.universal_off_diag.W_U)
+        grad_W_V_Lmax = model.universal_off_diag.W_V.grad.clone() if model.universal_off_diag.W_V.grad is not None else torch.zeros_like(model.universal_off_diag.W_V)
+        flat_L1 = torch.cat([grad_W_U_L1.view(-1), grad_W_V_L1.view(-1)])
+        flat_Lmax = torch.cat([grad_W_U_Lmax.view(-1), grad_W_V_Lmax.view(-1)])
+        cos_sim = F.cosine_similarity(flat_L1.unsqueeze(0), flat_Lmax.unsqueeze(0), dim=1).item()
+        print(f"  Level {level_min} (macro) vs Level {level_max} (micro) gradient cosine similarity: {cos_sim:.4f}")
+        print(f"  (Highly negative => macro and micro physics fighting for shared weights)")
+
+        print("\n=== Per-Level Residual Loss Decomposition ===")
+        cumulative_levels = set()
+        base_res = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels)
+        loss_diag = ((base_res - Z) ** 2).mean().item()
+        print(f"  Diag only:                          residual loss = {loss_diag:.6f}")
+        for lev in range(level_max, level_min - 1, -1):
+            cumulative_levels.add(lev)
+            out = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels)
+            loss_here = ((out - Z) ** 2).mean().item()
+            print(f"  Diag + Levels {level_max}..{lev}:                residual loss = {loss_here:.6f}")
+        full_loss = ((MAz - Z) ** 2).mean().item()
+        print(f"  Full M:                             residual loss = {full_loss:.6f}")
+
+        print("\n=== Basis Overlap (Subspace Angle) ===")
+        idx_L1 = next(idx for idx, s in enumerate(struct_list) if s["level"] == level_min)
+        idx_Lmax = next(idx for idx, s in enumerate(struct_list) if s["level"] == level_max)
+        U_L1, _ = off_diag_list[idx_L1]
+        U_Lmax, _ = off_diag_list[idx_Lmax]
+        angles = _principal_angles_between_U_matrices(U_L1, U_Lmax)
+        print(f"  Level {level_min} block U vs Level {level_max} block U principal angles (rad): {angles}")
+        print(f"  (Near zero => mode collapse; same basis regardless of scale)")
+        print("-" * 40)
+
+
+def _principal_angles_between_U_matrices(U1, U2, batch_idx=0):
+    """Principal angles (radians) between column spaces of U1 and U2. U1, U2 are (B, side, rank)."""
+    u1 = U1[batch_idx].detach().cpu().double().numpy()
+    u2 = U2[batch_idx].detach().cpu().double().numpy()
+    m1, r1 = u1.shape
+    m2, r2 = u2.shape
+    max_side = max(m1, m2)
+    if m1 < max_side:
+        u1 = np.pad(u1, ((0, max_side - m1), (0, 0)), mode='constant', constant_values=0)
+    if m2 < max_side:
+        u2 = np.pad(u2, ((0, max_side - m2), (0, 0)), mode='constant', constant_values=0)
+    try:
+        Q1, _ = np.linalg.qr(u1)
+        Q2, _ = np.linalg.qr(u2)
+        Q1 = Q1[:, :r1]
+        Q2 = Q2[:, :r2]
+        C = Q1.T @ Q2
+        U, s, Vt = np.linalg.svd(C)
+        s = np.clip(s, -1.0, 1.0)
+        angles_rad = np.arccos(s)
+        return angles_rad
+    except Exception:
+        return np.array([float('nan')])
 
 
 if __name__ == "__main__":
