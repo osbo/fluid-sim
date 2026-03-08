@@ -1,7 +1,12 @@
 """Inspect LeafOnly preconditioner: load weights, build M, compare A·M with AMG. Run with python3 InspectModel.py."""
 import sys
 import time
+import os
+import warnings
 from pathlib import Path
+
+# PyTorch sparse CSR is still in beta; suppress the warning when building A_gpu for PCG
+warnings.filterwarnings("ignore", message=".*Sparse CSR.*", category=UserWarning)
 
 _script_dir = Path(__file__).resolve().parent
 if str(_script_dir) not in sys.path:
@@ -387,7 +392,7 @@ def main():
     print(f"System N={num_nodes_real}")
 
     # n_requested = min(VIEW_SIZE, num_nodes_real)
-    n_requested = 4096
+    n_requested = 256
     n_pad = next_valid_size(n_requested, LEAF_SIZE)
     if n_pad != n_requested:
         print(f"  Padding view: {n_requested} nodes -> {n_pad} (power-of-2 * {LEAF_SIZE})")
@@ -505,12 +510,14 @@ def main():
     # On CUDA use sparse CSR (cuSPARSE); MPS does not support sparse_csr_tensor so use dense
     A_scipy_csr = csr_matrix(A_viz_n.astype(np.float32))
     if device.type == "cuda":
-        A_gpu = torch.sparse_csr_tensor(
-            torch.tensor(A_scipy_csr.indptr, dtype=torch.int32, device=device),
-            torch.tensor(A_scipy_csr.indices, dtype=torch.int32, device=device),
-            torch.tensor(A_scipy_csr.data, dtype=torch.float32, device=device),
-            size=(viz_n, viz_n),
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)  # Sparse CSR beta warning
+            A_gpu = torch.sparse_csr_tensor(
+                torch.tensor(A_scipy_csr.indptr, dtype=torch.int32, device=device),
+                torch.tensor(A_scipy_csr.indices, dtype=torch.int32, device=device),
+                torch.tensor(A_scipy_csr.data, dtype=torch.float32, device=device),
+                size=(viz_n, viz_n),
+            )
     else:
         A_gpu = torch.from_numpy(A_viz_n.astype(np.float32)).to(device)
     b_gpu = torch.from_numpy(b_np).float().to(device)
@@ -598,7 +605,16 @@ def main():
         x_init = np.zeros(viz_n, dtype=np.float64)
 
         try:
-            pyamgx.initialize()
+            # Suppress AMGX deprecation messages (initialize_plugins/finalize_plugins) from stderr
+            _stderr_fd = os.dup(2)
+            _devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(_devnull, 2)
+                pyamgx.initialize()
+            finally:
+                os.dup2(_stderr_fd, 2)
+                os.close(_stderr_fd)
+                os.close(_devnull)
 
             # 2. Configure PCG to use an actual AMG preconditioner
             cfg = pyamgx.Config().create_from_dict({
@@ -663,7 +679,15 @@ def main():
             A_amgx.destroy()
             rsc.destroy()
             cfg.destroy()
-            pyamgx.finalize()
+            _stderr_fd = os.dup(2)
+            _devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(_devnull, 2)
+                pyamgx.finalize()
+            finally:
+                os.dup2(_stderr_fd, 2)
+                os.close(_stderr_fd)
+                os.close(_devnull)
         except Exception as e:
             if HAS_AMGX:
                 print(f"Warning: AMGX failed: {e}")
@@ -671,7 +695,15 @@ def main():
             solve_amgx_ms = 0.0
             amgx_setup_ms = 0.0
             try:
-                pyamgx.finalize()
+                _stderr_fd = os.dup(2)
+                _devnull = os.open(os.devnull, os.O_WRONLY)
+                try:
+                    os.dup2(_devnull, 2)
+                    pyamgx.finalize()
+                finally:
+                    os.dup2(_stderr_fd, 2)
+                    os.close(_stderr_fd)
+                    os.close(_devnull)
             except Exception:
                 pass
     total_amgx_ms = amgx_setup_ms + solve_amgx_ms
