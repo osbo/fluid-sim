@@ -75,18 +75,13 @@ class FluidGraphDataset:
             if r == c:
                 diag_map[r] = v
 
-        # Fixed scale for positions (preserves physical scale invariance across frames)
+        # Fixed absolute scale for positions
         positions_n = positions / 1024.0
-
         layer_val = np.exp2(layer)
 
-        mass_max = float(np.max(mass))
-        if mass_max <= 1e-9: mass_max = 1.0
-        mass_n = mass / mass_max
-
         scale_A = float(np.abs(vals).max())
-        if scale_A <= 0.0: scale_A = 1.0
-        diag_map_n = diag_map / scale_A
+        if scale_A <= 0.0:
+            scale_A = 1.0
 
         dg_path = frame_path / "diffusion_gradient.bin"
         if dg_path.exists():
@@ -94,12 +89,35 @@ class FluidGraphDataset:
         else:
             diffusion_grad = np.zeros((num_nodes, 3), dtype=np.float32)
 
+        # Robust Frame-Local Z-Score Normalization
+        mass_mu, mass_std = float(np.mean(mass)), float(np.std(mass))
+        mass_n = (mass - mass_mu) / (mass_std if mass_std > 1e-6 else 1.0)
+
+        diag_mu, diag_std = float(np.mean(diag_map)), float(np.std(diag_map))
+        diag_map_n = (diag_map - diag_mu) / (diag_std if diag_std > 1e-6 else 1.0)
+
+        diff_mu = np.mean(diffusion_grad, axis=0)
+        diff_std = np.std(diffusion_grad, axis=0)
+        diff_std_safe = np.where(diff_std > 1e-6, diff_std, 1.0)
+        diffusion_grad_n = (diffusion_grad - diff_mu) / diff_std_safe
+
+        # Pack absolute frame statistics for the global Scale MLP
+        global_features = np.array([
+            math.log2(max(1, num_nodes)),
+            math.log(max(1e-6, scale_A)),
+            mass_mu, mass_std,
+            diag_mu, diag_std,
+            diff_mu[0], diff_std[0],
+            diff_mu[1], diff_std[1],
+            diff_mu[2], diff_std[2],
+        ], dtype=np.float32)
+
         n_float = 9
         x = np.zeros((num_nodes, n_float), dtype=np.float32)
         x[:, :3] = positions_n
         x[:, 3] = layer_val
         x[:, 4] = mass_n
-        x[:, 5:8] = diffusion_grad
+        x[:, 5:8] = diffusion_grad_n
         x[:, 8] = diag_map_n
 
         return {
@@ -109,6 +127,7 @@ class FluidGraphDataset:
             'num_nodes': int(num_nodes),
             'scale_A': scale_A,
             'frame_path': str(frame_path),
+            'global_features': torch.from_numpy(global_features).float(),
         }
 
 # --- Embedding and graph layers ---
@@ -574,8 +593,9 @@ class LeafCore(nn.Module):
         self.jacobi_gate = nn.Linear(d_model, 1)
         nn.init.normal_(self.jacobi_gate.weight, std=0.01)
         nn.init.constant_(self.jacobi_gate.bias, 0.0)
-        self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1e-2))
-        self.log_jacobi_scale_leaf = nn.Parameter(torch.ones(1) * math.log(0.64))  # only used when use_jacobi=True
+        # Inits from observed settling (e.g. sLeaf~7e-3, sJ~1.5)
+        self.log_hodlr_scale_leaf = nn.Parameter(torch.ones(1) * math.log(7e-3))
+        self.log_jacobi_scale_leaf = nn.Parameter(torch.ones(1) * math.log(1.5))  # only used when use_jacobi=True
 
     def get_leaf_blocks(self, h, x, scale_A=None):
         B, N, _ = h.shape
@@ -685,7 +705,10 @@ class UniversalOffDiagBlock(nn.Module):
         V = self.attn_v(down_col_cond)
         
         scores = (Q @ K.transpose(-2, -1)) * self._scale_attn
-        scores = scores.masked_fill(~mask.unsqueeze(0), float('-inf'))
+        # Handle both 2D (single block) and 3D (batched blocks) masks
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        scores = scores.masked_fill(~mask, float('-inf'))
         attn_probs = F.softmax(scores, dim=-1)
         row_out = (attn_probs @ V).reshape(B, self.n_super, -1)
         
@@ -711,8 +734,10 @@ class UniversalOffDiagBlock(nn.Module):
         
         # Counteract rank inflation (Scaled Dot-Product style)
         rank_scale = math.sqrt(safe_rank)
-        # Combine with the learned physical scale, split evenly across U and V
+        # Combine with the learned physical scale; [B,1] or [B,1,1] -> broadcast to (B, side, rank)
         unified_scalar = torch.sqrt(scale / rank_scale)
+        if unified_scalar.dim() == 2:
+            unified_scalar = unified_scalar.unsqueeze(-1)
         return U_raw * unified_scalar, V_raw * unified_scalar
 
 
@@ -722,9 +747,9 @@ class LeafOnlyNet(nn.Module):
         self.leaf_size = leaf_size
         self.rank_base = rank_base
         self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn, use_jacobi=use_jacobi)
-        # level_scale_params = [log(base_scale), decay_per_level]; init near observed settling
+        # level_scale_params = [log(base_scale), decay_per_level]; init from observed settling (lvl ~ (-4.88, -0.77))
         self.level_scale_params = nn.Parameter(
-            torch.tensor([math.log(1e-2), -0.83])
+            torch.tensor([-4.88, -0.77])
         )
 
         self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=512)
@@ -752,6 +777,10 @@ class LeafOnlyNet(nn.Module):
 
     def _off_diag(self, h, x, edge_index, current_struct, precomputed_masks=None):
         B, N, C = h.shape
+        level_p0 = self.level_scale_params[0]
+        level_p1 = self.level_scale_params[1]
+
+        # 1. Fetch or compute masks
         if precomputed_masks is not None:
             mask_list = precomputed_masks
         else:
@@ -767,24 +796,59 @@ class LeafOnlyNet(nn.Module):
                 self._off_diag_mask_cache_id = cache_id
             mask_list = self._off_diag_mask_cache
 
-        result = []
+        result = [None] * len(current_struct)
+
+        # 2. Group blocks by their HODLR level
+        level_to_blocks = {}
         for idx, spec in enumerate(current_struct):
-            rs, re = spec["row_start"], spec["row_end"]
-            cs, ce = spec["col_start"], spec["col_end"]
+            lvl = spec["level"]
+            if lvl not in level_to_blocks:
+                level_to_blocks[lvl] = []
+            level_to_blocks[lvl].append((idx, spec))
 
-            # Evaluate continuous scale function: log_scale = p[0] + (L - 1) * p[1]
-            L = torch.tensor(spec["level"], dtype=h.dtype, device=h.device)
-            log_scale = self.level_scale_params[0] + (L - 1.0) * self.level_scale_params[1]
-            scale = torch.exp(log_scale)
+        # 3. Execute batched blocks per level
+        for lvl, blocks in level_to_blocks.items():
+            K = len(blocks)
+            rank = blocks[0][1]["rank"]
 
-            pos_row = x[:, rs:re, :3]
-            pos_col = x[:, cs:ce, :3]
+            # Compute dynamic scale for this level
+            L_tensor = torch.tensor(lvl, dtype=h.dtype, device=h.device)
+            log_scale = level_p0.view(B, 1) + (L_tensor - 1.0) * level_p1.view(B, 1)
+            scale = torch.exp(log_scale)  # [B, 1]
+            scale_batched = scale.repeat(K, 1)  # [K*B, 1]
 
-            U, V = self.universal_off_diag(
-                h[:, rs:re], h[:, cs:ce], pos_row, pos_col,
-                mask_list[idx], scale, rank=spec["rank"]
+            h_rows, h_cols = [], []
+            pos_rows, pos_cols = [], []
+            masks = []
+
+            for idx, spec in blocks:
+                rs, re = spec["row_start"], spec["row_end"]
+                cs, ce = spec["col_start"], spec["col_end"]
+                h_rows.append(h[:, rs:re])
+                h_cols.append(h[:, cs:ce])
+                pos_rows.append(x[:, rs:re, :3])
+                pos_cols.append(x[:, cs:ce, :3])
+                masks.append(mask_list[idx])
+
+            h_row_batched = torch.cat(h_rows, dim=0)
+            h_col_batched = torch.cat(h_cols, dim=0)
+            pos_row_batched = torch.cat(pos_rows, dim=0)
+            pos_col_batched = torch.cat(pos_cols, dim=0)
+
+            stacked_masks = torch.stack(masks, dim=0)
+            batched_masks = stacked_masks.repeat_interleave(B, dim=0)
+
+            U_batched, V_batched = self.universal_off_diag(
+                h_row_batched, h_col_batched, pos_row_batched, pos_col_batched,
+                batched_masks, scale_batched, rank=rank
             )
-            result.append((U, V))
+
+            U_splits = torch.split(U_batched, B, dim=0)
+            V_splits = torch.split(V_batched, B, dim=0)
+
+            for i, (idx, _) in enumerate(blocks):
+                result[idx] = (U_splits[i], V_splits[i])
+
         return result
 
     def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_masks=None, precomputed_leaf_connectivity=None):
@@ -1091,8 +1155,8 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all). Default: True.')
-    parser.add_argument('--num_frames', type=int, default=100, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames. Default: 10.')
+    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
+    parser.add_argument('--num_frames', type=int, default=100, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
@@ -1102,9 +1166,14 @@ def train_leaf_only():
     parser.add_argument('--mixed_sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance. Default False = train on whole matrix per frame.')
     parser.add_argument('--contexts_per_step', type=int, default=1, help='Gradient accumulation: number of random cached contexts per optimizer step.')
     parser.add_argument('--continue_training', action='store_true', help='Load initial weights from the saved .bytes file (--save) and continue training from that state.')
+    parser.add_argument('--evaluate_gradients', action='store_true', help='Run gradient interference analysis then exit (uses same data config as training).')
     args = parser.parse_args()
     use_global_node = args.use_global_node
     use_gcn = args.use_gcn
+
+    if args.evaluate_gradients:
+        evaluate_gradient_interference(args)
+        return
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available():
@@ -1138,8 +1207,8 @@ def train_leaf_only():
             frame_indices = sorted(rng.sample(range(len(dataset)), n_sample))
             print(f"  [startup] Random sample of {n_sample} frames (--num_frames {args.num_frames})")
 
-    MIN_MIXED_SIZE = 4096
-    MAX_MIXED_SIZE = 4096
+    MIN_MIXED_SIZE = 256
+    MAX_MIXED_SIZE = 256
     base_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
 
     # Pre-extract and cache sub-graphs from every frame (sizes unchanged)
@@ -1209,13 +1278,17 @@ def train_leaf_only():
             precomputed_leaf_connectivity = (leaf_attn_mask, leaf_edge_feats)
 
             batch_vectors = max(128, int(round(n_pad ** 0.5)))
+            global_feat = batch.get('global_features')
+            if global_feat is not None:
+                global_feat = global_feat.to(device)
 
             training_contexts.append({
                 'n_pad': n_pad, 'n_orig': n, 'num_leaves': n_pad // LEAF_SIZE,
                 'x_input': x_input, 'edge_index': edge_index, 'edge_values': edge_values,
                 'scale_A': scale_A, 'A_dense': A_dense, 'precomputed_masks': precomputed_masks,
                 'precomputed_leaf_connectivity': precomputed_leaf_connectivity,
-                'batch_vectors': batch_vectors
+                'batch_vectors': batch_vectors,
+                'global_features': global_feat,
             })
 
     if len(training_contexts) == 0:
@@ -1236,7 +1309,10 @@ def train_leaf_only():
     if device.type == 'cuda':
         # dynamic=True causes dynamo to use symbolic dims (s0//32 vs s7) that don't unify in attention
         # (scores + bias_physics), leading to shape errors. Use dynamic=False so we trace with concrete
-        # shapes; each distinct graph size recompiles once.
+        # shapes; each distinct (n_pad, edge_index size, etc.) recompiles once.
+        # Allow more cached compilations so multi-frame / mixed-size training doesn't hit the default limit (8).
+        if hasattr(torch._dynamo.config, 'cache_size_limit'):
+            torch._dynamo.config.cache_size_limit = 128
         # NOTE: First step(s) per unique size will be slow while compiling, then it will fly.
         model = torch.compile(model, dynamic=False)
 
@@ -1480,6 +1556,179 @@ def train_leaf_only():
 
     save_leaf_only_weights(model, args.save, input_dim=9)
     print(f"Saved to {args.save}")
+
+
+def evaluate_gradient_interference(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+
+    print(f"\n--- Starting Gradient Interference Analysis on {device} ---")
+
+    # 1. Setup Model and Load Weights
+    model = LeafOnlyNet(
+        input_dim=9, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
+        num_heads=args.num_heads, rank_base=RANK_BASE_LEVEL1, mask_attention=True,
+        use_global_node=args.use_global_node, use_gcn=args.use_gcn,
+    ).to(device)
+
+    save_path = Path(args.save)
+    if save_path.exists():
+        load_leaf_only_weights(model, args.save)
+        print(f"Loaded weights from {args.save}")
+    else:
+        print("WARNING: No saved weights found. Analyzing randomly initialized gradients.")
+
+    model.train()  # Need train mode for gradients
+
+    # 2. Setup Data Contexts: same config as training (single vs multi) but only 10 passes/frames by default
+    num_eval = 10
+    data_path = Path(args.data_folder)
+    run_folder = _most_recent_run_folder(data_path)
+    dataset = FluidGraphDataset([run_folder])
+
+    if args.use_single_frame:
+        frame_idx = min(args.frame, len(dataset) - 1)
+        frame_indices = [frame_idx] * num_eval
+        print(f"Evaluating {num_eval} passes on SINGLE frame index {frame_idx}")
+    else:
+        rng = random.Random(args.seed)
+        n_sample = min(num_eval, len(dataset))
+        frame_indices = sorted(rng.sample(range(len(dataset)), n_sample))
+        print(f"Evaluating across {n_sample} random frames")
+
+    # 3. Define Parameter Groups to Analyze
+    # Isolating the scale factors helps track if they are fighting the structural updates
+    def _scale_params(m):
+        scale_list = [m.log_hodlr_scale_leaf, m.level_scale_params]
+        if getattr(m.core, 'use_jacobi', True) and hasattr(m.core, 'log_jacobi_scale_leaf'):
+            scale_list.append(m.core.log_jacobi_scale_leaf)
+        return [p for p in scale_list if p is not None]
+
+    param_groups = {
+        'Input Embeddings (Lift)': lambda m: list(m.embed.lift.parameters()),
+        'Neighbor Impact (GCN)': lambda m: list(m.embed.gcn.parameters()) if m.embed.gcn else [],
+        'Transformer Attention': lambda m: [p for b in m.blocks for p in b.parameters()],
+        'Off-Diagonal Routing': lambda m: list(m.universal_off_diag.parameters()),
+        'Diagonal Leaf Head': lambda m: list(m.core.leaf_head.parameters()),
+        'Scale Factors': _scale_params,
+    }
+
+    group_gradients = {name: [] for name in param_groups.keys()}
+    global_features_list = []
+
+    # 4. Extract Gradients per Frame
+    for step, frame_idx in enumerate(frame_indices):
+        batch = dataset[frame_idx]
+        if batch.get('global_features') is not None:
+            global_features_list.append(batch['global_features'].detach().cpu().numpy())
+        n_orig = int(batch['num_nodes'])
+        n_pad = next_valid_size(n_orig, LEAF_SIZE)
+
+        x_input = batch['x'][:n_orig].unsqueeze(0).to(device)
+        if n_pad > n_orig:
+            x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
+
+        active_pos = x_input[0, :n_orig, :3]
+        x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
+
+        rows, cols = batch['edge_index'][0], batch['edge_index'][1]
+        mask = (rows < n_orig) & (cols < n_orig)
+        edge_index = batch['edge_index'][:, mask].to(device)
+        edge_values = batch['edge_values'][mask].to(device)
+        scale_A = batch.get('scale_A')
+        if scale_A is not None and not isinstance(scale_A, torch.Tensor):
+            scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
+
+        A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
+        A_small = A_sparse.to_dense().to(device) if device.type == 'mps' else A_sparse.to(device).to_dense()
+        A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
+        A_dense[:n_orig, :n_orig] = A_small
+        A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
+
+        dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
+        pre_masks = get_or_compute_masks(batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE)
+        pre_leaf = build_leaf_block_connectivity(
+            edge_index, edge_values, x_input[0, :n_pad, :3], scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
+        )
+
+        # Forward Pass
+        model.zero_grad()
+        diag_blocks, off_diag_list = model(
+            x_input, edge_index=edge_index, edge_values=edge_values,
+            scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf
+        )
+
+        # Compute Loss
+        batch_vectors = max(128, int(round(n_pad ** 0.5)))
+        Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
+        Z[:, n_orig:, :] = 0.0
+        AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
+        MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
+
+        loss = ((MAZ - Z) ** 2).mean()
+        loss.backward()
+
+        # Extract and flatten gradients for this step
+        for group_name, get_params in param_groups.items():
+            params = get_params(model)
+            if not params:
+                continue
+
+            grads = []
+            for p in params:
+                if p.grad is not None:
+                    grads.append(p.grad.detach().clone().view(-1))
+                else:
+                    grads.append(torch.zeros_like(p).view(-1))
+
+            flat_grad = torch.cat(grads)
+            group_gradients[group_name].append(flat_grad)
+
+        print(f"  Processed frame {frame_idx} (Loss: {loss.item():.4f})")
+
+    # 5. Calculate Metrics
+    print("\n=== Gradient Interference Report ===")
+
+    for group_name, grads in group_gradients.items():
+        if not grads:
+            continue
+
+        grads_stack = torch.stack(grads)  # Shape: (num_frames, num_params)
+        num_frames = grads_stack.shape[0]
+
+        # Mean gradient and variance across frames
+        mean_grad = grads_stack.mean(dim=0)
+        var_grad = grads_stack.var(dim=0, unbiased=False)
+
+        # SNR: ||mu|| / sqrt(mean(variance) + eps)
+        signal_norm = mean_grad.norm().item()
+        noise_norm = torch.sqrt(var_grad.mean() + 1e-12).item()
+        snr = signal_norm / noise_norm if noise_norm > 0 else float('inf')
+
+        # Pairwise Cosine Similarity
+        cos_sims = []
+        for i in range(num_frames):
+            for j in range(i + 1, num_frames):
+                sim = F.cosine_similarity(grads_stack[i].unsqueeze(0), grads_stack[j].unsqueeze(0), dim=1).item()
+                cos_sims.append(sim)
+
+        avg_cos_sim = sum(cos_sims) / len(cos_sims) if cos_sims else 1.0
+
+        print(f"{group_name.upper()}:")
+        print(f"  Avg Cosine Similarity : {avg_cos_sim:8.4f}  (1.0 = aligned, 0.0 = orthogonal, -1.0 = fighting)")
+        print(f"  Signal-to-Noise (SNR) : {snr:8.4f}")
+        print(f"  Gradient Magnitude     : {signal_norm:8.4e}")
+        print("-" * 40)
+
+    if global_features_list:
+        gf_arr = np.array(global_features_list)
+        gf_mean = gf_arr.mean(axis=0)
+        gf_std = gf_arr.std(axis=0)
+        print("FRAME STATS (global_features, mean ± std across evaluated frames):")
+        print(f"  log2(N), log(scale_A), mass_mu, mass_std, diag_mu, diag_std, diff_mu/std(3): {gf_mean.tolist()}")
+        print(f"  stds: {gf_std.tolist()}")
+        print("-" * 40)
 
 
 if __name__ == "__main__":
