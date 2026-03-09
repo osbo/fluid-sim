@@ -440,12 +440,19 @@ def main():
         for spec in off_diag_struct
     ] if off_diag_struct else []
 
+    # Pass global_features so lift FiLM matches training (required for v10+ weights)
+    global_feat = batch.get('global_features')
+    if global_feat is not None:
+        global_feat = global_feat.to(device)
+        if global_feat.dim() == 1:
+            global_feat = global_feat.unsqueeze(0)
+
     with torch.no_grad():
         # Warm up inference (torch.compile + CUDA); match training warmup so timing is comparable
         for _ in range(15):
             _ = model_leaf(
                 x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
-                precomputed_masks=precomputed_masks,
+                precomputed_masks=precomputed_masks, global_features=global_feat,
             )
         if device.type == 'cuda':
             torch.cuda.synchronize()
@@ -454,7 +461,7 @@ def main():
             inf_start.record()
             diag_blocks, off_diag_list = model_leaf(
                 x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
-                precomputed_masks=precomputed_masks,
+                precomputed_masks=precomputed_masks, global_features=global_feat,
             )
             inf_end.record()
             torch.cuda.synchronize()
@@ -463,7 +470,7 @@ def main():
             t0 = time.perf_counter()
             diag_blocks, off_diag_list = model_leaf(
                 x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
-                precomputed_masks=precomputed_masks,
+                precomputed_masks=precomputed_masks, global_features=global_feat,
             )
             inference_ms = (time.perf_counter() - t0) * 1000
     # Keep preconditioner outputs on GPU so PCG CUDAGRAPH solver uses them without CPU round-trip
