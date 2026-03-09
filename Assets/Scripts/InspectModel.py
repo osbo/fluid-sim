@@ -226,6 +226,7 @@ def pcg_gpu_cudagraph(
     max_iter=500,
     device=None,
     check_freq=3,
+    scale_A=1.0,
 ):
     """
     PCG on GPU using CUDA Graphs: capture one iteration and replay to eliminate Python dispatch.
@@ -253,9 +254,10 @@ def pcg_gpu_cudagraph(
     x_static.zero_()
     r_static.copy_(b_gpu)
     diag_4d = diag_blocks if diag_blocks.dim() == 4 else diag_blocks.unsqueeze(0)
+    scale_A_f = float(scale_A) if scale_A is not None else 1.0
     z_initial = apply_block_structured_M(
         diag_4d, off_diag_list, r_static.unsqueeze(0), off_diag_struct,
-        leaf_size=LEAF_SIZE,
+        leaf_size=LEAF_SIZE, scale_A=scale_A_f,
     )
     z_static.copy_(z_initial.squeeze(0))
     p_static.copy_(z_static)
@@ -287,6 +289,8 @@ def pcg_gpu_cudagraph(
                 r_r = r_static[rs:re]
                 z_off_static[cs:ce].add_(V @ (U.T @ r_r))
         z_static.copy_(z_diag + z_off_static)
+        if scale_A_f != 1.0 and scale_A_f > 0:
+            z_static.mul_(1.0 / scale_A_f)
         rho_new = (r_static * z_static).sum()
         beta = rho_new / rho_static
         rho_static.fill_(rho_new)
@@ -388,7 +392,7 @@ def main():
     print(f"System N={num_nodes_real}")
 
     # n_requested = min(VIEW_SIZE, num_nodes_real)
-    n_requested = 1024
+    n_requested = 256
     n_pad = next_valid_size(n_requested, LEAF_SIZE)
     if n_pad != n_requested:
         print(f"  Padding view: {n_requested} nodes -> {n_pad} (power-of-2 * {LEAF_SIZE})")
@@ -551,7 +555,8 @@ def main():
     total_none_gpu_ms = setup_none_ms + solve_none_gpu_ms
     total_none_cpu_ms = setup_none_ms + solve_none_cpu_ms
 
-    # Use LeafOnly's level-wise batched apply (same fast path as LeafOnly.py)
+    scale_A_val = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
+    # Use LeafOnly's level-wise batched apply (same fast path as LeafOnly.py); M(A) = (1/α) M~(Â)
     with torch.no_grad():
         def apply_M_block_sparse(r):
             r_batched = r.unsqueeze(0)  # (1, viz_n, 1)
@@ -559,6 +564,7 @@ def main():
                 diag_blocks, off_diag_list, r_batched,
                 getattr(model_leaf, "off_diag_struct", None),
                 leaf_size=LEAF_SIZE,
+                scale_A=scale_A_val,
             )
             return out.squeeze(0)  # (viz_n, 1)
 
@@ -575,6 +581,7 @@ def main():
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=1,  # exact iteration count for e2e benchmark
+                scale_A=scale_A_val,
             )
         except Exception as e:
             print(f"  LeafOnly (CUDA graph failed, using regular solve): {e}")
