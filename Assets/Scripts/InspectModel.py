@@ -388,7 +388,7 @@ def main():
     print(f"System N={num_nodes_real}")
 
     # n_requested = min(VIEW_SIZE, num_nodes_real)
-    n_requested = 256
+    n_requested = 1024
     n_pad = next_valid_size(n_requested, LEAF_SIZE)
     if n_pad != n_requested:
         print(f"  Padding view: {n_requested} nodes -> {n_pad} (power-of-2 * {LEAF_SIZE})")
