@@ -734,10 +734,10 @@ class UniversalOffDiagBlock(nn.Module):
         self.scale_emb_dim = 16
         self.scale_embedder = SinusoidalPosEmb(self.scale_emb_dim)
 
-        # Context: scale_emb (16) + delta_x (3) + dist (1) = 20
-        self._context_dim = self.scale_emb_dim + 4
+        # Context: scale_emb (16) + delta_x (3) + dist (1) + global_features (optional) so film_gen sees frame-level physics
+        self._context_dim = self.scale_emb_dim + 4 + (global_features_dim or 0)
 
-        # AdaLN-style MLP FiLM Generator: scale context -> gamma, beta (can "turn off" macro channels for micro)
+        # AdaLN-style MLP FiLM Generator: scale + geometry + global context -> gamma, beta (can "turn off" macro channels for micro)
         self.film_gen = nn.Sequential(
             nn.Linear(self._context_dim, d_model),
             nn.GELU(),
@@ -824,8 +824,18 @@ class UniversalOffDiagBlock(nn.Module):
         features_U = torch.cat([h_row_3, row_exp_3, global_ctx_expanded], dim=-1)
         features_V = torch.cat([h_col_3, col_exp_3, global_ctx_expanded], dim=-1)
 
-        context_U = torch.cat([scale_emb, delta_x, dist], dim=-1)
-        context_V = torch.cat([scale_emb, -delta_x, dist], dim=-1)
+        if self.global_features_dim > 0:
+            if global_features is not None:
+                gf_exp = global_features.unsqueeze(1).expand(-1, self.n_super, -1)
+                context_U = torch.cat([scale_emb, delta_x, dist, gf_exp], dim=-1)
+                context_V = torch.cat([scale_emb, -delta_x, dist, gf_exp], dim=-1)
+            else:
+                padding = torch.zeros(B, self.n_super, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
+                context_U = torch.cat([scale_emb, delta_x, dist, padding], dim=-1)
+                context_V = torch.cat([scale_emb, -delta_x, dist, padding], dim=-1)
+        else:
+            context_U = torch.cat([scale_emb, delta_x, dist], dim=-1)
+            context_V = torch.cat([scale_emb, -delta_x, dist], dim=-1)
 
         film_U = self.film_gen(context_U)
         gamma_U, beta_U = film_U.chunk(2, dim=-1)
@@ -1061,31 +1071,16 @@ def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None):
 
 # --- Save / Load ---
 
-LEAF_ONLY_HEADER_BYTES_OLD = 20
-LEAF_ONLY_HEADER_BYTES_V2 = 24
-LEAF_ONLY_HEADER_BYTES = 28
-LEAF_ONLY_HEADER_BYTES_V3 = 32   # + format_version (1=no jacobi in scale section, 2=jacobi present)
+LEAF_ONLY_HEADER_BYTES = 32  # 8 x int32: d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, reserved
 
 def read_leaf_only_header(path):
     path = Path(path)
     with open(path, 'rb') as f:
-        header = f.read(LEAF_ONLY_HEADER_BYTES_V3)
-    if len(header) < LEAF_ONLY_HEADER_BYTES_OLD:
+        header = f.read(LEAF_ONLY_HEADER_BYTES)
+    if len(header) < LEAF_ONLY_HEADER_BYTES:
         raise ValueError("LeafOnly weights file too short")
-    if len(header) >= LEAF_ONLY_HEADER_BYTES:
-        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers = struct.unpack('<iiiiiii', header[:LEAF_ONLY_HEADER_BYTES])
-        format_version = struct.unpack('<i', header[LEAF_ONLY_HEADER_BYTES:LEAF_ONLY_HEADER_BYTES_V3])[0] if len(header) >= LEAF_ONLY_HEADER_BYTES_V3 else 1
-        if format_version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
-            format_version = 1
-            header_bytes = LEAF_ONLY_HEADER_BYTES
-        else:
-            header_bytes = LEAF_ONLY_HEADER_BYTES_V3
-        return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, format_version, header_bytes
-    if len(header) >= LEAF_ONLY_HEADER_BYTES_V2:
-        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn = struct.unpack('<iiiiii', header[:LEAF_ONLY_HEADER_BYTES_V2])
-        return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, 1, 1, LEAF_ONLY_HEADER_BYTES_V2
-    d_model, leaf_size, input_dim, num_layers, num_heads = struct.unpack('<iiiii', header[:LEAF_ONLY_HEADER_BYTES_OLD])
-    return d_model, leaf_size, input_dim, num_layers, num_heads, 1, 1, 1, LEAF_ONLY_HEADER_BYTES_OLD  
+    d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, _ = struct.unpack('<iiiiiiii', header)
+    return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, LEAF_ONLY_HEADER_BYTES
 
 
 def _write_gcn_layer(f, gcn_layer):
@@ -1105,10 +1100,8 @@ def save_leaf_only_weights(model, path, input_dim=9):
     use_gcn = model.embed.gcn is not None
     num_gcn_layers = len(model.embed.gcn) if use_gcn else 0
     use_jacobi = getattr(model.core, 'use_jacobi', True)
-    format_version = 13  # v13: off-diag rank input includes global token outputs (3*d_model); v12: 32+2 attn
     with open(path, 'wb') as f:
-        f.write(struct.pack('<iiiiiiii', d_model, model.leaf_size, input_dim, len(model.blocks), num_heads, int(use_gcn), num_gcn_layers, format_version))
-        # lift[0]: v11 has (d_model, 18); v10 had (d_model, 6)
+        f.write(struct.pack('<iiiiiiii', d_model, model.leaf_size, input_dim, len(model.blocks), num_heads, int(use_gcn), num_gcn_layers, 0))
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.embed.lift[0].bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.embed.lift[2].weight.detach().cpu().float(), transpose=True)
@@ -1186,7 +1179,7 @@ def load_leaf_only_weights(model, path):
     import numpy as np
     path = Path(path)
     result = read_leaf_only_header(path)
-    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, _num_heads_lo, use_gcn_file, num_gcn_layers_file, format_version, header_bytes = result
+    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, _num_heads_lo, use_gcn_file, num_gcn_layers_file, header_bytes = result
     if model.leaf_size != leaf_size_lo or len(model.blocks) != num_layers_lo:
         raise ValueError(f"Checkpoint leaf_size={leaf_size_lo} num_layers={num_layers_lo} != model {model.leaf_size} {len(model.blocks)}")
     has_gcn = model.embed.gcn is not None
@@ -1223,20 +1216,11 @@ def load_leaf_only_weights(model, path):
 
     with open(path, 'rb') as f:
         f.seek(header_bytes)
-        # lift[0]: v11 has in_features=18; v10 had in_features=6
-        lift0_in = model.embed.lift[0].weight.shape[1]
-        if format_version >= 11:
-            _read_into(f, model.embed.lift[0].weight, read_tensor, transpose=True)
-        else:
-            w0 = read_tensor(f, (d_model_lo, 6), transpose=True).to(model.embed.lift[0].weight.device)
-            with torch.no_grad():
-                model.embed.lift[0].weight.data[:, :6].copy_(w0)
-                if lift0_in > 6:
-                    model.embed.lift[0].weight.data[:, 6:].zero_()
+        _read_into(f, model.embed.lift[0].weight, read_tensor, transpose=True)
         _read_into(f, model.embed.lift[0].bias, read_tensor, transpose=False)
         _read_into(f, model.embed.lift[2].weight, read_tensor, transpose=True)
         _read_into(f, model.embed.lift[2].bias, read_tensor, transpose=False)
-        if format_version >= 10 and getattr(model.embed, 'lift_film', None) is not None:
+        if getattr(model.embed, 'lift_film', None) is not None:
             _read_into(f, model.embed.lift_film[0].weight, read_tensor, transpose=True)
             _read_into(f, model.embed.lift_film[0].bias, read_tensor, transpose=False)
             _read_into(f, model.embed.lift_film[2].weight, read_tensor, transpose=True)
@@ -1262,13 +1246,9 @@ def load_leaf_only_weights(model, path):
             _read_into(f, block.attn.edge_gate.bias, read_tensor, transpose=False)
         _read_into(f, model.leaf_head.weight, read_tensor, transpose=True)
         _read_into(f, model.leaf_head.bias, read_tensor, transpose=False)
-        if format_version < 3:
-            skip_tensor(f, (1,), transpose=False)
-        if format_version >= 2 and getattr(model.core, 'use_jacobi', True):
+        if getattr(model.core, 'use_jacobi', True):
             _read_into(f, model.core.jacobi_gate.weight, read_tensor, transpose=True)
             _read_into(f, model.core.jacobi_gate.bias, read_tensor, transpose=False)
-            if format_version < 3:
-                skip_tensor(f, (1,), transpose=False)
         extra = f.read(8)
         if len(extra) == 8:
             sentinel, _ = struct.unpack('<II', extra)
@@ -1280,92 +1260,17 @@ def load_leaf_only_weights(model, path):
                 _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
                 _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
                 _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
-                if format_version >= 6:
-                    _read_into(f, blk.film_gen[0].weight, read_tensor, transpose=True)
-                    _read_into(f, blk.film_gen[0].bias, read_tensor, transpose=False)
-                    _read_into(f, blk.film_gen[2].weight, read_tensor, transpose=True)
-                    _read_into(f, blk.film_gen[2].bias, read_tensor, transpose=False)
-                    if format_version >= 12 and getattr(blk, 'scene_proj', None) is not None:
-                        _read_into(f, blk.scene_proj.weight, read_tensor, transpose=True)
-                        _read_into(f, blk.scene_proj.bias, read_tensor, transpose=False)
-                    # v13: W_U/W_V have _proj_in_dim=3*d_model; v9–v12: 2*d_model
-                    old_off_rank = 512
-                    if format_version >= 9:
-                        if format_version >= 13:
-                            _read_into(f, blk.W_U, read_tensor, transpose=True)
-                            _read_into(f, blk.b_U, read_tensor, transpose=False)
-                            _read_into(f, blk.W_V, read_tensor, transpose=True)
-                            _read_into(f, blk.b_V, read_tensor, transpose=False)
-                        else:
-                            old_proj = blk._proj_in_dim * 2 // 3
-                            w_u = read_tensor(f, (blk.W_U.shape[0], old_proj), transpose=True).to(blk.W_U.device)
-                            blk.W_U.data[:, :old_proj].copy_(w_u)
-                            blk.W_U.data[:, old_proj:].zero_()
-                            _read_into(f, blk.b_U, read_tensor, transpose=False)
-                            w_v = read_tensor(f, (blk.W_V.shape[0], old_proj), transpose=True).to(blk.W_V.device)
-                            blk.W_V.data[:, :old_proj].copy_(w_v)
-                            blk.W_V.data[:, old_proj:].zero_()
-                            _read_into(f, blk.b_V, read_tensor, transpose=False)
-                    elif format_version >= 8:
-                        rank_v8 = 1024
-                        old_proj_v8 = blk._proj_in_dim * 2 // 3
-                        w_u = read_tensor(f, (rank_v8, old_proj_v8), transpose=True).to(blk.W_U.device)
-                        blk.W_U.data[:rank_v8, :old_proj_v8].copy_(w_u)
-                        blk.W_U.data[:rank_v8, old_proj_v8:].zero_()
-                        b_u = read_tensor(f, (rank_v8,), transpose=False).to(blk.b_U.device)
-                        blk.b_U.data[:rank_v8].copy_(b_u)
-                        w_v = read_tensor(f, (rank_v8, old_proj_v8), transpose=True).to(blk.W_V.device)
-                        blk.W_V.data[:rank_v8, :old_proj_v8].copy_(w_v)
-                        blk.W_V.data[:rank_v8, old_proj_v8:].zero_()
-                        b_v = read_tensor(f, (rank_v8,), transpose=False).to(blk.b_V.device)
-                        blk.b_V.data[:rank_v8].copy_(b_v)
-                    else:
-                        old_proj_old = blk._proj_in_dim * 2 // 3
-                        w_u = read_tensor(f, (old_off_rank, old_proj_old), transpose=True).to(blk.W_U.device)
-                        blk.W_U.data[:old_off_rank, :old_proj_old].copy_(w_u)
-                        blk.W_U.data[:old_off_rank, old_proj_old:].zero_()
-                        b_u = read_tensor(f, (old_off_rank,), transpose=False).to(blk.b_U.device)
-                        blk.b_U.data[:old_off_rank].copy_(b_u)
-                        w_v = read_tensor(f, (old_off_rank, old_proj_old), transpose=True).to(blk.W_V.device)
-                        blk.W_V.data[:old_off_rank, :old_proj_old].copy_(w_v)
-                        blk.W_V.data[:old_off_rank, old_proj_old:].zero_()
-                        b_v = read_tensor(f, (old_off_rank,), transpose=False).to(blk.b_V.device)
-                        blk.b_V.data[:old_off_rank].copy_(b_v)
-                elif format_version >= 5:
-                    skip_tensor(f, (blk._proj_in_dim * 2, 5), transpose=True)
-                    skip_tensor(f, (blk._proj_in_dim * 2,), transpose=False)
-                    _read_into(f, blk.W_U, read_tensor, transpose=True)
-                    _read_into(f, blk.b_U, read_tensor, transpose=False)
-                    _read_into(f, blk.W_V, read_tensor, transpose=True)
-                    _read_into(f, blk.b_V, read_tensor, transpose=False)
-                else:
-                    w_in_dim_file = (2 * d_model_lo + 5) if format_version >= 4 else (2 * d_model_lo)
-                    w_u_loaded = read_tensor(f, (blk.W_U.shape[0], w_in_dim_file), transpose=True).to(blk.W_U.device)
-                    _read_into(f, blk.b_U, read_tensor, transpose=False)
-                    w_v_loaded = read_tensor(f, (blk.W_V.shape[0], w_in_dim_file), transpose=True).to(blk.W_V.device)
-                    _read_into(f, blk.b_V, read_tensor, transpose=False)
-                    with torch.no_grad():
-                        copy_len = min(w_in_dim_file, blk.W_U.shape[1])
-                        blk.W_U.data[:, :copy_len].copy_(w_u_loaded[:, :copy_len])
-                        if blk.W_U.shape[1] > w_in_dim_file:
-                            blk.W_U.data[:, w_in_dim_file:].zero_()
-                        blk.W_V.data[:, :copy_len].copy_(w_v_loaded[:, :copy_len])
-                        if blk.W_V.shape[1] > w_in_dim_file:
-                            blk.W_V.data[:, w_in_dim_file:].zero_()
-                if format_version < 3:
-                    skip_tensor(f, (2,), transpose=False)
-            elif sentinel == 0xFFFFFFFF or sentinel == 0xFFFFFFFD:
-                raise ValueError("Attempted to load an older discrete/hypernetwork checkpoint into Matryoshka version. Clear checkpoint file.")
-            if format_version < 3:
-                extra2 = f.read(8)
-                if len(extra2) == 8:
-                    sentinel2, scale_head_ver = struct.unpack('<II', extra2)
-                    if sentinel2 == 0xFFFFFFFB:
-                        if scale_head_ver >= 1:
-                            skip_tensor(f, (4, GLOBAL_FEATURES_DIM + d_model_lo), transpose=True)
-                        else:
-                            skip_tensor(f, (4, d_model_lo), transpose=True)
-                        skip_tensor(f, (4,), transpose=False)
+                _read_into(f, blk.film_gen[0].weight, read_tensor, transpose=True)
+                _read_into(f, blk.film_gen[0].bias, read_tensor, transpose=False)
+                _read_into(f, blk.film_gen[2].weight, read_tensor, transpose=True)
+                _read_into(f, blk.film_gen[2].bias, read_tensor, transpose=False)
+                if getattr(blk, 'scene_proj', None) is not None:
+                    _read_into(f, blk.scene_proj.weight, read_tensor, transpose=True)
+                    _read_into(f, blk.scene_proj.bias, read_tensor, transpose=False)
+                _read_into(f, blk.W_U, read_tensor, transpose=True)
+                _read_into(f, blk.b_U, read_tensor, transpose=False)
+                _read_into(f, blk.W_V, read_tensor, transpose=True)
+                _read_into(f, blk.b_V, read_tensor, transpose=False)
 
 def _read_into(f, param, read_fn, transpose=False):
     t = read_fn(f, param.shape, transpose=transpose).to(param.device)
