@@ -711,16 +711,25 @@ class SinusoidalPosEmb(nn.Module):
 
 class UniversalOffDiagBlock(nn.Module):
     # Disjoint slicing: each level gets its own contiguous lane (0..r0-1, r0..r0+r1-1, ...), no gaps; max_rank is buffer for compile.
+    # Attention is over n_super + 2 tokens: 32 super-nodes + block-avg + scene-global (global_features).
+    NUM_GLOBAL_TOKENS = 2  # block average, scene global
 
-    def __init__(self, d_model, max_rank=1024):
+    def __init__(self, d_model, max_rank=1024, global_features_dim=0):
         super().__init__()
         self.n_super = OFF_DIAG_SUPER
+        self.n_attn = self.n_super + self.NUM_GLOBAL_TOKENS  # 34
         self.max_rank = max_rank
-        self._proj_in_dim = 2 * d_model
+        # [h, attn_out, global_ctx] so rank prediction sees the two global token outputs
+        self._proj_in_dim = 3 * d_model
+        self.global_features_dim = global_features_dim
 
         self.attn_q = nn.Linear(d_model + 5, d_model)
         self.attn_k = nn.Linear(d_model + 5, d_model)
         self.attn_v = nn.Linear(d_model + 5, d_model)
+        if global_features_dim > 0:
+            self.scene_proj = nn.Linear(global_features_dim, d_model + 5)
+        else:
+            self.scene_proj = None
 
         self.scale_emb_dim = 16
         self.scale_embedder = SinusoidalPosEmb(self.scale_emb_dim)
@@ -754,7 +763,7 @@ class UniversalOffDiagBlock(nn.Module):
 
         self._scale_attn = d_model ** -0.5
 
-    def forward(self, h_row, h_col, pos_row, pos_col, mask, rank, row_start=0, return_film_features=False):
+    def forward(self, h_row, h_col, pos_row, pos_col, mask, rank, row_start=0, return_film_features=False, global_features=None):
         B = h_row.shape[0]
         side = h_row.shape[1]
         g = side // self.n_super
@@ -777,27 +786,43 @@ class UniversalOffDiagBlock(nn.Module):
         down_row_cond = torch.cat([down_row, scale_tensor, delta_x, dist], dim=-1)
         down_col_cond = torch.cat([down_col, scale_tensor, -delta_x, dist], dim=-1)
 
-        Q = self.attn_q(down_row_cond)
-        K = self.attn_k(down_col_cond)
-        V = self.attn_v(down_col_cond)
+        # Two global tokens: (1) block average, (2) scene global (from global_features)
+        block_avg_row = torch.cat([down_row.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), delta_x.mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
+        block_avg_col = torch.cat([down_col.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), (-delta_x).mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
+        if self.scene_proj is not None and global_features is not None:
+            gf = global_features.unsqueeze(0) if global_features.dim() == 1 else global_features
+            scene_cond = self.scene_proj(gf).unsqueeze(1)
+        else:
+            scene_cond = torch.zeros(B, 1, down_row_cond.size(-1), device=h_row.device, dtype=h_row.dtype)
+
+        row_tokens = torch.cat([down_row_cond, block_avg_row, scene_cond], dim=1)
+        col_tokens = torch.cat([down_col_cond, block_avg_col, scene_cond], dim=1)
+
+        Q = self.attn_q(row_tokens)
+        K = self.attn_k(col_tokens)
+        V = self.attn_v(col_tokens)
 
         scores = (Q @ K.transpose(-2, -1)) * self._scale_attn
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
-        scores = scores.masked_fill(~mask, float('-inf'))
+        mask_34 = F.pad(mask, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=True)
+        scores = scores.masked_fill(~mask_34, float('-inf'))
         attn_probs = F.softmax(scores, dim=-1)
-        row_out = (attn_probs @ V).reshape(B, self.n_super, -1)
+        row_out_full = attn_probs @ V
+        row_out = row_out_full[:, : self.n_super].reshape(B, self.n_super, -1)
+        global_ctx = row_out_full[:, self.n_super :, :].mean(dim=1)
 
         row_out_expanded = row_out.repeat_interleave(g, dim=1)
         down_col_expanded = down_col.repeat_interleave(g, dim=1)
+        global_ctx_expanded = global_ctx.unsqueeze(1).expand(-1, side, -1)
 
         h_row_3 = h_row.reshape(B, -1, h_row.shape[-1])
         row_exp_3 = row_out_expanded.reshape(B, -1, row_out_expanded.shape[-1])
         h_col_3 = h_col.reshape(B, -1, h_col.shape[-1])
         col_exp_3 = down_col_expanded.reshape(B, -1, down_col_expanded.shape[-1])
 
-        features_U = torch.cat([h_row_3, row_exp_3], dim=-1)
-        features_V = torch.cat([h_col_3, col_exp_3], dim=-1)
+        features_U = torch.cat([h_row_3, row_exp_3, global_ctx_expanded], dim=-1)
+        features_V = torch.cat([h_col_3, col_exp_3, global_ctx_expanded], dim=-1)
 
         context_U = torch.cat([scale_emb, delta_x, dist], dim=-1)
         context_V = torch.cat([scale_emb, -delta_x, dist], dim=-1)
@@ -841,8 +866,8 @@ class LeafOnlyNet(nn.Module):
         self.leaf_size = leaf_size
         self.rank_base = rank_base
         self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn, use_jacobi=use_jacobi)
-        # max_rank must hold sum of ranks over all HODLR levels (e.g. 8 levels can exceed 1024)
-        self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=2048)
+        # max_rank must hold sum of ranks over all HODLR levels; global_features_dim for scene token in off-diag attn
+        self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=2048, global_features_dim=GLOBAL_FEATURES_DIM)
         self.off_diag_struct = []
 
     @property
@@ -861,7 +886,7 @@ class LeafOnlyNet(nn.Module):
     def leaf_head(self):
         return self.core.leaf_head
 
-    def _off_diag(self, h, x, edge_index, current_struct, precomputed_masks=None):
+    def _off_diag(self, h, x, edge_index, current_struct, precomputed_masks=None, global_features=None):
         B, N, C = h.shape
         # 1. Fetch or compute masks
         if precomputed_masks is not None:
@@ -917,9 +942,15 @@ class LeafOnlyNet(nn.Module):
             stacked_masks = torch.stack(masks, dim=0)
             batched_masks = stacked_masks.repeat_interleave(B, dim=0)
 
+            K = len(blocks)
+            gf_batched = None
+            if global_features is not None:
+                gf = global_features.unsqueeze(0).expand(B, -1) if global_features.dim() == 1 else global_features
+                gf_batched = gf.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
+
             U_batched, V_batched = self.universal_off_diag(
                 h_row_batched, h_col_batched, pos_row_batched, pos_col_batched,
-                batched_masks, rank=rank, row_start=row_start
+                batched_masks, rank=rank, row_start=row_start, global_features=gf_batched,
             )
             row_start += rank
 
@@ -942,7 +973,7 @@ class LeafOnlyNet(nn.Module):
         diag_blocks = self.core.get_leaf_blocks(h, x, scale_A)
 
         if current_struct:
-            off_diag_list = self._off_diag(h, x, edge_index, current_struct, precomputed_masks=precomputed_masks)
+            off_diag_list = self._off_diag(h, x, edge_index, current_struct, precomputed_masks=precomputed_masks, global_features=global_features)
             return (diag_blocks, off_diag_list)
         return (diag_blocks, [])
 
@@ -1044,7 +1075,7 @@ def read_leaf_only_header(path):
     if len(header) >= LEAF_ONLY_HEADER_BYTES:
         d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers = struct.unpack('<iiiiiii', header[:LEAF_ONLY_HEADER_BYTES])
         format_version = struct.unpack('<i', header[LEAF_ONLY_HEADER_BYTES:LEAF_ONLY_HEADER_BYTES_V3])[0] if len(header) >= LEAF_ONLY_HEADER_BYTES_V3 else 1
-        if format_version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+        if format_version not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
             format_version = 1
             header_bytes = LEAF_ONLY_HEADER_BYTES
         else:
@@ -1074,7 +1105,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
     use_gcn = model.embed.gcn is not None
     num_gcn_layers = len(model.embed.gcn) if use_gcn else 0
     use_jacobi = getattr(model.core, 'use_jacobi', True)
-    format_version = 11  # v11: lift[0] takes concat(per-node, global) = 18 dims; v10: lift_film; v9: max_rank 2048
+    format_version = 13  # v13: off-diag rank input includes global token outputs (3*d_model); v12: 32+2 attn
     with open(path, 'wb') as f:
         f.write(struct.pack('<iiiiiiii', d_model, model.leaf_size, input_dim, len(model.blocks), num_heads, int(use_gcn), num_gcn_layers, format_version))
         # lift[0]: v11 has (d_model, 18); v10 had (d_model, 6)
@@ -1121,6 +1152,9 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, blk.film_gen[0].bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.film_gen[2].weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.film_gen[2].bias.detach().cpu().float(), transpose=False)
+            if getattr(blk, 'scene_proj', None) is not None:
+                _write_packed_tensor(f, blk.scene_proj.weight.detach().cpu().float(), transpose=True)
+                _write_packed_tensor(f, blk.scene_proj.bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.W_U.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.b_U.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.W_V.detach().cpu().float(), transpose=True)
@@ -1251,30 +1285,50 @@ def load_leaf_only_weights(model, path):
                     _read_into(f, blk.film_gen[0].bias, read_tensor, transpose=False)
                     _read_into(f, blk.film_gen[2].weight, read_tensor, transpose=True)
                     _read_into(f, blk.film_gen[2].bias, read_tensor, transpose=False)
-                    # v9: full max_rank (2048); v8: 1024 rows; v6/v7: 512 rows
+                    if format_version >= 12 and getattr(blk, 'scene_proj', None) is not None:
+                        _read_into(f, blk.scene_proj.weight, read_tensor, transpose=True)
+                        _read_into(f, blk.scene_proj.bias, read_tensor, transpose=False)
+                    # v13: W_U/W_V have _proj_in_dim=3*d_model; v9–v12: 2*d_model
                     old_off_rank = 512
                     if format_version >= 9:
-                        _read_into(f, blk.W_U, read_tensor, transpose=True)
-                        _read_into(f, blk.b_U, read_tensor, transpose=False)
-                        _read_into(f, blk.W_V, read_tensor, transpose=True)
-                        _read_into(f, blk.b_V, read_tensor, transpose=False)
+                        if format_version >= 13:
+                            _read_into(f, blk.W_U, read_tensor, transpose=True)
+                            _read_into(f, blk.b_U, read_tensor, transpose=False)
+                            _read_into(f, blk.W_V, read_tensor, transpose=True)
+                            _read_into(f, blk.b_V, read_tensor, transpose=False)
+                        else:
+                            old_proj = blk._proj_in_dim * 2 // 3
+                            w_u = read_tensor(f, (blk.W_U.shape[0], old_proj), transpose=True).to(blk.W_U.device)
+                            blk.W_U.data[:, :old_proj].copy_(w_u)
+                            blk.W_U.data[:, old_proj:].zero_()
+                            _read_into(f, blk.b_U, read_tensor, transpose=False)
+                            w_v = read_tensor(f, (blk.W_V.shape[0], old_proj), transpose=True).to(blk.W_V.device)
+                            blk.W_V.data[:, :old_proj].copy_(w_v)
+                            blk.W_V.data[:, old_proj:].zero_()
+                            _read_into(f, blk.b_V, read_tensor, transpose=False)
                     elif format_version >= 8:
                         rank_v8 = 1024
-                        w_u = read_tensor(f, (rank_v8, blk._proj_in_dim), transpose=True).to(blk.W_U.device)
-                        blk.W_U.data[:rank_v8].copy_(w_u)
+                        old_proj_v8 = blk._proj_in_dim * 2 // 3
+                        w_u = read_tensor(f, (rank_v8, old_proj_v8), transpose=True).to(blk.W_U.device)
+                        blk.W_U.data[:rank_v8, :old_proj_v8].copy_(w_u)
+                        blk.W_U.data[:rank_v8, old_proj_v8:].zero_()
                         b_u = read_tensor(f, (rank_v8,), transpose=False).to(blk.b_U.device)
                         blk.b_U.data[:rank_v8].copy_(b_u)
-                        w_v = read_tensor(f, (rank_v8, blk._proj_in_dim), transpose=True).to(blk.W_V.device)
-                        blk.W_V.data[:rank_v8].copy_(w_v)
+                        w_v = read_tensor(f, (rank_v8, old_proj_v8), transpose=True).to(blk.W_V.device)
+                        blk.W_V.data[:rank_v8, :old_proj_v8].copy_(w_v)
+                        blk.W_V.data[:rank_v8, old_proj_v8:].zero_()
                         b_v = read_tensor(f, (rank_v8,), transpose=False).to(blk.b_V.device)
                         blk.b_V.data[:rank_v8].copy_(b_v)
                     else:
-                        w_u = read_tensor(f, (old_off_rank, blk._proj_in_dim), transpose=True).to(blk.W_U.device)
-                        blk.W_U.data[:old_off_rank].copy_(w_u)
+                        old_proj_old = blk._proj_in_dim * 2 // 3
+                        w_u = read_tensor(f, (old_off_rank, old_proj_old), transpose=True).to(blk.W_U.device)
+                        blk.W_U.data[:old_off_rank, :old_proj_old].copy_(w_u)
+                        blk.W_U.data[:old_off_rank, old_proj_old:].zero_()
                         b_u = read_tensor(f, (old_off_rank,), transpose=False).to(blk.b_U.device)
                         blk.b_U.data[:old_off_rank].copy_(b_u)
-                        w_v = read_tensor(f, (old_off_rank, blk._proj_in_dim), transpose=True).to(blk.W_V.device)
-                        blk.W_V.data[:old_off_rank].copy_(w_v)
+                        w_v = read_tensor(f, (old_off_rank, old_proj_old), transpose=True).to(blk.W_V.device)
+                        blk.W_V.data[:old_off_rank, :old_proj_old].copy_(w_v)
+                        blk.W_V.data[:old_off_rank, old_proj_old:].zero_()
                         b_v = read_tensor(f, (old_off_rank,), transpose=False).to(blk.b_V.device)
                         blk.b_V.data[:old_off_rank].copy_(b_v)
                 elif format_version >= 5:
@@ -1360,7 +1414,7 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
+    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
     parser.add_argument('--num_frames', type=int, default=50, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
@@ -2059,7 +2113,7 @@ def evaluate_gradient_interference(args):
                 mask = pre_masks[spec_idx].unsqueeze(0) if pre_masks[spec_idx].dim() == 2 else pre_masks[spec_idx]
                 row_start = row_start_for_spec(spec)
                 _, _, feat_U, feat_U_mod, gam = model.universal_off_diag(
-                    h_row, h_col, pos_row, pos_col, mask, spec["rank"], row_start=row_start, return_film_features=True
+                    h_row, h_col, pos_row, pos_col, mask, spec["rank"], row_start=row_start, return_film_features=True, global_features=global_feat,
                 )
                 return feat_U, feat_U_mod, gam
 
