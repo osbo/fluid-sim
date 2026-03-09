@@ -542,8 +542,8 @@ OFF_DIAG_SUPER = 32
 GLOBAL_FEATURES_DIM = 12  # dataset global_features vector for scale predictor
 
 # Trained graph size range: gradient interference evaluation uses levels that exist for this range
-MIN_MIXED_SIZE = 256
-MAX_MIXED_SIZE = 256  
+MIN_MIXED_SIZE = 1024
+MAX_MIXED_SIZE = 1024  
 
 def _rank_for_side(side, rank_base=RANK_BASE_LEVEL1, min_rank=4, max_rank=512):
     r = rank_base * ((side / 32.0) ** (2.0 / 3.0))
@@ -710,7 +710,7 @@ class SinusoidalPosEmb(nn.Module):
 
 
 class UniversalOffDiagBlock(nn.Module):
-    # Disjoint slicing: each level gets its own contiguous lane (0..r0-1, r0..r0+r1-1, ...), no gaps; max_rank is buffer for compile.
+    # Nested subspace: shared linear projections; output truncated to required rank per level (no disjoint lanes).
     # Attention is over n_super + 2 tokens: 32 super-nodes + block-avg + scene-global (global_features).
     NUM_GLOBAL_TOKENS = 2  # block average, scene global
 
@@ -724,7 +724,7 @@ class UniversalOffDiagBlock(nn.Module):
         self.scale_emb_dim = 16
         self.scale_embedder = SinusoidalPosEmb(self.scale_emb_dim)
         self._context_dim = self.scale_emb_dim + 4 + (global_features_dim or 0)
-        # [h, attn_out, global_ctx, context] so rank prediction sees context; W_U/W_V get 3*d_model + _context_dim
+        # [h, attn_out, global_ctx, context] so rank prediction sees context
         self._proj_in_dim = 3 * d_model + self._context_dim
 
         self.attn_q = nn.Linear(d_model + 5, d_model)
@@ -746,13 +746,14 @@ class UniversalOffDiagBlock(nn.Module):
             nn.init.zeros_(self.film_gen[2].bias)
             self.film_gen[2].bias[: self._proj_in_dim].fill_(1.0)
 
-        # Zero-Init W_U so the block starts as an identity/zero-op
-        self.W_U = nn.Parameter(torch.zeros(max_rank, self._proj_in_dim))
-        self.b_U = nn.Parameter(torch.zeros(max_rank))
-
-        # Keep W_V random so gradients can still flow backwards into the block when U becomes non-zero
-        self.W_V = nn.Parameter(torch.randn(max_rank, self._proj_in_dim) * 0.01)
-        self.b_V = nn.Parameter(torch.zeros(max_rank))
+        # Shared linear projections (nested subspace): output truncated to rank per level
+        self.proj_U = nn.Linear(self._proj_in_dim, max_rank)
+        self.proj_V = nn.Linear(self._proj_in_dim, max_rank)
+        with torch.no_grad():
+            nn.init.zeros_(self.proj_U.weight)
+            nn.init.zeros_(self.proj_U.bias)
+            nn.init.normal_(self.proj_V.weight, std=0.01)
+            nn.init.zeros_(self.proj_V.bias)
 
         self.feature_ln = nn.LayerNorm(self._proj_in_dim)
 
@@ -857,16 +858,14 @@ class UniversalOffDiagBlock(nn.Module):
         beta_V_exp = beta_V.repeat_interleave(g, dim=1)
         features_V_mod = (features_V * gamma_V_exp) + beta_V_exp
 
-        # Disjoint slicing: caller passes row_start so this level uses rows [row_start, row_start+rank); no gaps between levels
-        safe_rank = max(1, min(rank, self.max_rank - row_start))
-        row_end = row_start + safe_rank
-        W_U_sliced = self.W_U[row_start:row_end, :]
-        b_U_sliced = self.b_U[row_start:row_end]
-        W_V_sliced = self.W_V[row_start:row_end, :]
-        b_V_sliced = self.b_V[row_start:row_end]
-
-        U_raw = F.linear(features_U_mod, W_U_sliced, b_U_sliced)
-        V_raw = F.linear(features_V_mod, W_V_sliced, b_V_sliced)
+        # Shared projection and truncate to required rank for this level (nested subspace)
+        safe_rank = min(rank, self.max_rank)
+        if safe_rank < 1:
+            safe_rank = 1
+        U_raw_full = self.proj_U(features_U_mod)
+        V_raw_full = self.proj_V(features_V_mod)
+        U_raw = U_raw_full[..., :safe_rank]
+        V_raw = V_raw_full[..., :safe_rank]
 
         rank_scale = math.sqrt(safe_rank)
         unified_scalar = 1.0 / rank_scale
@@ -932,9 +931,8 @@ class LeafOnlyNet(nn.Module):
                 level_to_blocks[lvl] = []
             level_to_blocks[lvl].append((idx, spec))
 
-        # 3. Execute batched blocks per level; disjoint lanes: level 0 -> rows 0..r0-1, level 1 -> r0..r0+r1-1, etc.
+        # 3. Execute batched blocks per level (nested subspace: shared proj_U/proj_V, truncate by rank)
         sorted_levels = sorted(level_to_blocks.keys())
-        row_start = 0
         for lvl in sorted_levels:
             blocks = level_to_blocks[lvl]
             rank = blocks[0][1]["rank"]
@@ -971,10 +969,9 @@ class LeafOnlyNet(nn.Module):
 
             U_batched, V_batched = self.universal_off_diag(
                 h_row_batched, h_col_batched, pos_row_batched, pos_col_batched,
-                batched_masks, rank=rank, row_start=row_start, global_features=gf_batched,
+                batched_masks, rank=rank, global_features=gf_batched,
                 level_index=level_idx, block_side=block_side_vec,
             )
-            row_start += rank
 
             U_splits = torch.split(U_batched, B, dim=0)
             V_splits = torch.split(V_batched, B, dim=0)
@@ -1162,10 +1159,10 @@ def save_leaf_only_weights(model, path, input_dim=9):
             if getattr(blk, 'scene_proj', None) is not None:
                 _write_packed_tensor(f, blk.scene_proj.weight.detach().cpu().float(), transpose=True)
                 _write_packed_tensor(f, blk.scene_proj.bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.W_U.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.b_U.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.W_V.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.b_V.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, blk.proj_U.weight.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, blk.proj_U.bias.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, blk.proj_V.weight.detach().cpu().float(), transpose=True)
+            _write_packed_tensor(f, blk.proj_V.bias.detach().cpu().float(), transpose=False)
 
 def _write_packed_tensor(f, param, transpose=False):
     import numpy as np
@@ -1283,10 +1280,10 @@ def load_leaf_only_weights(model, path):
                 if getattr(blk, 'scene_proj', None) is not None:
                     _read_into(f, blk.scene_proj.weight, read_tensor, transpose=True)
                     _read_into(f, blk.scene_proj.bias, read_tensor, transpose=False)
-                _read_into(f, blk.W_U, read_tensor, transpose=True)
-                _read_into(f, blk.b_U, read_tensor, transpose=False)
-                _read_into(f, blk.W_V, read_tensor, transpose=True)
-                _read_into(f, blk.b_V, read_tensor, transpose=False)
+                _read_into(f, blk.proj_U.weight, read_tensor, transpose=True)
+                _read_into(f, blk.proj_U.bias, read_tensor, transpose=False)
+                _read_into(f, blk.proj_V.weight, read_tensor, transpose=True)
+                _read_into(f, blk.proj_V.bias, read_tensor, transpose=False)
 
 def _read_into(f, param, read_fn, transpose=False):
     t = read_fn(f, param.shape, transpose=transpose).to(param.device)
@@ -1329,7 +1326,7 @@ def train_leaf_only():
     default_data = script_dir.parent / "StreamingAssets" / "TestData"
     parser.add_argument('--steps', type=int, default=50000)
     parser.add_argument('--data_folder', type=str, default=str(default_data))
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
     parser.add_argument('--d_model', type=int, default=256)
     parser.add_argument('--num_layers', type=int, default=2)
@@ -1757,8 +1754,8 @@ def evaluate_gradient_interference(args):
         + list(m.universal_off_diag.attn_v.parameters())
     )
     param_groups['Off-diag W_U/W_V'] = lambda m: [
-        m.universal_off_diag.W_U, m.universal_off_diag.b_U,
-        m.universal_off_diag.W_V, m.universal_off_diag.b_V,
+        m.universal_off_diag.proj_U.weight, m.universal_off_diag.proj_U.bias,
+        m.universal_off_diag.proj_V.weight, m.universal_off_diag.proj_V.bias,
     ]
     # Diagonal
     param_groups['Diagonal Leaf Head'] = lambda m: list(m.core.leaf_head.parameters())
@@ -1973,7 +1970,7 @@ def evaluate_gradient_interference(args):
         print(f"  Level {level_min} (micro) vs Level {level_max} (macro) gradient cosine similarity on SHARED ADA-LN/ATTN: {cos_sim_shared:.4f}")
         print(f"  (If highly negative, AdaLN is failing to multiplex. If positive/near-zero, multiplexing is successful!)")
 
-        # W_U/W_V grads for "Per-level gradient" diagnostic below (disjoint lanes); need fresh graph (previous one was freed)
+        # proj_U/proj_V grads for "Per-level gradient" diagnostic (shared projection); need fresh graph (previous one was freed)
         diag_blocks, off_diag_list = model(
             x_input, edge_index=edge_index, edge_values=edge_values,
             scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
@@ -1981,16 +1978,23 @@ def evaluate_gradient_interference(args):
         )
         M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min})
         M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max})
+        blk = model.universal_off_diag
+
+        def _flat_grad_proj(proj):
+            w = proj.weight.grad.clone() if proj.weight.grad is not None else torch.zeros_like(proj.weight)
+            b = proj.bias.grad.clone() if proj.bias.grad is not None else torch.zeros_like(proj.bias)
+            return torch.cat([w.view(-1), b.view(-1)])
+
         model.zero_grad()
         loss_L1 = ((M_L1 - Z) ** 2).mean()
         loss_L1.backward(retain_graph=True)
-        grad_W_U_L1 = model.universal_off_diag.W_U.grad.clone() if model.universal_off_diag.W_U.grad is not None else torch.zeros_like(model.universal_off_diag.W_U)
-        grad_W_V_L1 = model.universal_off_diag.W_V.grad.clone() if model.universal_off_diag.W_V.grad is not None else torch.zeros_like(model.universal_off_diag.W_V)
+        grad_proj_U_L1 = _flat_grad_proj(blk.proj_U)
+        grad_proj_V_L1 = _flat_grad_proj(blk.proj_V)
         model.zero_grad()
         loss_Lmax = ((M_Lmax - Z) ** 2).mean()
         loss_Lmax.backward()
-        grad_W_U_Lmax = model.universal_off_diag.W_U.grad.clone() if model.universal_off_diag.W_U.grad is not None else torch.zeros_like(model.universal_off_diag.W_U)
-        grad_W_V_Lmax = model.universal_off_diag.W_V.grad.clone() if model.universal_off_diag.W_V.grad is not None else torch.zeros_like(model.universal_off_diag.W_V)
+        grad_proj_U_Lmax = _flat_grad_proj(blk.proj_U)
+        grad_proj_V_Lmax = _flat_grad_proj(blk.proj_V)
 
         print("\n=== Per-Level Residual Loss Decomposition ===")
         cumulative_levels = set()
@@ -2016,9 +2020,6 @@ def evaluate_gradient_interference(args):
 
         # --- Deep Diagnostic Probes ---
         print("\n=== Deep Diagnostic Probes ===")
-        level_ranks = {s["level"]: s["rank"] for s in struct_list}
-        def row_start_for_spec(spec):
-            return sum(level_ranks[l] for l in sorted(level_ranks) if l < spec["level"])
         with torch.no_grad():
             h = model.core.forward_features(
                 x_input, edge_index=edge_index, edge_values=edge_values,
@@ -2036,11 +2037,10 @@ def evaluate_gradient_interference(args):
                 pos_row = x_input[:, rs:re, :3]
                 pos_col = x_input[:, cs:ce, :3]
                 mask = pre_masks[spec_idx].unsqueeze(0) if pre_masks[spec_idx].dim() == 2 else pre_masks[spec_idx]
-                row_start = row_start_for_spec(spec)
                 lv = torch.full((1, 1), spec["level"], device=h_row.device, dtype=h_row.dtype)
                 bs = torch.full((1, 1), float(side_blk), device=h_row.device, dtype=h_row.dtype)
                 _, _, feat_U, feat_U_mod, gam = model.universal_off_diag(
-                    h_row, h_col, pos_row, pos_col, mask, spec["rank"], row_start=row_start, return_film_features=True, global_features=global_feat, level_index=lv, block_side=bs,
+                    h_row, h_col, pos_row, pos_col, mask, spec["rank"], return_film_features=True, global_features=global_feat, level_index=lv, block_side=bs,
                 )
                 return feat_U, feat_U_mod, gam
 
@@ -2066,19 +2066,10 @@ def evaluate_gradient_interference(args):
             print(f"   L{level_min} Top 5 Singular Values: {S_L1[:5].numpy()}")
             print(f"   L{level_max} Top 5 Singular Values: {S_Lmax[:5].numpy()}")
 
-        # 3. Per-level gradient (disjoint lanes: no shared rows to compare)
-        print("\n3. Per-level gradient (disjoint lanes):")
-        rs_L1 = row_start_for_spec(struct_list[idx_L1])
-        rs_Lmax = row_start_for_spec(struct_list[idx_Lmax])
-        max_rank = model.universal_off_diag.max_rank
-        safe_L1 = min(rank_L1, max_rank - rs_L1)
-        safe_Lmax = min(rank_Lmax, max_rank - rs_Lmax)
-        g_L1 = grad_W_U_L1[rs_L1 : rs_L1 + safe_L1]
-        g_Lmax = grad_W_U_Lmax[rs_Lmax : rs_Lmax + safe_Lmax]
-        range_L1 = f"rows {rs_L1}-{rs_L1 + safe_L1 - 1}" if safe_L1 == rank_L1 else f"rows {rs_L1}-{rs_L1 + safe_L1 - 1} (capped; requested {rank_L1})"
-        range_Lmax = f"rows {rs_Lmax}-{rs_Lmax + safe_Lmax - 1}" if safe_Lmax == rank_Lmax else f"rows {rs_Lmax}-{rs_Lmax + safe_Lmax - 1} (capped; requested {rank_Lmax})"
-        print(f"   L{level_min} {range_L1}: grad norm = {g_L1.norm().item():.6f}")
-        print(f"   L{level_max} {range_Lmax}: grad norm = {g_Lmax.norm().item():.6f}")
+        # 3. Per-level gradient (shared projection: full proj_U/proj_V grad norm per pass)
+        print("\n3. Per-level gradient (shared projection):")
+        print(f"   L{level_min} pass: proj_U grad norm = {grad_proj_U_L1.norm().item():.6f}, proj_V grad norm = {grad_proj_V_L1.norm().item():.6f}")
+        print(f"   L{level_max} pass: proj_U grad norm = {grad_proj_U_Lmax.norm().item():.6f}, proj_V grad norm = {grad_proj_V_Lmax.norm().item():.6f}")
         print("-" * 40)
 
 
