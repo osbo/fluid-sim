@@ -719,25 +719,22 @@ class UniversalOffDiagBlock(nn.Module):
         self.n_super = OFF_DIAG_SUPER
         self.n_attn = self.n_super + self.NUM_GLOBAL_TOKENS  # 34
         self.max_rank = max_rank
-        # [h, attn_out, global_ctx] so rank prediction sees the two global token outputs
-        self._proj_in_dim = 3 * d_model
         self.global_features_dim = global_features_dim
+
+        self.scale_emb_dim = 16
+        self.scale_embedder = SinusoidalPosEmb(self.scale_emb_dim)
+        self._context_dim = self.scale_emb_dim + 4 + (global_features_dim or 0)
+        # [h, attn_out, global_ctx, context] so rank prediction sees context; W_U/W_V get 3*d_model + _context_dim
+        self._proj_in_dim = 3 * d_model + self._context_dim
 
         self.attn_q = nn.Linear(d_model + 5, d_model)
         self.attn_k = nn.Linear(d_model + 5, d_model)
         self.attn_v = nn.Linear(d_model + 5, d_model)
         if global_features_dim > 0:
-            self.scene_proj = nn.Linear(global_features_dim, d_model + 5)
+            self.scene_proj = nn.Linear(global_features_dim + 2, d_model + 5)
         else:
             self.scene_proj = None
 
-        self.scale_emb_dim = 16
-        self.scale_embedder = SinusoidalPosEmb(self.scale_emb_dim)
-
-        # Context: scale_emb (16) + delta_x (3) + dist (1) + global_features (optional) so film_gen sees frame-level physics
-        self._context_dim = self.scale_emb_dim + 4 + (global_features_dim or 0)
-
-        # AdaLN-style MLP FiLM Generator: scale + geometry + global context -> gamma, beta (can "turn off" macro channels for micro)
         self.film_gen = nn.Sequential(
             nn.Linear(self._context_dim, d_model),
             nn.GELU(),
@@ -757,13 +754,15 @@ class UniversalOffDiagBlock(nn.Module):
         self.W_V = nn.Parameter(torch.randn(max_rank, self._proj_in_dim) * 0.01)
         self.b_V = nn.Parameter(torch.zeros(max_rank))
 
+        self.feature_ln = nn.LayerNorm(self._proj_in_dim)
+
         for m in (self.attn_q, self.attn_k, self.attn_v):
             nn.init.normal_(m.weight, std=0.01)
             nn.init.zeros_(m.bias)
 
         self._scale_attn = d_model ** -0.5
 
-    def forward(self, h_row, h_col, pos_row, pos_col, mask, rank, row_start=0, return_film_features=False, global_features=None):
+    def forward(self, h_row, h_col, pos_row, pos_col, mask, rank, row_start=0, return_film_features=False, global_features=None, level_index=None, block_side=None):
         B = h_row.shape[0]
         side = h_row.shape[1]
         g = side // self.n_super
@@ -786,12 +785,16 @@ class UniversalOffDiagBlock(nn.Module):
         down_row_cond = torch.cat([down_row, scale_tensor, delta_x, dist], dim=-1)
         down_col_cond = torch.cat([down_col, scale_tensor, -delta_x, dist], dim=-1)
 
-        # Two global tokens: (1) block average, (2) scene global (from global_features)
         block_avg_row = torch.cat([down_row.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), delta_x.mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
         block_avg_col = torch.cat([down_col.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), (-delta_x).mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
-        if self.scene_proj is not None and global_features is not None:
-            gf = global_features.unsqueeze(0) if global_features.dim() == 1 else global_features
-            scene_cond = self.scene_proj(gf).unsqueeze(1)
+        if self.scene_proj is not None:
+            gf = global_features if global_features is not None else torch.zeros(B, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
+            if gf.dim() == 1:
+                gf = gf.unsqueeze(0)
+            lv = level_index if level_index is not None else torch.zeros(B, 1, device=h_row.device, dtype=h_row.dtype)
+            bs = block_side if block_side is not None else torch.zeros(B, 1, device=h_row.device, dtype=h_row.dtype)
+            scene_input = torch.cat([gf, lv, bs], dim=-1)
+            scene_cond = self.scene_proj(scene_input).unsqueeze(1)
         else:
             scene_cond = torch.zeros(B, 1, down_row_cond.size(-1), device=h_row.device, dtype=h_row.dtype)
 
@@ -816,14 +819,6 @@ class UniversalOffDiagBlock(nn.Module):
         down_col_expanded = down_col.repeat_interleave(g, dim=1)
         global_ctx_expanded = global_ctx.unsqueeze(1).expand(-1, side, -1)
 
-        h_row_3 = h_row.reshape(B, -1, h_row.shape[-1])
-        row_exp_3 = row_out_expanded.reshape(B, -1, row_out_expanded.shape[-1])
-        h_col_3 = h_col.reshape(B, -1, h_col.shape[-1])
-        col_exp_3 = down_col_expanded.reshape(B, -1, down_col_expanded.shape[-1])
-
-        features_U = torch.cat([h_row_3, row_exp_3, global_ctx_expanded], dim=-1)
-        features_V = torch.cat([h_col_3, col_exp_3, global_ctx_expanded], dim=-1)
-
         if self.global_features_dim > 0:
             if global_features is not None:
                 gf_exp = global_features.unsqueeze(1).expand(-1, self.n_super, -1)
@@ -836,6 +831,19 @@ class UniversalOffDiagBlock(nn.Module):
         else:
             context_U = torch.cat([scale_emb, delta_x, dist], dim=-1)
             context_V = torch.cat([scale_emb, -delta_x, dist], dim=-1)
+
+        context_U_expanded = context_U.repeat_interleave(g, dim=1)
+        context_V_expanded = context_V.repeat_interleave(g, dim=1)
+
+        h_row_3 = h_row.reshape(B, -1, h_row.shape[-1])
+        row_exp_3 = row_out_expanded.reshape(B, -1, row_out_expanded.shape[-1])
+        h_col_3 = h_col.reshape(B, -1, h_col.shape[-1])
+        col_exp_3 = down_col_expanded.reshape(B, -1, down_col_expanded.shape[-1])
+
+        features_U = torch.cat([h_row_3, row_exp_3, global_ctx_expanded, context_U_expanded], dim=-1)
+        features_V = torch.cat([h_col_3, col_exp_3, global_ctx_expanded, context_V_expanded], dim=-1)
+        features_U = self.feature_ln(features_U)
+        features_V = self.feature_ln(features_V)
 
         film_U = self.film_gen(context_U)
         gamma_U, beta_U = film_U.chunk(2, dim=-1)
@@ -953,14 +961,18 @@ class LeafOnlyNet(nn.Module):
             batched_masks = stacked_masks.repeat_interleave(B, dim=0)
 
             K = len(blocks)
+            side_level = h_row_batched.shape[1]
             gf_batched = None
             if global_features is not None:
                 gf = global_features.unsqueeze(0).expand(B, -1) if global_features.dim() == 1 else global_features
                 gf_batched = gf.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
+            level_idx = torch.full((B * K, 1), lvl, device=h_row_batched.device, dtype=h_row_batched.dtype)
+            block_side_vec = torch.full((B * K, 1), float(side_level), device=h_row_batched.device, dtype=h_row_batched.dtype)
 
             U_batched, V_batched = self.universal_off_diag(
                 h_row_batched, h_col_batched, pos_row_batched, pos_col_batched,
                 batched_masks, rank=rank, row_start=row_start, global_features=gf_batched,
+                level_index=level_idx, block_side=block_side_vec,
             )
             row_start += rank
 
@@ -1145,6 +1157,8 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, blk.film_gen[0].bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.film_gen[2].weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.film_gen[2].bias.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, blk.feature_ln.weight.detach().cpu().float(), transpose=False)
+            _write_packed_tensor(f, blk.feature_ln.bias.detach().cpu().float(), transpose=False)
             if getattr(blk, 'scene_proj', None) is not None:
                 _write_packed_tensor(f, blk.scene_proj.weight.detach().cpu().float(), transpose=True)
                 _write_packed_tensor(f, blk.scene_proj.bias.detach().cpu().float(), transpose=False)
@@ -1264,6 +1278,8 @@ def load_leaf_only_weights(model, path):
                 _read_into(f, blk.film_gen[0].bias, read_tensor, transpose=False)
                 _read_into(f, blk.film_gen[2].weight, read_tensor, transpose=True)
                 _read_into(f, blk.film_gen[2].bias, read_tensor, transpose=False)
+                _read_into(f, blk.feature_ln.weight, read_tensor, transpose=False)
+                _read_into(f, blk.feature_ln.bias, read_tensor, transpose=False)
                 if getattr(blk, 'scene_proj', None) is not None:
                     _read_into(f, blk.scene_proj.weight, read_tensor, transpose=True)
                     _read_into(f, blk.scene_proj.bias, read_tensor, transpose=False)
@@ -1319,7 +1335,7 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
+    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
     parser.add_argument('--num_frames', type=int, default=50, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
@@ -1500,7 +1516,7 @@ def train_leaf_only():
         if device.type == 'cuda':
             torch.cuda.synchronize()
 
-    TIMING_STEP = 200
+    TIMING_STEP = 300
     for step in range(args.steps):
         do_timing = args.print_timing and (step == TIMING_STEP - 1)
         do_log = (step % print_interval == 0)
@@ -1657,13 +1673,13 @@ def train_leaf_only():
                 loss_str = f"Loss avg={loss_avg:.4f} ± {loss_std:.4f}"
             else:
                 loss_str = f"Loss {step_loss:.6f}"
-            if step >= 200:
+            if step >= TIMING_STEP:
                 now = time.perf_counter()
-                if step == 200:
+                if step == TIMING_STEP:
                     t_start_avg = now
                     avg_per_100 = elapsed
                 else:
-                    avg_per_100 = (now - t_start_avg) * 100 / (step - 200)
+                    avg_per_100 = (now - t_start_avg) * 100 / (step - TIMING_STEP)
                 print(f"{step:05d}: {loss_str}  ({elapsed:.3f}s, avg: {avg_per_100:.3f}s) gTot={log_tot:.2e} gL={log_leaf:.2e} gOff={log_off:.2e} rOff={_ratio_off:.3f}")
             else:
                 print(f"{step:05d}: {loss_str}  ({elapsed:.3f}s) gTot={log_tot:.2e} gL={log_leaf:.2e} gOff={log_off:.2e} rOff={_ratio_off:.3f}")
@@ -2011,14 +2027,17 @@ def evaluate_gradient_interference(args):
                 spec = struct_list[spec_idx]
                 rs, re = spec["row_start"], spec["row_end"]
                 cs, ce = spec["col_start"], spec["col_end"]
+                side_blk = re - rs
                 h_row = h[:, rs:re]
                 h_col = h[:, cs:ce]
                 pos_row = x_input[:, rs:re, :3]
                 pos_col = x_input[:, cs:ce, :3]
                 mask = pre_masks[spec_idx].unsqueeze(0) if pre_masks[spec_idx].dim() == 2 else pre_masks[spec_idx]
                 row_start = row_start_for_spec(spec)
+                lv = torch.full((1, 1), spec["level"], device=h_row.device, dtype=h_row.dtype)
+                bs = torch.full((1, 1), float(side_blk), device=h_row.device, dtype=h_row.dtype)
                 _, _, feat_U, feat_U_mod, gam = model.universal_off_diag(
-                    h_row, h_col, pos_row, pos_col, mask, spec["rank"], row_start=row_start, return_film_features=True, global_features=global_feat,
+                    h_row, h_col, pos_row, pos_col, mask, spec["rank"], row_start=row_start, return_film_features=True, global_features=global_feat, level_index=lv, block_side=bs,
                 )
                 return feat_U, feat_U_mod, gam
 
