@@ -1716,21 +1716,23 @@ def evaluate_gradient_interference(args):
 
     model.train()  # Need train mode for gradients
 
-    # 2. Setup Data Contexts: same config as training (single vs multi) but only 10 passes/frames by default
+    # 2. Setup Data Contexts: mirror training — num_eval "steps", each with contexts_per_step frames (gradient accumulation)
     num_eval = 10
+    contexts_per_step = max(1, int(getattr(args, 'contexts_per_step', 4)))
     data_path = Path(args.data_folder)
     run_folder = _most_recent_run_folder(data_path)
     dataset = FluidGraphDataset([run_folder])
+    rng = random.Random(args.seed)
 
     if args.use_single_frame:
         frame_idx = min(args.frame, len(dataset) - 1)
-        frame_indices = [frame_idx] * num_eval
-        print(f"Evaluating {num_eval} passes on SINGLE frame index {frame_idx}")
+        frame_indices_per_pass = [[frame_idx] * contexts_per_step for _ in range(num_eval)]
+        print(f"Evaluating {num_eval} passes, {contexts_per_step} contexts per pass (single frame {frame_idx})")
     else:
-        rng = random.Random(args.seed)
-        n_sample = min(num_eval, len(dataset))
-        frame_indices = sorted(rng.sample(range(len(dataset)), n_sample))
-        print(f"Evaluating across {n_sample} random frames")
+        frame_indices_per_pass = [
+            rng.choices(range(len(dataset)), k=contexts_per_step) for _ in range(num_eval)
+        ]
+        print(f"Evaluating {num_eval} passes, {contexts_per_step} frames per pass (gradient accumulation like training)")
 
     # 3. Define Parameter Groups to Analyze (split for finer gradient-interference diagnosis)
     num_blocks = getattr(args, 'num_layers', 3)
@@ -1764,81 +1766,82 @@ def evaluate_gradient_interference(args):
     group_gradients = {name: [] for name in param_groups.keys()}
     global_features_list = []
 
-    # 4. Extract Gradients per Frame
-    for step, frame_idx in enumerate(frame_indices):
-        batch = dataset[frame_idx]
-        if batch.get('global_features') is not None:
-            global_features_list.append(batch['global_features'].detach().cpu().numpy())
-        n_orig = int(batch['num_nodes'])
-        n_pad = next_valid_size(n_orig, LEAF_SIZE)
-
-        x_input = batch['x'][:n_orig].unsqueeze(0).to(device)
-        if n_pad > n_orig:
-            x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
-
-        active_pos = x_input[0, :n_orig, :3]
-        x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
-
-        rows, cols = batch['edge_index'][0], batch['edge_index'][1]
-        mask = (rows < n_orig) & (cols < n_orig)
-        edge_index = batch['edge_index'][:, mask].to(device)
-        edge_values = batch['edge_values'][mask].to(device)
-        scale_A = batch.get('scale_A')
-        if scale_A is not None and not isinstance(scale_A, torch.Tensor):
-            scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
-
-        A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
-        A_small = A_sparse.to_dense().to(device) if device.type == 'mps' else A_sparse.to(device).to_dense()
-        A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
-        A_dense[:n_orig, :n_orig] = A_small
-        A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
-
-        dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
-        pre_masks = get_or_compute_masks(batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE)
-        pre_leaf = build_leaf_block_connectivity(
-            edge_index, edge_values, x_input[0, :n_pad, :3], scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
-        )
-
-        # Forward Pass
-        global_feat = batch.get('global_features')
-        if global_feat is not None:
-            global_feat = global_feat.to(device)
-            if global_feat.dim() == 1:
-                global_feat = global_feat.unsqueeze(0)
+    # 4. Extract Gradients per Pass (each pass = contexts_per_step frames, gradient accumulated like training)
+    for step in range(num_eval):
         model.zero_grad()
-        diag_blocks, off_diag_list = model(
-            x_input, edge_index=edge_index, edge_values=edge_values,
-            scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
-            global_features=global_feat,
-        )
+        step_loss_sum = 0.0
+        for micro in range(contexts_per_step):
+            frame_idx = frame_indices_per_pass[step][micro]
+            batch = dataset[frame_idx]
+            if batch.get('global_features') is not None:
+                global_features_list.append(batch['global_features'].detach().cpu().numpy())
+            n_orig = int(batch['num_nodes'])
+            n_pad = next_valid_size(n_orig, LEAF_SIZE)
 
-        # Compute Loss
-        batch_vectors = max(128, int(round(n_pad ** 0.5)))
-        Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
-        Z[:, n_orig:, :] = 0.0
-        AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-        MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
+            x_input = batch['x'][:n_orig].unsqueeze(0).to(device)
+            if n_pad > n_orig:
+                x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
 
-        loss = ((MAZ - Z) ** 2).mean()
-        loss.backward()
+            active_pos = x_input[0, :n_orig, :3]
+            x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
 
-        # Extract and flatten gradients for this step
+            rows, cols = batch['edge_index'][0], batch['edge_index'][1]
+            mask = (rows < n_orig) & (cols < n_orig)
+            edge_index = batch['edge_index'][:, mask].to(device)
+            edge_values = batch['edge_values'][mask].to(device)
+            scale_A = batch.get('scale_A')
+            if scale_A is not None and not isinstance(scale_A, torch.Tensor):
+                scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
+
+            A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
+            A_small = A_sparse.to_dense().to(device) if device.type == 'mps' else A_sparse.to(device).to_dense()
+            A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
+            A_dense[:n_orig, :n_orig] = A_small
+            A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
+
+            dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
+            pre_masks = get_or_compute_masks(batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE)
+            pre_leaf = build_leaf_block_connectivity(
+                edge_index, edge_values, x_input[0, :n_pad, :3], scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
+            )
+
+            global_feat = batch.get('global_features')
+            if global_feat is not None:
+                global_feat = global_feat.to(device)
+                if global_feat.dim() == 1:
+                    global_feat = global_feat.unsqueeze(0)
+            diag_blocks, off_diag_list = model(
+                x_input, edge_index=edge_index, edge_values=edge_values,
+                scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
+                global_features=global_feat,
+            )
+
+            batch_vectors = max(128, int(round(n_pad ** 0.5)))
+            Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
+            Z[:, n_orig:, :] = 0.0
+            AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
+            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
+
+            raw_loss = ((MAZ - Z) ** 2).mean()
+            step_loss_sum += raw_loss.item()
+            loss = raw_loss / contexts_per_step
+            loss.backward()
+
+        step_loss_avg = step_loss_sum / contexts_per_step
         for group_name, get_params in param_groups.items():
             params = get_params(model)
             if not params:
                 continue
-
             grads = []
             for p in params:
                 if p.grad is not None:
                     grads.append(p.grad.detach().clone().view(-1))
                 else:
                     grads.append(torch.zeros_like(p).view(-1))
-
             flat_grad = torch.cat(grads)
             group_gradients[group_name].append(flat_grad)
 
-        print(f"  Processed frame {frame_idx} (Loss: {loss.item():.4f})")
+        print(f"  Processed pass {step + 1}/{num_eval} ({contexts_per_step} frames, avg loss: {step_loss_avg:.4f})")
 
     # 5. Calculate Metrics
     print("\n=== Gradient Interference Report ===")
@@ -1847,10 +1850,10 @@ def evaluate_gradient_interference(args):
         if not grads:
             continue
 
-        grads_stack = torch.stack(grads)  # Shape: (num_frames, num_params)
-        num_frames = grads_stack.shape[0]
+        grads_stack = torch.stack(grads)  # Shape: (num_passes, num_params)
+        num_passes = grads_stack.shape[0]
 
-        # Mean gradient and variance across frames
+        # Mean gradient and variance across passes (each pass = accumulated grad over contexts_per_step frames)
         mean_grad = grads_stack.mean(dim=0)
         var_grad = grads_stack.var(dim=0, unbiased=False)
 
@@ -1859,10 +1862,10 @@ def evaluate_gradient_interference(args):
         noise_norm = torch.sqrt(var_grad.mean() + 1e-12).item()
         snr = signal_norm / noise_norm if noise_norm > 0 else float('inf')
 
-        # Pairwise Cosine Similarity
+        # Pairwise Cosine Similarity (across passes)
         cos_sims = []
-        for i in range(num_frames):
-            for j in range(i + 1, num_frames):
+        for i in range(num_passes):
+            for j in range(i + 1, num_passes):
                 sim = F.cosine_similarity(grads_stack[i].unsqueeze(0), grads_stack[j].unsqueeze(0), dim=1).item()
                 cos_sims.append(sim)
 
@@ -1878,13 +1881,13 @@ def evaluate_gradient_interference(args):
         gf_arr = np.array(global_features_list)
         gf_mean = gf_arr.mean(axis=0)
         gf_std = gf_arr.std(axis=0)
-        print("FRAME STATS (global_features, mean ± std across evaluated frames):")
+        print("FRAME STATS (global_features, mean ± std across all frames in the evaluated passes):")
         print(f"  log2(N), log(scale_A), mass_mean, mass_std, diag_mu, diag_std, diff_mean/std(3): {gf_mean.tolist()}")
         print(f"  stds: {gf_std.tolist()}")
         print("-" * 40)
 
     # 6. HODLR Level Analysis (cross-level gradient, per-level residual waterfall, basis overlap) on first frame
-    frame_idx = frame_indices[0]
+    frame_idx = frame_indices_per_pass[0][0]
     batch = dataset[frame_idx]
     n_orig = int(batch['num_nodes'])
     n_pad = next_valid_size(n_orig, LEAF_SIZE)
