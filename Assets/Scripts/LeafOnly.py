@@ -861,21 +861,66 @@ def apply_block_structured_M(diag_blocks, off_diag_list, x, off_diag_struct, lea
 
 
 def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, levels_to_include=None):
-    """Apply M: diagonal always; off-diagonal only for levels in levels_to_include (None = all)."""
-    B, N, K = x.shape
+    """Apply M: diagonal always; off-diagonal only for levels in levels_to_include (None = all).
+    Off-diagonal application is level-wise batched: one bmm per HODLR level (O(log N) kernel launches)."""
+    B, N, K_dim = x.shape
     num_leaves = N // leaf_size
-    x_blk = x.view(B, num_leaves, leaf_size, K)
-    out = torch.einsum('blij,bljk->blik', diag_blocks, x_blk).reshape(B, N, K)
+    x_blk = x.view(B, num_leaves, leaf_size, K_dim)
+    out = torch.einsum('blij,bljk->blik', diag_blocks, x_blk).reshape(B, N, K_dim)
+
+    # Group off_diag_struct by level (mirror _off_diag structure)
+    level_to_blocks = {}
     for idx, spec in enumerate(off_diag_struct):
         if levels_to_include is not None and spec["level"] not in levels_to_include:
             continue
-        U, V = off_diag_list[idx]
-        rs, re = spec["row_start"], spec["row_end"]
-        cs, ce = spec["col_start"], spec["col_end"]
-        x_col = x[:, cs:ce]
-        x_row = x[:, rs:re]
-        out[:, rs:re] = out[:, rs:re] + torch.matmul(U, torch.matmul(V.transpose(1, 2), x_col))
-        out[:, cs:ce] = out[:, cs:ce] + torch.matmul(V, torch.matmul(U.transpose(1, 2), x_row))
+        lvl = spec["level"]
+        if lvl not in level_to_blocks:
+            level_to_blocks[lvl] = []
+        level_to_blocks[lvl].append((idx, spec))
+
+    for lvl, blocks in level_to_blocks.items():
+        K_blocks = len(blocks)
+        side = blocks[0][1]["side"]
+        rank = blocks[0][1]["rank"]
+        device = x.device
+
+        # Stack U, V into (B*K_blocks, side, rank) — same order as _off_diag: block 0 all batches, then block 1, ...
+        U_list = [off_diag_list[idx][0] for idx, _ in blocks]   # each (B, side, rank)
+        V_list = [off_diag_list[idx][1] for idx, _ in blocks]
+        U_batched = torch.cat(U_list, dim=0)   # (K_blocks*B, side, rank)
+        V_batched = torch.cat(V_list, dim=0)
+
+        # Batched x_col and x_row: (K_blocks*B, side, K_dim)
+        x_col_list = [x[:, spec["col_start"]:spec["col_end"]] for _, spec in blocks]
+        x_row_list = [x[:, spec["row_start"]:spec["row_end"]] for _, spec in blocks]
+        x_col_batched = torch.cat(x_col_list, dim=0)
+        x_row_batched = torch.cat(x_row_list, dim=0)
+
+        # Batched matmuls: Z_row = U @ (V^T @ x_col), Z_col = V @ (U^T @ x_row)
+        # V^T @ x_col: (B*K_blocks, side, rank)^T @ (B*K_blocks, side, K_dim) -> (B*K_blocks, rank, K_dim)
+        VT_x_col = torch.bmm(V_batched.transpose(1, 2), x_col_batched)
+        Z_row = torch.bmm(U_batched, VT_x_col)   # (B*K_blocks, side, K_dim)
+        # U^T @ x_row -> (B*K_blocks, rank, K_dim)
+        UT_x_row = torch.bmm(U_batched.transpose(1, 2), x_row_batched)
+        Z_col = torch.bmm(V_batched, UT_x_row)   # (B*K_blocks, side, K_dim)
+
+        # Linear indices for scatter_add: batched order is block0_b0..block0_b(B-1), block1_b0.. so bk % B = batch, bk // B = block_idx
+        row_starts = torch.tensor([spec["row_start"] for _, spec in blocks], device=device, dtype=torch.long)
+        col_starts = torch.tensor([spec["col_start"] for _, spec in blocks], device=device, dtype=torch.long)
+        bk = torch.arange(K_blocks * B, device=device)
+        batch_idx = bk % B
+        block_idx = bk // B
+        row_start_per_bk = row_starts[block_idx]
+        col_start_per_bk = col_starts[block_idx]
+        # (B*K_blocks, side) -> linear index into out.view(B*N, K_dim)
+        row_linear = batch_idx.unsqueeze(1) * N + row_start_per_bk.unsqueeze(1) + torch.arange(side, device=device).unsqueeze(0)
+        col_linear = batch_idx.unsqueeze(1) * N + col_start_per_bk.unsqueeze(1) + torch.arange(side, device=device).unsqueeze(0)
+        out_flat = out.reshape(-1, K_dim)
+        row_linear_exp = row_linear.reshape(-1, 1).expand(-1, K_dim)
+        col_linear_exp = col_linear.reshape(-1, 1).expand(-1, K_dim)
+        out_flat.scatter_add_(0, row_linear_exp, Z_row.reshape(-1, K_dim))
+        out_flat.scatter_add_(0, col_linear_exp, Z_col.reshape(-1, K_dim))
+
     return out
 
 

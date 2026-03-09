@@ -38,6 +38,8 @@ from LeafOnly import (
     read_leaf_only_header,
     load_leaf_only_weights,
     apply_block_structured_M,
+    build_hodlr_off_diag_structure,
+    build_off_diag_super_connectivity,
     LEAF_SIZE,
     VIEW_SIZE,
     next_valid_size,
@@ -236,6 +238,9 @@ def pcg_gpu_cudagraph(
     viz_n = n
     num_leaves = n // LEAF_SIZE
 
+    # diag_blocks may be (B, num_leaves, L, L) or (num_leaves, L, L); in-graph we need (num_leaves, L, L)
+    diag_blocks_0 = diag_blocks[0] if diag_blocks.dim() == 4 else diag_blocks
+
     # Static tensors (fixed addresses for capture; no new allocations inside graph)
     x_static = torch.zeros_like(b_gpu)
     r_static = torch.zeros_like(b_gpu)
@@ -244,24 +249,15 @@ def pcg_gpu_cudagraph(
     z_off_static = torch.zeros_like(b_gpu)
     rho_static = torch.zeros(1, device=device, dtype=b_gpu.dtype)
 
-    # Initial state in Python (once)
+    # Initial state in Python (once): use LeafOnly's level-wise batched apply for first z = M @ r
     x_static.zero_()
     r_static.copy_(b_gpu)
-    # z_static = M @ r_static (inline block-sparse); param diag_blocks is already (num_leaves, LEAF_SIZE, LEAF_SIZE)
-    r_blocks = r_static.view(num_leaves, LEAF_SIZE, 1)
-    z_diag = torch.bmm(diag_blocks, r_blocks).view(viz_n, 1)
-    z_off = torch.zeros_like(r_static)
-    if off_diag_list and off_diag_struct:
-        for idx, spec in enumerate(off_diag_struct):
-            U = off_diag_list[idx][0][0]
-            V = off_diag_list[idx][1][0]
-            rs, re = spec["row_start"], spec["row_end"]
-            cs, ce = spec["col_start"], spec["col_end"]
-            r_c = r_static[cs:ce]
-            z_off[rs:re].add_(U @ (V.T @ r_c))
-            r_r = r_static[rs:re]
-            z_off[cs:ce].add_(V @ (U.T @ r_r))
-    z_static.copy_(z_diag + z_off)
+    diag_4d = diag_blocks if diag_blocks.dim() == 4 else diag_blocks.unsqueeze(0)
+    z_initial = apply_block_structured_M(
+        diag_4d, off_diag_list, r_static.unsqueeze(0), off_diag_struct,
+        leaf_size=LEAF_SIZE,
+    )
+    z_static.copy_(z_initial.squeeze(0))
     p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
 
@@ -278,7 +274,7 @@ def pcg_gpu_cudagraph(
         r_static.sub_(Ap * alpha)
         # Inline M: z_static = M @ r_static (reuse z_off_static to avoid allocation in graph)
         r_blocks = r_static.view(num_leaves, LEAF_SIZE, 1)
-        z_diag = torch.bmm(diag_blocks, r_blocks).view(viz_n, 1)
+        z_diag = torch.bmm(diag_blocks_0, r_blocks).view(viz_n, 1)
         z_off_static.zero_()
         if off_diag_list and off_diag_struct:
             for idx, spec in enumerate(off_diag_struct):
@@ -432,17 +428,33 @@ def main():
     if scale_A is not None and not isinstance(scale_A, torch.Tensor):
         scale_A = torch.tensor(scale_A, device=device, dtype=x_leaf.dtype)
 
+    # Precompute off-diag masks once (same as LeafOnly training) so forward never builds them
+    off_diag_struct = build_hodlr_off_diag_structure(
+        n_pad, LEAF_SIZE, rank_base=getattr(model_leaf, "rank_base", 16)
+    )
+    precomputed_masks = [
+        build_off_diag_super_connectivity(
+            edge_index_leaf, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
+            device, LEAF_SIZE,
+        )
+        for spec in off_diag_struct
+    ] if off_diag_struct else []
+
     with torch.no_grad():
-        # Warm up inference (torch.compile + CUDA)
-        for _ in range(3):
-            _ = model_leaf(x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A)
+        # Warm up inference (torch.compile + CUDA); match training warmup so timing is comparable
+        for _ in range(15):
+            _ = model_leaf(
+                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
+                precomputed_masks=precomputed_masks,
+            )
         if device.type == 'cuda':
             torch.cuda.synchronize()
             inf_start = torch.cuda.Event(enable_timing=True)
             inf_end = torch.cuda.Event(enable_timing=True)
             inf_start.record()
             diag_blocks, off_diag_list = model_leaf(
-                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A
+                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
+                precomputed_masks=precomputed_masks,
             )
             inf_end.record()
             torch.cuda.synchronize()
@@ -450,7 +462,8 @@ def main():
         else:
             t0 = time.perf_counter()
             diag_blocks, off_diag_list = model_leaf(
-                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A
+                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
+                precomputed_masks=precomputed_masks,
             )
             inference_ms = (time.perf_counter() - t0) * 1000
     # Keep preconditioner outputs on GPU so PCG CUDAGRAPH solver uses them without CPU round-trip
@@ -531,30 +544,16 @@ def main():
     total_none_gpu_ms = setup_none_ms + solve_none_gpu_ms
     total_none_cpu_ms = setup_none_ms + solve_none_cpu_ms
 
-    # True O(N) Block-Sparse Neural Preconditioner Application
+    # Use LeafOnly's level-wise batched apply (same fast path as LeafOnly.py)
     with torch.no_grad():
         def apply_M_block_sparse(r):
-            # 1. Block Diagonal Application: Batched Matrix Multiply (O(N))
-            r_blocks = r.view(num_leaves, LEAF_SIZE, 1)
-            z_diag = torch.bmm(diag_blocks[0], r_blocks).view(viz_n, 1)
-
-            # 2. Low-Rank Off-Diagonal Updates (if any)
-            z_off = torch.zeros_like(r)
-            if off_diag_list and getattr(model_leaf, 'off_diag_struct', None):
-                for idx, spec in enumerate(model_leaf.off_diag_struct):
-                    U = off_diag_list[idx][0][0]   # (side, rank)
-                    V = off_diag_list[idx][1][0]   # (side, rank)
-                    rs, re = spec["row_start"], spec["row_end"]
-                    cs, ce = spec["col_start"], spec["col_end"]
-
-                    # Compute U(V^T r) instead of (UV^T)r
-                    r_c = r[cs:ce]
-                    z_off[rs:re] += U @ (V.T @ r_c)
-
-                    r_r = r[rs:re]
-                    z_off[cs:ce] += V @ (U.T @ r_r)
-
-            return z_diag + z_off
+            r_batched = r.unsqueeze(0)  # (1, viz_n, 1)
+            out = apply_block_structured_M(
+                diag_blocks, off_diag_list, r_batched,
+                getattr(model_leaf, "off_diag_struct", None),
+                leaf_size=LEAF_SIZE,
+            )
+            return out.squeeze(0)  # (viz_n, 1)
 
     # On CUDA use graph solve (no Python overhead); otherwise or on graph failure use regular pcg_gpu
     if device.type == "cuda":
@@ -562,7 +561,7 @@ def main():
             x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph(
                 A_gpu,
                 b_gpu,
-                diag_blocks[0],
+                diag_blocks,
                 off_diag_list,
                 getattr(model_leaf, "off_diag_struct", None),
                 tol=pcg_tol,
