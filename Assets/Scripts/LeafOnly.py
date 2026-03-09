@@ -80,8 +80,15 @@ class FluidGraphDataset:
         # Layer: keep it linear/ordinal for the MLP instead of exponential
         layer_n = layer / 4.0
 
-        # Robust scaling for edge values (ignore top 1% outliers)
-        scale_A = float(np.percentile(np.abs(vals), 99.0))
+        # Gershgorin spectral radius bound: γ = min(max row sum, max col sum) of |A|
+        row_sums = np.zeros(num_nodes, dtype=np.float64)
+        col_sums = np.zeros(num_nodes, dtype=np.float64)
+        for r, c, v in zip(rows, cols, vals):
+            row_sums[r] += abs(v)
+            col_sums[c] += abs(v)
+        max_row = float(np.max(row_sums)) if row_sums.size else 1.0
+        max_col = float(np.max(col_sums)) if col_sums.size else 1.0
+        scale_A = float(min(max_row, max_col))
         if scale_A <= 0.0:
             scale_A = 1.0
 
@@ -92,8 +99,9 @@ class FluidGraphDataset:
             diffusion_grad = np.zeros((num_nodes, 3), dtype=np.float32)
 
         # --- PHYSICS-PRESERVING NORMALIZATION ---
-        # 1. Diag Map: scaled identically to edge values to preserve condition number
+        # 1. Diag Map and edge values: normalize by γ so network sees Â = A/γ
         diag_map_n = diag_map / scale_A
+        vals_n = vals / scale_A
 
         # 2. SymLog then Z-score per-frame so every frame looks statistically identical to the Lift module
         mass_sym = np.sign(mass) * np.log1p(np.abs(mass))
@@ -128,7 +136,7 @@ class FluidGraphDataset:
         return {
             'x': torch.from_numpy(x).float(),
             'edge_index': torch.stack([torch.from_numpy(rows.astype(np.int64)), torch.from_numpy(cols.astype(np.int64))]),
-            'edge_values': torch.from_numpy(vals.copy()),
+            'edge_values': torch.from_numpy(vals_n.astype(np.float32)),
             'num_nodes': int(num_nodes),
             'scale_A': scale_A,
             'frame_path': str(frame_path),
@@ -154,9 +162,7 @@ class SparsePhysicsGCN(nn.Module):
 
         row, col = edge_index[0], edge_index[1]
         w = edge_values.clone().to(x.dtype)
-        if scale_A is not None and scale_A != 1.0:
-            s = scale_A.to(x.dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=w.device, dtype=x.dtype)
-            w = w / s
+        # Input is pre-normalized (Â = A/γ); no scale_A division
 
         neighbor_features = self.linear_neighbor(x_flat)
         messages = neighbor_features[col] * w.unsqueeze(-1)
@@ -245,9 +251,7 @@ def build_leaf_block_physics_bias(edge_index, edge_values, scale_A, leaf_size, d
     c_l = cols[in_block] % leaf_size
     b_l = block_r[in_block]
     w = edge_values[in_block].to(device=device, dtype=dtype)
-    if scale_A is not None and scale_A != 1.0:
-        s = scale_A.to(device=device, dtype=dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=device, dtype=dtype)
-        w = w / s
+    # Input is pre-normalized (Â = A/γ); no scale_A division
     bias = torch.zeros(num_blocks, leaf_size, leaf_size, device=device, dtype=dtype)
     bias[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device)] = 1.0
     bias[b_l, r_l, c_l] = w
@@ -268,9 +272,7 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, l
     pos_c = positions[cols[in_block]]
     dx = (pos_c - pos_r).to(device=device, dtype=dtype)
     w = edge_values[in_block].to(device=device, dtype=dtype)
-    if scale_A is not None and scale_A != 1.0:
-        s = scale_A.to(device=device, dtype=dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=device, dtype=dtype)
-        w = w / s
+    # Input is pre-normalized (Â = A/γ); no scale_A division
     edge_feats_flat = torch.cat([dx, w.unsqueeze(1)], dim=1)
 
     # Batched adjacency (num_blocks, leaf_size, leaf_size) from in-block edges
@@ -542,8 +544,8 @@ OFF_DIAG_SUPER = 32
 GLOBAL_FEATURES_DIM = 12  # dataset global_features vector for scale predictor
 
 # Trained graph size range: gradient interference evaluation uses levels that exist for this range
-MIN_MIXED_SIZE = 1024
-MAX_MIXED_SIZE = 1024  
+MIN_MIXED_SIZE = 256
+MAX_MIXED_SIZE = 256  
 
 def _rank_for_side(side, rank_base=RANK_BASE_LEVEL1, min_rank=4, max_rank=512):
     r = rank_base * ((side / 32.0) ** (2.0 / 3.0))
@@ -710,43 +712,24 @@ class SinusoidalPosEmb(nn.Module):
 
 
 class UniversalOffDiagBlock(nn.Module):
-    # Nested subspace: shared linear projections; output truncated to required rank per level (no disjoint lanes).
-    # Attention is over n_super + 2 tokens: 32 super-nodes + block-avg + scene-global (global_features).
-    NUM_GLOBAL_TOKENS = 2  # block average, scene global
+    # Scale-equivariant: no scale_emb, no scene_cond, no FiLM. Maps topology of Â to M~; output scaled by 1/α in apply_block_structured_M.
+    # Attention: 32 super-nodes + 1 block-avg token. Context for projection: geometry only (delta_x, dist).
+    NUM_GLOBAL_TOKENS = 1  # block average only
 
     def __init__(self, d_model, max_rank=1024, global_features_dim=0):
         super().__init__()
         self.n_super = OFF_DIAG_SUPER
-        self.n_attn = self.n_super + self.NUM_GLOBAL_TOKENS  # 34
+        self.n_attn = self.n_super + self.NUM_GLOBAL_TOKENS  # 33
         self.max_rank = max_rank
-        self.global_features_dim = global_features_dim
+        self.global_features_dim = 0  # unused; kept for API compat
 
-        self.scale_emb_dim = 16
-        self.scale_embedder = SinusoidalPosEmb(self.scale_emb_dim)
-        self._context_dim = self.scale_emb_dim + 4 + (global_features_dim or 0)
-        # [h, attn_out, global_ctx, context] so rank prediction sees context
+        self._context_dim = 4  # delta_x (3) + dist (1) only; no scale, no global
         self._proj_in_dim = 3 * d_model + self._context_dim
 
-        self.attn_q = nn.Linear(d_model + 5, d_model)
-        self.attn_k = nn.Linear(d_model + 5, d_model)
-        self.attn_v = nn.Linear(d_model + 5, d_model)
-        if global_features_dim > 0:
-            self.scene_proj = nn.Linear(global_features_dim + 2, d_model + 5)
-        else:
-            self.scene_proj = None
+        self.attn_q = nn.Linear(d_model + 4, d_model)
+        self.attn_k = nn.Linear(d_model + 4, d_model)
+        self.attn_v = nn.Linear(d_model + 4, d_model)
 
-        self.film_gen = nn.Sequential(
-            nn.Linear(self._context_dim, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, 2 * self._proj_in_dim),
-        )
-
-        with torch.no_grad():
-            nn.init.zeros_(self.film_gen[2].weight)
-            nn.init.zeros_(self.film_gen[2].bias)
-            self.film_gen[2].bias[: self._proj_in_dim].fill_(1.0)
-
-        # Shared linear projections (nested subspace): output truncated to rank per level
         self.proj_U = nn.Linear(self._proj_in_dim, max_rank)
         self.proj_V = nn.Linear(self._proj_in_dim, max_rank)
         with torch.no_grad():
@@ -779,28 +762,14 @@ class UniversalOffDiagBlock(nn.Module):
         delta_x = down_pos_col - down_pos_row
         dist = torch.norm(delta_x, dim=-1, keepdim=True).clamp(min=1e-8)
 
-        scale_val = math.log2(max(1.0, side / float(self.n_super)))
-        scale_tensor = torch.full((B, self.n_super, 1), scale_val, device=h_row.device, dtype=h_row.dtype)
-        scale_emb = self.scale_embedder(scale_tensor)
+        down_row_cond = torch.cat([down_row, delta_x, dist], dim=-1)
+        down_col_cond = torch.cat([down_col, -delta_x, dist], dim=-1)
 
-        down_row_cond = torch.cat([down_row, scale_tensor, delta_x, dist], dim=-1)
-        down_col_cond = torch.cat([down_col, scale_tensor, -delta_x, dist], dim=-1)
+        block_avg_row = torch.cat([down_row.mean(dim=1, keepdim=True), delta_x.mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
+        block_avg_col = torch.cat([down_col.mean(dim=1, keepdim=True), (-delta_x).mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
 
-        block_avg_row = torch.cat([down_row.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), delta_x.mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
-        block_avg_col = torch.cat([down_col.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), (-delta_x).mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
-        if self.scene_proj is not None:
-            gf = global_features if global_features is not None else torch.zeros(B, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
-            if gf.dim() == 1:
-                gf = gf.unsqueeze(0)
-            lv = level_index if level_index is not None else torch.zeros(B, 1, device=h_row.device, dtype=h_row.dtype)
-            bs = block_side if block_side is not None else torch.zeros(B, 1, device=h_row.device, dtype=h_row.dtype)
-            scene_input = torch.cat([gf, lv, bs], dim=-1)
-            scene_cond = self.scene_proj(scene_input).unsqueeze(1)
-        else:
-            scene_cond = torch.zeros(B, 1, down_row_cond.size(-1), device=h_row.device, dtype=h_row.dtype)
-
-        row_tokens = torch.cat([down_row_cond, block_avg_row, scene_cond], dim=1)
-        col_tokens = torch.cat([down_col_cond, block_avg_col, scene_cond], dim=1)
+        row_tokens = torch.cat([down_row_cond, block_avg_row], dim=1)
+        col_tokens = torch.cat([down_col_cond, block_avg_col], dim=1)
 
         Q = self.attn_q(row_tokens)
         K = self.attn_k(col_tokens)
@@ -809,8 +778,8 @@ class UniversalOffDiagBlock(nn.Module):
         scores = (Q @ K.transpose(-2, -1)) * self._scale_attn
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
-        mask_34 = F.pad(mask, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=True)
-        scores = scores.masked_fill(~mask_34, float('-inf'))
+        mask_33 = F.pad(mask, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=True)
+        scores = scores.masked_fill(~mask_33, float('-inf'))
         attn_probs = F.softmax(scores, dim=-1)
         row_out_full = attn_probs @ V
         row_out = row_out_full[:, : self.n_super].reshape(B, self.n_super, -1)
@@ -820,19 +789,8 @@ class UniversalOffDiagBlock(nn.Module):
         down_col_expanded = down_col.repeat_interleave(g, dim=1)
         global_ctx_expanded = global_ctx.unsqueeze(1).expand(-1, side, -1)
 
-        if self.global_features_dim > 0:
-            if global_features is not None:
-                gf_exp = global_features.unsqueeze(1).expand(-1, self.n_super, -1)
-                context_U = torch.cat([scale_emb, delta_x, dist, gf_exp], dim=-1)
-                context_V = torch.cat([scale_emb, -delta_x, dist, gf_exp], dim=-1)
-            else:
-                padding = torch.zeros(B, self.n_super, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
-                context_U = torch.cat([scale_emb, delta_x, dist, padding], dim=-1)
-                context_V = torch.cat([scale_emb, -delta_x, dist, padding], dim=-1)
-        else:
-            context_U = torch.cat([scale_emb, delta_x, dist], dim=-1)
-            context_V = torch.cat([scale_emb, -delta_x, dist], dim=-1)
-
+        context_U = torch.cat([delta_x, dist], dim=-1)
+        context_V = torch.cat([-delta_x, dist], dim=-1)
         context_U_expanded = context_U.repeat_interleave(g, dim=1)
         context_V_expanded = context_V.repeat_interleave(g, dim=1)
 
@@ -845,20 +803,9 @@ class UniversalOffDiagBlock(nn.Module):
         features_V = torch.cat([h_col_3, col_exp_3, global_ctx_expanded, context_V_expanded], dim=-1)
         features_U = self.feature_ln(features_U)
         features_V = self.feature_ln(features_V)
+        features_U_mod = features_U
+        features_V_mod = features_V
 
-        film_U = self.film_gen(context_U)
-        gamma_U, beta_U = film_U.chunk(2, dim=-1)
-        gamma_U_exp = gamma_U.repeat_interleave(g, dim=1)
-        beta_U_exp = beta_U.repeat_interleave(g, dim=1)
-        features_U_mod = (features_U * gamma_U_exp) + beta_U_exp
-
-        film_V = self.film_gen(context_V)
-        gamma_V, beta_V = film_V.chunk(2, dim=-1)
-        gamma_V_exp = gamma_V.repeat_interleave(g, dim=1)
-        beta_V_exp = beta_V.repeat_interleave(g, dim=1)
-        features_V_mod = (features_V * gamma_V_exp) + beta_V_exp
-
-        # Shared projection and truncate to required rank for this level (nested subspace)
         safe_rank = min(rank, self.max_rank)
         if safe_rank < 1:
             safe_rank = 1
@@ -873,7 +820,7 @@ class UniversalOffDiagBlock(nn.Module):
         out_V = V_raw * unified_scalar
 
         if return_film_features:
-            return out_U, out_V, features_U.detach(), features_U_mod.detach(), gamma_U.detach()
+            return out_U, out_V, features_U.detach(), features_U_mod.detach(), None
         return out_U, out_V
 
 
@@ -997,15 +944,14 @@ class LeafOnlyNet(nn.Module):
         return (diag_blocks, [])
 
 
-def apply_block_structured_M(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE):
+def apply_block_structured_M(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0):
     return apply_block_structured_M_with_levels(
-        diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size, levels_to_include=None
+        diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size, levels_to_include=None, scale_A=scale_A
     )
 
 
-def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, levels_to_include=None):
-    """Apply M: diagonal always; off-diagonal only for levels in levels_to_include (None = all).
-    Off-diagonal application is level-wise batched: one bmm per HODLR level (O(log N) kernel launches)."""
+def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, levels_to_include=None, scale_A=1.0):
+    """Apply M(A) = (1/α) M~(Â): diagonal + off-diag from network (M~), then scale by 1/scale_A for scale equivariance."""
     B, N, K_dim = x.shape
     num_leaves = N // leaf_size
     x_blk = x.view(B, num_leaves, leaf_size, K_dim)
@@ -1064,10 +1010,19 @@ def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag
         out_flat.scatter_add_(0, row_linear_exp, Z_row.reshape(-1, K_dim))
         out_flat.scatter_add_(0, col_linear_exp, Z_col.reshape(-1, K_dim))
 
+    alpha = scale_A
+    if alpha is not None and abs(float(alpha) - 1.0) > 1e-9:
+        if isinstance(alpha, torch.Tensor):
+            alpha = alpha.to(device=out.device, dtype=out.dtype)
+            if alpha.dim() > 0:
+                alpha = alpha.squeeze()
+            out = out / alpha
+        else:
+            out = out / float(alpha)
     return out
 
 
-def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None):
+def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None, scale_A=1.0):
     B, N, K = x.shape
     num_leaves = leaf_blocks.shape[1]
     leaf_size = leaf_blocks.shape[2]
@@ -1075,7 +1030,7 @@ def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None):
         x_leaves = x.view(B, num_leaves, leaf_size, K)
         y_leaves = torch.matmul(leaf_blocks, x_leaves)
         return y_leaves.view(B, N, K)
-    return apply_block_structured_M(leaf_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size)
+    return apply_block_structured_M(leaf_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size, scale_A=scale_A)
 
 
 # --- Save / Load ---
@@ -1150,15 +1105,8 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, blk.attn_k.bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.attn_v.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.attn_v.bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.film_gen[0].weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.film_gen[0].bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.film_gen[2].weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.film_gen[2].bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.feature_ln.weight.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.feature_ln.bias.detach().cpu().float(), transpose=False)
-            if getattr(blk, 'scene_proj', None) is not None:
-                _write_packed_tensor(f, blk.scene_proj.weight.detach().cpu().float(), transpose=True)
-                _write_packed_tensor(f, blk.scene_proj.bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.proj_U.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.proj_U.bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.proj_V.weight.detach().cpu().float(), transpose=True)
@@ -1271,15 +1219,8 @@ def load_leaf_only_weights(model, path):
                 _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
                 _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
                 _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
-                _read_into(f, blk.film_gen[0].weight, read_tensor, transpose=True)
-                _read_into(f, blk.film_gen[0].bias, read_tensor, transpose=False)
-                _read_into(f, blk.film_gen[2].weight, read_tensor, transpose=True)
-                _read_into(f, blk.film_gen[2].bias, read_tensor, transpose=False)
                 _read_into(f, blk.feature_ln.weight, read_tensor, transpose=False)
                 _read_into(f, blk.feature_ln.bias, read_tensor, transpose=False)
-                if getattr(blk, 'scene_proj', None) is not None:
-                    _read_into(f, blk.scene_proj.weight, read_tensor, transpose=True)
-                    _read_into(f, blk.scene_proj.bias, read_tensor, transpose=False)
                 _read_into(f, blk.proj_U.weight, read_tensor, transpose=True)
                 _read_into(f, blk.proj_U.bias, read_tensor, transpose=False)
                 _read_into(f, blk.proj_V.weight, read_tensor, transpose=True)
@@ -1332,7 +1273,7 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
+    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
     parser.add_argument('--num_frames', type=int, default=50, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
@@ -1587,9 +1528,10 @@ def train_leaf_only():
             if do_timing:
                 _sync()
                 t0 = time.perf_counter()
-            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
+            scale_A_val = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
+            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=scale_A_val)
             if do_log:
-                MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE)
+                MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE, scale_A=scale_A_val)
                 _norm_diag = MAZ_diag_only.norm().item()
                 _norm_off = (MAZ - MAZ_diag_only).norm().item()
                 ratio_off_sum += _norm_off / (_norm_diag + 1e-12)
@@ -1746,8 +1688,7 @@ def evaluate_gradient_interference(args):
     # Transformer: per block
     for b in range(num_blocks):
         param_groups[f'Transformer block {b}'] = (lambda m, b=b: list(m.blocks[b].parameters()))
-    # Off-diagonal: AdaLN (film_gen) vs Attention (Q/K/V) vs W_U/W_V
-    param_groups['Off-diag AdaLN (film_gen)'] = lambda m: list(m.universal_off_diag.film_gen.parameters())
+    # Off-diagonal: Attention (Q/K/V) vs W_U/W_V (scale-equivariant: no FiLM)
     param_groups['Off-diag Attention (Q/K/V)'] = lambda m: (
         list(m.universal_off_diag.attn_q.parameters())
         + list(m.universal_off_diag.attn_k.parameters())
@@ -1817,7 +1758,8 @@ def evaluate_gradient_interference(args):
             Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
             Z[:, n_orig:, :] = 0.0
             AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
+            scale_A_val = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
+            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=scale_A_val)
 
             raw_loss = ((MAZ - Z) ** 2).mean()
             step_loss_sum += raw_loss.item()
@@ -1938,7 +1880,8 @@ def evaluate_gradient_interference(args):
         Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
         Z[:, n_orig:, :] = 0.0
         AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-        MAz = apply_block_structured_M(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE)
+        scale_A_scalar = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
+        MAz = apply_block_structured_M(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar)
         residual = (MAz - Z).detach()
 
         print("\n=== Cross-Level Gradient Interference (Shared Backbone) ===")
@@ -1946,14 +1889,13 @@ def evaluate_gradient_interference(args):
         # We care if the macro and micro levels are fighting over the SHARED AdaLN MLP and Attention!
 
         shared_params = (
-            list(model.universal_off_diag.film_gen.parameters())
-            + list(model.universal_off_diag.attn_q.parameters())
+            list(model.universal_off_diag.attn_q.parameters())
             + list(model.universal_off_diag.attn_k.parameters())
             + list(model.universal_off_diag.attn_v.parameters())
         )
 
-        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min})
-        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max})
+        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min}, scale_A=scale_A_scalar)
+        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max}, scale_A=scale_A_scalar)
 
         model.zero_grad()
         loss_L1 = ((M_L1 - Z) ** 2).mean()
@@ -1967,8 +1909,8 @@ def evaluate_gradient_interference(args):
 
         cos_sim_shared = F.cosine_similarity(grad_shared_L1.unsqueeze(0), grad_shared_Lmax.unsqueeze(0), dim=1).item()
 
-        print(f"  Level {level_min} (micro) vs Level {level_max} (macro) gradient cosine similarity on SHARED ADA-LN/ATTN: {cos_sim_shared:.4f}")
-        print(f"  (If highly negative, AdaLN is failing to multiplex. If positive/near-zero, multiplexing is successful!)")
+        print(f"  Level {level_min} (micro) vs Level {level_max} (macro) gradient cosine similarity on SHARED ATTN: {cos_sim_shared:.4f}")
+        print(f"  (If highly negative, shared backbone is failing to multiplex. If positive/near-zero, multiplexing is successful!)")
 
         # proj_U/proj_V grads for "Per-level gradient" diagnostic (shared projection); need fresh graph (previous one was freed)
         diag_blocks, off_diag_list = model(
@@ -1976,8 +1918,8 @@ def evaluate_gradient_interference(args):
             scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
             global_features=global_feat,
         )
-        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min})
-        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max})
+        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min}, scale_A=scale_A_scalar)
+        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max}, scale_A=scale_A_scalar)
         blk = model.universal_off_diag
 
         def _flat_grad_proj(proj):
@@ -1998,12 +1940,12 @@ def evaluate_gradient_interference(args):
 
         print("\n=== Per-Level Residual Loss Decomposition ===")
         cumulative_levels = set()
-        base_res = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels)
+        base_res = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels, scale_A=scale_A_scalar)
         loss_diag = ((base_res - Z) ** 2).mean().item()
         print(f"  Diag only:                          residual loss = {loss_diag:.6f}")
         for lev in range(level_max, level_min - 1, -1):
             cumulative_levels.add(lev)
-            out = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels)
+            out = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels, scale_A=scale_A_scalar)
             loss_here = ((out - Z) ** 2).mean().item()
             print(f"  Diag + Levels {level_max}..{lev}:                residual loss = {loss_here:.6f}")
         full_loss = ((MAz - Z) ** 2).mean().item()
