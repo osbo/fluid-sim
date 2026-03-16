@@ -546,6 +546,7 @@ GLOBAL_FEATURES_DIM = 12  # dataset global_features vector for scale predictor
 # Trained graph size range: gradient interference evaluation uses levels that exist for this range
 MIN_MIXED_SIZE = 256
 MAX_MIXED_SIZE = 256  
+DEFAULT_MAX_LEVELS = max(1, int(math.log2(max(2, MAX_MIXED_SIZE // LEAF_SIZE))))
 
 def _rank_for_side(side, rank_base=RANK_BASE_LEVEL1, min_rank=4, max_rank=512):
     r = rank_base * ((side / 32.0) ** (2.0 / 3.0))
@@ -690,56 +691,32 @@ class LeafCore(nn.Module):
         return self.get_leaf_blocks(h, x)
 
 
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        # x shape: (..., 1)
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device, dtype=x.dtype) * -emb)
-        emb = x * emb.view(*([1] * (x.dim() - 1)), -1)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
-class UniversalOffDiagBlock(nn.Module):
-    # Scale-equivariant off-diagonal block with lightweight context modulation.
+class LevelSpecificOffDiagBlock(nn.Module):
+    # Level-specific off-diagonal block (one module per HODLR level).
     # Attention stays at 32 super-nodes + 1 block-avg token for speed.
     NUM_GLOBAL_TOKENS = 1  # block average only
 
-    def __init__(self, d_model, max_rank=1024, global_features_dim=0):
+    def __init__(self, d_model, exact_rank, global_features_dim=0):
         super().__init__()
         self.n_super = OFF_DIAG_SUPER
         self.n_attn = self.n_super + self.NUM_GLOBAL_TOKENS  # 33
-        self.max_rank = max_rank
+        self.exact_rank = max(1, int(exact_rank))
         self.global_features_dim = int(global_features_dim or 0)
-
-        self.scale_emb_dim = 8
-        self.scale_embedder = SinusoidalPosEmb(self.scale_emb_dim)
-        self._context_dim = self.scale_emb_dim + 4 + self.global_features_dim  # scale emb + delta_x/dist + frame stats
+        self._context_dim = 4 + self.global_features_dim  # delta_x(3) + dist(1) + optional frame stats
         self._proj_in_dim = 3 * d_model + self._context_dim
 
-        self.attn_q = nn.Linear(d_model + 5, d_model)
-        self.attn_k = nn.Linear(d_model + 5, d_model)
-        self.attn_v = nn.Linear(d_model + 5, d_model)
+        # Each token is [downsampled features, local context] => d_model + context_dim.
+        # Block-average is appended as an extra token, not concatenated to token channels.
+        qkv_in_dim = d_model + self._context_dim
+        self.attn_q = nn.Linear(qkv_in_dim, d_model)
+        self.attn_k = nn.Linear(qkv_in_dim, d_model)
+        self.attn_v = nn.Linear(qkv_in_dim, d_model)
 
-        self.film_gen = nn.Sequential(
-            nn.Linear(self._context_dim, max(64, d_model // 2)),
-            nn.GELU(),
-            nn.Linear(max(64, d_model // 2), 2 * self._proj_in_dim),
-        )
         self.feature_ln = nn.LayerNorm(self._proj_in_dim)
 
-        self.proj_U = nn.Linear(self._proj_in_dim, max_rank)
-        self.proj_V = nn.Linear(self._proj_in_dim, max_rank)
+        self.proj_U = nn.Linear(self._proj_in_dim, self.exact_rank)
+        self.proj_V = nn.Linear(self._proj_in_dim, self.exact_rank)
         with torch.no_grad():
-            nn.init.zeros_(self.film_gen[2].weight)
-            nn.init.zeros_(self.film_gen[2].bias)
-            self.film_gen[2].bias[: self._proj_in_dim].fill_(1.0)
             nn.init.zeros_(self.proj_U.weight)
             nn.init.zeros_(self.proj_U.bias)
             nn.init.normal_(self.proj_V.weight, std=0.01)
@@ -751,7 +728,7 @@ class UniversalOffDiagBlock(nn.Module):
 
         self._scale_attn = d_model ** -0.5
 
-    def forward(self, h_row, h_col, pos_row, pos_col, mask, rank, row_start=0, return_film_features=False, global_features=None, level_index=None, block_side=None):
+    def forward(self, h_row, h_col, pos_row, pos_col, mask, return_features=False, global_features=None):
         B = h_row.shape[0]
         side = h_row.shape[1]
         g = side // self.n_super
@@ -764,15 +741,23 @@ class UniversalOffDiagBlock(nn.Module):
         delta_x = down_pos_col - down_pos_row
         dist = torch.norm(delta_x, dim=-1, keepdim=True).clamp(min=1e-8)
 
-        scale_val = math.log2(max(1.0, side / float(self.n_super)))
-        scale_tensor = torch.full((B, self.n_super, 1), scale_val, device=h_row.device, dtype=h_row.dtype)
-        scale_emb = self.scale_embedder(scale_tensor)
+        if self.global_features_dim > 0:
+            if global_features is not None:
+                gf = global_features if global_features.dim() == 2 else global_features.unsqueeze(0)
+                gf_exp = gf.unsqueeze(1).expand(-1, self.n_super, -1)
+            else:
+                gf_exp = torch.zeros(B, self.n_super, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
+            context_U = torch.cat([delta_x, dist, gf_exp], dim=-1)
+            context_V = torch.cat([-delta_x, dist, gf_exp], dim=-1)
+        else:
+            context_U = torch.cat([delta_x, dist], dim=-1)
+            context_V = torch.cat([-delta_x, dist], dim=-1)
 
-        down_row_cond = torch.cat([down_row, scale_tensor, delta_x, dist], dim=-1)
-        down_col_cond = torch.cat([down_col, scale_tensor, -delta_x, dist], dim=-1)
+        down_row_cond = torch.cat([down_row, context_U], dim=-1)
+        down_col_cond = torch.cat([down_col, context_V], dim=-1)
 
-        block_avg_row = torch.cat([down_row.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), delta_x.mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
-        block_avg_col = torch.cat([down_col.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), (-delta_x).mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
+        block_avg_row = torch.cat([down_row.mean(dim=1, keepdim=True), context_U.mean(dim=1, keepdim=True)], dim=-1)
+        block_avg_col = torch.cat([down_col.mean(dim=1, keepdim=True), context_V.mean(dim=1, keepdim=True)], dim=-1)
 
         row_tokens = torch.cat([down_row_cond, block_avg_row], dim=1)
         col_tokens = torch.cat([down_col_cond, block_avg_col], dim=1)
@@ -795,18 +780,6 @@ class UniversalOffDiagBlock(nn.Module):
         down_col_expanded = down_col.repeat_interleave(g, dim=1)
         global_ctx_expanded = global_ctx.unsqueeze(1).expand(-1, side, -1)
 
-        if self.global_features_dim > 0:
-            if global_features is not None:
-                gf = global_features if global_features.dim() == 2 else global_features.unsqueeze(0)
-                gf_exp = gf.unsqueeze(1).expand(-1, self.n_super, -1)
-            else:
-                gf_exp = torch.zeros(B, self.n_super, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
-            context_U = torch.cat([scale_emb, delta_x, dist, gf_exp], dim=-1)
-            context_V = torch.cat([scale_emb, -delta_x, dist, gf_exp], dim=-1)
-        else:
-            context_U = torch.cat([scale_emb, delta_x, dist], dim=-1)
-            context_V = torch.cat([scale_emb, -delta_x, dist], dim=-1)
-
         context_U_expanded = context_U.repeat_interleave(g, dim=1)
         context_V_expanded = context_V.repeat_interleave(g, dim=1)
 
@@ -820,43 +793,30 @@ class UniversalOffDiagBlock(nn.Module):
         features_U = self.feature_ln(features_U)
         features_V = self.feature_ln(features_V)
 
-        film_U = self.film_gen(context_U)
-        gamma_U, beta_U = film_U.chunk(2, dim=-1)
-        gamma_U_exp = gamma_U.repeat_interleave(g, dim=1)
-        beta_U_exp = beta_U.repeat_interleave(g, dim=1)
-        features_U_mod = (features_U * gamma_U_exp) + beta_U_exp
-
-        film_V = self.film_gen(context_V)
-        gamma_V, beta_V = film_V.chunk(2, dim=-1)
-        gamma_V_exp = gamma_V.repeat_interleave(g, dim=1)
-        beta_V_exp = beta_V.repeat_interleave(g, dim=1)
-        features_V_mod = (features_V * gamma_V_exp) + beta_V_exp
-
-        safe_rank = min(rank, self.max_rank)
-        if safe_rank < 1:
-            safe_rank = 1
-        U_raw_full = self.proj_U(features_U_mod)
-        V_raw_full = self.proj_V(features_V_mod)
-        U_raw = U_raw_full[..., :safe_rank]
-        V_raw = V_raw_full[..., :safe_rank]
+        U_raw = self.proj_U(features_U)
+        V_raw = self.proj_V(features_V)
         # Keep block energy comparable across levels/ranks.
-        rank_scale = math.sqrt(float(safe_rank))
+        rank_scale = math.sqrt(float(self.exact_rank))
         out_U = U_raw / rank_scale
         out_V = V_raw / rank_scale
 
-        if return_film_features:
-            return out_U, out_V, features_U.detach(), features_U_mod.detach(), gamma_U.detach()
+        if return_features:
+            return out_U, out_V, features_U.detach(), features_V.detach()
         return out_U, out_V
 
 
 class LeafOnlyNet(nn.Module):
-    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=True, use_gcn=True, use_jacobi=True):
+    def __init__(self, input_dim=9, d_model=128, leaf_size=32, num_layers=3, num_heads=4, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=True, use_gcn=True, use_jacobi=True, max_levels=3):
         super().__init__()
         self.leaf_size = leaf_size
         self.rank_base = rank_base
+        self.max_levels = max(1, int(max_levels))
         self.core = LeafCore(input_dim=input_dim, d_model=d_model, leaf_size=leaf_size, num_layers=num_layers, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node, use_gcn=use_gcn, use_jacobi=use_jacobi)
-        # max_rank must hold sum of ranks over all HODLR levels; global_features_dim for scene token in off-diag attn
-        self.universal_off_diag = UniversalOffDiagBlock(d_model, max_rank=2048, global_features_dim=GLOBAL_FEATURES_DIM)
+        self.level_ranks = [_rank_for_side(self.leaf_size * (2 ** lvl_idx), rank_base=self.rank_base) for lvl_idx in range(self.max_levels)]
+        self.level_off_diag = nn.ModuleList([
+            LevelSpecificOffDiagBlock(d_model, exact_rank=self.level_ranks[lvl_idx], global_features_dim=GLOBAL_FEATURES_DIM)
+            for lvl_idx in range(self.max_levels)
+        ])
         self.off_diag_struct = []
 
     @property
@@ -903,11 +863,17 @@ class LeafOnlyNet(nn.Module):
                 level_to_blocks[lvl] = []
             level_to_blocks[lvl].append((idx, spec))
 
-        # 3. Execute batched blocks per level (nested subspace: shared proj_U/proj_V, truncate by rank)
+        # 3. Execute batched blocks per level
         sorted_levels = sorted(level_to_blocks.keys())
         for lvl in sorted_levels:
+            module_idx = lvl - 1
+            if module_idx >= self.max_levels:
+                raise ValueError(f"Graph requires {lvl} off-diagonal levels, but model only has {self.max_levels} level blocks.")
             blocks = level_to_blocks[lvl]
             rank = blocks[0][1]["rank"]
+            expected_rank = self.level_off_diag[module_idx].exact_rank
+            if rank != expected_rank:
+                raise ValueError(f"HODLR rank mismatch at level {lvl}: struct rank={rank}, level block rank={expected_rank}.")
 
             h_rows, h_cols = [], []
             pos_rows, pos_cols = [], []
@@ -931,18 +897,14 @@ class LeafOnlyNet(nn.Module):
             batched_masks = stacked_masks.repeat_interleave(B, dim=0)
 
             K = len(blocks)
-            side_level = h_row_batched.shape[1]
             gf_batched = None
             if global_features is not None:
                 gf = global_features.unsqueeze(0).expand(B, -1) if global_features.dim() == 1 else global_features
                 gf_batched = gf.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
-            level_idx = torch.full((B * K, 1), lvl, device=h_row_batched.device, dtype=h_row_batched.dtype)
-            block_side_vec = torch.full((B * K, 1), float(side_level), device=h_row_batched.device, dtype=h_row_batched.dtype)
 
-            U_batched, V_batched = self.universal_off_diag(
+            U_batched, V_batched = self.level_off_diag[module_idx](
                 h_row_batched, h_col_batched, pos_row_batched, pos_col_batched,
-                batched_masks, rank=rank, global_features=gf_batched,
-                level_index=level_idx, block_side=block_side_vec,
+                batched_masks, global_features=gf_batched,
             )
 
             U_splits = torch.split(U_batched, B, dim=0)
@@ -1065,6 +1027,8 @@ def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None, sc
 # --- Save / Load ---
 
 LEAF_ONLY_HEADER_BYTES = 32  # 8 x int32: d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, reserved
+OFF_DIAG_SENTINEL_LEVELSPEC = 0xFFFFFFEB
+OFF_DIAG_SENTINELS_LEGACY = (0xFFFFFFFC, 0xFFFFFFFD, 0xFFFFFFFE, 0xFFFFFFFF)
 
 def read_leaf_only_header(path):
     path = Path(path)
@@ -1125,26 +1089,21 @@ def save_leaf_only_weights(model, path, input_dim=9):
         if use_jacobi:
             _write_packed_tensor(f, model.core.jacobi_gate.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, model.core.jacobi_gate.bias.detach().cpu().float(), transpose=False)
-        if getattr(model, 'universal_off_diag', None) is not None:
-            # 0xFFFFFFFE = off-diag v3 (feature_ln + context FiLM modulation).
-            f.write(struct.pack('<II', 0xFFFFFFFE, 0))
-            blk = model.universal_off_diag
-            _write_packed_tensor(f, blk.attn_q.weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.attn_q.bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.attn_k.weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.attn_k.bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.attn_v.weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.attn_v.bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.film_gen[0].weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.film_gen[0].bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.film_gen[2].weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.film_gen[2].bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.feature_ln.weight.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.feature_ln.bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.proj_U.weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.proj_U.bias.detach().cpu().float(), transpose=False)
-            _write_packed_tensor(f, blk.proj_V.weight.detach().cpu().float(), transpose=True)
-            _write_packed_tensor(f, blk.proj_V.bias.detach().cpu().float(), transpose=False)
+        if getattr(model, 'level_off_diag', None) is not None and len(model.level_off_diag) > 0:
+            f.write(struct.pack('<II', OFF_DIAG_SENTINEL_LEVELSPEC, int(len(model.level_off_diag))))
+            for blk in model.level_off_diag:
+                _write_packed_tensor(f, blk.attn_q.weight.detach().cpu().float(), transpose=True)
+                _write_packed_tensor(f, blk.attn_q.bias.detach().cpu().float(), transpose=False)
+                _write_packed_tensor(f, blk.attn_k.weight.detach().cpu().float(), transpose=True)
+                _write_packed_tensor(f, blk.attn_k.bias.detach().cpu().float(), transpose=False)
+                _write_packed_tensor(f, blk.attn_v.weight.detach().cpu().float(), transpose=True)
+                _write_packed_tensor(f, blk.attn_v.bias.detach().cpu().float(), transpose=False)
+                _write_packed_tensor(f, blk.feature_ln.weight.detach().cpu().float(), transpose=False)
+                _write_packed_tensor(f, blk.feature_ln.bias.detach().cpu().float(), transpose=False)
+                _write_packed_tensor(f, blk.proj_U.weight.detach().cpu().float(), transpose=True)
+                _write_packed_tensor(f, blk.proj_U.bias.detach().cpu().float(), transpose=False)
+                _write_packed_tensor(f, blk.proj_V.weight.detach().cpu().float(), transpose=True)
+                _write_packed_tensor(f, blk.proj_V.bias.detach().cpu().float(), transpose=False)
 
 def _write_packed_tensor(f, param, transpose=False):
     import numpy as np
@@ -1244,32 +1203,41 @@ def load_leaf_only_weights(model, path):
             _read_into(f, model.core.jacobi_gate.bias, read_tensor, transpose=False)
         extra = f.read(8)
         if len(extra) == 8:
-            sentinel, _ = struct.unpack('<II', extra)
-            if sentinel in (0xFFFFFFFC, 0xFFFFFFFD, 0xFFFFFFFE, 0xFFFFFFFF) and getattr(model, 'universal_off_diag', None) is not None:
-                blk = model.universal_off_diag
-                _read_into(f, blk.attn_q.weight, read_tensor, transpose=True)
-                _read_into(f, blk.attn_q.bias, read_tensor, transpose=False)
-                _read_into(f, blk.attn_k.weight, read_tensor, transpose=True)
-                _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
-                _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
-                _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
-                if sentinel == 0xFFFFFFFC:
-                    skip_tensor(f, (blk._proj_in_dim,), transpose=False)
-                    skip_tensor(f, (blk._proj_in_dim,), transpose=False)
-                elif sentinel == 0xFFFFFFFE:
-                    _read_into(f, blk.film_gen[0].weight, read_tensor, transpose=True)
-                    _read_into(f, blk.film_gen[0].bias, read_tensor, transpose=False)
-                    _read_into(f, blk.film_gen[2].weight, read_tensor, transpose=True)
-                    _read_into(f, blk.film_gen[2].bias, read_tensor, transpose=False)
-                    _read_into(f, blk.feature_ln.weight, read_tensor, transpose=False)
-                    _read_into(f, blk.feature_ln.bias, read_tensor, transpose=False)
-                _read_into(f, blk.proj_U.weight, read_tensor, transpose=True)
-                _read_into(f, blk.proj_U.bias, read_tensor, transpose=False)
-                _read_into(f, blk.proj_V.weight, read_tensor, transpose=True)
-                _read_into(f, blk.proj_V.bias, read_tensor, transpose=False)
-                if sentinel == 0xFFFFFFFF:
-                    # Legacy gated checkpoints may include one extra tensor. Safe to ignore.
-                    pass
+            sentinel, n_blocks_file = struct.unpack('<II', extra)
+            if sentinel == OFF_DIAG_SENTINEL_LEVELSPEC and getattr(model, 'level_off_diag', None) is not None and len(model.level_off_diag) > 0:
+                n_to_load = min(int(n_blocks_file), len(model.level_off_diag))
+                for i in range(int(n_blocks_file)):
+                    blk = model.level_off_diag[min(i, len(model.level_off_diag) - 1)]
+                    if i < n_to_load:
+                        _read_into(f, blk.attn_q.weight, read_tensor, transpose=True)
+                        _read_into(f, blk.attn_q.bias, read_tensor, transpose=False)
+                        _read_into(f, blk.attn_k.weight, read_tensor, transpose=True)
+                        _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
+                        _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
+                        _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
+                        _read_into(f, blk.feature_ln.weight, read_tensor, transpose=False)
+                        _read_into(f, blk.feature_ln.bias, read_tensor, transpose=False)
+                        _read_into(f, blk.proj_U.weight, read_tensor, transpose=True)
+                        _read_into(f, blk.proj_U.bias, read_tensor, transpose=False)
+                        _read_into(f, blk.proj_V.weight, read_tensor, transpose=True)
+                        _read_into(f, blk.proj_V.bias, read_tensor, transpose=False)
+                    else:
+                        skip_tensor(f, blk.attn_q.weight.shape, transpose=True)
+                        skip_tensor(f, blk.attn_q.bias.shape, transpose=False)
+                        skip_tensor(f, blk.attn_k.weight.shape, transpose=True)
+                        skip_tensor(f, blk.attn_k.bias.shape, transpose=False)
+                        skip_tensor(f, blk.attn_v.weight.shape, transpose=True)
+                        skip_tensor(f, blk.attn_v.bias.shape, transpose=False)
+                        skip_tensor(f, blk.feature_ln.weight.shape, transpose=False)
+                        skip_tensor(f, blk.feature_ln.bias.shape, transpose=False)
+                        skip_tensor(f, blk.proj_U.weight.shape, transpose=True)
+                        skip_tensor(f, blk.proj_U.bias.shape, transpose=False)
+                        skip_tensor(f, blk.proj_V.weight.shape, transpose=True)
+                        skip_tensor(f, blk.proj_V.bias.shape, transpose=False)
+                if int(n_blocks_file) < len(model.level_off_diag):
+                    print(f"INFO: Loaded {int(n_blocks_file)} off-diag level blocks; keeping remaining {len(model.level_off_diag) - int(n_blocks_file)} blocks at init.")
+            elif sentinel in OFF_DIAG_SENTINELS_LEGACY:
+                print("INFO: Legacy universal off-diagonal checkpoint tail detected; skipping legacy off-diag tensors for level-specific architecture.")
 
 def _read_into(f, param, read_fn, transpose=False):
     t = read_fn(f, param.shape, transpose=transpose).to(param.device)
@@ -1328,6 +1296,7 @@ def train_leaf_only():
     parser.add_argument('--print_timing', type=bool, default=True, help='On step 200, print detailed timing of each training substep')
     parser.add_argument('--mixed_sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance. Default False = train on whole matrix per frame.')
     parser.add_argument('--contexts_per_step', type=int, default=4, help='Gradient accumulation: number of random cached contexts per optimizer step.')
+    parser.add_argument('--max_levels', type=int, default=DEFAULT_MAX_LEVELS, help='Number of instantiated level-specific off-diagonal blocks.')
     parser.add_argument('--continue_training', action='store_true', help='Load initial weights from the saved .bytes file (--save) and continue training from that state.')
     parser.add_argument('--evaluate_gradients', action='store_true', help='Run gradient interference analysis (includes HODLR level analysis) then exit.')
     args = parser.parse_args()
@@ -1465,6 +1434,7 @@ def train_leaf_only():
     model = LeafOnlyNet(
         input_dim=9, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
         num_heads=args.num_heads, rank_base=RANK_BASE_LEVEL1, mask_attention=True, use_global_node=use_global_node, use_gcn=use_gcn,
+        max_levels=args.max_levels,
     ).to(device)
     
     if device.type == 'cuda':
@@ -1616,7 +1586,7 @@ def train_leaf_only():
                 return (sum(p.grad.data.pow(2).sum().item() for p in params if p.grad is not None)) ** 0.5
             _all = list(model.parameters())
             _leaf = [p for n, p in model.named_parameters() if "leaf_head" in n and "leaf_scale" not in n]
-            _off = [p for n, p in model.named_parameters() if "universal_off_diag" in n]
+            _off = [p for n, p in model.named_parameters() if "level_off_diag" in n]
             log_tot = _grad_norm(_all)
             log_leaf = _grad_norm(_leaf)
             log_off = _grad_norm(_off)
@@ -1692,6 +1662,7 @@ def evaluate_gradient_interference(args):
         input_dim=9, d_model=args.d_model, leaf_size=LEAF_SIZE, num_layers=args.num_layers,
         num_heads=args.num_heads, rank_base=RANK_BASE_LEVEL1, mask_attention=True,
         use_global_node=args.use_global_node, use_gcn=args.use_gcn,
+        max_levels=args.max_levels,
     ).to(device)
 
     save_path = Path(args.save)
@@ -1706,6 +1677,7 @@ def evaluate_gradient_interference(args):
     # 2. Setup Data Contexts: mirror training — num_eval "steps", each with contexts_per_step frames (gradient accumulation)
     num_eval = 10
     contexts_per_step = max(1, int(getattr(args, 'contexts_per_step', 4)))
+    eval_max_nodes = max(LEAF_SIZE * 2, int(MAX_MIXED_SIZE))
     data_path = Path(args.data_folder)
     run_folder = _most_recent_run_folder(data_path)
     dataset = FluidGraphDataset([run_folder])
@@ -1736,17 +1708,25 @@ def evaluate_gradient_interference(args):
     # Transformer: per block
     for b in range(num_blocks):
         param_groups[f'Transformer block {b}'] = (lambda m, b=b: list(m.blocks[b].parameters()))
-    # Off-diagonal: Context modulation vs Attention (Q/K/V) vs W_U/W_V.
-    param_groups['Off-diag Context Mod (FiLM)'] = lambda m: list(m.universal_off_diag.film_gen.parameters())
-    param_groups['Off-diag Attention (Q/K/V)'] = lambda m: (
-        list(m.universal_off_diag.attn_q.parameters())
-        + list(m.universal_off_diag.attn_k.parameters())
-        + list(m.universal_off_diag.attn_v.parameters())
-    )
-    param_groups['Off-diag W_U/W_V'] = lambda m: [
-        m.universal_off_diag.proj_U.weight, m.universal_off_diag.proj_U.bias,
-        m.universal_off_diag.proj_V.weight, m.universal_off_diag.proj_V.bias,
-    ]
+    # Off-diagonal: per-level diagnostics (attention, feature norm, projections).
+    for lvl_idx in range(len(model.level_off_diag)):
+        lvl = lvl_idx + 1
+        param_groups[f'Off-diag L{lvl} Attention (Q/K/V)'] = (
+            lambda m, lvl_idx=lvl_idx: (
+                list(m.level_off_diag[lvl_idx].attn_q.parameters())
+                + list(m.level_off_diag[lvl_idx].attn_k.parameters())
+                + list(m.level_off_diag[lvl_idx].attn_v.parameters())
+            )
+        )
+        param_groups[f'Off-diag L{lvl} Feature LN'] = (
+            lambda m, lvl_idx=lvl_idx: list(m.level_off_diag[lvl_idx].feature_ln.parameters())
+        )
+        param_groups[f'Off-diag L{lvl} W_U/W_V'] = (
+            lambda m, lvl_idx=lvl_idx: [
+                m.level_off_diag[lvl_idx].proj_U.weight, m.level_off_diag[lvl_idx].proj_U.bias,
+                m.level_off_diag[lvl_idx].proj_V.weight, m.level_off_diag[lvl_idx].proj_V.bias,
+            ]
+        )
     # Diagonal
     param_groups['Diagonal Leaf Head'] = lambda m: list(m.core.leaf_head.parameters())
 
@@ -1762,7 +1742,7 @@ def evaluate_gradient_interference(args):
             batch = dataset[frame_idx]
             if batch.get('global_features') is not None:
                 global_features_list.append(batch['global_features'].detach().cpu().numpy())
-            n_orig = int(batch['num_nodes'])
+            n_orig = min(int(batch['num_nodes']), eval_max_nodes)
             n_pad = next_valid_size(n_orig, LEAF_SIZE)
 
             x_input = batch['x'][:n_orig].unsqueeze(0).to(device)
@@ -1880,7 +1860,7 @@ def evaluate_gradient_interference(args):
     # 6. HODLR Level Analysis (cross-level gradient, per-level residual waterfall, basis overlap) on first frame
     frame_idx = frame_indices_per_pass[0][0]
     batch = dataset[frame_idx]
-    n_orig = int(batch['num_nodes'])
+    n_orig = min(int(batch['num_nodes']), eval_max_nodes)
     n_pad = next_valid_size(n_orig, LEAF_SIZE)
     x_input = batch['x'][:n_orig].unsqueeze(0).to(device)
     if n_pad > n_orig:
@@ -1938,16 +1918,7 @@ def evaluate_gradient_interference(args):
         )
         residual = (MAz - Z).detach()
 
-        print("\n=== Cross-Level Gradient Interference (Shared Backbone) ===")
-        # We don't care about W_U / W_V here because they are disjoint per-rank truncation.
-        # We care whether macro/micro levels fight over shared context modulation + attention.
-
-        shared_params = (
-            list(model.universal_off_diag.film_gen.parameters())
-            + list(model.universal_off_diag.attn_q.parameters())
-            + list(model.universal_off_diag.attn_k.parameters())
-            + list(model.universal_off_diag.attn_v.parameters())
-        )
+        print("\n=== Cross-Level Gradient Comparison (Level-Specific Heads) ===")
 
         M_L1 = apply_block_structured_M_with_levels(
             diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE,
@@ -1958,22 +1929,47 @@ def evaluate_gradient_interference(args):
             levels_to_include={level_max}, scale_A=scale_A_scalar,
         )
 
+        blk_min = model.level_off_diag[level_min - 1]
+        blk_max = model.level_off_diag[level_max - 1]
+
+        def _flat_grad(params):
+            grads = []
+            for p in params:
+                if p.grad is not None:
+                    grads.append(p.grad.detach().clone().view(-1))
+                else:
+                    grads.append(torch.zeros_like(p).view(-1))
+            return torch.cat(grads) if grads else torch.zeros(1, device=device)
+
+        # Compare only rank-invariant parameters across levels; projection matrices have different sizes by design.
+        shared_params_min = (
+            list(blk_min.attn_q.parameters())
+            + list(blk_min.attn_k.parameters())
+            + list(blk_min.attn_v.parameters())
+            + list(blk_min.feature_ln.parameters())
+        )
+        shared_params_max = (
+            list(blk_max.attn_q.parameters())
+            + list(blk_max.attn_k.parameters())
+            + list(blk_max.attn_v.parameters())
+            + list(blk_max.feature_ln.parameters())
+        )
+
         model.zero_grad()
         loss_L1 = ((M_L1 - Z) ** 2).mean()
         loss_L1.backward(retain_graph=True)
-        grad_shared_L1 = torch.cat([p.grad.clone().view(-1) for p in shared_params if p.grad is not None])
+        grad_lvl_L1 = _flat_grad(shared_params_min)
 
         model.zero_grad()
         loss_Lmax = ((M_Lmax - Z) ** 2).mean()
         loss_Lmax.backward()
-        grad_shared_Lmax = torch.cat([p.grad.clone().view(-1) for p in shared_params if p.grad is not None])
+        grad_lvl_Lmax = _flat_grad(shared_params_max)
 
-        cos_sim_shared = F.cosine_similarity(grad_shared_L1.unsqueeze(0), grad_shared_Lmax.unsqueeze(0), dim=1).item()
+        cos_sim_levels = F.cosine_similarity(grad_lvl_L1.unsqueeze(0), grad_lvl_Lmax.unsqueeze(0), dim=1).item()
+        print(f"  Level {level_min} vs Level {level_max} gradient cosine similarity (Q/K/V + FeatureLN): {cos_sim_levels:.4f}")
+        print("  (Projection gradients are reported separately below because exact-rank heads have different parameter sizes.)")
 
-        print(f"  Level {level_min} (micro) vs Level {level_max} (macro) gradient cosine similarity on SHARED MOD/ATTN: {cos_sim_shared:.4f}")
-        print(f"  (If highly negative, shared modulation/attention is failing to multiplex. If positive/near-zero, multiplexing is successful!)")
-
-        # proj_U/proj_V grads for "Per-level gradient" diagnostic (shared projection); need fresh graph (previous one was freed)
+        # Per-level gradient diagnostic; need fresh graph (previous one was freed)
         diag_blocks, off_diag_list = model(
             x_input, edge_index=edge_index, edge_values=edge_values,
             scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
@@ -1987,8 +1983,6 @@ def evaluate_gradient_interference(args):
             diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE,
             levels_to_include={level_max}, scale_A=scale_A_scalar,
         )
-        blk = model.universal_off_diag
-
         def _flat_grad_proj(proj):
             w = proj.weight.grad.clone() if proj.weight.grad is not None else torch.zeros_like(proj.weight)
             b = proj.bias.grad.clone() if proj.bias.grad is not None else torch.zeros_like(proj.bias)
@@ -1997,13 +1991,13 @@ def evaluate_gradient_interference(args):
         model.zero_grad()
         loss_L1 = ((M_L1 - Z) ** 2).mean()
         loss_L1.backward(retain_graph=True)
-        grad_proj_U_L1 = _flat_grad_proj(blk.proj_U)
-        grad_proj_V_L1 = _flat_grad_proj(blk.proj_V)
+        grad_proj_U_L1 = _flat_grad_proj(blk_min.proj_U)
+        grad_proj_V_L1 = _flat_grad_proj(blk_min.proj_V)
         model.zero_grad()
         loss_Lmax = ((M_Lmax - Z) ** 2).mean()
         loss_Lmax.backward()
-        grad_proj_U_Lmax = _flat_grad_proj(blk.proj_U)
-        grad_proj_V_Lmax = _flat_grad_proj(blk.proj_V)
+        grad_proj_U_Lmax = _flat_grad_proj(blk_max.proj_U)
+        grad_proj_V_Lmax = _flat_grad_proj(blk_max.proj_V)
 
         print("\n=== Off-Diagonal Usefulness Probe ===")
         # Fairness note: use the same frozen model outputs and compare diag-only vs full on many random probes.
@@ -2072,26 +2066,24 @@ def evaluate_gradient_interference(args):
                 spec = struct_list[spec_idx]
                 rs, re = spec["row_start"], spec["row_end"]
                 cs, ce = spec["col_start"], spec["col_end"]
-                side_blk = re - rs
                 h_row = h[:, rs:re]
                 h_col = h[:, cs:ce]
                 pos_row = x_input[:, rs:re, :3]
                 pos_col = x_input[:, cs:ce, :3]
                 mask = pre_masks[spec_idx].unsqueeze(0) if pre_masks[spec_idx].dim() == 2 else pre_masks[spec_idx]
-                lv = torch.full((1, 1), spec["level"], device=h_row.device, dtype=h_row.dtype)
-                bs = torch.full((1, 1), float(side_blk), device=h_row.device, dtype=h_row.dtype)
-                _, _, feat_U, feat_U_mod, gam = model.universal_off_diag(
-                    h_row, h_col, pos_row, pos_col, mask, spec["rank"], return_film_features=True, global_features=global_feat, level_index=lv, block_side=bs,
+                blk = model.level_off_diag[spec["level"] - 1]
+                _, _, feat_U, feat_V = blk(
+                    h_row, h_col, pos_row, pos_col, mask, return_features=True, global_features=global_feat,
                 )
-                return feat_U, feat_U_mod, gam
+                return feat_U, feat_V
 
-            feat_U_L1, mod_U_L1, gam_L1 = extract_block_data(idx_L1)
-            feat_U_Lmax, mod_U_Lmax, gam_Lmax = extract_block_data(idx_Lmax)
+            feat_U_L1, feat_V_L1 = extract_block_data(idx_L1)
+            feat_U_Lmax, feat_V_Lmax = extract_block_data(idx_Lmax)
 
-            # 1. Feature magnitude tracking (context modulation path)
-            print("1. Projection Feature Magnitudes (context modulation effect):")
-            print(f"   L{level_min} Raw: mu={feat_U_L1.mean().item():.4f}, std={feat_U_L1.std().item():.4f} -> Mod: mu={mod_U_L1.mean().item():.4f}, std={mod_U_L1.std().item():.4f}")
-            print(f"   L{level_max} Raw: mu={feat_U_Lmax.mean().item():.4f}, std={feat_U_Lmax.std().item():.4f} -> Mod: mu={mod_U_Lmax.mean().item():.4f}, std={mod_U_Lmax.std().item():.4f}")
+            # 1. Feature magnitude tracking (post-LN, pre-projection)
+            print("1. Projection Feature Magnitudes (post-LN, pre-projection):")
+            print(f"   L{level_min} U: mu={feat_U_L1.mean().item():.4f}, std={feat_U_L1.std().item():.4f} | V: mu={feat_V_L1.mean().item():.4f}, std={feat_V_L1.std().item():.4f}")
+            print(f"   L{level_max} U: mu={feat_U_Lmax.mean().item():.4f}, std={feat_U_Lmax.std().item():.4f} | V: mu={feat_V_Lmax.mean().item():.4f}, std={feat_V_Lmax.std().item():.4f}")
 
             # 2. Singular Value Spectrum (from actual forward output, not recomputed)
             print("\n2. Singular Value Spectrum (Is micro-physics violating low-rank assumption?):")
@@ -2105,8 +2097,8 @@ def evaluate_gradient_interference(args):
             print(f"   L{level_min} Top 5 Singular Values: {S_L1[:5].numpy()}")
             print(f"   L{level_max} Top 5 Singular Values: {S_Lmax[:5].numpy()}")
 
-        # 3. Per-level gradient (shared projection: full proj_U/proj_V grad norm per pass)
-        print("\n3. Per-level gradient (shared projection):")
+        # 3. Per-level gradient (level-specific projections)
+        print("\n3. Per-level gradient (level-specific projections):")
         print(f"   L{level_min} pass: proj_U grad norm = {grad_proj_U_L1.norm().item():.6f}, proj_V grad norm = {grad_proj_V_L1.norm().item():.6f}")
         print(f"   L{level_max} pass: proj_U grad norm = {grad_proj_U_Lmax.norm().item():.6f}, proj_V grad norm = {grad_proj_V_Lmax.norm().item():.6f}")
         print("-" * 40)
