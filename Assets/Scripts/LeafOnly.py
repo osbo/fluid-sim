@@ -114,10 +114,10 @@ class FluidGraphDataset:
         diff_std = np.std(diff_sym, axis=0) + 1e-8
         diffusion_grad_n = (diff_sym - diff_mean) / diff_std
 
-        # 3. Global features: include mean/std used for z-score so the network still has absolute scale
+        # 3. Global features: no scale_A leak (network must be blind to γ; 1/γ applied only at inference)
         global_features = np.array([
             math.log2(max(1, num_nodes)),
-            math.log10(max(1e-6, scale_A)),
+            0.0,  # slot reserved; do not pass log10(scale_A) to avoid FiLM/gradient fighting with explicit 1/γ
             mass_mean, mass_std,
             float(np.mean(diag_map_n)), float(np.std(diag_map_n)),
             float(diff_mean[0]), float(diff_std[0]),
@@ -647,16 +647,11 @@ class LeafCore(nn.Module):
         leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2))
         if not self.use_jacobi:
             return leaf_base
-        # 2. Extract and format the true Jacobi diagonal
+        # 2. Jacobi diagonal in normalized space (Â_diag); final 1/γ at inference gives A_diag^{-1}
         diag_A_n = x[..., 8]
-        s = scale_A if scale_A is not None else 1.0
-        if isinstance(s, torch.Tensor):
-            diag_A_real = diag_A_n * s
-        else:
-            diag_A_real = diag_A_n * s
-        jacobi_diag = torch.zeros_like(diag_A_real)
-        mask = diag_A_real.abs() > 1e-6
-        jacobi_diag[mask] = 1.0 / diag_A_real[mask]
+        jacobi_diag = torch.zeros_like(diag_A_n)
+        mask = diag_A_n.abs() > 1e-6
+        jacobi_diag[mask] = 1.0 / diag_A_n[mask]
         jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
         mask_blocks = mask.view(B, num_leaves, self.leaf_size)
         new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
@@ -1273,7 +1268,7 @@ def train_leaf_only():
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
     parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=True, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
+    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
     parser.add_argument('--num_frames', type=int, default=50, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
@@ -1528,10 +1523,10 @@ def train_leaf_only():
             if do_timing:
                 _sync()
                 t0 = time.perf_counter()
-            scale_A_val = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
-            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=scale_A_val)
+            # Training: no 1/γ so loss is M̃ Â z ≈ z (M̃ ≈ Â^{-1}); apply 1/γ only at inference
+            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0)
             if do_log:
-                MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE, scale_A=scale_A_val)
+                MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE, scale_A=1.0)
                 _norm_diag = MAZ_diag_only.norm().item()
                 _norm_off = (MAZ - MAZ_diag_only).norm().item()
                 ratio_off_sum += _norm_off / (_norm_diag + 1e-12)
@@ -1758,8 +1753,8 @@ def evaluate_gradient_interference(args):
             Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
             Z[:, n_orig:, :] = 0.0
             AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-            scale_A_val = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
-            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=scale_A_val)
+            # Training: no 1/γ so loss is M̃ Â z ≈ z; apply 1/γ only at inference
+            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0)
 
             raw_loss = ((MAZ - Z) ** 2).mean()
             step_loss_sum += raw_loss.item()
