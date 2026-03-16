@@ -745,7 +745,7 @@ def main():
     PLOT_MATRICES = True  # Set to True when you actually want the image
 
     if PLOT_MATRICES:
-        M_neural_n = M_gpu.cpu().numpy()
+        M_neural_n = M_gpu.detach().cpu().numpy()
         methods = [("LeafOnly", M_neural_n), ("AMG", M_amg_n)]
         n_cols = 5
         n_rows = 1 + len(methods)
