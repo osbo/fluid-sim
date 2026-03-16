@@ -1030,7 +1030,6 @@ def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag
         # U^T @ x_row -> (B*K_blocks, rank, K_dim)
         UT_x_row = torch.bmm(U_batched.transpose(1, 2), x_row_batched)
         Z_col = torch.bmm(V_batched, UT_x_row)   # (B*K_blocks, side, K_dim)
-
         # Linear indices for scatter_add: batched order is block0_b0..block0_b(B-1), block1_b0.. so bk % B = batch, bk // B = block_idx
         row_starts = torch.tensor([spec["row_start"] for _, spec in blocks], device=device, dtype=torch.long)
         col_starts = torch.tensor([spec["col_start"] for _, spec in blocks], device=device, dtype=torch.long)
@@ -1246,7 +1245,7 @@ def load_leaf_only_weights(model, path):
         extra = f.read(8)
         if len(extra) == 8:
             sentinel, _ = struct.unpack('<II', extra)
-            if sentinel in (0xFFFFFFFC, 0xFFFFFFFD, 0xFFFFFFFE) and getattr(model, 'universal_off_diag', None) is not None:
+            if sentinel in (0xFFFFFFFC, 0xFFFFFFFD, 0xFFFFFFFE, 0xFFFFFFFF) and getattr(model, 'universal_off_diag', None) is not None:
                 blk = model.universal_off_diag
                 _read_into(f, blk.attn_q.weight, read_tensor, transpose=True)
                 _read_into(f, blk.attn_q.bias, read_tensor, transpose=False)
@@ -1268,6 +1267,9 @@ def load_leaf_only_weights(model, path):
                 _read_into(f, blk.proj_U.bias, read_tensor, transpose=False)
                 _read_into(f, blk.proj_V.weight, read_tensor, transpose=True)
                 _read_into(f, blk.proj_V.bias, read_tensor, transpose=False)
+                if sentinel == 0xFFFFFFFF:
+                    # Legacy gated checkpoints may include one extra tensor. Safe to ignore.
+                    pass
 
 def _read_into(f, param, read_fn, transpose=False):
     t = read_fn(f, param.shape, transpose=transpose).to(param.device)
@@ -1572,7 +1574,10 @@ def train_leaf_only():
                 _sync()
                 t0 = time.perf_counter()
             # Training: no 1/γ so loss is M̃ Â z ≈ z (M̃ ≈ Â^{-1}); apply 1/γ only at inference
-            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0)
+            MAZ = apply_block_structured_M(
+                diag_blocks, off_diag_list, AZ, model.off_diag_struct,
+                leaf_size=LEAF_SIZE, scale_A=1.0,
+            )
             if do_log:
                 MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE, scale_A=1.0)
                 _norm_diag = MAZ_diag_only.norm().item()
@@ -1803,7 +1808,10 @@ def evaluate_gradient_interference(args):
             Z[:, n_orig:, :] = 0.0
             AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
             # Training: no 1/γ so loss is M̃ Â z ≈ z; apply 1/γ only at inference
-            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0)
+            MAZ = apply_block_structured_M(
+                diag_blocks, off_diag_list, AZ, model.off_diag_struct,
+                leaf_size=LEAF_SIZE, scale_A=1.0,
+            )
 
             raw_loss = ((MAZ - Z) ** 2).mean()
             step_loss_sum += raw_loss.item()
@@ -1925,7 +1933,9 @@ def evaluate_gradient_interference(args):
         Z[:, n_orig:, :] = 0.0
         AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
         scale_A_scalar = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
-        MAz = apply_block_structured_M(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar)
+        MAz = apply_block_structured_M(
+            diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar,
+        )
         residual = (MAz - Z).detach()
 
         print("\n=== Cross-Level Gradient Interference (Shared Backbone) ===")
@@ -1939,8 +1949,14 @@ def evaluate_gradient_interference(args):
             + list(model.universal_off_diag.attn_v.parameters())
         )
 
-        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min}, scale_A=scale_A_scalar)
-        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max}, scale_A=scale_A_scalar)
+        M_L1 = apply_block_structured_M_with_levels(
+            diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE,
+            levels_to_include={level_min}, scale_A=scale_A_scalar,
+        )
+        M_Lmax = apply_block_structured_M_with_levels(
+            diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE,
+            levels_to_include={level_max}, scale_A=scale_A_scalar,
+        )
 
         model.zero_grad()
         loss_L1 = ((M_L1 - Z) ** 2).mean()
@@ -1963,8 +1979,14 @@ def evaluate_gradient_interference(args):
             scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
             global_features=global_feat,
         )
-        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min}, scale_A=scale_A_scalar)
-        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max}, scale_A=scale_A_scalar)
+        M_L1 = apply_block_structured_M_with_levels(
+            diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE,
+            levels_to_include={level_min}, scale_A=scale_A_scalar,
+        )
+        M_Lmax = apply_block_structured_M_with_levels(
+            diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE,
+            levels_to_include={level_max}, scale_A=scale_A_scalar,
+        )
         blk = model.universal_off_diag
 
         def _flat_grad_proj(proj):
@@ -1983,18 +2005,50 @@ def evaluate_gradient_interference(args):
         grad_proj_U_Lmax = _flat_grad_proj(blk.proj_U)
         grad_proj_V_Lmax = _flat_grad_proj(blk.proj_V)
 
-        print("\n=== Per-Level Residual Loss Decomposition ===")
-        cumulative_levels = set()
-        base_res = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels, scale_A=scale_A_scalar)
-        loss_diag = ((base_res - Z) ** 2).mean().item()
-        print(f"  Diag only:                          residual loss = {loss_diag:.6f}")
-        for lev in range(level_max, level_min - 1, -1):
-            cumulative_levels.add(lev)
-            out = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels, scale_A=scale_A_scalar)
-            loss_here = ((out - Z) ** 2).mean().item()
-            print(f"  Diag + Levels {level_max}..{lev}:                residual loss = {loss_here:.6f}")
-        full_loss = ((MAz - Z) ** 2).mean().item()
-        print(f"  Full M:                             residual loss = {full_loss:.6f}")
+        print("\n=== Off-Diagonal Usefulness Probe ===")
+        # Fairness note: use the same frozen model outputs and compare diag-only vs full on many random probes.
+        # This measures whether off-diagonal correction actually reduces residual, not whether each level improves monotonically.
+        num_probe = 24
+        probe_vectors = max(96, int(round(n_pad ** 0.5)))
+        improvements = []
+        cos_to_neg_diag_res = []
+        wins = 0
+        with torch.no_grad():
+            for _ in range(num_probe):
+                Zp = torch.randn(1, n_pad, probe_vectors, device=device, dtype=x_input.dtype)
+                Zp[:, n_orig:, :] = 0.0
+                AZp = (A_dense @ Zp.squeeze(0)).unsqueeze(0)
+
+                M_diag = apply_block_structured_M_with_levels(
+                    diag_blocks, off_diag_list, AZp, struct_list, leaf_size=LEAF_SIZE,
+                    levels_to_include=set(), scale_A=scale_A_scalar,
+                )
+                M_full = apply_block_structured_M(
+                    diag_blocks, off_diag_list, AZp, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar,
+                )
+
+                r_diag = M_diag - Zp
+                r_full = M_full - Zp
+                corr = M_full - M_diag
+
+                n_diag = r_diag.norm().item()
+                n_full = r_full.norm().item()
+                if n_full < n_diag:
+                    wins += 1
+                rel_improve = (n_diag - n_full) / (n_diag + 1e-12)
+                improvements.append(rel_improve)
+
+                # Positive cosine means off-diag correction points toward cancelling diag residual.
+                cos_val = F.cosine_similarity(corr.reshape(1, -1), (-r_diag).reshape(1, -1), dim=1).item()
+                cos_to_neg_diag_res.append(cos_val)
+
+        imp_arr = np.array(improvements, dtype=np.float64)
+        cos_arr = np.array(cos_to_neg_diag_res, dtype=np.float64)
+        print(f"  Probe count:                        {num_probe}")
+        print(f"  Win rate (full better than diag):  {wins}/{num_probe} = {wins / float(num_probe):.2%}")
+        print(f"  Relative residual change:           mean={imp_arr.mean():+.4%}, std={imp_arr.std():.4%}")
+        print(f"  Corr vs -diag residual cosine:      mean={cos_arr.mean():+.4f}, std={cos_arr.std():.4f}")
+        print("  (Positive residual-change mean and high win-rate => off-diagonal is useful.)")
 
         print("\n=== Basis Overlap (Subspace Angle) ===")
         idx_L1 = next(idx for idx, s in enumerate(struct_list) if s["level"] == level_min)
