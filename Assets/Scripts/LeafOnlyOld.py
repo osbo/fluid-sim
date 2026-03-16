@@ -80,15 +80,8 @@ class FluidGraphDataset:
         # Layer: keep it linear/ordinal for the MLP instead of exponential
         layer_n = layer / 4.0
 
-        # Gershgorin spectral radius bound: γ = min(max row sum, max col sum) of |A|
-        row_sums = np.zeros(num_nodes, dtype=np.float64)
-        col_sums = np.zeros(num_nodes, dtype=np.float64)
-        for r, c, v in zip(rows, cols, vals):
-            row_sums[r] += abs(v)
-            col_sums[c] += abs(v)
-        max_row = float(np.max(row_sums)) if row_sums.size else 1.0
-        max_col = float(np.max(col_sums)) if col_sums.size else 1.0
-        scale_A = float(min(max_row, max_col))
+        # Robust scaling for edge values (ignore top 1% outliers)
+        scale_A = float(np.percentile(np.abs(vals), 99.0))
         if scale_A <= 0.0:
             scale_A = 1.0
 
@@ -99,9 +92,8 @@ class FluidGraphDataset:
             diffusion_grad = np.zeros((num_nodes, 3), dtype=np.float32)
 
         # --- PHYSICS-PRESERVING NORMALIZATION ---
-        # 1. Diag Map and edge values: normalize by γ so network sees Â = A/γ
+        # 1. Diag Map: scaled identically to edge values to preserve condition number
         diag_map_n = diag_map / scale_A
-        vals_n = vals / scale_A
 
         # 2. SymLog then Z-score per-frame so every frame looks statistically identical to the Lift module
         mass_sym = np.sign(mass) * np.log1p(np.abs(mass))
@@ -114,10 +106,10 @@ class FluidGraphDataset:
         diff_std = np.std(diff_sym, axis=0) + 1e-8
         diffusion_grad_n = (diff_sym - diff_mean) / diff_std
 
-        # 3. Global features: no scale_A leak (network must be blind to γ; 1/γ applied only at inference)
+        # 3. Global features: include mean/std used for z-score so the network still has absolute scale
         global_features = np.array([
             math.log2(max(1, num_nodes)),
-            0.0,  # slot reserved; do not pass log10(scale_A) to avoid FiLM/gradient fighting with explicit 1/γ
+            math.log10(max(1e-6, scale_A)),
             mass_mean, mass_std,
             float(np.mean(diag_map_n)), float(np.std(diag_map_n)),
             float(diff_mean[0]), float(diff_std[0]),
@@ -136,7 +128,7 @@ class FluidGraphDataset:
         return {
             'x': torch.from_numpy(x).float(),
             'edge_index': torch.stack([torch.from_numpy(rows.astype(np.int64)), torch.from_numpy(cols.astype(np.int64))]),
-            'edge_values': torch.from_numpy(vals_n.astype(np.float32)),
+            'edge_values': torch.from_numpy(vals.copy()),
             'num_nodes': int(num_nodes),
             'scale_A': scale_A,
             'frame_path': str(frame_path),
@@ -156,13 +148,15 @@ class SparsePhysicsGCN(nn.Module):
             nn.Linear(d_model, d_model)
         )
 
-    def forward(self, x, edge_index, edge_values):
+    def forward(self, x, edge_index, edge_values, scale_A=None):
         B, N, C = x.shape
         x_flat = x.squeeze(0) if B == 1 else x.view(B * N, C)
 
         row, col = edge_index[0], edge_index[1]
         w = edge_values.clone().to(x.dtype)
-        # Input is pre-normalized (Â = A/γ); no scale_A division
+        if scale_A is not None and scale_A != 1.0:
+            s = scale_A.to(x.dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=w.device, dtype=x.dtype)
+            w = w / s
 
         neighbor_features = self.linear_neighbor(x_flat)
         messages = neighbor_features[col] * w.unsqueeze(-1)
@@ -208,7 +202,7 @@ class PhysicsAwareEmbedding(nn.Module):
         else:
             self.lift_film = None
 
-    def forward(self, x, edge_index=None, edge_values=None, global_features=None):
+    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, global_features=None):
         # Per-node features (6) + optional frame context so linears can specialize by frame
         node_feats = x[..., 3:]  # (B, N, 6)
         if self.global_features_dim > 0:
@@ -221,7 +215,7 @@ class PhysicsAwareEmbedding(nn.Module):
         h = self.lift(node_feats)
         if self.use_gcn and self.gcn is not None and edge_index is not None and edge_values is not None:
             for gcn_layer in self.gcn:
-                h = gcn_layer(h, edge_index, edge_values)
+                h = gcn_layer(h, edge_index, edge_values, scale_A)
         h = self.norm(h)
         if self.lift_film is not None and global_features is not None:
             # (B, 12) or (12,) -> (B, 2*d_model) -> gamma, beta; broadcast to (B, N, d_model)
@@ -235,7 +229,7 @@ class PhysicsAwareEmbedding(nn.Module):
 # Masked attention within each leaf block: 1 = self + 1-hop only; 2 = up to 2-hop; etc.
 ATTENTION_HOPS = 1
 
-def build_leaf_block_physics_bias(edge_index, edge_values, leaf_size, device, dtype=torch.float32, num_nodes=None):
+def build_leaf_block_physics_bias(edge_index, edge_values, scale_A, leaf_size, device, dtype=torch.float32, num_nodes=None):
     rows, cols = edge_index[0], edge_index[1]
     if num_nodes is not None:
         N = num_nodes
@@ -251,13 +245,15 @@ def build_leaf_block_physics_bias(edge_index, edge_values, leaf_size, device, dt
     c_l = cols[in_block] % leaf_size
     b_l = block_r[in_block]
     w = edge_values[in_block].to(device=device, dtype=dtype)
-    # Input is pre-normalized (Â = A/γ); no scale_A division
+    if scale_A is not None and scale_A != 1.0:
+        s = scale_A.to(device=device, dtype=dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=device, dtype=dtype)
+        w = w / s
     bias = torch.zeros(num_blocks, leaf_size, leaf_size, device=device, dtype=dtype)
     bias[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device)] = 1.0
     bias[b_l, r_l, c_l] = w
     return bias
 
-def build_leaf_block_connectivity(edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS):
+def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS):
     N = positions.shape[0]
     num_blocks = N // leaf_size
     if num_blocks == 0:
@@ -272,7 +268,9 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, leaf_size,
     pos_c = positions[cols[in_block]]
     dx = (pos_c - pos_r).to(device=device, dtype=dtype)
     w = edge_values[in_block].to(device=device, dtype=dtype)
-    # Input is pre-normalized (Â = A/γ); no scale_A division
+    if scale_A is not None and scale_A != 1.0:
+        s = scale_A.to(device=device, dtype=dtype).squeeze() if isinstance(scale_A, torch.Tensor) else torch.tensor(scale_A, device=device, dtype=dtype)
+        w = w / s
     edge_feats_flat = torch.cat([dx, w.unsqueeze(1)], dim=1)
 
     # Batched adjacency (num_blocks, leaf_size, leaf_size) from in-block edges
@@ -316,7 +314,7 @@ class LeafBlockAttention(nn.Module):
         self.last_scores_matrix = None
         self.last_bias_physics_matrix = None
 
-    def forward(self, x, edge_index=None, edge_values=None, positions=None, save_attention=False, attn_mask=None, edge_feats=None, physics_bias=None):
+    def forward(self, x, edge_index=None, edge_values=None, positions=None, scale_A=None, save_attention=False, attn_mask=None, edge_feats=None, physics_bias=None):
         B, N, C = x.shape
         if edge_index is None or (self.mask_attention and positions is None):
             return self._forward_dense_fallback(x, B, N, C, save_attention)
@@ -332,11 +330,11 @@ class LeafBlockAttention(nn.Module):
         x_blk = x.view(B, num_blocks, self.block_size, C)
 
         if not self.mask_attention:
-            return self._forward_unmasked_32(x_blk, B, N_pad, N, pad, num_blocks, device, dtype, edge_index, edge_values, save_attention, physics_bias, N_pad)
+            return self._forward_unmasked_32(x_blk, B, N_pad, N, pad, num_blocks, device, dtype, edge_index, edge_values, scale_A, save_attention, physics_bias, N_pad)
 
         if attn_mask is None or edge_feats is None:
             attn_mask, edge_feats = build_leaf_block_connectivity(
-                edge_index, edge_values, positions, self.block_size, device, dtype
+                edge_index, edge_values, positions, scale_A, self.block_size, device, dtype
             )
         if attn_mask is None:
             return x[:, :N, :] if pad > 0 else x
@@ -435,10 +433,10 @@ class LeafBlockAttention(nn.Module):
         x_out = self.proj(x_out.view(B, N_pad, C))
         return x_out[:, :N_orig, :] if pad > 0 else x_out
 
-    def _forward_unmasked_32(self, x_blk, B, N_pad, N_orig, pad, num_blocks, device, dtype, edge_index, edge_values, save_attention, physics_bias=None, num_nodes=None):
+    def _forward_unmasked_32(self, x_blk, B, N_pad, N_orig, pad, num_blocks, device, dtype, edge_index, edge_values, scale_A, save_attention, physics_bias=None, num_nodes=None):
         C = x_blk.shape[-1]
         if physics_bias is None:
-            physics_bias = build_leaf_block_physics_bias(edge_index, edge_values, self.block_size, device, dtype, num_nodes=num_nodes or N_pad)
+            physics_bias = build_leaf_block_physics_bias(edge_index, edge_values, scale_A, self.block_size, device, dtype, num_nodes=num_nodes or N_pad)
         if physics_bias is None:
             physics_bias = torch.eye(self.block_size, device=device, dtype=dtype).unsqueeze(0).expand(num_blocks, -1, -1)
         qkv = self.qkv(x_blk)
@@ -511,10 +509,10 @@ class TransformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.attn = attn_module
 
-    def forward(self, x, edge_index=None, edge_values=None, positions=None, save_attention=False, attn_mask=None, edge_feats=None, physics_bias=None):
+    def forward(self, x, edge_index=None, edge_values=None, positions=None, scale_A=None, save_attention=False, attn_mask=None, edge_feats=None, physics_bias=None):
         x = x + self.attn(
             self.norm1(x), edge_index=edge_index, edge_values=edge_values, positions=positions,
-            save_attention=save_attention, attn_mask=attn_mask, edge_feats=edge_feats, physics_bias=physics_bias
+            scale_A=scale_A, save_attention=save_attention, attn_mask=attn_mask, edge_feats=edge_feats, physics_bias=physics_bias
         )
         return x
 
@@ -544,8 +542,8 @@ OFF_DIAG_SUPER = 32
 GLOBAL_FEATURES_DIM = 12  # dataset global_features vector for scale predictor
 
 # Trained graph size range: gradient interference evaluation uses levels that exist for this range
-MIN_MIXED_SIZE = 256
-MAX_MIXED_SIZE = 256  
+MIN_MIXED_SIZE = 1024
+MAX_MIXED_SIZE = 1024  
 
 def _rank_for_side(side, rank_base=RANK_BASE_LEVEL1, min_rank=4, max_rank=512):
     r = rank_base * ((side / 32.0) ** (2.0 / 3.0))
@@ -638,7 +636,7 @@ class LeafCore(nn.Module):
         nn.init.normal_(self.jacobi_gate.weight, std=0.01)
         nn.init.constant_(self.jacobi_gate.bias, 0.0)
 
-    def get_leaf_blocks(self, h, x):
+    def get_leaf_blocks(self, h, x, scale_A=None):
         B, N, _ = h.shape
         num_leaves = N // self.leaf_size
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
@@ -647,11 +645,16 @@ class LeafCore(nn.Module):
         leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2))
         if not self.use_jacobi:
             return leaf_base
-        # 2. Jacobi diagonal in normalized space (Â_diag); final 1/γ at inference gives A_diag^{-1}
+        # 2. Extract and format the true Jacobi diagonal
         diag_A_n = x[..., 8]
-        jacobi_diag = torch.zeros_like(diag_A_n)
-        mask = diag_A_n.abs() > 1e-6
-        jacobi_diag[mask] = 1.0 / diag_A_n[mask]
+        s = scale_A if scale_A is not None else 1.0
+        if isinstance(s, torch.Tensor):
+            diag_A_real = diag_A_n * s
+        else:
+            diag_A_real = diag_A_n * s
+        jacobi_diag = torch.zeros_like(diag_A_real)
+        mask = diag_A_real.abs() > 1e-6
+        jacobi_diag[mask] = 1.0 / diag_A_real[mask]
         jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
         mask_blocks = mask.view(B, num_leaves, self.leaf_size)
         new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
@@ -661,10 +664,10 @@ class LeafCore(nn.Module):
         local_jacobi_diag = new_diag * j_gate
         return leaf_base + torch.diag_embed(local_jacobi_diag)
 
-    def forward_features(self, x, edge_index=None, edge_values=None, save_attention=False, precomputed_leaf_connectivity=None, global_features=None):
+    def forward_features(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False, precomputed_leaf_connectivity=None, global_features=None):
         B, N, _ = x.shape
         positions = x[0, :, :3] if x.dim() == 3 else x[:, :3]
-        h = self.embed(x, edge_index, edge_values, global_features=global_features)
+        h = self.embed(x, edge_index, edge_values, scale_A, global_features=global_features)
         h = self.enc_input_proj(h)
         attn_mask, edge_feats, physics_bias = None, None, None
         if edge_index is not None and edge_values is not None:
@@ -674,20 +677,20 @@ class LeafCore(nn.Module):
                     attn_mask, edge_feats = precomputed_leaf_connectivity
                 else:
                     attn_mask, edge_feats = build_leaf_block_connectivity(
-                        edge_index, edge_values, positions, self.leaf_size, device, dtype, num_hops=ATTENTION_HOPS
+                        edge_index, edge_values, positions, scale_A, self.leaf_size, device, dtype, num_hops=ATTENTION_HOPS
                     )
             else:
-                physics_bias = build_leaf_block_physics_bias(edge_index, edge_values, self.leaf_size, device, dtype, num_nodes=x.shape[1])
+                physics_bias = build_leaf_block_physics_bias(edge_index, edge_values, scale_A, self.leaf_size, device, dtype, num_nodes=x.shape[1])
         for i, block in enumerate(self.blocks):
             h = block(
                 h, edge_index=edge_index, edge_values=edge_values, positions=positions,
-                save_attention=save_attention, attn_mask=attn_mask, edge_feats=edge_feats, physics_bias=physics_bias
+                scale_A=scale_A, save_attention=save_attention, attn_mask=attn_mask, edge_feats=edge_feats, physics_bias=physics_bias
             )
         return h
 
-    def forward(self, x, edge_index=None, edge_values=None, save_attention=False):
-        h = self.forward_features(x, edge_index, edge_values, save_attention=save_attention)
-        return self.get_leaf_blocks(h, x)
+    def forward(self, x, edge_index=None, edge_values=None, scale_A=None, save_attention=False):
+        h = self.forward_features(x, edge_index, edge_values, scale_A, save_attention)
+        return self.get_leaf_blocks(h, x, scale_A)
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -707,43 +710,52 @@ class SinusoidalPosEmb(nn.Module):
 
 
 class UniversalOffDiagBlock(nn.Module):
-    # Scale-equivariant off-diagonal block with lightweight context modulation.
-    # Attention stays at 32 super-nodes + 1 block-avg token for speed.
-    NUM_GLOBAL_TOKENS = 1  # block average only
+    # Nested subspace: shared linear projections; output truncated to required rank per level (no disjoint lanes).
+    # Attention is over n_super + 2 tokens: 32 super-nodes + block-avg + scene-global (global_features).
+    NUM_GLOBAL_TOKENS = 2  # block average, scene global
 
     def __init__(self, d_model, max_rank=1024, global_features_dim=0):
         super().__init__()
         self.n_super = OFF_DIAG_SUPER
-        self.n_attn = self.n_super + self.NUM_GLOBAL_TOKENS  # 33
+        self.n_attn = self.n_super + self.NUM_GLOBAL_TOKENS  # 34
         self.max_rank = max_rank
-        self.global_features_dim = int(global_features_dim or 0)
+        self.global_features_dim = global_features_dim
 
-        self.scale_emb_dim = 8
+        self.scale_emb_dim = 16
         self.scale_embedder = SinusoidalPosEmb(self.scale_emb_dim)
-        self._context_dim = self.scale_emb_dim + 4 + self.global_features_dim  # scale emb + delta_x/dist + frame stats
+        self._context_dim = self.scale_emb_dim + 4 + (global_features_dim or 0)
+        # [h, attn_out, global_ctx, context] so rank prediction sees context
         self._proj_in_dim = 3 * d_model + self._context_dim
 
         self.attn_q = nn.Linear(d_model + 5, d_model)
         self.attn_k = nn.Linear(d_model + 5, d_model)
         self.attn_v = nn.Linear(d_model + 5, d_model)
+        if global_features_dim > 0:
+            self.scene_proj = nn.Linear(global_features_dim + 2, d_model + 5)
+        else:
+            self.scene_proj = None
 
         self.film_gen = nn.Sequential(
-            nn.Linear(self._context_dim, max(64, d_model // 2)),
+            nn.Linear(self._context_dim, d_model),
             nn.GELU(),
-            nn.Linear(max(64, d_model // 2), 2 * self._proj_in_dim),
+            nn.Linear(d_model, 2 * self._proj_in_dim),
         )
-        self.feature_ln = nn.LayerNorm(self._proj_in_dim)
 
-        self.proj_U = nn.Linear(self._proj_in_dim, max_rank)
-        self.proj_V = nn.Linear(self._proj_in_dim, max_rank)
         with torch.no_grad():
             nn.init.zeros_(self.film_gen[2].weight)
             nn.init.zeros_(self.film_gen[2].bias)
             self.film_gen[2].bias[: self._proj_in_dim].fill_(1.0)
+
+        # Shared linear projections (nested subspace): output truncated to rank per level
+        self.proj_U = nn.Linear(self._proj_in_dim, max_rank)
+        self.proj_V = nn.Linear(self._proj_in_dim, max_rank)
+        with torch.no_grad():
             nn.init.zeros_(self.proj_U.weight)
             nn.init.zeros_(self.proj_U.bias)
             nn.init.normal_(self.proj_V.weight, std=0.01)
             nn.init.zeros_(self.proj_V.bias)
+
+        self.feature_ln = nn.LayerNorm(self._proj_in_dim)
 
         for m in (self.attn_q, self.attn_k, self.attn_v):
             nn.init.normal_(m.weight, std=0.01)
@@ -759,6 +771,9 @@ class UniversalOffDiagBlock(nn.Module):
         down_row = h_row.view(B, self.n_super, g, -1).mean(dim=2)
         down_col = h_col.view(B, self.n_super, g, -1).mean(dim=2)
 
+        down_row = F.layer_norm(down_row, down_row.shape[-1:])
+        down_col = F.layer_norm(down_col, down_col.shape[-1:])
+
         down_pos_row = pos_row.view(B, self.n_super, g, -1).mean(dim=2)
         down_pos_col = pos_col.view(B, self.n_super, g, -1).mean(dim=2)
         delta_x = down_pos_col - down_pos_row
@@ -773,9 +788,19 @@ class UniversalOffDiagBlock(nn.Module):
 
         block_avg_row = torch.cat([down_row.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), delta_x.mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
         block_avg_col = torch.cat([down_col.mean(dim=1, keepdim=True), scale_tensor.mean(dim=1, keepdim=True), (-delta_x).mean(dim=1, keepdim=True), dist.mean(dim=1, keepdim=True)], dim=-1)
+        if self.scene_proj is not None:
+            gf = global_features if global_features is not None else torch.zeros(B, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
+            if gf.dim() == 1:
+                gf = gf.unsqueeze(0)
+            lv = level_index if level_index is not None else torch.zeros(B, 1, device=h_row.device, dtype=h_row.dtype)
+            bs = block_side if block_side is not None else torch.zeros(B, 1, device=h_row.device, dtype=h_row.dtype)
+            scene_input = torch.cat([gf, lv, bs], dim=-1)
+            scene_cond = self.scene_proj(scene_input).unsqueeze(1)
+        else:
+            scene_cond = torch.zeros(B, 1, down_row_cond.size(-1), device=h_row.device, dtype=h_row.dtype)
 
-        row_tokens = torch.cat([down_row_cond, block_avg_row], dim=1)
-        col_tokens = torch.cat([down_col_cond, block_avg_col], dim=1)
+        row_tokens = torch.cat([down_row_cond, block_avg_row, scene_cond], dim=1)
+        col_tokens = torch.cat([down_col_cond, block_avg_col, scene_cond], dim=1)
 
         Q = self.attn_q(row_tokens)
         K = self.attn_k(col_tokens)
@@ -784,8 +809,8 @@ class UniversalOffDiagBlock(nn.Module):
         scores = (Q @ K.transpose(-2, -1)) * self._scale_attn
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
-        mask_33 = F.pad(mask, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=True)
-        scores = scores.masked_fill(~mask_33, float('-inf'))
+        mask_34 = F.pad(mask, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=True)
+        scores = scores.masked_fill(~mask_34, float('-inf'))
         attn_probs = F.softmax(scores, dim=-1)
         row_out_full = attn_probs @ V
         row_out = row_out_full[:, : self.n_super].reshape(B, self.n_super, -1)
@@ -797,12 +822,13 @@ class UniversalOffDiagBlock(nn.Module):
 
         if self.global_features_dim > 0:
             if global_features is not None:
-                gf = global_features if global_features.dim() == 2 else global_features.unsqueeze(0)
-                gf_exp = gf.unsqueeze(1).expand(-1, self.n_super, -1)
+                gf_exp = global_features.unsqueeze(1).expand(-1, self.n_super, -1)
+                context_U = torch.cat([scale_emb, delta_x, dist, gf_exp], dim=-1)
+                context_V = torch.cat([scale_emb, -delta_x, dist, gf_exp], dim=-1)
             else:
-                gf_exp = torch.zeros(B, self.n_super, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
-            context_U = torch.cat([scale_emb, delta_x, dist, gf_exp], dim=-1)
-            context_V = torch.cat([scale_emb, -delta_x, dist, gf_exp], dim=-1)
+                padding = torch.zeros(B, self.n_super, self.global_features_dim, device=h_row.device, dtype=h_row.dtype)
+                context_U = torch.cat([scale_emb, delta_x, dist, padding], dim=-1)
+                context_V = torch.cat([scale_emb, -delta_x, dist, padding], dim=-1)
         else:
             context_U = torch.cat([scale_emb, delta_x, dist], dim=-1)
             context_V = torch.cat([scale_emb, -delta_x, dist], dim=-1)
@@ -832,6 +858,7 @@ class UniversalOffDiagBlock(nn.Module):
         beta_V_exp = beta_V.repeat_interleave(g, dim=1)
         features_V_mod = (features_V * gamma_V_exp) + beta_V_exp
 
+        # Shared projection and truncate to required rank for this level (nested subspace)
         safe_rank = min(rank, self.max_rank)
         if safe_rank < 1:
             safe_rank = 1
@@ -839,10 +866,11 @@ class UniversalOffDiagBlock(nn.Module):
         V_raw_full = self.proj_V(features_V_mod)
         U_raw = U_raw_full[..., :safe_rank]
         V_raw = V_raw_full[..., :safe_rank]
-        # Keep block energy comparable across levels/ranks.
-        rank_scale = math.sqrt(float(safe_rank))
-        out_U = U_raw / rank_scale
-        out_V = V_raw / rank_scale
+
+        rank_scale = math.sqrt(safe_rank)
+        unified_scalar = 1.0 / rank_scale
+        out_U = U_raw * unified_scalar
+        out_V = V_raw * unified_scalar
 
         if return_film_features:
             return out_U, out_V, features_U.detach(), features_U_mod.detach(), gamma_U.detach()
@@ -960,8 +988,8 @@ class LeafOnlyNet(nn.Module):
         current_struct = build_hodlr_off_diag_structure(N, self.leaf_size, self.rank_base)
         self.off_diag_struct = current_struct
 
-        h = self.core.forward_features(x, edge_index=edge_index, edge_values=edge_values, save_attention=save_attention, precomputed_leaf_connectivity=precomputed_leaf_connectivity, global_features=global_features)
-        diag_blocks = self.core.get_leaf_blocks(h, x)
+        h = self.core.forward_features(x, edge_index=edge_index, edge_values=edge_values, scale_A=scale_A, save_attention=save_attention, precomputed_leaf_connectivity=precomputed_leaf_connectivity, global_features=global_features)
+        diag_blocks = self.core.get_leaf_blocks(h, x, scale_A)
 
         if current_struct:
             off_diag_list = self._off_diag(h, x, edge_index, current_struct, precomputed_masks=precomputed_masks, global_features=global_features)
@@ -969,27 +997,15 @@ class LeafOnlyNet(nn.Module):
         return (diag_blocks, [])
 
 
-def apply_block_structured_M(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0):
+def apply_block_structured_M(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE):
     return apply_block_structured_M_with_levels(
-        diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size, levels_to_include=None, scale_A=scale_A
+        diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size, levels_to_include=None
     )
 
 
-def _apply_scale_equivariance(out, scale_A):
-    """Convert normalized operator output M~(A^)z to physical-space M(A)z by dividing by scale_A."""
-    if scale_A is None:
-        return out
-    if isinstance(scale_A, torch.Tensor):
-        alpha = scale_A.to(device=out.device, dtype=out.dtype)
-        if alpha.dim() > 0:
-            alpha = alpha.squeeze()
-        return out if torch.allclose(alpha, torch.ones_like(alpha), atol=1e-9, rtol=0.0) else (out / alpha)
-    alpha = float(scale_A)
-    return out if abs(alpha - 1.0) <= 1e-9 else (out / alpha)
-
-
-def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, levels_to_include=None, scale_A=1.0):
-    """Apply M(A) = (1/α) M~(Â): diagonal + off-diag from network (M~), then scale by 1/scale_A for scale equivariance."""
+def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, levels_to_include=None):
+    """Apply M: diagonal always; off-diagonal only for levels in levels_to_include (None = all).
+    Off-diagonal application is level-wise batched: one bmm per HODLR level (O(log N) kernel launches)."""
     B, N, K_dim = x.shape
     num_leaves = N // leaf_size
     x_blk = x.view(B, num_leaves, leaf_size, K_dim)
@@ -1042,25 +1058,24 @@ def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag
         # (B*K_blocks, side) -> linear index into out.view(B*N, K_dim)
         row_linear = batch_idx.unsqueeze(1) * N + row_start_per_bk.unsqueeze(1) + torch.arange(side, device=device).unsqueeze(0)
         col_linear = batch_idx.unsqueeze(1) * N + col_start_per_bk.unsqueeze(1) + torch.arange(side, device=device).unsqueeze(0)
+        out_flat = out.reshape(-1, K_dim)
         row_linear_exp = row_linear.reshape(-1, 1).expand(-1, K_dim)
         col_linear_exp = col_linear.reshape(-1, 1).expand(-1, K_dim)
-        out_off_diag = torch.zeros_like(out.reshape(-1, K_dim))
-        out_off_diag.scatter_add_(0, row_linear_exp, Z_row.reshape(-1, K_dim))
-        out_off_diag.scatter_add_(0, col_linear_exp, Z_col.reshape(-1, K_dim))
-        out = out + out_off_diag.reshape(B, N, K_dim)
+        out_flat.scatter_add_(0, row_linear_exp, Z_row.reshape(-1, K_dim))
+        out_flat.scatter_add_(0, col_linear_exp, Z_col.reshape(-1, K_dim))
 
-    return _apply_scale_equivariance(out, scale_A)
+    return out
 
 
-def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None, scale_A=1.0):
+def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None):
     B, N, K = x.shape
     num_leaves = leaf_blocks.shape[1]
     leaf_size = leaf_blocks.shape[2]
     if not off_diag_list or not off_diag_struct:
         x_leaves = x.view(B, num_leaves, leaf_size, K)
         y_leaves = torch.matmul(leaf_blocks, x_leaves)
-        return _apply_scale_equivariance(y_leaves.view(B, N, K), scale_A)
-    return apply_block_structured_M(leaf_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size, scale_A=scale_A)
+        return y_leaves.view(B, N, K)
+    return apply_block_structured_M(leaf_blocks, off_diag_list, x, off_diag_struct, leaf_size=leaf_size)
 
 
 # --- Save / Load ---
@@ -1127,8 +1142,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, model.core.jacobi_gate.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, model.core.jacobi_gate.bias.detach().cpu().float(), transpose=False)
         if getattr(model, 'universal_off_diag', None) is not None:
-            # 0xFFFFFFFE = off-diag v3 (feature_ln + context FiLM modulation).
-            f.write(struct.pack('<II', 0xFFFFFFFE, 0))
+            f.write(struct.pack('<II', 0xFFFFFFFC, 0))
             blk = model.universal_off_diag
             _write_packed_tensor(f, blk.attn_q.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.attn_q.bias.detach().cpu().float(), transpose=False)
@@ -1142,6 +1156,9 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, blk.film_gen[2].bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.feature_ln.weight.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.feature_ln.bias.detach().cpu().float(), transpose=False)
+            if getattr(blk, 'scene_proj', None) is not None:
+                _write_packed_tensor(f, blk.scene_proj.weight.detach().cpu().float(), transpose=True)
+                _write_packed_tensor(f, blk.scene_proj.bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.proj_U.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, blk.proj_U.bias.detach().cpu().float(), transpose=False)
             _write_packed_tensor(f, blk.proj_V.weight.detach().cpu().float(), transpose=True)
@@ -1246,7 +1263,7 @@ def load_leaf_only_weights(model, path):
         extra = f.read(8)
         if len(extra) == 8:
             sentinel, _ = struct.unpack('<II', extra)
-            if sentinel in (0xFFFFFFFC, 0xFFFFFFFD, 0xFFFFFFFE) and getattr(model, 'universal_off_diag', None) is not None:
+            if sentinel == 0xFFFFFFFC and getattr(model, 'universal_off_diag', None) is not None:
                 blk = model.universal_off_diag
                 _read_into(f, blk.attn_q.weight, read_tensor, transpose=True)
                 _read_into(f, blk.attn_q.bias, read_tensor, transpose=False)
@@ -1254,16 +1271,15 @@ def load_leaf_only_weights(model, path):
                 _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
                 _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
                 _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
-                if sentinel == 0xFFFFFFFC:
-                    skip_tensor(f, (blk._proj_in_dim,), transpose=False)
-                    skip_tensor(f, (blk._proj_in_dim,), transpose=False)
-                elif sentinel == 0xFFFFFFFE:
-                    _read_into(f, blk.film_gen[0].weight, read_tensor, transpose=True)
-                    _read_into(f, blk.film_gen[0].bias, read_tensor, transpose=False)
-                    _read_into(f, blk.film_gen[2].weight, read_tensor, transpose=True)
-                    _read_into(f, blk.film_gen[2].bias, read_tensor, transpose=False)
-                    _read_into(f, blk.feature_ln.weight, read_tensor, transpose=False)
-                    _read_into(f, blk.feature_ln.bias, read_tensor, transpose=False)
+                _read_into(f, blk.film_gen[0].weight, read_tensor, transpose=True)
+                _read_into(f, blk.film_gen[0].bias, read_tensor, transpose=False)
+                _read_into(f, blk.film_gen[2].weight, read_tensor, transpose=True)
+                _read_into(f, blk.film_gen[2].bias, read_tensor, transpose=False)
+                _read_into(f, blk.feature_ln.weight, read_tensor, transpose=False)
+                _read_into(f, blk.feature_ln.bias, read_tensor, transpose=False)
+                if getattr(blk, 'scene_proj', None) is not None:
+                    _read_into(f, blk.scene_proj.weight, read_tensor, transpose=True)
+                    _read_into(f, blk.scene_proj.bias, read_tensor, transpose=False)
                 _read_into(f, blk.proj_U.weight, read_tensor, transpose=True)
                 _read_into(f, blk.proj_U.bias, read_tensor, transpose=False)
                 _read_into(f, blk.proj_V.weight, read_tensor, transpose=True)
@@ -1325,7 +1341,7 @@ def train_leaf_only():
     parser.add_argument('--use_gcn', type=bool, default=True, help='When True, run SparsePhysicsGCN before transformer blocks (graph message passing). When False, raw inputs pass through lift only.')
     parser.add_argument('--print_timing', type=bool, default=True, help='On step 200, print detailed timing of each training substep')
     parser.add_argument('--mixed_sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance. Default False = train on whole matrix per frame.')
-    parser.add_argument('--contexts_per_step', type=int, default=4, help='Gradient accumulation: number of random cached contexts per optimizer step.')
+    parser.add_argument('--contexts_per_step', type=int, default=1, help='Gradient accumulation: number of random cached contexts per optimizer step.')
     parser.add_argument('--continue_training', action='store_true', help='Load initial weights from the saved .bytes file (--save) and continue training from that state.')
     parser.add_argument('--evaluate_gradients', action='store_true', help='Run gradient interference analysis (includes HODLR level analysis) then exit.')
     args = parser.parse_args()
@@ -1432,7 +1448,7 @@ def train_leaf_only():
             # Use n_pad positions so num_blocks = n_pad//leaf_size matches forward (x.shape[1] == n_pad)
             positions_ctx = x_input[0, :n_pad, :3]
             leaf_attn_mask, leaf_edge_feats = build_leaf_block_connectivity(
-                edge_index, edge_values, positions_ctx, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
+                edge_index, edge_values, positions_ctx, scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
             )
             precomputed_leaf_connectivity = (leaf_attn_mask, leaf_edge_feats)
 
@@ -1571,10 +1587,9 @@ def train_leaf_only():
             if do_timing:
                 _sync()
                 t0 = time.perf_counter()
-            # Training: no 1/γ so loss is M̃ Â z ≈ z (M̃ ≈ Â^{-1}); apply 1/γ only at inference
-            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0)
+            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
             if do_log:
-                MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE, scale_A=1.0)
+                MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE)
                 _norm_diag = MAZ_diag_only.norm().item()
                 _norm_off = (MAZ - MAZ_diag_only).norm().item()
                 ratio_off_sum += _norm_off / (_norm_diag + 1e-12)
@@ -1731,8 +1746,8 @@ def evaluate_gradient_interference(args):
     # Transformer: per block
     for b in range(num_blocks):
         param_groups[f'Transformer block {b}'] = (lambda m, b=b: list(m.blocks[b].parameters()))
-    # Off-diagonal: Context modulation vs Attention (Q/K/V) vs W_U/W_V.
-    param_groups['Off-diag Context Mod (FiLM)'] = lambda m: list(m.universal_off_diag.film_gen.parameters())
+    # Off-diagonal: AdaLN (film_gen) vs Attention (Q/K/V) vs W_U/W_V
+    param_groups['Off-diag AdaLN (film_gen)'] = lambda m: list(m.universal_off_diag.film_gen.parameters())
     param_groups['Off-diag Attention (Q/K/V)'] = lambda m: (
         list(m.universal_off_diag.attn_q.parameters())
         + list(m.universal_off_diag.attn_k.parameters())
@@ -1784,7 +1799,7 @@ def evaluate_gradient_interference(args):
             dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
             pre_masks = get_or_compute_masks(batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE)
             pre_leaf = build_leaf_block_connectivity(
-                edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
+                edge_index, edge_values, x_input[0, :n_pad, :3], scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
             )
 
             global_feat = batch.get('global_features')
@@ -1802,8 +1817,7 @@ def evaluate_gradient_interference(args):
             Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
             Z[:, n_orig:, :] = 0.0
             AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-            # Training: no 1/γ so loss is M̃ Â z ≈ z; apply 1/γ only at inference
-            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0)
+            MAZ = apply_block_structured_M(diag_blocks, off_diag_list, AZ, model.off_diag_struct, leaf_size=LEAF_SIZE)
 
             raw_loss = ((MAZ - Z) ** 2).mean()
             step_loss_sum += raw_loss.item()
@@ -1865,7 +1879,7 @@ def evaluate_gradient_interference(args):
         gf_mean = gf_arr.mean(axis=0)
         gf_std = gf_arr.std(axis=0)
         print("FRAME STATS (global_features, mean ± std across all frames in the evaluated passes):")
-        print(f"  log2(N), reserved_scale_slot(=0), mass_mean, mass_std, diag_mu, diag_std, diff_mean/std(3): {gf_mean.tolist()}")
+        print(f"  log2(N), log(scale_A), mass_mean, mass_std, diag_mu, diag_std, diff_mean/std(3): {gf_mean.tolist()}")
         print(f"  stds: {gf_std.tolist()}")
         print("-" * 40)
 
@@ -1893,7 +1907,7 @@ def evaluate_gradient_interference(args):
     dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
     pre_masks = get_or_compute_masks(batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE)
     pre_leaf = build_leaf_block_connectivity(
-        edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
+        edge_index, edge_values, x_input[0, :n_pad, :3], scale_A, LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
     )
     global_feat = batch.get('global_features')
     if global_feat is not None:
@@ -1924,13 +1938,12 @@ def evaluate_gradient_interference(args):
         Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
         Z[:, n_orig:, :] = 0.0
         AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-        scale_A_scalar = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
-        MAz = apply_block_structured_M(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar)
+        MAz = apply_block_structured_M(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE)
         residual = (MAz - Z).detach()
 
         print("\n=== Cross-Level Gradient Interference (Shared Backbone) ===")
-        # We don't care about W_U / W_V here because they are disjoint per-rank truncation.
-        # We care whether macro/micro levels fight over shared context modulation + attention.
+        # We don't care about W_U / W_V anymore because they are disjoint.
+        # We care if the macro and micro levels are fighting over the SHARED AdaLN MLP and Attention!
 
         shared_params = (
             list(model.universal_off_diag.film_gen.parameters())
@@ -1939,8 +1952,8 @@ def evaluate_gradient_interference(args):
             + list(model.universal_off_diag.attn_v.parameters())
         )
 
-        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min}, scale_A=scale_A_scalar)
-        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max}, scale_A=scale_A_scalar)
+        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min})
+        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max})
 
         model.zero_grad()
         loss_L1 = ((M_L1 - Z) ** 2).mean()
@@ -1954,8 +1967,8 @@ def evaluate_gradient_interference(args):
 
         cos_sim_shared = F.cosine_similarity(grad_shared_L1.unsqueeze(0), grad_shared_Lmax.unsqueeze(0), dim=1).item()
 
-        print(f"  Level {level_min} (micro) vs Level {level_max} (macro) gradient cosine similarity on SHARED MOD/ATTN: {cos_sim_shared:.4f}")
-        print(f"  (If highly negative, shared modulation/attention is failing to multiplex. If positive/near-zero, multiplexing is successful!)")
+        print(f"  Level {level_min} (micro) vs Level {level_max} (macro) gradient cosine similarity on SHARED ADA-LN/ATTN: {cos_sim_shared:.4f}")
+        print(f"  (If highly negative, AdaLN is failing to multiplex. If positive/near-zero, multiplexing is successful!)")
 
         # proj_U/proj_V grads for "Per-level gradient" diagnostic (shared projection); need fresh graph (previous one was freed)
         diag_blocks, off_diag_list = model(
@@ -1963,8 +1976,8 @@ def evaluate_gradient_interference(args):
             scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
             global_features=global_feat,
         )
-        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min}, scale_A=scale_A_scalar)
-        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max}, scale_A=scale_A_scalar)
+        M_L1 = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_min})
+        M_Lmax = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include={level_max})
         blk = model.universal_off_diag
 
         def _flat_grad_proj(proj):
@@ -1985,12 +1998,12 @@ def evaluate_gradient_interference(args):
 
         print("\n=== Per-Level Residual Loss Decomposition ===")
         cumulative_levels = set()
-        base_res = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels, scale_A=scale_A_scalar)
+        base_res = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels)
         loss_diag = ((base_res - Z) ** 2).mean().item()
         print(f"  Diag only:                          residual loss = {loss_diag:.6f}")
         for lev in range(level_max, level_min - 1, -1):
             cumulative_levels.add(lev)
-            out = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels, scale_A=scale_A_scalar)
+            out = apply_block_structured_M_with_levels(diag_blocks, off_diag_list, AZ, struct_list, leaf_size=LEAF_SIZE, levels_to_include=cumulative_levels)
             loss_here = ((out - Z) ** 2).mean().item()
             print(f"  Diag + Levels {level_max}..{lev}:                residual loss = {loss_here:.6f}")
         full_loss = ((MAz - Z) ** 2).mean().item()
@@ -2010,7 +2023,7 @@ def evaluate_gradient_interference(args):
         with torch.no_grad():
             h = model.core.forward_features(
                 x_input, edge_index=edge_index, edge_values=edge_values,
-                precomputed_leaf_connectivity=pre_leaf,
+                scale_A=scale_A, precomputed_leaf_connectivity=pre_leaf,
                 global_features=global_feat,
             )
 
@@ -2033,9 +2046,11 @@ def evaluate_gradient_interference(args):
 
             feat_U_L1, mod_U_L1, gam_L1 = extract_block_data(idx_L1)
             feat_U_Lmax, mod_U_Lmax, gam_Lmax = extract_block_data(idx_Lmax)
+            rank_L1 = struct_list[idx_L1]["rank"]
+            rank_Lmax = struct_list[idx_Lmax]["rank"]
 
-            # 1. Feature magnitude tracking (context modulation path)
-            print("1. Projection Feature Magnitudes (context modulation effect):")
+            # 1. Feature Magnitude Tracking (AdaLN effect)
+            print("1. Activation Magnitudes (Is AdaLN modulating variance?):")
             print(f"   L{level_min} Raw: mu={feat_U_L1.mean().item():.4f}, std={feat_U_L1.std().item():.4f} -> Mod: mu={mod_U_L1.mean().item():.4f}, std={mod_U_L1.std().item():.4f}")
             print(f"   L{level_max} Raw: mu={feat_U_Lmax.mean().item():.4f}, std={feat_U_Lmax.std().item():.4f} -> Mod: mu={mod_U_Lmax.mean().item():.4f}, std={mod_U_Lmax.std().item():.4f}")
 
