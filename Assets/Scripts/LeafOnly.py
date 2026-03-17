@@ -788,7 +788,7 @@ class LevelSpecificOffDiagBlock(nn.Module):
 
         self._scale_attn = d_model ** -0.5
 
-    def forward(self, h_row, h_col, pos_row, pos_col, mask, super_edge_strength=None, return_features=False, global_features=None):
+    def forward(self, h_row, h_col, pos_row, pos_col, mask, super_edge_strength=None, return_features=False, global_features=None, return_attn_debug=False):
         B = h_row.shape[0]
         side = h_row.shape[1]
         g = side // self.n_super
@@ -830,16 +830,56 @@ class LevelSpecificOffDiagBlock(nn.Module):
         scores = (Q @ K.transpose(-2, -1)) * self._scale_attn
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
+        edge_scale_33 = None  # multiplicative modulation of attention probabilities (option 3)
+        scores_pre_mask = scores
         if super_edge_strength is not None:
             edge_strength = super_edge_strength
             if edge_strength.dim() == 2:
                 edge_strength = edge_strength.unsqueeze(0)
             edge_bias = self.super_edge_gate(edge_strength.to(dtype=scores.dtype).unsqueeze(-1)).squeeze(-1)
+            # Map learned bias to a positive scale so probability reweighting is well-defined.
+            # Option 3: multiply attention probs by this scale, then renormalize.
             edge_bias_33 = F.pad(edge_bias, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=0.0)
-            scores = scores + edge_bias_33
+            edge_scale_33 = torch.exp(edge_bias_33.clamp(min=-10.0, max=10.0))
         mask_33 = F.pad(mask, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=True)
-        scores = scores.masked_fill(~mask_33, float('-inf'))
-        attn_probs = F.softmax(scores, dim=-1)
+        scores_masked = scores_pre_mask.masked_fill(~mask_33, float('-inf'))
+        attn_probs = F.softmax(scores_masked, dim=-1)
+        if edge_scale_33 is not None:
+            attn_probs = attn_probs * edge_scale_33
+            attn_probs = attn_probs / (attn_probs.sum(dim=-1, keepdim=True) + 1e-12)
+
+        attn_debug = None
+        if return_attn_debug:
+            # Reduced stats only: keep probe cheap and avoid returning large tensors.
+            with torch.no_grad():
+                scores_sel = scores_pre_mask.masked_select(mask_33)
+                scores_mean = scores_sel.mean().item() if scores_sel.numel() > 0 else float('nan')
+                scores_std = scores_sel.std(unbiased=False).item() if scores_sel.numel() > 1 else float('nan')
+                scores_max = scores_sel.max().item() if scores_sel.numel() > 0 else float('nan')
+
+                p = attn_probs.clamp_min(1e-12)
+                entropy = (-(p * p.log()).sum(dim=-1))  # (B, n_super)
+                entropy_mean = entropy.mean().item()
+                entropy_std = entropy.std(unbiased=False).item()
+
+                if edge_scale_33 is not None:
+                    es_sel = edge_scale_33.masked_select(mask_33)
+                    es_mean = es_sel.mean().item() if es_sel.numel() > 0 else float('nan')
+                    es_std = es_sel.std(unbiased=False).item() if es_sel.numel() > 1 else float('nan')
+                else:
+                    es_mean, es_std = float('nan'), float('nan')
+
+                attn_debug = {
+                    "scores_mean_on_mask": scores_mean,
+                    "scores_std_on_mask": scores_std,
+                    "scores_max_on_mask": scores_max,
+                    "attn_entropy_mean": entropy_mean,
+                    "attn_entropy_std": entropy_std,
+                    "edge_scale_mean_on_mask": es_mean,
+                    "edge_scale_std_on_mask": es_std,
+                    "attn_probs_mean": attn_probs.mean().item(),
+                    "attn_probs_std": attn_probs.std(unbiased=False).item(),
+                }
         row_out_full = attn_probs @ V
         row_out = row_out_full[:, : self.n_super].reshape(B, self.n_super, -1)
         global_ctx = row_out_full[:, self.n_super :, :].mean(dim=1)
@@ -869,7 +909,11 @@ class LevelSpecificOffDiagBlock(nn.Module):
         out_V = V_raw / rank_scale
 
         if return_features:
+            if return_attn_debug:
+                return out_U, out_V, features_U.detach(), features_V.detach(), attn_debug
             return out_U, out_V, features_U.detach(), features_V.detach()
+        if return_attn_debug:
+            return out_U, out_V, attn_debug
         return out_U, out_V
 
 
@@ -2218,48 +2262,287 @@ def evaluate_gradient_interference(args):
         grad_proj_U_Lmax = _flat_grad_proj(blk_max.proj_U)
         grad_proj_V_Lmax = _flat_grad_proj(blk_max.proj_V)
 
-        print("\n=== Off-Diagonal Usefulness Probe ===")
-        # Fairness note: use the same frozen model outputs and compare diag-only vs full on many random probes.
-        # This measures whether off-diagonal correction actually reduces residual, not whether each level improves monotonically.
-        num_probe = 24
-        probe_vectors = max(96, int(round(n_pad ** 0.5)))
-        improvements = []
-        cos_to_neg_diag_res = []
-        wins = 0
-        hodlr_op = build_hodlr_operator(
-            diag_blocks, off_diag_list, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar,
-        )
-        with torch.no_grad():
+        print("\n=== Component Reliance Probe ===")
+        # Goal: estimate how much the model (preconditioner M) and the downstream residual depend
+        # on each component it is given (features, A values, off-diag precomputed tensors, etc.).
+        # Metric: for random probe vectors Z, compare residual MSE under ablation vs full.
+        #   + large positive delta => component is critical
+        #   + ~0             => component ignored
+        #   + negative      => component hurts (or ablation removes harmful noise)
+        def _build_dense_A_from_edges(edge_index_local, edge_values_local):
+            A_sparse_local = torch.sparse_coo_tensor(edge_index_local, edge_values_local, (n_orig, n_orig)).coalesce()
+            A_small_local = A_sparse_local.to_dense().to(device) if device.type == 'mps' else A_sparse_local.to(device).to_dense()
+            A_dense_local = torch.zeros(n_pad, n_pad, device=device, dtype=A_small_local.dtype)
+            A_dense_local[:n_orig, :n_orig] = A_small_local
+            A_dense_local[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small_local.dtype)
+            return A_dense_local
+
+        def _zero_precomputed_masks(pre_masks_in):
+            out = []
+            for pm in pre_masks_in:
+                if isinstance(pm, tuple):
+                    mask_raw, strength_raw = pm
+                    mask_new = torch.zeros_like(mask_raw, dtype=torch.bool) if mask_raw is not None else None
+                    if strength_raw is None:
+                        out.append((mask_new, None))
+                    else:
+                        out.append((mask_new, torch.zeros_like(strength_raw)))
+                else:
+                    # Legacy path: pm is just a mask tensor.
+                    out.append(torch.zeros_like(pm))
+            return out
+
+        def _zero_pre_leaf(pre_leaf_in):
+            """
+            Safe leaf-ablation: zero leaf edge-features and remove all neighbor-to-neighbor edges,
+            but KEEP the global-node column enabled to avoid all-keys-masked -> NaNs in softmax.
+            """
+            leaf_mask_in, leaf_feats_in = pre_leaf_in
+            # leaf_mask_in is usually float (1.0/0.0). Keep dtype to match attention masking.
+            leaf_mask_new = torch.zeros_like(leaf_mask_in)
+            # The last column corresponds to the "global node" token (see build_leaf_block_connectivity).
+            leaf_mask_new[..., -1] = 1.0
+            leaf_feats_new = torch.zeros_like(leaf_feats_in)
+            return (leaf_mask_new, leaf_feats_new)
+
+        # Use eval() for consistent ablations (avoid any dropout randomness).
+        was_training = model.training
+        model.eval()
+        try:
+            num_probe = 16
+            probe_vectors = max(64, int(round(n_pad ** 0.5)))
+            Z_list = []
             for _ in range(num_probe):
                 Zp = torch.randn(1, n_pad, probe_vectors, device=device, dtype=x_input.dtype)
                 Zp[:, n_orig:, :] = 0.0
-                AZp = (A_dense @ Zp.squeeze(0)).unsqueeze(0)
+                Z_list.append(Zp)
 
-                M_diag = hodlr_op.apply(AZp, levels_to_include=set())
-                M_full = hodlr_op.apply(AZp)
+            hodlr_op_base = build_hodlr_operator(
+                diag_blocks, off_diag_list, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar,
+            )
 
-                r_diag = M_diag - Zp
-                r_full = M_full - Zp
-                corr = M_full - M_diag
+            def _eval_residual_mse(hodlr_op_local, A_dense_local):
+                mses = []
+                for Zp in Z_list:
+                    AZp = (A_dense_local @ Zp.squeeze(0)).unsqueeze(0)
+                    MAz = hodlr_op_local.apply(AZp)
+                    resid = MAz - Zp
+                    mses.append((resid ** 2).mean().item())
+                return np.asarray(mses, dtype=np.float64)
 
-                n_diag = r_diag.norm().item()
-                n_full = r_full.norm().item()
-                if n_full < n_diag:
-                    wins += 1
-                rel_improve = (n_diag - n_full) / (n_diag + 1e-12)
-                improvements.append(rel_improve)
+            with torch.no_grad():
+                base_mse = _eval_residual_mse(hodlr_op_base, A_dense)
 
-                # Positive cosine means off-diag correction points toward cancelling diag residual.
-                cos_val = F.cosine_similarity(corr.reshape(1, -1), (-r_diag).reshape(1, -1), dim=1).item()
-                cos_to_neg_diag_res.append(cos_val)
+                diag_mask_edges = (edge_index[0] == edge_index[1])
+                offdiag_mask_edges = ~diag_mask_edges
 
-        imp_arr = np.array(improvements, dtype=np.float64)
-        cos_arr = np.array(cos_to_neg_diag_res, dtype=np.float64)
-        print(f"  Probe count:                        {num_probe}")
-        print(f"  Win rate (full better than diag):  {wins}/{num_probe} = {wins / float(num_probe):.2%}")
-        print(f"  Relative residual change:           mean={imp_arr.mean():+.4%}, std={imp_arr.std():.4%}")
-        print(f"  Corr vs -diag residual cosine:      mean={cos_arr.mean():+.4f}, std={cos_arr.std():.4f}")
-        print("  (Positive residual-change mean and high win-rate => off-diagonal is useful.)")
+                idx_Lmin = next(idx for idx, s in enumerate(struct_list) if s["level"] == level_min)
+                idx_Lmax = next(idx for idx, s in enumerate(struct_list) if s["level"] == level_max) if level_max != level_min else idx_Lmin
+
+                scenarios = []
+
+                # 1) Feature ablation
+                x_zero = x_input.clone()
+                x_zero.zero_()
+                pre_leaf_x_zero = build_leaf_block_connectivity(
+                    edge_index, edge_values, x_zero[0, :n_pad, :3], LEAF_SIZE, device, x_zero.dtype, num_hops=ATTENTION_HOPS
+                )
+                scenarios.append((
+                    "x_input zeroed (features+positions)",
+                    dict(
+                        x_input=x_zero,
+                        edge_values=edge_values,
+                        pre_masks=pre_masks,
+                        pre_leaf=pre_leaf_x_zero,
+                        global_features=global_feat,
+                        A_dense=A_dense,
+                    ),
+                ))
+
+                # 2) Global feature ablation (if present)
+                if global_feat is not None:
+                    global_zero = torch.zeros_like(global_feat)
+                else:
+                    global_zero = None
+                scenarios.append((
+                    "global_features zeroed",
+                    dict(
+                        x_input=x_input,
+                        edge_values=edge_values,
+                        pre_masks=pre_masks,
+                        pre_leaf=pre_leaf,
+                        global_features=global_zero,
+                        A_dense=A_dense,
+                    ),
+                ))
+
+                # 3) Off-diagonal precomputed masks ablation
+                pre_masks_zero = _zero_precomputed_masks(pre_masks)
+                scenarios.append((
+                    "precomputed off-diag masks zeroed",
+                    dict(
+                        x_input=x_input,
+                        edge_values=edge_values,
+                        pre_masks=pre_masks_zero,
+                        pre_leaf=pre_leaf,
+                        global_features=global_feat,
+                        A_dense=A_dense,
+                    ),
+                ))
+
+                # 4) Leaf connectivity ablation
+                pre_leaf_zero = _zero_pre_leaf(pre_leaf)
+                scenarios.append((
+                    "precomputed leaf connectivity zeroed",
+                    dict(
+                        x_input=x_input,
+                        edge_values=edge_values,
+                        pre_masks=pre_masks,
+                        pre_leaf=pre_leaf_zero,
+                        global_features=global_feat,
+                        A_dense=A_dense,
+                    ),
+                ))
+
+                # 5) A values ablations: only affect the *off-diagonal attention strength* input (precomputed mask strength).
+                # We keep `A_dense` fixed so we don't perform the catastrophic "AZ uses only off-diagonal A" test.
+                edge_values_diag = edge_values * diag_mask_edges.to(edge_values.dtype)
+                pre_masks_diag_strength = get_or_compute_offdiag_super_data(
+                    batch['frame_path'], edge_index, edge_values_diag, dummy_struct, device, x_input.dtype, LEAF_SIZE
+                )
+                scenarios.append((
+                    "off-diag attention strength: diag-only (AZ fixed)",
+                    dict(
+                        x_input=x_input,
+                        edge_values=edge_values,  # keep embedding + leaf features unchanged
+                        pre_masks=pre_masks_diag_strength,
+                        pre_leaf=pre_leaf,
+                        global_features=global_feat,
+                        A_dense=A_dense,
+                    ),
+                ))
+
+                edge_values_offdiag = edge_values * offdiag_mask_edges.to(edge_values.dtype)
+                pre_masks_offdiag_strength = get_or_compute_offdiag_super_data(
+                    batch['frame_path'], edge_index, edge_values_offdiag, dummy_struct, device, x_input.dtype, LEAF_SIZE
+                )
+                scenarios.append((
+                    "off-diag attention strength: off-diag-only (AZ fixed)",
+                    dict(
+                        x_input=x_input,
+                        edge_values=edge_values,
+                        pre_masks=pre_masks_offdiag_strength,
+                        pre_leaf=pre_leaf,
+                        global_features=global_feat,
+                        A_dense=A_dense,
+                    ),
+                ))
+
+                # Zero only the strength term but keep the mask structure.
+                def _zero_precomputed_masks_strength_only(pre_masks_in):
+                    out = []
+                    for pm in pre_masks_in:
+                        if isinstance(pm, tuple):
+                            mask_raw, strength_raw = pm
+                            out.append((mask_raw, torch.zeros_like(strength_raw) if strength_raw is not None else None))
+                        else:
+                            out.append(torch.zeros_like(pm))
+                    return out
+
+                pre_masks_strength_zero = _zero_precomputed_masks_strength_only(pre_masks)
+                scenarios.append((
+                    "off-diag attention strength: zeroed (mask kept, AZ fixed)",
+                    dict(
+                        x_input=x_input,
+                        edge_values=edge_values,
+                        pre_masks=pre_masks_strength_zero,
+                        pre_leaf=pre_leaf,
+                        global_features=global_feat,
+                        A_dense=A_dense,
+                    ),
+                ))
+
+                print(f"  Probe count: {num_probe}, probe_vectors={probe_vectors}")
+                print(f"  Base residual MSE: mean={base_mse.mean():.6e} std={base_mse.std():.6e}")
+
+                for scenario_name, sc in scenarios:
+                    diag_blocks_ab, off_diag_list_ab = model(
+                        sc['x_input'],
+                        edge_index=edge_index,
+                        edge_values=sc['edge_values'],
+                        scale_A=scale_A,
+                        precomputed_masks=sc['pre_masks'],
+                        precomputed_leaf_connectivity=sc['pre_leaf'],
+                        global_features=sc['global_features'],
+                    )
+                    hodlr_op_ab = build_hodlr_operator(
+                        diag_blocks_ab, off_diag_list_ab, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar,
+                    )
+                    mse_ab = _eval_residual_mse(hodlr_op_ab, sc['A_dense'])
+                    if np.isnan(mse_ab).any():
+                        print(f"  - {scenario_name}: produced NaNs in residual MSE (component ablation likely masks all attention keys).")
+                        continue
+                    delta = mse_ab - base_mse
+                    delta_rel = delta / (base_mse + 1e-12)
+
+                    # Attention debug: inspect how off-diagonal attention is reweighted after softmax.
+                    h_ab = model.core.forward_features(
+                        sc['x_input'], edge_index=edge_index, edge_values=sc['edge_values'],
+                        precomputed_leaf_connectivity=sc['pre_leaf'],
+                        global_features=sc['global_features'],
+                    )
+
+                    def _attn_debug_for_spec(spec_idx):
+                        spec = struct_list[spec_idx]
+                        rs, re = spec["row_start"], spec["row_end"]
+                        cs, ce = spec["col_start"], spec["col_end"]
+                        h_row = h_ab[:, rs:re]
+                        h_col = h_ab[:, cs:ce]
+                        pos_row = sc['x_input'][:, rs:re, :3]
+                        pos_col = sc['x_input'][:, cs:ce, :3]
+                        pm = sc['pre_masks'][spec_idx]
+                        if isinstance(pm, tuple):
+                            mask_raw, strength_raw = pm
+                        else:
+                            mask_raw, strength_raw = pm, None
+                        mask = mask_raw.unsqueeze(0) if mask_raw is not None and mask_raw.dim() == 2 else mask_raw
+                        edge_strength = None
+                        if strength_raw is not None:
+                            edge_strength = strength_raw.unsqueeze(0) if strength_raw.dim() == 2 else strength_raw
+                        blk = model.level_off_diag[spec["level"] - 1]
+                        _, _, dbg = blk(
+                            h_row, h_col, pos_row, pos_col, mask,
+                            super_edge_strength=edge_strength,
+                            return_attn_debug=True,
+                            global_features=sc['global_features'],
+                        )
+                        return dbg
+
+                    dbg_min = _attn_debug_for_spec(idx_Lmin)
+                    dbg_max = _attn_debug_for_spec(idx_Lmax) if idx_Lmax != idx_Lmin else dbg_min
+
+                    def _fmt_dbg(dbg):
+                        return (
+                            f"scores(mean/std/max)={dbg['scores_mean_on_mask']:.3e}/{dbg['scores_std_on_mask']:.3e}/{dbg['scores_max_on_mask']:.3e}, "
+                            f"entropy={dbg['attn_entropy_mean']:.3f}±{dbg['attn_entropy_std']:.3f}, "
+                            f"edge_scale={dbg['edge_scale_mean_on_mask']:.3e}±{dbg['edge_scale_std_on_mask']:.3e}"
+                        )
+
+                    if level_min == level_max:
+                        print(
+                            f"  - {scenario_name}: delta MSE rel mean={delta_rel.mean():+.4%} std={delta_rel.std():.4%} | "
+                            f"attn L{level_min}: {_fmt_dbg(dbg_min)}"
+                        )
+                    else:
+                        print(
+                            f"  - {scenario_name}: delta MSE rel mean={delta_rel.mean():+.4%} std={delta_rel.std():.4%} | "
+                            f"attn L{level_min}: {_fmt_dbg(dbg_min)} | attn L{level_max}: {_fmt_dbg(dbg_max)}"
+                        )
+
+                print("  (Interpretation: delta MSE shows loss-sensitivity; debug stats show how attention is reweighted by each component.)")
+        finally:
+            if was_training:
+                model.train()
 
         print("\n=== Basis Overlap (Subspace Angle) ===")
         idx_L1 = next(idx for idx, s in enumerate(struct_list) if s["level"] == level_min)
