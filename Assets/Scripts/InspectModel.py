@@ -38,8 +38,9 @@ from LeafOnly import (
     read_leaf_only_header,
     load_leaf_only_weights,
     apply_block_structured_M,
+    build_hodlr_operator,
     build_hodlr_off_diag_structure,
-    build_off_diag_super_connectivity,
+    build_off_diag_super_connectivity_features,
     LEAF_SIZE,
     VIEW_SIZE,
     next_valid_size,
@@ -379,6 +380,7 @@ def main():
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
     print(f"Using device: {device}")
+    check_freq = 1
 
     print(f"Loading data from {data_folder}")
     dataset = FluidGraphDataset([Path(data_folder)])
@@ -437,9 +439,9 @@ def main():
         n_pad, LEAF_SIZE, rank_base=getattr(model_leaf, "rank_base", 16)
     )
     precomputed_masks = [
-        build_off_diag_super_connectivity(
-            edge_index_leaf, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
-            device, LEAF_SIZE,
+        build_off_diag_super_connectivity_features(
+            edge_index_leaf, edge_values_leaf, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
+            device, x_leaf.dtype, LEAF_SIZE,
         )
         for spec in off_diag_struct
     ] if off_diag_struct else []
@@ -556,16 +558,16 @@ def main():
     total_none_cpu_ms = setup_none_ms + solve_none_cpu_ms
 
     scale_A_val = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
-    # Use LeafOnly's level-wise batched apply (same fast path as LeafOnly.py); M(A) = (1/α) M~(Â)
+    # Setup once: cache batched off-diag tensors/indices and reuse in every PCG apply.
+    hodlr_op = build_hodlr_operator(
+        diag_blocks, off_diag_list, getattr(model_leaf, "off_diag_struct", None),
+        leaf_size=LEAF_SIZE, scale_A=scale_A_val,
+    )
+    # Use cached setup for M(A) = (1/α) M~(Â) in regular PCG fallback path.
     with torch.no_grad():
         def apply_M_block_sparse(r):
             r_batched = r.unsqueeze(0)  # (1, viz_n, 1)
-            out = apply_block_structured_M(
-                diag_blocks, off_diag_list, r_batched,
-                getattr(model_leaf, "off_diag_struct", None),
-                leaf_size=LEAF_SIZE,
-                scale_A=scale_A_val,
-            )
+            out = hodlr_op.apply(r_batched)
             return out.squeeze(0)  # (viz_n, 1)
 
     # On CUDA use graph solve (no Python overhead); otherwise or on graph failure use regular pcg_gpu
@@ -580,14 +582,14 @@ def main():
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
-                check_freq=1,  # exact iteration count for e2e benchmark
+                check_freq=check_freq,
                 scale_A=scale_A_val,
             )
         except Exception as e:
             print(f"  LeafOnly (CUDA graph failed, using regular solve): {e}")
-            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_sparse, tol=pcg_tol, max_iter=pcg_max_iter, device=device)
+            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_sparse, tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq)
     else:
-        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_sparse, tol=pcg_tol, max_iter=pcg_max_iter, device=device)
+        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_sparse, tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq)
 
     total_leaf_ms = inference_ms + solve_leaf_ms
 

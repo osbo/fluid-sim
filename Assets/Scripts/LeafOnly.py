@@ -357,14 +357,22 @@ class LeafBlockAttention(nn.Module):
 
         scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
 
-        bias_physics = edge_feats[..., :4].clone()
-        bias_physics[:, :, self.block_size, :] = 0.0
-        bias_physics[:, :, self.block_size, 3] = 1.0
+        # edge_feats can be shared across batch (num_blocks, Q, K, 4)
+        # or batched per sample (B, num_blocks, Q, K, 4).
+        if edge_feats.dim() == 4:
+            bias_physics = edge_feats[..., :4].unsqueeze(0).expand(B, -1, -1, -1, -1).clone()
+        else:
+            bias_physics = edge_feats[..., :4].clone()
+        bias_physics[:, :, :, self.block_size, :] = 0.0
+        bias_physics[:, :, :, self.block_size, 3] = 1.0
         arange = torch.arange(self.block_size, device=device)
-        bias_physics[:, arange, arange, :] = 0.0
-        bias_physics[:, arange, arange, 3] = 1.0
-        scores = scores + bias_physics[..., 3:4].unsqueeze(0)
-        mask_expanded = attn_mask.unsqueeze(0).unsqueeze(-1)
+        bias_physics[:, :, arange, arange, :] = 0.0
+        bias_physics[:, :, arange, arange, 3] = 1.0
+        scores = scores + bias_physics[..., 3:4]
+        if attn_mask.dim() == 3:
+            mask_expanded = attn_mask.unsqueeze(0).unsqueeze(-1)
+        else:
+            mask_expanded = attn_mask.unsqueeze(-1)
         scores = scores.masked_fill(mask_expanded == 0, float('-inf'))
 
         if save_attention:
@@ -374,8 +382,7 @@ class LeafBlockAttention(nn.Module):
 
         attn_probs = F.softmax(scores, dim=3)
 
-        linear_edge_weights = self.edge_gate(bias_physics)
-        linear_edge_weights = linear_edge_weights.unsqueeze(0).masked_fill(mask_expanded == 0, 0.0)
+        linear_edge_weights = self.edge_gate(bias_physics).masked_fill(mask_expanded == 0, 0.0)
 
         combined_weights = attn_probs + linear_edge_weights
 
@@ -399,26 +406,38 @@ class LeafBlockAttention(nn.Module):
 
     def _forward_masked_32_only(self, x_blk, B, N_pad, N_orig, pad, num_blocks, device, dtype, attn_mask, edge_feats, save_attention):
         C = x_blk.shape[-1]
-        attn_mask = attn_mask[:, :, :self.block_size]
-        edge_feats = edge_feats[:, :, :self.block_size, :]
+        if attn_mask.dim() == 3:
+            attn_mask = attn_mask[:, :, :self.block_size]
+        else:
+            attn_mask = attn_mask[:, :, :, :self.block_size]
+        if edge_feats.dim() == 4:
+            edge_feats = edge_feats[:, :, :self.block_size, :]
+        else:
+            edge_feats = edge_feats[:, :, :, :self.block_size, :]
         qkv = self.qkv(x_blk)
         q = qkv[..., :C].view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
         k = qkv[..., C:2*C].view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
         v = qkv[..., 2*C:3*C].view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
         scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
-        bias_physics = edge_feats[..., :4].clone()
+        if edge_feats.dim() == 4:
+            bias_physics = edge_feats[..., :4].unsqueeze(0).expand(B, -1, -1, -1, -1).clone()
+        else:
+            bias_physics = edge_feats[..., :4].clone()
         arange = torch.arange(self.block_size, device=device)
-        bias_physics[:, arange, arange, :] = 0.0
-        bias_physics[:, arange, arange, 3] = 1.0
-        scores = scores + bias_physics[..., 3:4].unsqueeze(0)
-        mask_expanded = attn_mask.unsqueeze(0).unsqueeze(-1)
+        bias_physics[:, :, arange, arange, :] = 0.0
+        bias_physics[:, :, arange, arange, 3] = 1.0
+        scores = scores + bias_physics[..., 3:4]
+        if attn_mask.dim() == 3:
+            mask_expanded = attn_mask.unsqueeze(0).unsqueeze(-1)
+        else:
+            mask_expanded = attn_mask.unsqueeze(-1)
         scores = scores.masked_fill(mask_expanded == 0, float('-inf'))
         if save_attention:
             with torch.no_grad():
                 self.last_scores_matrix = scores.mean(dim=-1).cpu().float()
                 self.last_bias_physics_matrix = bias_physics.cpu().float()
         attn_probs = F.softmax(scores, dim=3)
-        linear_edge_weights = self.edge_gate(bias_physics).unsqueeze(0).masked_fill(mask_expanded == 0, 0.0)
+        linear_edge_weights = self.edge_gate(bias_physics).masked_fill(mask_expanded == 0, 0.0)
         combined_weights = attn_probs + linear_edge_weights
         if not torch.compiler.is_compiling():
             with torch.no_grad():
@@ -595,6 +614,43 @@ def build_off_diag_super_connectivity(edge_index, rs, re, cs, ce, device, leaf_s
             mask[i, 0] = True
     return mask
 
+
+def build_off_diag_super_connectivity_features(edge_index, edge_values, rs, re, cs, ce, device, dtype=torch.float32, leaf_size=LEAF_SIZE):
+    side = re - rs
+    assert side == (ce - cs) and side % leaf_size == 0, f"Block must be square and multiple of {leaf_size}"
+    n_super = OFF_DIAG_SUPER
+    group_size = side // n_super
+    row, col = edge_index[0], edge_index[1]
+    in_block = (row >= rs) & (row < re) & (col >= cs) & (col < ce)
+
+    r_super = ((row[in_block] - rs) // group_size).clamp(0, n_super - 1)
+    c_super = ((col[in_block] - cs) // group_size).clamp(0, n_super - 1)
+    mask = torch.zeros(n_super, n_super, device=device, dtype=torch.bool)
+    mask[r_super, c_super] = True
+
+    for i in range(n_super):
+        if not mask[i].any():
+            mask[i, 0] = True
+
+    strength = torch.zeros(n_super, n_super, device=device, dtype=dtype)
+    if edge_values is not None:
+        w = edge_values[in_block].to(device=device, dtype=dtype).abs()
+        if w.numel() > 0:
+            lin_idx = r_super * n_super + c_super
+            flat = torch.zeros(n_super * n_super, device=device, dtype=dtype)
+            # Max-pool cross-super coupling strength (instead of sum pooling).
+            if hasattr(flat, "scatter_reduce_"):
+                flat.scatter_reduce_(0, lin_idx, w, reduce="amax", include_self=True)
+            else:
+                # Fallback for older runtimes.
+                for idx in torch.unique(lin_idx):
+                    flat[idx] = w[lin_idx == idx].max()
+            strength = flat.view(n_super, n_super)
+            # Compress dynamic range only; keep absolute magnitude information.
+            strength = torch.log1p(strength)
+
+    return mask, strength
+
 def print_hodlr_structure(n_nodes, leaf_size=LEAF_SIZE, rank_base=RANK_BASE_LEVEL1):
     num_blocks = n_nodes // leaf_size
     depth = int(round(math.log2(num_blocks)))
@@ -711,6 +767,7 @@ class LevelSpecificOffDiagBlock(nn.Module):
         self.attn_q = nn.Linear(qkv_in_dim, d_model)
         self.attn_k = nn.Linear(qkv_in_dim, d_model)
         self.attn_v = nn.Linear(qkv_in_dim, d_model)
+        self.super_edge_gate = nn.Linear(1, 1)
 
         self.feature_ln = nn.LayerNorm(self._proj_in_dim)
 
@@ -725,19 +782,23 @@ class LevelSpecificOffDiagBlock(nn.Module):
         for m in (self.attn_q, self.attn_k, self.attn_v):
             nn.init.normal_(m.weight, std=0.01)
             nn.init.zeros_(m.bias)
+        with torch.no_grad():
+            self.super_edge_gate.weight.fill_(1.0)
+            self.super_edge_gate.bias.zero_()
 
         self._scale_attn = d_model ** -0.5
 
-    def forward(self, h_row, h_col, pos_row, pos_col, mask, return_features=False, global_features=None):
+    def forward(self, h_row, h_col, pos_row, pos_col, mask, super_edge_strength=None, return_features=False, global_features=None):
         B = h_row.shape[0]
         side = h_row.shape[1]
         g = side // self.n_super
 
-        down_row = h_row.view(B, self.n_super, g, -1).mean(dim=2)
-        down_col = h_col.view(B, self.n_super, g, -1).mean(dim=2)
+        # Max-pool within each super-group.
+        down_row = h_row.view(B, self.n_super, g, -1).amax(dim=2)
+        down_col = h_col.view(B, self.n_super, g, -1).amax(dim=2)
 
-        down_pos_row = pos_row.view(B, self.n_super, g, -1).mean(dim=2)
-        down_pos_col = pos_col.view(B, self.n_super, g, -1).mean(dim=2)
+        down_pos_row = pos_row.view(B, self.n_super, g, -1).amax(dim=2)
+        down_pos_col = pos_col.view(B, self.n_super, g, -1).amax(dim=2)
         delta_x = down_pos_col - down_pos_row
         dist = torch.norm(delta_x, dim=-1, keepdim=True).clamp(min=1e-8)
 
@@ -756,8 +817,8 @@ class LevelSpecificOffDiagBlock(nn.Module):
         down_row_cond = torch.cat([down_row, context_U], dim=-1)
         down_col_cond = torch.cat([down_col, context_V], dim=-1)
 
-        block_avg_row = torch.cat([down_row.mean(dim=1, keepdim=True), context_U.mean(dim=1, keepdim=True)], dim=-1)
-        block_avg_col = torch.cat([down_col.mean(dim=1, keepdim=True), context_V.mean(dim=1, keepdim=True)], dim=-1)
+        block_avg_row = torch.cat([down_row.amax(dim=1, keepdim=True), context_U.amax(dim=1, keepdim=True)], dim=-1)
+        block_avg_col = torch.cat([down_col.amax(dim=1, keepdim=True), context_V.amax(dim=1, keepdim=True)], dim=-1)
 
         row_tokens = torch.cat([down_row_cond, block_avg_row], dim=1)
         col_tokens = torch.cat([down_col_cond, block_avg_col], dim=1)
@@ -769,6 +830,13 @@ class LevelSpecificOffDiagBlock(nn.Module):
         scores = (Q @ K.transpose(-2, -1)) * self._scale_attn
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
+        if super_edge_strength is not None:
+            edge_strength = super_edge_strength
+            if edge_strength.dim() == 2:
+                edge_strength = edge_strength.unsqueeze(0)
+            edge_bias = self.super_edge_gate(edge_strength.to(dtype=scores.dtype).unsqueeze(-1)).squeeze(-1)
+            edge_bias_33 = F.pad(edge_bias, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=0.0)
+            scores = scores + edge_bias_33
         mask_33 = F.pad(mask, (0, self.NUM_GLOBAL_TOKENS, 0, self.NUM_GLOBAL_TOKENS), value=True)
         scores = scores.masked_fill(~mask_33, float('-inf'))
         attn_probs = F.softmax(scores, dim=-1)
@@ -776,12 +844,12 @@ class LevelSpecificOffDiagBlock(nn.Module):
         row_out = row_out_full[:, : self.n_super].reshape(B, self.n_super, -1)
         global_ctx = row_out_full[:, self.n_super :, :].mean(dim=1)
 
+        # Piecewise-constant broadcast from super tokens back to node resolution.
         row_out_expanded = row_out.repeat_interleave(g, dim=1)
         down_col_expanded = down_col.repeat_interleave(g, dim=1)
-        global_ctx_expanded = global_ctx.unsqueeze(1).expand(-1, side, -1)
-
         context_U_expanded = context_U.repeat_interleave(g, dim=1)
         context_V_expanded = context_V.repeat_interleave(g, dim=1)
+        global_ctx_expanded = global_ctx.unsqueeze(1).expand(-1, side, -1)
 
         h_row_3 = h_row.reshape(B, -1, h_row.shape[-1])
         row_exp_3 = row_out_expanded.reshape(B, -1, row_out_expanded.shape[-1])
@@ -835,23 +903,39 @@ class LeafOnlyNet(nn.Module):
     def leaf_head(self):
         return self.core.leaf_head
 
-    def _off_diag(self, h, x, edge_index, current_struct, precomputed_masks=None, global_features=None):
+    def _off_diag(self, h, x, edge_index, edge_values, current_struct, precomputed_masks=None, global_features=None):
         B, N, C = h.shape
         # 1. Fetch or compute masks
         if precomputed_masks is not None:
-            mask_list = precomputed_masks
+            if len(precomputed_masks) > 0 and isinstance(precomputed_masks[0], tuple):
+                mask_list = [m for (m, _) in precomputed_masks]
+                edge_strength_list = [w for (_, w) in precomputed_masks]
+            else:
+                mask_list = precomputed_masks
+                cache_id = (id(edge_index), id(edge_values))
+                if getattr(self, "_off_diag_super_cache_id", None) != cache_id:
+                    self._off_diag_super_cache = [
+                        build_off_diag_super_connectivity_features(
+                            edge_index, edge_values, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
+                            h.device, h.dtype, self.leaf_size
+                        )
+                        for spec in current_struct
+                    ]
+                    self._off_diag_super_cache_id = cache_id
+                edge_strength_list = [w for (_, w) in self._off_diag_super_cache]
         else:
-            cache_id = id(edge_index)
-            if getattr(self, "_off_diag_mask_cache_id", None) != cache_id:
-                self._off_diag_mask_cache = [
-                    build_off_diag_super_connectivity(
-                        edge_index, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
-                        h.device, self.leaf_size
+            cache_id = (id(edge_index), id(edge_values))
+            if getattr(self, "_off_diag_super_cache_id", None) != cache_id:
+                self._off_diag_super_cache = [
+                    build_off_diag_super_connectivity_features(
+                        edge_index, edge_values, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
+                        h.device, h.dtype, self.leaf_size
                     )
                     for spec in current_struct
                 ]
-                self._off_diag_mask_cache_id = cache_id
-            mask_list = self._off_diag_mask_cache
+                self._off_diag_super_cache_id = cache_id
+            mask_list = [m for (m, _) in self._off_diag_super_cache]
+            edge_strength_list = [w for (_, w) in self._off_diag_super_cache]
 
         result = [None] * len(current_struct)
 
@@ -878,6 +962,7 @@ class LeafOnlyNet(nn.Module):
             h_rows, h_cols = [], []
             pos_rows, pos_cols = [], []
             masks = []
+            edge_strengths = []
 
             for idx, spec in blocks:
                 rs, re = spec["row_start"], spec["row_end"]
@@ -887,16 +972,24 @@ class LeafOnlyNet(nn.Module):
                 pos_rows.append(x[:, rs:re, :3])
                 pos_cols.append(x[:, cs:ce, :3])
                 masks.append(mask_list[idx])
+                edge_strengths.append(edge_strength_list[idx])
 
             h_row_batched = torch.cat(h_rows, dim=0)
             h_col_batched = torch.cat(h_cols, dim=0)
             pos_row_batched = torch.cat(pos_rows, dim=0)
             pos_col_batched = torch.cat(pos_cols, dim=0)
 
-            stacked_masks = torch.stack(masks, dim=0)
-            batched_masks = stacked_masks.repeat_interleave(B, dim=0)
-
             K = len(blocks)
+            stacked_masks = torch.stack(masks, dim=0)
+            stacked_edge_strengths = torch.stack(edge_strengths, dim=0)
+            if stacked_masks.dim() == 4:
+                # Per-sample masks provided as (K_blocks, B, 32, 32) -> (B*K_blocks, 32, 32)
+                batched_masks = stacked_masks.permute(1, 0, 2, 3).reshape(B * K, self.level_off_diag[module_idx].n_super, self.level_off_diag[module_idx].n_super)
+                batched_edge_strengths = stacked_edge_strengths.permute(1, 0, 2, 3).reshape(B * K, self.level_off_diag[module_idx].n_super, self.level_off_diag[module_idx].n_super)
+            else:
+                batched_masks = stacked_masks.repeat_interleave(B, dim=0)
+                batched_edge_strengths = stacked_edge_strengths.repeat_interleave(B, dim=0)
+
             gf_batched = None
             if global_features is not None:
                 gf = global_features.unsqueeze(0).expand(B, -1) if global_features.dim() == 1 else global_features
@@ -904,7 +997,7 @@ class LeafOnlyNet(nn.Module):
 
             U_batched, V_batched = self.level_off_diag[module_idx](
                 h_row_batched, h_col_batched, pos_row_batched, pos_col_batched,
-                batched_masks, global_features=gf_batched,
+                batched_masks, super_edge_strength=batched_edge_strengths, global_features=gf_batched,
             )
 
             U_splits = torch.split(U_batched, B, dim=0)
@@ -926,7 +1019,7 @@ class LeafOnlyNet(nn.Module):
         diag_blocks = self.core.get_leaf_blocks(h, x)
 
         if current_struct:
-            off_diag_list = self._off_diag(h, x, edge_index, current_struct, precomputed_masks=precomputed_masks, global_features=global_features)
+            off_diag_list = self._off_diag(h, x, edge_index, edge_values, current_struct, precomputed_masks=precomputed_masks, global_features=global_features)
             return (diag_blocks, off_diag_list)
         return (diag_blocks, [])
 
@@ -950,67 +1043,80 @@ def _apply_scale_equivariance(out, scale_A):
     return out if abs(alpha - 1.0) <= 1e-9 else (out / alpha)
 
 
+class HODLROperator:
+    """Cached setup/apply operator for LeafOnly HODLR preconditioner."""
+    def __init__(self, diag_blocks, off_diag_list, off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0):
+        self.diag_blocks = diag_blocks
+        self.off_diag_list = off_diag_list
+        self.off_diag_struct = off_diag_struct
+        self.leaf_size = leaf_size
+        self.scale_A = scale_A
+        self.level_cache = {}
+        if not off_diag_list or not off_diag_struct:
+            return
+        level_to_blocks = {}
+        for idx, spec in enumerate(off_diag_struct):
+            level_to_blocks.setdefault(spec["level"], []).append((idx, spec))
+        for lvl, blocks in level_to_blocks.items():
+            side = blocks[0][1]["side"]
+            row_ranges = [(spec["row_start"], spec["row_end"]) for _, spec in blocks]
+            col_ranges = [(spec["col_start"], spec["col_end"]) for _, spec in blocks]
+            U_list = [off_diag_list[idx][0] for idx, _ in blocks]
+            V_list = [off_diag_list[idx][1] for idx, _ in blocks]
+            U_batched = torch.cat(U_list, dim=0)
+            V_batched = torch.cat(V_list, dim=0)
+            self.level_cache[lvl] = {
+                "blocks": blocks,
+                "side": side,
+                "U_batched": U_batched,
+                "V_batched": V_batched,
+                "row_ranges": row_ranges,
+                "col_ranges": col_ranges,
+            }
+
+    def apply(self, x, levels_to_include=None):
+        B, N, K_dim = x.shape
+        num_leaves = N // self.leaf_size
+        x_blk = x.view(B, num_leaves, self.leaf_size, K_dim)
+        out = torch.einsum('blij,bljk->blik', self.diag_blocks, x_blk).reshape(B, N, K_dim)
+        for lvl, cache in self.level_cache.items():
+            if levels_to_include is not None and lvl not in levels_to_include:
+                continue
+            blocks = cache["blocks"]
+            K_blocks = len(blocks)
+            U_batched = cache["U_batched"]
+            V_batched = cache["V_batched"]
+            row_ranges = cache["row_ranges"]
+            col_ranges = cache["col_ranges"]
+            x_col_list = [x[:, cs:ce] for (cs, ce) in col_ranges]
+            x_row_list = [x[:, rs:re] for (rs, re) in row_ranges]
+            x_col_batched = torch.cat(x_col_list, dim=0)
+            x_row_batched = torch.cat(x_row_list, dim=0)
+            VT_x_col = torch.bmm(V_batched.transpose(1, 2), x_col_batched)
+            Z_row = torch.bmm(U_batched, VT_x_col)
+            UT_x_row = torch.bmm(U_batched.transpose(1, 2), x_row_batched)
+            Z_col = torch.bmm(V_batched, UT_x_row)
+            Z_row_splits = torch.split(Z_row, B, dim=0)
+            Z_col_splits = torch.split(Z_col, B, dim=0)
+            for i in range(K_blocks):
+                rs, re = row_ranges[i]
+                cs, ce = col_ranges[i]
+                out[:, rs:re] = out[:, rs:re] + Z_row_splits[i]
+                out[:, cs:ce] = out[:, cs:ce] + Z_col_splits[i]
+        return _apply_scale_equivariance(out, self.scale_A)
+
+
+def build_hodlr_operator(diag_blocks, off_diag_list, off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0):
+    return HODLROperator(diag_blocks, off_diag_list, off_diag_struct, leaf_size=leaf_size, scale_A=scale_A)
+
+
 def apply_block_structured_M_with_levels(diag_blocks, off_diag_list, x, off_diag_struct, leaf_size=LEAF_SIZE, levels_to_include=None, scale_A=1.0):
     """Apply M(A) = (1/α) M~(Â): diagonal + off-diag from network (M~), then scale by 1/scale_A for scale equivariance."""
-    B, N, K_dim = x.shape
-    num_leaves = N // leaf_size
-    x_blk = x.view(B, num_leaves, leaf_size, K_dim)
-    out = torch.einsum('blij,bljk->blik', diag_blocks, x_blk).reshape(B, N, K_dim)
+    if isinstance(diag_blocks, HODLROperator):
+        return diag_blocks.apply(x, levels_to_include=levels_to_include)
 
-    # Group off_diag_struct by level (mirror _off_diag structure)
-    level_to_blocks = {}
-    for idx, spec in enumerate(off_diag_struct):
-        if levels_to_include is not None and spec["level"] not in levels_to_include:
-            continue
-        lvl = spec["level"]
-        if lvl not in level_to_blocks:
-            level_to_blocks[lvl] = []
-        level_to_blocks[lvl].append((idx, spec))
-
-    for lvl, blocks in level_to_blocks.items():
-        K_blocks = len(blocks)
-        side = blocks[0][1]["side"]
-        rank = blocks[0][1]["rank"]
-        device = x.device
-
-        # Stack U, V into (B*K_blocks, side, rank) — same order as _off_diag: block 0 all batches, then block 1, ...
-        U_list = [off_diag_list[idx][0] for idx, _ in blocks]   # each (B, side, rank)
-        V_list = [off_diag_list[idx][1] for idx, _ in blocks]
-        U_batched = torch.cat(U_list, dim=0)   # (K_blocks*B, side, rank)
-        V_batched = torch.cat(V_list, dim=0)
-
-        # Batched x_col and x_row: (K_blocks*B, side, K_dim)
-        x_col_list = [x[:, spec["col_start"]:spec["col_end"]] for _, spec in blocks]
-        x_row_list = [x[:, spec["row_start"]:spec["row_end"]] for _, spec in blocks]
-        x_col_batched = torch.cat(x_col_list, dim=0)
-        x_row_batched = torch.cat(x_row_list, dim=0)
-
-        # Batched matmuls: Z_row = U @ (V^T @ x_col), Z_col = V @ (U^T @ x_row)
-        # V^T @ x_col: (B*K_blocks, side, rank)^T @ (B*K_blocks, side, K_dim) -> (B*K_blocks, rank, K_dim)
-        VT_x_col = torch.bmm(V_batched.transpose(1, 2), x_col_batched)
-        Z_row = torch.bmm(U_batched, VT_x_col)   # (B*K_blocks, side, K_dim)
-        # U^T @ x_row -> (B*K_blocks, rank, K_dim)
-        UT_x_row = torch.bmm(U_batched.transpose(1, 2), x_row_batched)
-        Z_col = torch.bmm(V_batched, UT_x_row)   # (B*K_blocks, side, K_dim)
-        # Linear indices for scatter_add: batched order is block0_b0..block0_b(B-1), block1_b0.. so bk % B = batch, bk // B = block_idx
-        row_starts = torch.tensor([spec["row_start"] for _, spec in blocks], device=device, dtype=torch.long)
-        col_starts = torch.tensor([spec["col_start"] for _, spec in blocks], device=device, dtype=torch.long)
-        bk = torch.arange(K_blocks * B, device=device)
-        batch_idx = bk % B
-        block_idx = bk // B
-        row_start_per_bk = row_starts[block_idx]
-        col_start_per_bk = col_starts[block_idx]
-        # (B*K_blocks, side) -> linear index into out.view(B*N, K_dim)
-        row_linear = batch_idx.unsqueeze(1) * N + row_start_per_bk.unsqueeze(1) + torch.arange(side, device=device).unsqueeze(0)
-        col_linear = batch_idx.unsqueeze(1) * N + col_start_per_bk.unsqueeze(1) + torch.arange(side, device=device).unsqueeze(0)
-        row_linear_exp = row_linear.reshape(-1, 1).expand(-1, K_dim)
-        col_linear_exp = col_linear.reshape(-1, 1).expand(-1, K_dim)
-        out_off_diag = torch.zeros_like(out.reshape(-1, K_dim))
-        out_off_diag.scatter_add_(0, row_linear_exp, Z_row.reshape(-1, K_dim))
-        out_off_diag.scatter_add_(0, col_linear_exp, Z_col.reshape(-1, K_dim))
-        out = out + out_off_diag.reshape(B, N, K_dim)
-
-    return _apply_scale_equivariance(out, scale_A)
+    op = HODLROperator(diag_blocks, off_diag_list, off_diag_struct, leaf_size=leaf_size, scale_A=scale_A)
+    return op.apply(x, levels_to_include=levels_to_include)
 
 
 def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None, scale_A=1.0):
@@ -1028,6 +1134,7 @@ def apply_leaf_only(leaf_blocks, x, off_diag_list=None, off_diag_struct=None, sc
 
 LEAF_ONLY_HEADER_BYTES = 32  # 8 x int32: d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, reserved
 OFF_DIAG_SENTINEL_LEVELSPEC = 0xFFFFFFEB
+OFF_DIAG_SENTINEL_LEVELSPEC_V2 = 0xFFFFFFEA
 OFF_DIAG_SENTINELS_LEGACY = (0xFFFFFFFC, 0xFFFFFFFD, 0xFFFFFFFE, 0xFFFFFFFF)
 
 def read_leaf_only_header(path):
@@ -1090,7 +1197,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_packed_tensor(f, model.core.jacobi_gate.weight.detach().cpu().float(), transpose=True)
             _write_packed_tensor(f, model.core.jacobi_gate.bias.detach().cpu().float(), transpose=False)
         if getattr(model, 'level_off_diag', None) is not None and len(model.level_off_diag) > 0:
-            f.write(struct.pack('<II', OFF_DIAG_SENTINEL_LEVELSPEC, int(len(model.level_off_diag))))
+            f.write(struct.pack('<II', OFF_DIAG_SENTINEL_LEVELSPEC_V2, int(len(model.level_off_diag))))
             for blk in model.level_off_diag:
                 _write_packed_tensor(f, blk.attn_q.weight.detach().cpu().float(), transpose=True)
                 _write_packed_tensor(f, blk.attn_q.bias.detach().cpu().float(), transpose=False)
@@ -1098,6 +1205,8 @@ def save_leaf_only_weights(model, path, input_dim=9):
                 _write_packed_tensor(f, blk.attn_k.bias.detach().cpu().float(), transpose=False)
                 _write_packed_tensor(f, blk.attn_v.weight.detach().cpu().float(), transpose=True)
                 _write_packed_tensor(f, blk.attn_v.bias.detach().cpu().float(), transpose=False)
+                _write_packed_tensor(f, blk.super_edge_gate.weight.detach().cpu().float(), transpose=True)
+                _write_packed_tensor(f, blk.super_edge_gate.bias.detach().cpu().float(), transpose=False)
                 _write_packed_tensor(f, blk.feature_ln.weight.detach().cpu().float(), transpose=False)
                 _write_packed_tensor(f, blk.feature_ln.bias.detach().cpu().float(), transpose=False)
                 _write_packed_tensor(f, blk.proj_U.weight.detach().cpu().float(), transpose=True)
@@ -1204,7 +1313,8 @@ def load_leaf_only_weights(model, path):
         extra = f.read(8)
         if len(extra) == 8:
             sentinel, n_blocks_file = struct.unpack('<II', extra)
-            if sentinel == OFF_DIAG_SENTINEL_LEVELSPEC and getattr(model, 'level_off_diag', None) is not None and len(model.level_off_diag) > 0:
+            if sentinel in (OFF_DIAG_SENTINEL_LEVELSPEC, OFF_DIAG_SENTINEL_LEVELSPEC_V2) and getattr(model, 'level_off_diag', None) is not None and len(model.level_off_diag) > 0:
+                has_super_edge_gate = (sentinel == OFF_DIAG_SENTINEL_LEVELSPEC_V2)
                 n_to_load = min(int(n_blocks_file), len(model.level_off_diag))
                 for i in range(int(n_blocks_file)):
                     blk = model.level_off_diag[min(i, len(model.level_off_diag) - 1)]
@@ -1215,6 +1325,9 @@ def load_leaf_only_weights(model, path):
                         _read_into(f, blk.attn_k.bias, read_tensor, transpose=False)
                         _read_into(f, blk.attn_v.weight, read_tensor, transpose=True)
                         _read_into(f, blk.attn_v.bias, read_tensor, transpose=False)
+                        if has_super_edge_gate:
+                            _read_into(f, blk.super_edge_gate.weight, read_tensor, transpose=True)
+                            _read_into(f, blk.super_edge_gate.bias, read_tensor, transpose=False)
                         _read_into(f, blk.feature_ln.weight, read_tensor, transpose=False)
                         _read_into(f, blk.feature_ln.bias, read_tensor, transpose=False)
                         _read_into(f, blk.proj_U.weight, read_tensor, transpose=True)
@@ -1228,6 +1341,9 @@ def load_leaf_only_weights(model, path):
                         skip_tensor(f, blk.attn_k.bias.shape, transpose=False)
                         skip_tensor(f, blk.attn_v.weight.shape, transpose=True)
                         skip_tensor(f, blk.attn_v.bias.shape, transpose=False)
+                        if has_super_edge_gate:
+                            skip_tensor(f, blk.super_edge_gate.weight.shape, transpose=True)
+                            skip_tensor(f, blk.super_edge_gate.bias.shape, transpose=False)
                         skip_tensor(f, blk.feature_ln.weight.shape, transpose=False)
                         skip_tensor(f, blk.feature_ln.bias.shape, transpose=False)
                         skip_tensor(f, blk.proj_U.weight.shape, transpose=True)
@@ -1245,6 +1361,7 @@ def _read_into(f, param, read_fn, transpose=False):
         param.copy_(t)
 
 RAM_MASK_CACHE = {}
+RAM_OFFDIAG_SUPER_CACHE = {}
 
 def get_or_compute_masks(frame_path_str, edge_index, off_diag_struct, device, leaf_size=LEAF_SIZE):
     if not off_diag_struct:
@@ -1272,6 +1389,26 @@ def get_or_compute_masks(frame_path_str, edge_index, off_diag_struct, device, le
     masks_np.tofile(bin_path)
     RAM_MASK_CACHE[cache_key] = masks
     return masks
+
+
+def get_or_compute_offdiag_super_data(frame_path_str, edge_index, edge_values, off_diag_struct, device, dtype, leaf_size=LEAF_SIZE):
+    """Return per-offdiag-block [(mask_32x32_bool, strength_32x32_float)] cached in RAM."""
+    if not off_diag_struct:
+        return []
+    frame_path = Path(frame_path_str)
+    num_blocks = len(off_diag_struct)
+    cache_key = f"{frame_path.name}_b{num_blocks}_{str(dtype)}_{device.type}"
+    if cache_key in RAM_OFFDIAG_SUPER_CACHE:
+        return RAM_OFFDIAG_SUPER_CACHE[cache_key]
+    data = [
+        build_off_diag_super_connectivity_features(
+            edge_index, edge_values, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
+            device, dtype, leaf_size
+        )
+        for spec in off_diag_struct
+    ]
+    RAM_OFFDIAG_SUPER_CACHE[cache_key] = data
+    return data
 
 
 def train_leaf_only():
@@ -1397,8 +1534,8 @@ def train_leaf_only():
             A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
 
             dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
-            precomputed_masks = get_or_compute_masks(
-                batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE
+            precomputed_masks = get_or_compute_offdiag_super_data(
+                batch['frame_path'], edge_index, edge_values, dummy_struct, device, x_input.dtype, LEAF_SIZE
             )
             # Use n_pad positions so num_blocks = n_pad//leaf_size matches forward (x.shape[1] == n_pad)
             positions_ctx = x_input[0, :n_pad, :3]
@@ -1423,7 +1560,9 @@ def train_leaf_only():
 
     if len(training_contexts) == 0:
         raise SystemExit("No valid (frame, size) pairs: ensure frames have at least MIN_MIXED_SIZE nodes.")
+    global_max_edges = max(ctx['edge_index'].shape[1] for ctx in training_contexts)
     print(f"  [startup] Cached {len(training_contexts)} training contexts")
+    print(f"  [startup] global_max_edges = {global_max_edges}")
     contexts_per_step = max(1, int(args.contexts_per_step))
     print(f"  [startup] contexts_per_step = {contexts_per_step} (gradient accumulation)")
 
@@ -1441,9 +1580,11 @@ def train_leaf_only():
         # dynamic=True causes dynamo to use symbolic dims (s0//32 vs s7) that don't unify in attention
         # (scores + bias_physics), leading to shape errors. Use dynamic=False so we trace with concrete
         # shapes; each distinct (n_pad, edge_index size, etc.) recompiles once.
-        # Allow more cached compilations so multi-frame / mixed-size training doesn't hit the default limit (8).
+        # Keep compiling across many graph/context variants on large GPUs.
         if hasattr(torch._dynamo.config, 'cache_size_limit'):
-            torch._dynamo.config.cache_size_limit = 128
+            torch._dynamo.config.cache_size_limit = 4096
+        if hasattr(torch._dynamo.config, 'accumulated_cache_size_limit'):
+            torch._dynamo.config.accumulated_cache_size_limit = 65536
         # NOTE: First step(s) per unique size will be slow while compiling, then it will fly.
         model = torch.compile(model, dynamic=False)
 
@@ -1494,90 +1635,163 @@ def train_leaf_only():
             t_backward = 0.0
             n_orig_t, n_pad_t = None, None
 
-        for micro in range(contexts_per_step):
-            # Randomly select a cached graph size for this micro-batch
-            ctx = random.choice(training_contexts)
-            x_input = ctx['x_input']
-            edge_index = ctx['edge_index']
-            edge_values = ctx['edge_values']
-            scale_A = ctx['scale_A']
-            A_dense = ctx['A_dense']
-            pre_masks = ctx['precomputed_masks']
-            pre_leaf = ctx['precomputed_leaf_connectivity']
-            n_pad = ctx['n_pad']
-            n_orig = ctx['n_orig']
-            batch_vectors = ctx['batch_vectors']
-            if do_timing and micro == 0:
-                n_orig_t, n_pad_t = n_orig, n_pad
+        # True batching over contexts_per_step contexts.
+        batch_ctx = [random.choice(training_contexts) for _ in range(contexts_per_step)]
+        B_step = len(batch_ctx)
+        max_n_pad_step = max(ctx['n_pad'] for ctx in batch_ctx)
+        n_orig_t = batch_ctx[0]['n_orig']
+        n_pad_t = max_n_pad_step
+        struct_max = build_hodlr_off_diag_structure(max_n_pad_step, LEAF_SIZE, RANK_BASE_LEVEL1)
+        x_list, A_list, gf_list = [], [], []
+        edge_idx_parts, edge_val_parts = [], []
+        leaf_masks_list, leaf_feats_list = [], []
+        super_data_per_sample = []
+        n_orig_list = []
 
-            if do_timing:
-                _sync()
-                t0 = time.perf_counter()
-            diag_blocks, off_diag_list = model(
-                x_input, edge_index=edge_index, edge_values=edge_values,
-                scale_A=scale_A, precomputed_masks=pre_masks, precomputed_leaf_connectivity=pre_leaf,
-                global_features=ctx.get('global_features'),
+        for b_idx, ctx in enumerate(batch_ctx):
+            x_ctx = ctx['x_input']
+            n_pad_ctx = ctx['n_pad']
+            n_orig_ctx = ctx['n_orig']
+            n_orig_list.append(n_orig_ctx)
+            edge_index_ctx = ctx['edge_index']
+            edge_values_ctx = ctx['edge_values']
+
+            # Pad x and dense A to common N for batching.
+            if n_pad_ctx < max_n_pad_step:
+                pad_nodes = max_n_pad_step - n_pad_ctx
+                x_ctx = F.pad(x_ctx, (0, 0, 0, pad_nodes), value=0.0)
+                A_ctx = torch.zeros(max_n_pad_step, max_n_pad_step, device=device, dtype=ctx['A_dense'].dtype)
+                A_ctx[:n_pad_ctx, :n_pad_ctx] = ctx['A_dense']
+                A_ctx[n_pad_ctx:, n_pad_ctx:] = torch.eye(pad_nodes, device=device, dtype=ctx['A_dense'].dtype)
+            else:
+                A_ctx = ctx['A_dense']
+            x_list.append(x_ctx)
+            A_list.append(A_ctx)
+
+            # Batched sparse graph via block-diagonal offsets.
+            E_ctx = edge_index_ctx.shape[1]
+            pad_e = global_max_edges - E_ctx
+            if pad_e > 0:
+                edge_index_ctx = F.pad(edge_index_ctx, (0, pad_e), value=0)
+                edge_values_ctx = F.pad(edge_values_ctx, (0, pad_e), value=0.0)
+            offset = b_idx * max_n_pad_step
+            edge_idx_parts.append(edge_index_ctx + offset)
+            edge_val_parts.append(edge_values_ctx)
+
+            # Per-sample leaf connectivity at the batched size.
+            leaf_mask_b, leaf_feats_b = build_leaf_block_connectivity(
+                edge_index_ctx, edge_values_ctx, x_ctx[0, :max_n_pad_step, :3], LEAF_SIZE, device, x_ctx.dtype, num_hops=ATTENTION_HOPS
             )
-            if do_timing:
-                _sync()
-                t_forward += time.perf_counter() - t0
+            leaf_masks_list.append(leaf_mask_b)
+            leaf_feats_list.append(leaf_feats_b)
 
-            if do_timing:
-                _sync()
-                t0 = time.perf_counter()
-            # SAI loss: E_z || M A z - z ||^2
-            Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
-            Z[:, n_orig:, :] = 0.0
-            if do_timing:
-                _sync()
-                t_sample_z += time.perf_counter() - t0
+            # Per-sample off-diag super data at the batched size.
+            if n_pad_ctx == max_n_pad_step:
+                super_data = ctx['precomputed_masks']
+            else:
+                super_data = [
+                    build_off_diag_super_connectivity_features(
+                        edge_index_ctx, edge_values_ctx, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
+                        device, x_ctx.dtype, LEAF_SIZE
+                    )
+                    for spec in struct_max
+                ]
+            super_data_per_sample.append(super_data)
 
-            if do_timing:
-                _sync()
-                t0 = time.perf_counter()
-            AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-            if do_timing:
-                _sync()
-                t_az += time.perf_counter() - t0
+            gf = ctx.get('global_features')
+            if gf is None:
+                gf = torch.zeros(GLOBAL_FEATURES_DIM, device=device, dtype=x_ctx.dtype)
+            gf_list.append(gf if gf.dim() == 1 else gf.squeeze(0))
 
-            if do_timing:
-                _sync()
-                t0 = time.perf_counter()
-            # Training: no 1/γ so loss is M̃ Â z ≈ z (M̃ ≈ Â^{-1}); apply 1/γ only at inference
-            MAZ = apply_block_structured_M(
-                diag_blocks, off_diag_list, AZ, model.off_diag_struct,
-                leaf_size=LEAF_SIZE, scale_A=1.0,
-            )
-            if do_log:
-                MAZ_diag_only = apply_block_structured_M(diag_blocks, [], AZ, [], leaf_size=LEAF_SIZE, scale_A=1.0)
-                _norm_diag = MAZ_diag_only.norm().item()
-                _norm_off = (MAZ - MAZ_diag_only).norm().item()
-                ratio_off_sum += _norm_off / (_norm_diag + 1e-12)
-                ratio_off_count += 1
-            if do_timing:
-                _sync()
-                t_apply_m += time.perf_counter() - t0
+        x_batched = torch.cat(x_list, dim=0)  # (B_step, N, C)
+        A_batched = torch.stack(A_list, dim=0)  # (B_step, N, N)
+        edge_index_batched = torch.cat(edge_idx_parts, dim=1)
+        edge_values_batched = torch.cat(edge_val_parts, dim=0)
+        global_features_batched = torch.stack(gf_list, dim=0)
 
-            if do_timing:
-                _sync()
-                t0 = time.perf_counter()
-            residual = MAZ - Z
-            raw_loss = (residual ** 2).mean()
-            step_loss_sum += raw_loss.item()
-            loss = raw_loss / contexts_per_step
-            if do_timing:
-                _sync()
-                t_loss += time.perf_counter() - t0
+        # Batched leaf connectivity tensors: (B_step, num_blocks, leaf, leaf+1[,+feat])
+        pre_leaf_batched = (torch.stack(leaf_masks_list, dim=0), torch.stack(leaf_feats_list, dim=0))
 
-            if do_timing:
-                _sync()
-                t0 = time.perf_counter()
-            loss.backward()
-            if do_timing:
-                _sync()
-                t_backward += time.perf_counter() - t0
+        # Batched off-diag super data: list over blocks, each tuple has (B_step, 32, 32).
+        pre_masks_batched = []
+        for k in range(len(struct_max)):
+            m_k = torch.stack([super_data_per_sample[b][k][0] for b in range(B_step)], dim=0)
+            w_k = torch.stack([super_data_per_sample[b][k][1] for b in range(B_step)], dim=0)
+            pre_masks_batched.append((m_k, w_k))
 
-        step_loss = step_loss_sum / contexts_per_step
+        batch_vectors = max(1024, int(round(max_n_pad_step ** 0.5)))
+
+        if do_timing:
+            _sync()
+            t0 = time.perf_counter()
+        diag_blocks, off_diag_list = model(
+            x_batched, edge_index=edge_index_batched, edge_values=edge_values_batched,
+            scale_A=None, precomputed_masks=pre_masks_batched, precomputed_leaf_connectivity=pre_leaf_batched,
+            global_features=global_features_batched,
+        )
+        if do_timing:
+            _sync()
+            t_forward += time.perf_counter() - t0
+
+        if do_timing:
+            _sync()
+            t0 = time.perf_counter()
+        # SAI loss: E_z || M A z - z ||^2
+        Z = torch.randn(B_step, max_n_pad_step, batch_vectors, device=device, dtype=x_batched.dtype)
+        for b_idx, n_orig_ctx in enumerate(n_orig_list):
+            if n_orig_ctx < max_n_pad_step:
+                Z[b_idx, n_orig_ctx:, :] = 0.0
+        if do_timing:
+            _sync()
+            t_sample_z += time.perf_counter() - t0
+
+        if do_timing:
+            _sync()
+            t0 = time.perf_counter()
+        AZ = torch.bmm(A_batched, Z)
+        if do_timing:
+            _sync()
+            t_az += time.perf_counter() - t0
+
+        if do_timing:
+            _sync()
+            t0 = time.perf_counter()
+        # Training: no 1/γ so loss is M̃ Â z ≈ z (M̃ ≈ Â^{-1}); apply 1/γ only at inference
+        hodlr_op = build_hodlr_operator(
+            diag_blocks, off_diag_list, model.off_diag_struct,
+            leaf_size=LEAF_SIZE, scale_A=1.0,
+        )
+        MAZ = hodlr_op.apply(AZ)
+        if do_log:
+            MAZ_diag_only = hodlr_op.apply(AZ, levels_to_include=set())
+            _norm_diag = MAZ_diag_only.norm().item()
+            _norm_off = (MAZ - MAZ_diag_only).norm().item()
+            ratio_off_sum += _norm_off / (_norm_diag + 1e-12)
+            ratio_off_count += 1
+        if do_timing:
+            _sync()
+            t_apply_m += time.perf_counter() - t0
+
+        if do_timing:
+            _sync()
+            t0 = time.perf_counter()
+        residual = MAZ - Z
+        raw_loss = (residual ** 2).mean()
+        step_loss_sum += raw_loss.item()
+        loss = raw_loss
+        if do_timing:
+            _sync()
+            t_loss += time.perf_counter() - t0
+
+        if do_timing:
+            _sync()
+            t0 = time.perf_counter()
+        loss.backward()
+        if do_timing:
+            _sync()
+            t_backward += time.perf_counter() - t0
+
+        step_loss = step_loss_sum
         loss_history.append(step_loss)
         _ratio_off = (ratio_off_sum / ratio_off_count) if ratio_off_count > 0 else 0.0
 
@@ -1767,7 +1981,9 @@ def evaluate_gradient_interference(args):
             A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
 
             dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
-            pre_masks = get_or_compute_masks(batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE)
+            pre_masks = get_or_compute_offdiag_super_data(
+                batch['frame_path'], edge_index, edge_values, dummy_struct, device, x_input.dtype, LEAF_SIZE
+            )
             pre_leaf = build_leaf_block_connectivity(
                 edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
             )
@@ -1783,15 +1999,16 @@ def evaluate_gradient_interference(args):
                 global_features=global_feat,
             )
 
-            batch_vectors = max(128, int(round(n_pad ** 0.5)))
+            batch_vectors = max(1024, int(round(n_pad ** 0.5)))
             Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
             Z[:, n_orig:, :] = 0.0
             AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
             # Training: no 1/γ so loss is M̃ Â z ≈ z; apply 1/γ only at inference
-            MAZ = apply_block_structured_M(
-                diag_blocks, off_diag_list, AZ, model.off_diag_struct,
+            hodlr_op = build_hodlr_operator(
+                diag_blocks, off_diag_list, model.off_diag_struct,
                 leaf_size=LEAF_SIZE, scale_A=1.0,
             )
+            MAZ = hodlr_op.apply(AZ)
 
             raw_loss = ((MAZ - Z) ** 2).mean()
             step_loss_sum += raw_loss.item()
@@ -1879,7 +2096,9 @@ def evaluate_gradient_interference(args):
     A_dense[:n_orig, :n_orig] = A_small
     A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
     dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
-    pre_masks = get_or_compute_masks(batch['frame_path'], edge_index, dummy_struct, device, LEAF_SIZE)
+    pre_masks = get_or_compute_offdiag_super_data(
+        batch['frame_path'], edge_index, edge_values, dummy_struct, device, x_input.dtype, LEAF_SIZE
+    )
     pre_leaf = build_leaf_block_connectivity(
         edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype, num_hops=ATTENTION_HOPS
     )
@@ -2007,19 +2226,17 @@ def evaluate_gradient_interference(args):
         improvements = []
         cos_to_neg_diag_res = []
         wins = 0
+        hodlr_op = build_hodlr_operator(
+            diag_blocks, off_diag_list, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar,
+        )
         with torch.no_grad():
             for _ in range(num_probe):
                 Zp = torch.randn(1, n_pad, probe_vectors, device=device, dtype=x_input.dtype)
                 Zp[:, n_orig:, :] = 0.0
                 AZp = (A_dense @ Zp.squeeze(0)).unsqueeze(0)
 
-                M_diag = apply_block_structured_M_with_levels(
-                    diag_blocks, off_diag_list, AZp, struct_list, leaf_size=LEAF_SIZE,
-                    levels_to_include=set(), scale_A=scale_A_scalar,
-                )
-                M_full = apply_block_structured_M(
-                    diag_blocks, off_diag_list, AZp, struct_list, leaf_size=LEAF_SIZE, scale_A=scale_A_scalar,
-                )
+                M_diag = hodlr_op.apply(AZp, levels_to_include=set())
+                M_full = hodlr_op.apply(AZp)
 
                 r_diag = M_diag - Zp
                 r_full = M_full - Zp
@@ -2070,10 +2287,18 @@ def evaluate_gradient_interference(args):
                 h_col = h[:, cs:ce]
                 pos_row = x_input[:, rs:re, :3]
                 pos_col = x_input[:, cs:ce, :3]
-                mask = pre_masks[spec_idx].unsqueeze(0) if pre_masks[spec_idx].dim() == 2 else pre_masks[spec_idx]
+                pm = pre_masks[spec_idx]
+                if isinstance(pm, tuple):
+                    mask_raw, strength_raw = pm
+                else:
+                    mask_raw, strength_raw = pm, None
+                mask = mask_raw.unsqueeze(0) if mask_raw.dim() == 2 else mask_raw
+                edge_strength = None
+                if strength_raw is not None:
+                    edge_strength = strength_raw.unsqueeze(0) if strength_raw.dim() == 2 else strength_raw
                 blk = model.level_off_diag[spec["level"] - 1]
                 _, _, feat_U, feat_V = blk(
-                    h_row, h_col, pos_row, pos_col, mask, return_features=True, global_features=global_feat,
+                    h_row, h_col, pos_row, pos_col, mask, super_edge_strength=edge_strength, return_features=True, global_features=global_feat,
                 )
                 return feat_U, feat_V
 
