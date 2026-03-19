@@ -1,4 +1,3 @@
-import math
 from pathlib import Path
 
 import torch
@@ -6,14 +5,10 @@ import torch
 
 LEAF_SIZE = 32
 ATTENTION_HOPS = 1
-RANK_BASE_LEVEL1 = 16
-OFF_DIAG_SUPER = 32
 GLOBAL_FEATURES_DIM = 12
 
-# Trained graph size range
 MIN_MIXED_SIZE = 256
 MAX_MIXED_SIZE = 256
-DEFAULT_MAX_LEVELS = max(1, int(math.log2(max(2, MAX_MIXED_SIZE // LEAF_SIZE))))
 
 
 def require_cuda_or_mps_device():
@@ -34,6 +29,5 @@ def fixed_runtime_config(script_file):
         "use_global_node": True,
         "use_gcn": True,
         "print_timing": True,
-        "max_levels": DEFAULT_MAX_LEVELS,
         "max_grad_norm": 1.0,
     }

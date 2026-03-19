@@ -3,9 +3,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-from .config import ATTENTION_HOPS, LEAF_SIZE, OFF_DIAG_SUPER
+from .config import ATTENTION_HOPS, LEAF_SIZE
 
 
 NODE_DTYPE = np.dtype(
@@ -173,61 +172,6 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, leaf_size,
     return attn_mask, edge_feats
 
 
-def build_off_diag_super_connectivity_features(edge_index, edge_values, rs, re, cs, ce, device, dtype=torch.float32, leaf_size=LEAF_SIZE):
-    side = re - rs
-    assert side == (ce - cs) and side % leaf_size == 0, f"Block must be square and multiple of {leaf_size}"
-    n_super = OFF_DIAG_SUPER
-    group_size = side // n_super
-    row, col = edge_index[0], edge_index[1]
-    in_block = (row >= rs) & (row < re) & (col >= cs) & (col < ce)
-    r_super = ((row[in_block] - rs) // group_size).clamp(0, n_super - 1)
-    c_super = ((col[in_block] - cs) // group_size).clamp(0, n_super - 1)
-    mask = torch.zeros(n_super, n_super, device=device, dtype=torch.bool)
-    mask[r_super, c_super] = True
-    for i in range(n_super):
-        if not mask[i].any():
-            mask[i, 0] = True
-    strength = torch.zeros(n_super, n_super, device=device, dtype=dtype)
-    if edge_values is not None:
-        w = edge_values[in_block].to(device=device, dtype=dtype).abs()
-        if w.numel() > 0:
-            lin_idx = r_super * n_super + c_super
-            flat = torch.zeros(n_super * n_super, device=device, dtype=dtype)
-            flat.scatter_reduce_(0, lin_idx, w, reduce="amax", include_self=True)
-            strength = flat.view(n_super, n_super)
-            strength = torch.log1p(strength)
-    return mask, strength
-
-
-RAM_OFFDIAG_SUPER_CACHE = {}
-
-
-def get_or_compute_offdiag_super_data(frame_path_str, edge_index, edge_values, off_diag_struct, device, dtype, leaf_size=LEAF_SIZE):
-    if not off_diag_struct:
-        return []
-    frame_path = Path(frame_path_str)
-    num_blocks = len(off_diag_struct)
-    cache_key = f"{frame_path.name}_b{num_blocks}_{str(dtype)}_{device.type}"
-    if cache_key in RAM_OFFDIAG_SUPER_CACHE:
-        return RAM_OFFDIAG_SUPER_CACHE[cache_key]
-    data = [
-        build_off_diag_super_connectivity_features(
-            edge_index,
-            edge_values,
-            spec["row_start"],
-            spec["row_end"],
-            spec["col_start"],
-            spec["col_end"],
-            device,
-            dtype,
-            leaf_size,
-        )
-        for spec in off_diag_struct
-    ]
-    RAM_OFFDIAG_SUPER_CACHE[cache_key] = data
-    return data
-
-
 def most_recent_run_folder(base_path):
     base = Path(base_path)
     if not base.exists():
@@ -236,4 +180,3 @@ def most_recent_run_folder(base_path):
     if not runs:
         return base
     return runs[0]
-
