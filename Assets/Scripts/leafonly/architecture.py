@@ -116,12 +116,12 @@ class LeafBlockAttention(nn.Module):
         num_blocks = N_pad // self.block_size
         x_blk = x.view(B, num_blocks, self.block_size, C)
 
-        if attn_mask is None or edge_feats is None:
-            attn_mask, edge_feats = build_leaf_block_connectivity(
-                edge_index, edge_values, positions, self.block_size, device, dtype
-            )
         if attn_mask is None:
+            if edge_feats is not None:
+                raise ValueError("LeafBlockAttention: edge_feats set but attn_mask is None.")
             return x[:, :N, :] if node_pad > 0 else x
+        if edge_feats is None:
+            raise ValueError("LeafBlockAttention requires edge_feats when attn_mask is provided.")
 
         use_block_node = self.attention_layout in ("32x33", "32x34")
         use_matrix_node = self.attention_layout == "32x34"
@@ -323,7 +323,13 @@ class LeafOnlyNet(nn.Module):
                 attn_mask, edge_feats = precomputed_leaf_connectivity
             else:
                 attn_mask, edge_feats = build_leaf_block_connectivity(
-                    edge_index, edge_values, positions, self.leaf_size, device, dtype, num_hops=ATTENTION_HOPS
+                    edge_index,
+                    edge_values,
+                    positions,
+                    self.leaf_size,
+                    device,
+                    dtype,
+                    num_hops=ATTENTION_HOPS,
                 )
         for block in self.blocks:
             h = block(

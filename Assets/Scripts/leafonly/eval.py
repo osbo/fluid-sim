@@ -304,6 +304,34 @@ def evaluate_gradient_interference(args, runtime):
     inv_mask_profile = diag_A_profile.abs() > 1e-6
     jacobi_inv_diag_profile[0, inv_mask_profile] = 1.0 / diag_A_profile[inv_mask_profile]
 
+    was_training = model.training
+    model.eval()
+    try:
+        compiled_model = torch.compile(model)
+        ms_end_to_end = _timed_ms(
+            lambda: compiled_model(
+                x_input,
+                edge_index=edge_index,
+                edge_values=edge_values,
+                global_features=global_feat,
+                precomputed_leaf_connectivity=pre_leaf,
+            ),
+            device,
+            warmup=15,
+            repeat=10,
+        )
+    except Exception as e:
+        ms_end_to_end = None
+        print(f"\nEnd-to-end torch.compile timing skipped: {e}")
+    if was_training:
+        model.train()
+
+    if ms_end_to_end is not None:
+        print(
+            f"\nEnd-to-end forward (torch.compile, precomputed masks, n_pad={n_pad}): "
+            f"{ms_end_to_end:.2f} ms — same style as InspectModel 'Inference'"
+        )
+
     timing_rows = []
     ms_lift = _timed_ms(
         lambda: model.embed.lift(
@@ -383,3 +411,13 @@ def evaluate_gradient_interference(args, runtime):
         ["Component", "ms/call", "% of measured total"],
         timed_rows,
     )
+    if ms_end_to_end is not None:
+        print(
+            "\nNote: Rows above time each submodule alone in eager mode; their sum is not comparable to "
+            f"the {ms_end_to_end:.2f} ms end-to-end line (torch.compile fuses the full graph, like InspectModel)."
+        )
+    else:
+        print(
+            "\nNote: Rows above time each submodule alone in eager mode; their sum is not comparable to "
+            "a single fused torch.compile forward (see InspectModel 'Inference')."
+        )
