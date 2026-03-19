@@ -137,11 +137,9 @@ class FluidGraphDataset:
         }
 
 
-def build_leaf_block_connectivity(edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS):
-    N = positions.shape[0]
-    num_blocks = N // leaf_size
-    if num_blocks == 0:
-        return None, None
+def _reachable_blocks_from_edges(
+    edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype, num_hops
+):
     rows, cols = edge_index[0], edge_index[1]
     block_r = rows // leaf_size
     block_c = cols // leaf_size
@@ -162,14 +160,33 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, leaf_size,
     for _ in range(num_hops):
         reachable = (reachable + cur).clamp(0.0, 1.0)
         cur = torch.bmm(cur, adj)
-    attn_mask = torch.zeros(num_blocks, leaf_size, leaf_size + 1, device=device, dtype=dtype)
-    attn_mask[:, :, :leaf_size] = reachable
-    attn_mask[:, :, leaf_size] = 1.0
-    edge_feats = torch.zeros(num_blocks, leaf_size, leaf_size + 1, 4, device=device, dtype=dtype)
-    edge_feats[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device), :] = 0.0
+    return reachable, b_l, r_l, c_l, edge_feats_flat
+
+
+def _materialize_block_attn_and_edge_feats(
+    reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
+):
+    L = leaf_size
+    attn_mask = torch.zeros(num_blocks, L, L + 1, device=device, dtype=dtype)
+    attn_mask[:, :, :L] = reachable
+    attn_mask[:, :, L] = 1.0
+    edge_feats = torch.zeros(num_blocks, L, L + 1, 4, device=device, dtype=dtype)
     if b_l.numel() > 0:
-        edge_feats[b_l, r_l, c_l, :] = edge_feats_flat.to(device)
+        edge_feats[b_l, r_l, c_l, :] = edge_feats_flat.to(device=device, dtype=dtype)
     return attn_mask, edge_feats
+
+
+def build_leaf_block_connectivity(edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS):
+    N = positions.shape[0]
+    num_blocks = N // leaf_size
+    if num_blocks == 0:
+        return None, None
+    reachable, b_l, r_l, c_l, edge_feats_flat = _reachable_blocks_from_edges(
+        edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype, num_hops
+    )
+    return _materialize_block_attn_and_edge_feats(
+        reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
+    )
 
 
 def most_recent_run_folder(base_path):

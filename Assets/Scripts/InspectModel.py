@@ -39,6 +39,7 @@ from leafonly import (
     unpack_precond,
     next_valid_size,
     FluidGraphDataset,
+    build_leaf_block_connectivity,
 )
 from leafonly.eval import _timed_ms
 from leafonly.checkpoint import read_leaf_only_header
@@ -323,11 +324,22 @@ def main():
         if global_feat.dim() == 1:
             global_feat = global_feat.unsqueeze(0)
 
+    positions_leaf = x_leaf[0, :, :3]
+    pre_leaf_connectivity = build_leaf_block_connectivity(
+        edge_index_leaf,
+        edge_values_leaf,
+        positions_leaf,
+        LEAF_SIZE,
+        device,
+        x_leaf.dtype,
+    )
+
     _last_out = [None]
     def _fwd():
         _last_out[0] = model_leaf(
             x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
             global_features=global_feat,
+            precomputed_leaf_connectivity=pre_leaf_connectivity,
         )
     inference_ms = _timed_ms(_fwd, device, warmup=15, repeat=10)
     precond_out = _last_out[0]
