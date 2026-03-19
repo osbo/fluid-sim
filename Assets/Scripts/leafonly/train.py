@@ -25,7 +25,6 @@ from .data import (
 def train_leaf_only(args, runtime):
     data_folder = runtime["data_folder"]
     save_path = runtime["save_path"]
-    use_global_node = runtime["use_global_node"]
     runtime_use_gcn = runtime["use_gcn"]
     print_timing = runtime["print_timing"]
     max_grad_norm = runtime["max_grad_norm"]
@@ -106,6 +105,11 @@ def train_leaf_only(args, runtime):
                 raise ValueError(f"Missing global_features for frame: {batch.get('frame_path', '<unknown>')}")
             global_feat = global_feat.to(device)
 
+            inv_diag = torch.ones(n_pad, device=device, dtype=A_dense.dtype)
+            diag_A = torch.diagonal(A_dense, 0)
+            inv_mask = diag_A.abs() > 1e-6
+            inv_diag[inv_mask] = 1.0 / diag_A[inv_mask]
+
             training_contexts.append(
                 {
                     "n_pad": n_pad,
@@ -118,6 +122,7 @@ def train_leaf_only(args, runtime):
                     "precomputed_leaf_connectivity": precomputed_leaf_connectivity,
                     "batch_vectors": batch_vectors,
                     "global_features": global_feat,
+                    "jacobi_inv_diag": inv_diag,
                 }
             )
 
@@ -132,6 +137,7 @@ def train_leaf_only(args, runtime):
     args.num_layers = 2
     args.num_gcn_layers = 2
     args.use_jacobi = True
+    attention_layout = str(args.attention_layout)
 
     torch.manual_seed(args.seed)
     max_n_pad = max(ctx["n_pad"] for ctx in training_contexts)
@@ -146,23 +152,19 @@ def train_leaf_only(args, runtime):
         leaf_size=LEAF_SIZE,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
-        mask_attention=True,
-        use_global_node=use_global_node,
+        attention_layout=attention_layout,
         use_gcn=use_gcn,
         num_gcn_layers=effective_gcn_layers,
         use_jacobi=True,
     ).to(device)
     print(
         "  [startup] Ablation config:"
-        f" layers={args.num_layers}, gcn_layers={effective_gcn_layers}, jacobi=True"
+        f" layers={args.num_layers}, gcn_layers={effective_gcn_layers}, jacobi=True (node_scalar),"
+        f" attention_layout={attention_layout}"
     )
 
-    if device.type == "cuda":
-        if hasattr(torch._dynamo.config, "cache_size_limit"):
-            torch._dynamo.config.cache_size_limit = 4096
-        if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
-            torch._dynamo.config.accumulated_cache_size_limit = 65536
-        model = torch.compile(model, dynamic=False)
+    # NOTE: keep eager mode here. torch.compile on tuple-returning model outputs
+    # can hit AOTAutograd subclass metadata assertion failures in backward.
 
     if args.continue_training:
         if save_path.exists():
@@ -199,7 +201,7 @@ def train_leaf_only(args, runtime):
             torch.cuda.synchronize()
 
     TIMING_STEP = 300
-    target_step = int(getattr(args, "target_step", 10000))
+    target_step = int(args.target_step)
     target_loss_mean = None
     target_loss_std = None
     target_lr = None
@@ -225,7 +227,7 @@ def train_leaf_only(args, runtime):
         max_n_pad_step = max(ctx["n_pad"] for ctx in batch_ctx)
         n_orig_t = batch_ctx[0]["n_orig"]
         n_pad_t = max_n_pad_step
-        x_list, A_list, gf_list = [], [], []
+        x_list, A_list, gf_list, inv_diag_list = [], [], [], []
         edge_idx_parts, edge_val_parts = [], []
         leaf_masks_list, leaf_feats_list = [], []
         n_orig_list = []
@@ -265,19 +267,24 @@ def train_leaf_only(args, runtime):
 
             gf = ctx["global_features"]
             gf_list.append(gf if gf.dim() == 1 else gf.squeeze(0))
+            inv_diag_ctx = ctx["jacobi_inv_diag"]
+            if n_pad_ctx < max_n_pad_step:
+                inv_diag_ctx = F.pad(inv_diag_ctx, (0, max_n_pad_step - n_pad_ctx), value=1.0)
+            inv_diag_list.append(inv_diag_ctx)
 
         x_batched = torch.cat(x_list, dim=0)
         A_batched = torch.stack(A_list, dim=0)
         edge_index_batched = torch.cat(edge_idx_parts, dim=1)
         edge_values_batched = torch.cat(edge_val_parts, dim=0)
         global_features_batched = torch.stack(gf_list, dim=0)
+        jacobi_inv_diag_batched = torch.stack(inv_diag_list, dim=0)
         pre_leaf_batched = (torch.stack(leaf_masks_list, dim=0), torch.stack(leaf_feats_list, dim=0))
 
         batch_vectors = max(1024, int(round(max_n_pad_step ** 0.5)))
         if do_timing:
             _sync()
             t0 = time.perf_counter()
-        diag_blocks = model(
+        precond_out = model(
             x_batched,
             edge_index=edge_index_batched,
             edge_values=edge_values_batched,
@@ -310,7 +317,7 @@ def train_leaf_only(args, runtime):
         if do_timing:
             _sync()
             t0 = time.perf_counter()
-        MAZ = apply_block_diagonal_M(diag_blocks, AZ, leaf_size=LEAF_SIZE)
+        MAZ = apply_block_diagonal_M(precond_out, AZ, leaf_size=LEAF_SIZE, jacobi_inv_diag=jacobi_inv_diag_batched)
         if do_timing:
             _sync()
             t_apply_m += time.perf_counter() - t0

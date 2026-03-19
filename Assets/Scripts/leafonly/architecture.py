@@ -77,12 +77,15 @@ class PhysicsAwareEmbedding(nn.Module):
 
 
 class LeafBlockAttention(nn.Module):
-    def __init__(self, dim, block_size, num_heads=2, mask_attention=True, use_global_node=True):
+    VALID_LAYOUTS = ("32x32", "32x33", "32x34")
+
+    def __init__(self, dim, block_size, num_heads=2, attention_layout="32x33"):
         super().__init__()
         self.dim = dim
         self.block_size = block_size
-        self.mask_attention = mask_attention
-        self.use_global_node = use_global_node
+        if attention_layout not in self.VALID_LAYOUTS:
+            raise ValueError(f"Unsupported attention_layout='{attention_layout}'. Expected one of {self.VALID_LAYOUTS}.")
+        self.attention_layout = attention_layout
         self.num_heads = num_heads if dim % num_heads == 0 else 1
         self.head_dim = dim // self.num_heads
         self.scale = self.head_dim ** -0.5
@@ -102,17 +105,13 @@ class LeafBlockAttention(nn.Module):
         B, N, C = x.shape
         if edge_index is None or edge_values is None or positions is None:
             raise ValueError("LeafBlockAttention requires edge_index, edge_values, and positions.")
-        if not self.mask_attention:
-            raise ValueError("mask_attention=False path has been removed.")
-        if not self.use_global_node:
-            raise ValueError("use_global_node=False path has been removed.")
 
         device = x.device
         dtype = x.dtype
-        pad = 0
+        node_pad = 0
         if N % self.block_size != 0:
-            pad = self.block_size - (N % self.block_size)
-            x = F.pad(x, (0, 0, 0, pad))
+            node_pad = self.block_size - (N % self.block_size)
+            x = F.pad(x, (0, 0, 0, node_pad))
         N_pad = x.shape[1]
         num_blocks = N_pad // self.block_size
         x_blk = x.view(B, num_blocks, self.block_size, C)
@@ -122,18 +121,27 @@ class LeafBlockAttention(nn.Module):
                 edge_index, edge_values, positions, self.block_size, device, dtype
             )
         if attn_mask is None:
-            return x[:, :N, :] if pad > 0 else x
+            return x[:, :N, :] if node_pad > 0 else x
 
-        block_node = x_blk.mean(dim=2, keepdim=True)
-        kv = torch.cat([x_blk, block_node], dim=2)
+        use_block_node = self.attention_layout in ("32x33", "32x34")
+        use_matrix_node = self.attention_layout == "32x34"
+        kv_parts = [x_blk]
+        if use_block_node:
+            block_node = x_blk.mean(dim=2, keepdim=True)
+            kv_parts.append(block_node)
+        if use_matrix_node:
+            matrix_node = x.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, num_blocks, -1, -1)
+            kv_parts.append(matrix_node)
+        kv = torch.cat(kv_parts, dim=2)
         qkv_q = self.qkv(x_blk)
         qkv_kv = self.qkv(kv)
         q = qkv_q[..., :C]
         k = qkv_kv[..., C:2 * C]
         v = qkv_kv[..., 2 * C:3 * C]
+        key_count = kv.shape[2]
         q = q.view(B, num_blocks, self.block_size, self.num_heads, self.head_dim)
-        k = k.view(B, num_blocks, self.block_size + 1, self.num_heads, self.head_dim)
-        v = v.view(B, num_blocks, self.block_size + 1, self.num_heads, self.head_dim)
+        k = k.view(B, num_blocks, key_count, self.num_heads, self.head_dim)
+        v = v.view(B, num_blocks, key_count, self.num_heads, self.head_dim)
 
         scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
 
@@ -141,16 +149,37 @@ class LeafBlockAttention(nn.Module):
             bias_physics = edge_feats[..., :4].unsqueeze(0).expand(B, -1, -1, -1, -1).clone()
         else:
             bias_physics = edge_feats[..., :4].clone()
-        bias_physics[:, :, :, self.block_size, :] = 0.0
-        bias_physics[:, :, :, self.block_size, 3] = 1.0
+        if bias_physics.shape[3] != key_count:
+            if bias_physics.shape[3] > key_count:
+                bias_physics = bias_physics[:, :, :, :key_count, :]
+            else:
+                key_pad = key_count - bias_physics.shape[3]
+                pad_tensor = torch.zeros(*bias_physics.shape[:3], key_pad, bias_physics.shape[4], device=bias_physics.device, dtype=bias_physics.dtype)
+                bias_physics = torch.cat([bias_physics, pad_tensor], dim=3)
+        special_start = self.block_size
+        if use_block_node:
+            bias_physics[:, :, :, special_start, :] = 0.0
+            bias_physics[:, :, :, special_start, 3] = 1.0
+            special_start += 1
+        if use_matrix_node:
+            bias_physics[:, :, :, special_start, :] = 0.0
+            bias_physics[:, :, :, special_start, 3] = 1.0
         arange = torch.arange(self.block_size, device=device)
         bias_physics[:, :, arange, arange, :] = 0.0
         bias_physics[:, :, arange, arange, 3] = 1.0
         scores = scores + bias_physics[..., 3:4]
         if attn_mask.dim() == 3:
-            mask_expanded = attn_mask.unsqueeze(0).unsqueeze(-1)
+            mask_base = attn_mask.unsqueeze(0)
         else:
-            mask_expanded = attn_mask.unsqueeze(-1)
+            mask_base = attn_mask
+        if mask_base.shape[3] != key_count:
+            if mask_base.shape[3] > key_count:
+                mask_base = mask_base[:, :, :, :key_count]
+            else:
+                key_pad = key_count - mask_base.shape[3]
+                pad_tensor = torch.ones(*mask_base.shape[:3], key_pad, device=mask_base.device, dtype=mask_base.dtype)
+                mask_base = torch.cat([mask_base, pad_tensor], dim=3)
+        mask_expanded = mask_base.unsqueeze(-1)
         scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
 
         if save_attention:
@@ -159,7 +188,8 @@ class LeafBlockAttention(nn.Module):
                 self.last_bias_physics_matrix = bias_physics[:, :, :self.block_size].cpu().float()
 
         attn_probs = F.softmax(scores, dim=3)
-        linear_edge_weights = self.edge_gate(bias_physics).masked_fill(mask_expanded == 0, 0.0)
+        linear_edge_weights = self.edge_gate(bias_physics)
+        linear_edge_weights = linear_edge_weights.masked_fill(mask_expanded == 0, 0.0)
         combined_weights = attn_probs + linear_edge_weights
 
         if not torch.compiler.is_compiling():
@@ -167,7 +197,10 @@ class LeafBlockAttention(nn.Module):
                 attn_viz = combined_weights.mean(dim=-1)
                 arange = torch.arange(self.block_size, device=attn_viz.device)
                 self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
-                self.last_attn_block = attn_viz[:, :, :, self.block_size].mean().item()
+                if use_block_node and attn_viz.shape[3] > self.block_size:
+                    self.last_attn_block = attn_viz[:, :, :, self.block_size].mean().item()
+                else:
+                    self.last_attn_block = 0.0
                 to_nodes = attn_viz[:, :, :, :self.block_size].sum(dim=3)
                 self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
                 if save_attention:
@@ -176,7 +209,7 @@ class LeafBlockAttention(nn.Module):
         x_out = torch.einsum("bnqkh,bnkhd->bnqhd", combined_weights, v)
         x_out = x_out.reshape(B, num_blocks, self.block_size, C)
         x_out = self.proj(x_out.view(B, N_pad, C))
-        if pad > 0:
+        if node_pad > 0:
             x_out = x_out[:, :N, :]
         return x_out
 
@@ -220,8 +253,7 @@ class LeafOnlyNet(nn.Module):
         leaf_size=32,
         num_layers=2,
         num_heads=4,
-        mask_attention=True,
-        use_global_node=True,
+        attention_layout="32x33",
         use_gcn=True,
         num_gcn_layers=PhysicsAwareEmbedding.DEFAULT_NUM_GCN_LAYERS,
         use_jacobi=True,
@@ -241,7 +273,12 @@ class LeafOnlyNet(nn.Module):
                 TransformerBlock(
                     d_model,
                     block_size=leaf_size,
-                    attn_module=LeafBlockAttention(d_model, leaf_size, num_heads=num_heads, mask_attention=mask_attention, use_global_node=use_global_node),
+                    attn_module=LeafBlockAttention(
+                        d_model,
+                        leaf_size,
+                        num_heads=num_heads,
+                        attention_layout=attention_layout,
+                    ),
                 )
                 for _ in range(num_layers)
             ]
@@ -254,25 +291,22 @@ class LeafOnlyNet(nn.Module):
         nn.init.constant_(self.jacobi_gate.bias, 0.0)
         self.use_jacobi = use_jacobi
 
-    def _get_leaf_blocks(self, h, x):
+    def _get_leaf_blocks(self, h):
         B, N, _ = h.shape
         num_leaves = N // self.leaf_size
         h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
         u_leaf = self.leaf_head(h_leaves)
-        leaf_base = torch.matmul(u_leaf, u_leaf.transpose(-1, -2))
+        return torch.matmul(u_leaf, u_leaf.transpose(-1, -2))
+
+    def _get_jacobi_scale(self, h):
         if not self.use_jacobi:
-            return leaf_base
-        diag_A_n = x[..., 8]
-        jacobi_diag = torch.zeros_like(diag_A_n)
-        mask = diag_A_n.abs() > 1e-6
-        jacobi_diag[mask] = 1.0 / diag_A_n[mask]
-        jacobi_diag_blocks = jacobi_diag.view(B, num_leaves, self.leaf_size)
-        mask_blocks = mask.view(B, num_leaves, self.leaf_size)
-        new_diag = torch.where(mask_blocks, jacobi_diag_blocks, torch.ones_like(jacobi_diag_blocks))
+            return None
+        B, N, C = h.shape
+        num_leaves = N // self.leaf_size
+        h_leaves = h.view(B, num_leaves, self.leaf_size, C)
         j_gate = torch.sigmoid(self.jacobi_gate(h_leaves)).squeeze(-1) * 2.0
         self._last_j_gate = j_gate.detach()
-        local_jacobi_diag = new_diag * j_gate
-        return leaf_base + torch.diag_embed(local_jacobi_diag)
+        return j_gate.view(B, N)
 
     def forward(self, x, edge_index, edge_values, save_attention=False, precomputed_leaf_connectivity=None, global_features=None):
         B, N, _ = x.shape
@@ -301,11 +335,21 @@ class LeafOnlyNet(nn.Module):
                 attn_mask=attn_mask,
                 edge_feats=edge_feats,
             )
-        return self._get_leaf_blocks(h, x)
+        diag_blocks = self._get_leaf_blocks(h)
+        jacobi_scale = self._get_jacobi_scale(h)
+        return diag_blocks, jacobi_scale
 
 
-def apply_block_diagonal_M(diag_blocks, x, leaf_size=LEAF_SIZE):
+def apply_block_diagonal_M(precond_out, x, leaf_size=LEAF_SIZE, jacobi_inv_diag=None):
+    diag_blocks, jacobi_scale = precond_out
     B, N, K = x.shape
     num_leaves = diag_blocks.shape[1]
     x_leaves = x.view(B, num_leaves, leaf_size, K)
-    return torch.matmul(diag_blocks, x_leaves).view(B, N, K)
+    y = torch.matmul(diag_blocks, x_leaves).view(B, N, K)
+    if jacobi_scale is not None:
+        if jacobi_inv_diag is None:
+            raise ValueError("jacobi_inv_diag is required when jacobi_scale is present.")
+        if jacobi_inv_diag.shape[:2] != (B, N):
+            raise ValueError(f"jacobi_inv_diag shape {jacobi_inv_diag.shape} does not match (B,N)=({B},{N}).")
+        y = y + (jacobi_scale * jacobi_inv_diag).unsqueeze(-1) * x
+    return y
