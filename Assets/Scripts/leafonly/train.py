@@ -10,18 +10,14 @@ import torch.optim as optim
 
 from .architecture import (
     LeafOnlyNet,
-    build_hodlr_off_diag_structure,
-    build_hodlr_operator,
+    apply_block_diagonal_M,
     next_valid_size,
-    print_hodlr_structure,
 )
 from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
-from .config import ATTENTION_HOPS, LEAF_SIZE, MIN_MIXED_SIZE, MAX_MIXED_SIZE, RANK_BASE_LEVEL1
+from .config import ATTENTION_HOPS, LEAF_SIZE, MIN_MIXED_SIZE, MAX_MIXED_SIZE
 from .data import (
     FluidGraphDataset,
     build_leaf_block_connectivity,
-    build_off_diag_super_connectivity_features,
-    get_or_compute_offdiag_super_data,
     most_recent_run_folder,
 )
 
@@ -30,9 +26,8 @@ def train_leaf_only(args, runtime):
     data_folder = runtime["data_folder"]
     save_path = runtime["save_path"]
     use_global_node = runtime["use_global_node"]
-    use_gcn = runtime["use_gcn"]
+    runtime_use_gcn = runtime["use_gcn"]
     print_timing = runtime["print_timing"]
-    max_levels = runtime["max_levels"]
     max_grad_norm = runtime["max_grad_norm"]
     device = runtime["device"]
 
@@ -92,10 +87,6 @@ def train_leaf_only(args, runtime):
             edge_index = batch["edge_index"][:, mask].to(device)
             edge_values = batch["edge_values"][mask].to(device)
 
-            scale_A = batch.get("scale_A")
-            if scale_A is not None and not isinstance(scale_A, torch.Tensor):
-                scale_A = torch.tensor(scale_A, device=device, dtype=x_input.dtype)
-
             A_indices = batch["edge_index"][:, mask]
             A_vals = batch["edge_values"][mask]
             A_sparse = torch.sparse_coo_tensor(A_indices, A_vals, (n, n)).coalesce()
@@ -104,8 +95,6 @@ def train_leaf_only(args, runtime):
             A_dense[:n, :n] = A_small
             A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
 
-            dummy_struct = build_hodlr_off_diag_structure(n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
-            precomputed_masks = get_or_compute_offdiag_super_data(batch["frame_path"], edge_index, edge_values, dummy_struct, device, x_input.dtype, LEAF_SIZE)
             positions_ctx = x_input[0, :n_pad, :3]
             leaf_attn_mask, leaf_edge_feats = build_leaf_block_connectivity(
                 edge_index, edge_values, positions_ctx, LEAF_SIZE, device, x_input.dtype
@@ -125,9 +114,7 @@ def train_leaf_only(args, runtime):
                     "x_input": x_input,
                     "edge_index": edge_index,
                     "edge_values": edge_values,
-                    "scale_A": scale_A,
                     "A_dense": A_dense,
-                    "precomputed_masks": precomputed_masks,
                     "precomputed_leaf_connectivity": precomputed_leaf_connectivity,
                     "batch_vectors": batch_vectors,
                     "global_features": global_feat,
@@ -142,20 +129,33 @@ def train_leaf_only(args, runtime):
     contexts_per_step = max(1, int(args.contexts_per_step))
     print(f"  [startup] contexts_per_step = {contexts_per_step} (gradient accumulation)")
 
+    args.num_layers = 2
+    args.num_gcn_layers = 2
+    args.use_jacobi = True
+
     torch.manual_seed(args.seed)
     max_n_pad = max(ctx["n_pad"] for ctx in training_contexts)
+    if not runtime_use_gcn:
+        raise ValueError("Runtime has use_gcn=False, but the fixed architecture requires 2 GCN layers.")
+    requested_gcn_layers = 2
+    effective_gcn_layers = requested_gcn_layers
+    use_gcn = effective_gcn_layers > 0
     model = LeafOnlyNet(
         input_dim=9,
         d_model=args.d_model,
         leaf_size=LEAF_SIZE,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
-        rank_base=RANK_BASE_LEVEL1,
         mask_attention=True,
         use_global_node=use_global_node,
         use_gcn=use_gcn,
-        max_levels=max_levels,
+        num_gcn_layers=effective_gcn_layers,
+        use_jacobi=True,
     ).to(device)
+    print(
+        "  [startup] Ablation config:"
+        f" layers={args.num_layers}, gcn_layers={effective_gcn_layers}, jacobi=True"
+    )
 
     if device.type == "cuda":
         if hasattr(torch._dynamo.config, "cache_size_limit"):
@@ -172,7 +172,22 @@ def train_leaf_only(args, runtime):
             raise SystemExit(f"--continue_training given but save file not found: {save_path}")
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    print_hodlr_structure(max_n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=5,
+        threshold=5e-3,
+        threshold_mode="rel",
+        cooldown=1,
+        min_lr=max(args.lr * 1e-2, 1e-6),
+    )
+    print(
+        "  [startup] LR scheduler: ReduceLROnPlateau"
+        f" (factor=0.5, patience=5, threshold=5e-3, min_lr={max(args.lr * 1e-2, 1e-6):.2e})"
+    )
+    num_leaves_max = max_n_pad // LEAF_SIZE
+    print(f"  Block-diagonal preconditioner: {num_leaves_max} leaves of {LEAF_SIZE}x{LEAF_SIZE}")
     model.train()
     print_interval = 100
     loss_history = deque(maxlen=print_interval)
@@ -184,12 +199,14 @@ def train_leaf_only(args, runtime):
             torch.cuda.synchronize()
 
     TIMING_STEP = 300
+    target_step = int(getattr(args, "target_step", 10000))
+    target_loss_mean = None
+    target_loss_std = None
+    target_lr = None
     for step in range(args.steps):
         do_timing = print_timing and (step == TIMING_STEP - 1)
         do_log = step % print_interval == 0
         step_loss_sum = 0.0
-        ratio_off_sum = 0.0
-        ratio_off_count = 0
 
         if do_timing:
             _sync()
@@ -208,11 +225,9 @@ def train_leaf_only(args, runtime):
         max_n_pad_step = max(ctx["n_pad"] for ctx in batch_ctx)
         n_orig_t = batch_ctx[0]["n_orig"]
         n_pad_t = max_n_pad_step
-        struct_max = build_hodlr_off_diag_structure(max_n_pad_step, LEAF_SIZE, RANK_BASE_LEVEL1)
         x_list, A_list, gf_list = [], [], []
         edge_idx_parts, edge_val_parts = [], []
         leaf_masks_list, leaf_feats_list = [], []
-        super_data_per_sample = []
         n_orig_list = []
 
         for b_idx, ctx in enumerate(batch_ctx):
@@ -248,17 +263,6 @@ def train_leaf_only(args, runtime):
             leaf_masks_list.append(leaf_mask_b)
             leaf_feats_list.append(leaf_feats_b)
 
-            if n_pad_ctx == max_n_pad_step:
-                super_data = ctx["precomputed_masks"]
-            else:
-                super_data = [
-                    build_off_diag_super_connectivity_features(
-                        edge_index_ctx, edge_values_ctx, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"], device, x_ctx.dtype, LEAF_SIZE
-                    )
-                    for spec in struct_max
-                ]
-            super_data_per_sample.append(super_data)
-
             gf = ctx["global_features"]
             gf_list.append(gf if gf.dim() == 1 else gf.squeeze(0))
 
@@ -269,22 +273,14 @@ def train_leaf_only(args, runtime):
         global_features_batched = torch.stack(gf_list, dim=0)
         pre_leaf_batched = (torch.stack(leaf_masks_list, dim=0), torch.stack(leaf_feats_list, dim=0))
 
-        pre_masks_batched = []
-        for k in range(len(struct_max)):
-            m_k = torch.stack([super_data_per_sample[b][k][0] for b in range(B_step)], dim=0)
-            w_k = torch.stack([super_data_per_sample[b][k][1] for b in range(B_step)], dim=0)
-            pre_masks_batched.append((m_k, w_k))
-
         batch_vectors = max(1024, int(round(max_n_pad_step ** 0.5)))
         if do_timing:
             _sync()
             t0 = time.perf_counter()
-        diag_blocks, off_diag_list = model(
+        diag_blocks = model(
             x_batched,
             edge_index=edge_index_batched,
             edge_values=edge_values_batched,
-            scale_A=None,
-            precomputed_masks=pre_masks_batched,
             precomputed_leaf_connectivity=pre_leaf_batched,
             global_features=global_features_batched,
         )
@@ -314,14 +310,7 @@ def train_leaf_only(args, runtime):
         if do_timing:
             _sync()
             t0 = time.perf_counter()
-        hodlr_op = build_hodlr_operator(diag_blocks, off_diag_list, model.off_diag_struct, leaf_size=LEAF_SIZE, scale_A=1.0)
-        MAZ = hodlr_op.apply(AZ)
-        if do_log:
-            MAZ_diag_only = hodlr_op.apply(AZ, levels_to_include=set())
-            _norm_diag = MAZ_diag_only.norm().item()
-            _norm_off = (MAZ - MAZ_diag_only).norm().item()
-            ratio_off_sum += _norm_off / (_norm_diag + 1e-12)
-            ratio_off_count += 1
+        MAZ = apply_block_diagonal_M(diag_blocks, AZ, leaf_size=LEAF_SIZE)
         if do_timing:
             _sync()
             t_apply_m += time.perf_counter() - t0
@@ -347,18 +336,15 @@ def train_leaf_only(args, runtime):
 
         step_loss = step_loss_sum
         loss_history.append(step_loss)
-        _ratio_off = (ratio_off_sum / ratio_off_count) if ratio_off_count > 0 else 0.0
 
         if step % print_interval == 0:
             def _grad_norm(params):
                 return (sum(p.grad.data.pow(2).sum().item() for p in params if p.grad is not None)) ** 0.5
 
             _all = list(model.parameters())
-            _leaf = [p for n, p in model.named_parameters() if "leaf_head" in n and "leaf_scale" not in n]
-            _off = [p for n, p in model.named_parameters() if "level_off_diag" in n]
+            _leaf = [p for n, p in model.named_parameters() if "leaf_head" in n]
             log_tot = _grad_norm(_all)
             log_leaf = _grad_norm(_leaf)
-            log_off = _grad_norm(_off)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         if do_timing:
@@ -396,7 +382,16 @@ def train_leaf_only(args, runtime):
                 loss_avg, loss_std = float(arr.mean()), float(arr.std())
                 loss_str = f"Loss avg={loss_avg:.4f} ± {loss_std:.4f}"
             else:
+                loss_avg = float(step_loss)
                 loss_str = f"Loss {step_loss:.6f}"
+
+            lr_before = optimizer.param_groups[0]["lr"]
+            if step > 0:
+                scheduler.step(loss_avg)
+            lr_after = optimizer.param_groups[0]["lr"]
+            if lr_after < lr_before:
+                print(f"  [lr] plateau detected: lr {lr_before:.2e} -> {lr_after:.2e}")
+
             if step >= TIMING_STEP:
                 now = time.perf_counter()
                 if step == TIMING_STEP:
@@ -404,13 +399,29 @@ def train_leaf_only(args, runtime):
                     avg_per_100 = elapsed
                 else:
                     avg_per_100 = (now - t_start_avg) * 100 / (step - TIMING_STEP)
-                print(f"{step:05d}: {loss_str}  ({elapsed:.3f}s, avg: {avg_per_100:.3f}s) gTot={log_tot:.2e} gL={log_leaf:.2e} gOff={log_off:.2e} rOff={_ratio_off:.3f}")
+                print(
+                    f"{step:05d}: {loss_str}  ({elapsed:.3f}s, avg: {avg_per_100:.3f}s)"
+                    f" lr={lr_after:.2e} gTot={log_tot:.2e} gL={log_leaf:.2e}"
+                )
             else:
-                print(f"{step:05d}: {loss_str}  ({elapsed:.3f}s) gTot={log_tot:.2e} gL={log_leaf:.2e} gOff={log_off:.2e} rOff={_ratio_off:.3f}")
+                print(
+                    f"{step:05d}: {loss_str}  ({elapsed:.3f}s)"
+                    f" lr={lr_after:.2e} gTot={log_tot:.2e} gL={log_leaf:.2e}"
+                )
             if step > 0 and step % (print_interval * 10) == 0:
                 save_leaf_only_weights(model, str(save_path), input_dim=9)
+            if step == target_step:
+                target_loss_mean = loss_avg
+                target_loss_std = loss_std if n > 0 else 0.0
+                target_lr = lr_after
             t_start = time.perf_counter()
 
     save_leaf_only_weights(model, str(save_path), input_dim=9)
     print(f"Saved to {save_path}")
-
+    return {
+        "target_step": target_step,
+        "loss_mean_at_target": target_loss_mean,
+        "loss_std_at_target": target_loss_std,
+        "lr_at_target": target_lr,
+        "save_path": str(save_path),
+    }

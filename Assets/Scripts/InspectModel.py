@@ -5,7 +5,6 @@ import os
 import warnings
 from pathlib import Path
 
-# PyTorch sparse CSR is still in beta; suppress the warning when building A_gpu for PCG
 warnings.filterwarnings("ignore", message=".*Sparse CSR.*", category=UserWarning)
 
 _script_dir = Path(__file__).resolve().parent
@@ -33,87 +32,18 @@ import torch
 
 import torch.nn.functional as F
 
-from LeafOnly import (
+from leafonly import (
     LeafOnlyNet,
-    read_leaf_only_header,
     load_leaf_only_weights,
-    apply_block_structured_M,
-    build_hodlr_operator,
-    build_hodlr_off_diag_structure,
-    build_off_diag_super_connectivity_features,
-    LEAF_SIZE,
-    VIEW_SIZE,
+    apply_block_diagonal_M,
     next_valid_size,
     FluidGraphDataset,
 )
-
-
-def print_hodlr_m_stats(diag_blocks, off_diag_list, off_diag_struct, model_leaf=None):
-    """Print per-level statistics of the neural M (diag + off-diag by HODLR level) for normalized*scale analysis."""
-    import math
-    # --- Level 0: diagonal blocks ---
-    d = diag_blocks.detach()
-    if d.dim() == 3:
-        d = d.unsqueeze(0)
-    B, num_leaves, L, _ = d.shape
-    frobs = (d ** 2).sum(dim=(-2, -1)).sqrt()
-    flat = d.reshape(-1)
-    print("\n  [HODLR M stats] Level 0 (diagonal blocks)")
-    print(f"    shape {tuple(d.shape)}, leaf_size={L}")
-    print(f"    Frobenius per block: mean={frobs.mean().item():.6f} std={frobs.std().item():.6f} min={frobs.min().item():.6f} max={frobs.max().item():.6f}")
-    print(f"    elements: mean={flat.mean().item():.6e} std={flat.std().item():.6e} min={flat.min().item():.6e} max={flat.max().item():.6e}")
-
-    if not off_diag_list or not off_diag_struct:
-        return
-    by_level = {}
-    for idx, spec in enumerate(off_diag_struct):
-        L = spec["level"]
-        by_level.setdefault(L, []).append((idx, spec))
-
-    level_scale_params = getattr(model_leaf, "level_scale_params", None)
-    for level in sorted(by_level.keys()):
-        entries = by_level[level]
-        scales = []
-        u_frobs, v_frobs, block_frobs = [], [], []
-        block_means, block_stds, block_mins, block_maxs = [], [], [], []
-        for idx, spec in entries:
-            U = off_diag_list[idx][0]
-            V = off_diag_list[idx][1]
-            if isinstance(U, (list, tuple)):
-                U, V = U[0], V[0]
-            U = U.detach().float()
-            V = V.detach().float()
-            if U.dim() == 3:
-                U, V = U[0], V[0]
-            side, rank = U.shape[0], U.shape[1]
-            uv = U @ V.T
-            u_frobs.append(U.norm().item())
-            v_frobs.append(V.norm().item())
-            block_frobs.append(uv.norm().item())
-            flat_uv = uv.reshape(-1)
-            block_means.append(flat_uv.mean().item())
-            block_stds.append(flat_uv.std().item())
-            block_mins.append(flat_uv.min().item())
-            block_maxs.append(flat_uv.max().item())
-        scale_str = ""
-        if level_scale_params is not None:
-            p = level_scale_params.detach().cpu()
-            log_scale = (p[0] + (level - 1.0) * p[1]).item()
-            scale_val = math.exp(log_scale)
-            scale_str = f" scale(level)={scale_val:.6e} (log={log_scale:.4f})"
-        n_blk = len(entries)
-        rs, re = entries[0][1]["row_start"], entries[0][1]["row_end"]
-        side = re - rs
-        rk = entries[0][1]["rank"]
-        print(f"\n  [HODLR M stats] Level {level} (off-diag) n_blocks={n_blk} side={side} rank={rk}{scale_str}")
-        print(f"    U Frobenius: mean={np.mean(u_frobs):.6f} std={np.std(u_frobs):.6f}")
-        print(f"    V Frobenius: mean={np.mean(v_frobs):.6f} std={np.std(v_frobs):.6f}")
-        print(f"    UV^T block Frobenius: mean={np.mean(block_frobs):.6f} std={np.std(block_frobs):.6f}")
-        print(f"    UV^T elements: mean={np.mean(block_means):.6e} std={np.mean(block_stds):.6e} min={np.min(block_mins):.6e} max={np.max(block_maxs):.6e}")
+from leafonly.checkpoint import read_leaf_only_header
+from leafonly.config import LEAF_SIZE
 
 
 def _amg_solver(A_sparse_scipy):
-    """Build AMG hierarchy only (setup). Returns solver or None if no pyamg."""
     if not HAS_AMG:
         return None
     dtype = np.float64
@@ -123,7 +53,6 @@ def _amg_solver(A_sparse_scipy):
 
 
 def get_dense_amg(A_sparse_scipy, viz_limit=200, maxiter=1, tol=1e-6, progress_interval=200, ml=None):
-    """Build dense M by columns via AMG solves (for plot only). If ml is provided, reuse it (no setup)."""
     if not HAS_AMG:
         n = min(A_sparse_scipy.shape[0], viz_limit)
         return np.eye(n)
@@ -148,17 +77,12 @@ def get_dense_amg(A_sparse_scipy, viz_limit=200, maxiter=1, tol=1e-6, progress_i
 
 
 def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=False, check_freq=3):
-    """
-    Optimized PCG on GPU with accurate CUDA Event timing (CUDA) or wall-clock (MPS).
-    Includes initial residual calculation and preconditioning inside the timed block.
-    """
     if device is None:
         device = b.device
-        
+
     n = b.shape[0]
     x = torch.zeros(n, 1, device=device, dtype=b.dtype)
-    
-    # Timing: CUDA Events on CUDA, wall-clock on MPS/CPU
+
     if device.type == "cuda":
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -169,11 +93,10 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
             torch.mps.synchronize()
         t0 = time.perf_counter()
 
-    # Initial setup is now correctly timed
     r = b - (A @ x.squeeze(-1)).unsqueeze(-1)
     z = apply_precond(r)
     p = z.clone()
-    
+
     rho = (r * z).sum()
     b_norm_sq = (b * b).sum()
     tol_sq = (tol * tol) * b_norm_sq
@@ -190,12 +113,11 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
 
             z = apply_precond(r)
             rho_new = (r * z).sum()
-            
+
             beta = rho_new / rho
             p = z + beta * p
             rho = rho_new
 
-            # Periodic sync to check convergence
             if (k + 1) % check_freq == 0 or k == max_iter - 1:
                 r_sq = (r * r).sum()
                 if r_sq.item() <= tol_sq.item():
@@ -217,49 +139,24 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
     return x, iters, wall_ms
 
 
-def pcg_gpu_cudagraph(
-    A_gpu,
-    b_gpu,
-    diag_blocks,
-    off_diag_list,
-    off_diag_struct,
-    tol=1e-8,
-    max_iter=500,
-    device=None,
-    check_freq=3,
-    scale_A=1.0,
-):
-    """
-    PCG on GPU using CUDA Graphs: capture one iteration and replay to eliminate Python dispatch.
-    Preconditioner is inlined (diag_blocks + off_diag_list) so the graph has no Python calls.
-    Returns (x, iters, wall_ms) with wall_ms measuring only GPU time (replays).
-    """
+def pcg_gpu_cudagraph(A_gpu, b_gpu, diag_blocks, tol=1e-8, max_iter=500, device=None, check_freq=3):
     if device is None:
         device = b_gpu.device
     n = b_gpu.shape[0]
-    viz_n = n
     num_leaves = n // LEAF_SIZE
 
-    # diag_blocks may be (B, num_leaves, L, L) or (num_leaves, L, L); in-graph we need (num_leaves, L, L)
     diag_blocks_0 = diag_blocks[0] if diag_blocks.dim() == 4 else diag_blocks
 
-    # Static tensors (fixed addresses for capture; no new allocations inside graph)
     x_static = torch.zeros_like(b_gpu)
     r_static = torch.zeros_like(b_gpu)
     p_static = torch.zeros_like(b_gpu)
     z_static = torch.zeros_like(b_gpu)
-    z_off_static = torch.zeros_like(b_gpu)
     rho_static = torch.zeros(1, device=device, dtype=b_gpu.dtype)
 
-    # Initial state in Python (once): use LeafOnly's level-wise batched apply for first z = M @ r
     x_static.zero_()
     r_static.copy_(b_gpu)
     diag_4d = diag_blocks if diag_blocks.dim() == 4 else diag_blocks.unsqueeze(0)
-    scale_A_f = float(scale_A) if scale_A is not None else 1.0
-    z_initial = apply_block_structured_M(
-        diag_4d, off_diag_list, r_static.unsqueeze(0), off_diag_struct,
-        leaf_size=LEAF_SIZE, scale_A=scale_A_f,
-    )
+    z_initial = apply_block_diagonal_M(diag_4d, r_static.unsqueeze(0), leaf_size=LEAF_SIZE)
     z_static.copy_(z_initial.squeeze(0))
     p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
@@ -267,7 +164,6 @@ def pcg_gpu_cudagraph(
     b_norm_sq = (b_gpu * b_gpu).sum()
     tol_sq = (tol * tol) * b_norm_sq
 
-    # One iteration: read x,r,p,rho; write x,r,p,rho (in-place where possible)
     def one_iter():
         Ap = A_gpu @ p_static.squeeze(-1)
         Ap = Ap.unsqueeze(-1)
@@ -275,23 +171,9 @@ def pcg_gpu_cudagraph(
         alpha = rho_static / pAp
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
-        # Inline M: z_static = M @ r_static (reuse z_off_static to avoid allocation in graph)
         r_blocks = r_static.view(num_leaves, LEAF_SIZE, 1)
-        z_diag = torch.bmm(diag_blocks_0, r_blocks).view(viz_n, 1)
-        z_off_static.zero_()
-        if off_diag_list and off_diag_struct:
-            for idx, spec in enumerate(off_diag_struct):
-                U = off_diag_list[idx][0][0]
-                V = off_diag_list[idx][1][0]
-                rs, re = spec["row_start"], spec["row_end"]
-                cs, ce = spec["col_start"], spec["col_end"]
-                r_c = r_static[cs:ce]
-                z_off_static[rs:re].add_(U @ (V.T @ r_c))
-                r_r = r_static[rs:re]
-                z_off_static[cs:ce].add_(V @ (U.T @ r_r))
-        z_static.copy_(z_diag + z_off_static)
-        if scale_A_f != 1.0 and scale_A_f > 0:
-            z_static.mul_(1.0 / scale_A_f)
+        z_diag = torch.bmm(diag_blocks_0, r_blocks).view(n, 1)
+        z_static.copy_(z_diag)
         rho_new = (r_static * z_static).sum()
         beta = rho_new / rho_static
         rho_static.fill_(rho_new)
@@ -320,7 +202,6 @@ def pcg_gpu_cudagraph(
 
 
 def pcg_cpu(A, b, apply_precond, tol=1e-8, max_iter=500, debug=False):
-    """PCG on CPU: solve A x = b. Precond(r) must return z = M@r. Returns (x, iters, wall_ms)."""
     n = b.shape[0]
     x = np.zeros((n, 1), dtype=np.float64)
     r = b - A @ x
@@ -393,13 +274,11 @@ def main():
     num_nodes_real = int(batch['num_nodes'])
     print(f"System N={num_nodes_real}")
 
-    # n_requested = min(VIEW_SIZE, num_nodes_real)
     n_requested = 256
     n_pad = next_valid_size(n_requested, LEAF_SIZE)
     if n_pad != n_requested:
         print(f"  Padding view: {n_requested} nodes -> {n_pad} (power-of-2 * {LEAF_SIZE})")
 
-    # A_viz: n_pad x n_pad block for preconditioner comparison (real A in [:n_requested,:n_requested], identity for padded dofs)
     ei, ev = batch['edge_index'], batch['edge_values']
     em = (ei[0] < n_requested) & (ei[1] < n_requested)
     A_small = torch.sparse_coo_tensor(ei[:, em], ev[em], (n_requested, n_requested)).coalesce().to_dense().numpy()
@@ -409,18 +288,16 @@ def main():
         A_viz[n_requested:, n_requested:] = np.eye(n_pad - n_requested, dtype=np.float64)
     viz_n = n_pad
 
-    # LeafOnly: setup (load) + one forward (get M), no compilation
     print("\nLeafOnly (GPU)...")
     if not leaf_only_weights_path.exists():
         raise SystemExit(f"Leaf-only weights not found: {leaf_only_weights_path}. Run LeafOnly.py first.")
     header_lo = read_leaf_only_header(leaf_only_weights_path)
     d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, num_heads_lo = header_lo[:5]
-    use_gcn_lo = header_lo[5] if len(header_lo) > 5 else True  # old checkpoints have no use_gcn → True
+    use_gcn_lo = header_lo[5] if len(header_lo) > 5 else True
     model_leaf = LeafOnlyNet(
         input_dim=input_dim_lo, d_model=d_model_lo, leaf_size=LEAF_SIZE, num_layers=num_layers_lo,
         num_heads=num_heads_lo, use_gcn=bool(use_gcn_lo),
     ).to(device)
-    # Default compile (reduce-overhead causes CUDA graph capture to fail on LeafOnly's index_put_)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
 
@@ -430,23 +307,7 @@ def main():
     em = (ei[0] < n_requested) & (ei[1] < n_requested)
     edge_index_leaf = ei[:, em].to(device)
     edge_values_leaf = batch['edge_values'][em].to(device)
-    scale_A = batch.get('scale_A')
-    if scale_A is not None and not isinstance(scale_A, torch.Tensor):
-        scale_A = torch.tensor(scale_A, device=device, dtype=x_leaf.dtype)
 
-    # Precompute off-diag masks once (same as LeafOnly training) so forward never builds them
-    off_diag_struct = build_hodlr_off_diag_structure(
-        n_pad, LEAF_SIZE, rank_base=getattr(model_leaf, "rank_base", 16)
-    )
-    precomputed_masks = [
-        build_off_diag_super_connectivity_features(
-            edge_index_leaf, edge_values_leaf, spec["row_start"], spec["row_end"], spec["col_start"], spec["col_end"],
-            device, x_leaf.dtype, LEAF_SIZE,
-        )
-        for spec in off_diag_struct
-    ] if off_diag_struct else []
-
-    # Pass global_features so lift FiLM matches training (required for v10+ weights)
     global_feat = batch.get('global_features')
     if global_feat is not None:
         global_feat = global_feat.to(device)
@@ -454,60 +315,46 @@ def main():
             global_feat = global_feat.unsqueeze(0)
 
     with torch.no_grad():
-        # Warm up inference (torch.compile + CUDA); match training warmup so timing is comparable
         for _ in range(15):
             _ = model_leaf(
-                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
-                precomputed_masks=precomputed_masks, global_features=global_feat,
+                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
+                global_features=global_feat,
             )
         if device.type == 'cuda':
             torch.cuda.synchronize()
             inf_start = torch.cuda.Event(enable_timing=True)
             inf_end = torch.cuda.Event(enable_timing=True)
             inf_start.record()
-            diag_blocks, off_diag_list = model_leaf(
-                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
-                precomputed_masks=precomputed_masks, global_features=global_feat,
+            diag_blocks = model_leaf(
+                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
+                global_features=global_feat,
             )
             inf_end.record()
             torch.cuda.synchronize()
             inference_ms = inf_start.elapsed_time(inf_end)
         else:
             t0 = time.perf_counter()
-            diag_blocks, off_diag_list = model_leaf(
-                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf, scale_A=scale_A,
-                precomputed_masks=precomputed_masks, global_features=global_feat,
+            diag_blocks = model_leaf(
+                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
+                global_features=global_feat,
             )
             inference_ms = (time.perf_counter() - t0) * 1000
-    # Keep preconditioner outputs on GPU so PCG CUDAGRAPH solver uses them without CPU round-trip
     diag_blocks = diag_blocks.to(device)
-    if off_diag_list:
-        off_diag_list = [
-            (tuple(t.to(device) for t in pair[0]), tuple(t.to(device) for t in pair[1]))
-            if isinstance(pair[0], (list, tuple)) and isinstance(pair[1], (list, tuple))
-            else pair
-            for pair in off_diag_list
-        ]
     num_leaves = n_pad // LEAF_SIZE
-    # Build dense M on GPU to avoid CPU-GPU sync in a loop (keeps inference timing accurate)
     M_neural_gpu = torch.zeros((n_pad, n_pad), dtype=torch.float32, device=device)
     for b in range(num_leaves):
         r0, r1 = b * LEAF_SIZE, (b + 1) * LEAF_SIZE
         M_neural_gpu[r0:r1, r0:r1] = diag_blocks[0, b]
-    if off_diag_list and getattr(model_leaf, 'off_diag_struct', None):
-        for idx, spec in enumerate(model_leaf.off_diag_struct):
-            U = off_diag_list[idx][0][0]   # (1, side, rank)
-            V = off_diag_list[idx][1][0]
-            rs, re = spec["row_start"], spec["row_end"]
-            cs, ce = spec["col_start"], spec["col_end"]
-            UVt = (U @ V.T).squeeze(0)
-            VUt = (V @ U.T).squeeze(0)
-            M_neural_gpu[rs:re, cs:ce] = UVt
-            M_neural_gpu[cs:ce, rs:re] = VUt
-    print(f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} M")
-    print_hodlr_m_stats(diag_blocks, off_diag_list, getattr(model_leaf, "off_diag_struct", None), model_leaf)
+    print(f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} block-diagonal M")
 
-    # AMG on the same n_pad x n_pad block (CPU)
+    d = diag_blocks.detach()
+    if d.dim() == 3:
+        d = d.unsqueeze(0)
+    frobs = (d ** 2).sum(dim=(-2, -1)).sqrt()
+    flat = d.reshape(-1)
+    print(f"  Diagonal blocks: Frob mean={frobs.mean().item():.6f} std={frobs.std().item():.6f}")
+    print(f"  Elements: mean={flat.mean().item():.6e} std={flat.std().item():.6e} min={flat.min().item():.6e} max={flat.max().item():.6e}")
+
     A_scipy = csr_matrix(A_viz.astype(np.float64))
     ml_amg = None
     amg_setup_ms = 0.0
@@ -516,16 +363,13 @@ def main():
         ml_amg = _amg_solver(A_scipy)
         amg_setup_ms = (time.perf_counter() - t0) * 1000
 
-    # Dense M only for plot (not part of timing)
     M_amg = get_dense_amg(A_scipy, viz_limit=viz_n, tol=1e-6, progress_interval=200, ml=ml_amg)
 
-    # All solves use the subset block A_viz_n (viz_n x viz_n), not the full dataset A.
     A_viz_n = A_viz[:viz_n, :viz_n]
-    assert A_viz_n.shape[0] == viz_n and A_viz_n.shape[1] == viz_n, "Solve must be on subset A (viz_n x viz_n)"
+    assert A_viz_n.shape[0] == viz_n and A_viz_n.shape[1] == viz_n
     M_gpu = M_neural_gpu[:viz_n, :viz_n]
     M_amg_n = M_amg[:viz_n, :viz_n]
 
-    # PCG solve A x = b on block A_viz_n (viz_n x viz_n)
     pcg_tol = 1e-8
     pcg_max_iter = 5000
     np.random.seed(123)
@@ -533,11 +377,10 @@ def main():
     b_np = b_np / (np.linalg.norm(b_np) + 1e-12)
     b_np = b_np.reshape(-1, 1)
 
-    # On CUDA use sparse CSR (cuSPARSE); MPS does not support sparse_csr_tensor so use dense
     A_scipy_csr = csr_matrix(A_viz_n.astype(np.float32))
     if device.type == "cuda":
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)  # Sparse CSR beta warning
+            warnings.simplefilter("ignore", UserWarning)
             A_gpu = torch.sparse_csr_tensor(
                 torch.tensor(A_scipy_csr.indptr, dtype=torch.int32, device=device),
                 torch.tensor(A_scipy_csr.indices, dtype=torch.int32, device=device),
@@ -548,7 +391,6 @@ def main():
         A_gpu = torch.from_numpy(A_viz_n.astype(np.float32)).to(device)
     b_gpu = torch.from_numpy(b_np).float().to(device)
 
-    # Unpreconditioned (CG): identity preconditioner
     with torch.no_grad():
         x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu(A_gpu, b_gpu, lambda r: r, tol=pcg_tol, max_iter=pcg_max_iter, device=device)
     x_cpu_none, iters_none_cpu, solve_none_cpu_ms = pcg_cpu(A_viz_n.astype(np.float64), b_np, lambda r: r, tol=pcg_tol, max_iter=pcg_max_iter)
@@ -557,39 +399,23 @@ def main():
     total_none_gpu_ms = setup_none_ms + solve_none_gpu_ms
     total_none_cpu_ms = setup_none_ms + solve_none_cpu_ms
 
-    scale_A_val = scale_A.item() if isinstance(scale_A, torch.Tensor) and scale_A.numel() == 1 else (float(scale_A) if scale_A is not None else 1.0)
-    # Setup once: cache batched off-diag tensors/indices and reuse in every PCG apply.
-    hodlr_op = build_hodlr_operator(
-        diag_blocks, off_diag_list, getattr(model_leaf, "off_diag_struct", None),
-        leaf_size=LEAF_SIZE, scale_A=scale_A_val,
-    )
-    # Use cached setup for M(A) = (1/α) M~(Â) in regular PCG fallback path.
     with torch.no_grad():
-        def apply_M_block_sparse(r):
-            r_batched = r.unsqueeze(0)  # (1, viz_n, 1)
-            out = hodlr_op.apply(r_batched)
-            return out.squeeze(0)  # (viz_n, 1)
+        def apply_M_block_diag(r):
+            r_batched = r.unsqueeze(0)
+            out = apply_block_diagonal_M(diag_blocks, r_batched, leaf_size=LEAF_SIZE)
+            return out.squeeze(0)
 
-    # On CUDA use graph solve (no Python overhead); otherwise or on graph failure use regular pcg_gpu
     if device.type == "cuda":
         try:
             x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph(
-                A_gpu,
-                b_gpu,
-                diag_blocks,
-                off_diag_list,
-                getattr(model_leaf, "off_diag_struct", None),
-                tol=pcg_tol,
-                max_iter=pcg_max_iter,
-                device=device,
-                check_freq=check_freq,
-                scale_A=scale_A_val,
+                A_gpu, b_gpu, diag_blocks,
+                tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq,
             )
         except Exception as e:
             print(f"  LeafOnly (CUDA graph failed, using regular solve): {e}")
-            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_sparse, tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq)
+            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_diag, tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq)
     else:
-        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_sparse, tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq)
+        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_diag, tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq)
 
     total_leaf_ms = inference_ms + solve_leaf_ms
 
@@ -604,13 +430,10 @@ def main():
         x_cpu, iters_amg, solve_amg_ms = pcg_cpu(A_viz_n.astype(np.float64), b_np, apply_M_amg, tol=pcg_tol, max_iter=pcg_max_iter)
     total_amg_ms = amg_setup_ms + solve_amg_ms
 
-    # AMGX (GPU): PCG with preconditioner. Use same matrix as other solvers (A_viz_n).
     solve_amgx_ms = 0.0
     iters_amgx = 0
     amgx_setup_ms = 0.0
     if HAS_AMGX and device.type == 'cuda':
-        # 1. Explicitly cast to strictly 32-bit ints and 64-bit floats.
-        # This prevents the silent Cython dtype mismatch that mangles the CSR structure.
         A_amgx_csr = csr_matrix(A_viz_n.astype(np.float64))
         A_amgx_csr.indptr = np.ascontiguousarray(A_amgx_csr.indptr.astype(np.int32))
         A_amgx_csr.indices = np.ascontiguousarray(A_amgx_csr.indices.astype(np.int32))
@@ -620,7 +443,6 @@ def main():
         x_init = np.zeros(viz_n, dtype=np.float64)
 
         try:
-            # Suppress AMGX deprecation messages (initialize_plugins/finalize_plugins) from stderr
             _stderr_fd = os.dup(2)
             _devnull = os.open(os.devnull, os.O_WRONLY)
             try:
@@ -631,7 +453,6 @@ def main():
                 os.close(_stderr_fd)
                 os.close(_devnull)
 
-            # 2. Configure PCG to use an actual AMG preconditioner
             cfg = pyamgx.Config().create_from_dict({
                 "config_version": 2,
                 "determinism_flag": 1,
@@ -669,7 +490,6 @@ def main():
                 torch.cuda.synchronize()
             amgx_setup_ms = (time.perf_counter() - t0) * 1000
 
-            # Warm up AMGX: run a few solves so timed solve doesn't include one-off costs
             num_amgx_warmup = 3
             for _ in range(num_amgx_warmup):
                 if device.type == 'cuda':
@@ -743,8 +563,7 @@ def main():
     print(f"Condition number (block A): {cond_A:.2e}")
     print(f"Leaf boundaries: every {LEAF_SIZE}")
 
-    # Convert to NumPy only for plotting
-    PLOT_MATRICES = True  # Set to True when you actually want the image
+    PLOT_MATRICES = True
 
     if PLOT_MATRICES:
         M_neural_n = M_gpu.detach().cpu().numpy()
@@ -753,23 +572,19 @@ def main():
         n_rows = 1 + len(methods)
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows), constrained_layout=True)
 
-        # Shared color scale for A^{-1}, LeafOnly M, and AMG M (log10 magnitude)
         log_ainv = np.log10(np.abs(A_inv_viz) + 1e-9)
         log_m_leaf = np.log10(np.abs(M_neural_n) + 1e-9)
         log_m_amg = np.log10(np.abs(M_amg_n) + 1e-9)
         vmin_log = min(log_ainv.min(), log_m_leaf.min(), log_m_amg.min())
         vmax_log = max(log_ainv.max(), log_m_leaf.max(), log_m_amg.max())
 
-        # Row 0: A, A^{-1}
         axes[0, 0].imshow(np.log10(np.abs(A_viz_n) + 1e-9), cmap='magma', aspect='auto')
         axes[0, 0].set_title(f"A (input) log10 [leaf {LEAF_SIZE}x{LEAF_SIZE}]")
         plt.colorbar(axes[0, 0].images[0], ax=axes[0, 0])
         im_ainv = axes[0, 1].imshow(log_ainv, cmap='magma', aspect='auto', vmin=vmin_log, vmax=vmax_log)
         axes[0, 1].set_title(f"A^{{-1}} (viz {viz_n}x{viz_n}) log10")
         plt.colorbar(im_ainv, ax=axes[0, 1])
-        # Row 0, col 2: empty (no A·M for unpreconditioned)
         axes[0, 2].axis('off')
-        # Row 0, col 3: eigenvalues of unpreconditioned A (align with method rows)
         ax_a = axes[0, 3]
         try:
             evals_A = np.linalg.eigvals(A_viz_n)
@@ -787,13 +602,11 @@ def main():
         except Exception as e:
             ax_a.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_a.transAxes, ha='center', va='center', fontsize=9)
             ax_a.set_title("Eigenvalues of A (failed)")
-        # Row 0, col 4: condition number (align with method rows text)
         ax_a_t = axes[0, 4]
         ax_a_t.axis('off')
         ax_a_t.text(0.1, 0.8, "Unpreconditioned A", fontsize=12, fontfamily='monospace')
         ax_a_t.text(0.1, 0.65, f"Cond(A): {cond_A:.2e}", fontsize=12, fontfamily='monospace')
 
-        # Shared color scale for all A·M (log10 |·|) panels
         am_log_min, am_log_max = None, None
         for _name, M in methods:
             AM = A_viz_n @ M
@@ -809,14 +622,12 @@ def main():
             im_m = axes[row, 0].imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto', vmin=vmin_log, vmax=vmax_log)
             axes[row, 0].set_title(f"{name} M (log10)")
             plt.colorbar(im_m, ax=axes[row, 0])
-            # |M - A^{-1}| (absolute error), log10 to show detail
             abs_err = np.abs(M - A_inv_viz)
             log_err = np.log10(abs_err + 1e-12)
             im_diff = axes[row, 1].imshow(log_err, cmap='magma', aspect='auto')
             axes[row, 1].set_title(f"{name} |M − A^{{-1}}| (log10)")
             plt.colorbar(im_diff, ax=axes[row, 1])
             AM = A_viz_n @ M
-            # Absolute value, same colormap and shared scale as the other A·M panel(s)
             am_abs_log = np.log10(np.abs(AM) + 1e-9)
             im_am = axes[row, 2].imshow(am_abs_log, cmap='magma', aspect='auto', vmin=am_log_min, vmax=am_log_max)
             axes[row, 2].set_title(f"{name} A·M (log10 |·|)")
