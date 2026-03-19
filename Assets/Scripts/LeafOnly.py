@@ -11,7 +11,7 @@ def _build_parser():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=2, help="Fixed architecture depth for LeafOnly (kept at 2).")
-    parser.add_argument("--num_heads", type=int, default=2, help="LeafBlockAttention heads; must divide d_model")
+    parser.add_argument("--num_heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
     parser.add_argument("--frame", type=int, default=600, help="Frame index to use when --use_single_frame is True. Default: 600.")
     parser.add_argument("--use_single_frame", action="store_true", help="Train on a single frame (--frame) instead of random-frame sampling.")
     parser.add_argument("--num_frames", type=int, default=50, help="When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.")

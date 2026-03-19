@@ -361,9 +361,13 @@ def evaluate_gradient_interference(args, runtime):
 
     ms_AZ = _timed_ms(lambda: (A_dense @ Z.squeeze(0)).unsqueeze(0), device)
     timing_rows.append(["A @ Z", ms_AZ])
+    B_prof = diag_blocks_profile.shape[0]
+    packed_profile = diag_blocks_profile.reshape(B_prof, -1)
+    if jacobi_scale_profile is not None:
+        packed_profile = torch.cat([packed_profile, jacobi_scale_profile], dim=1)
     ms_apply_m = _timed_ms(
         lambda: apply_block_diagonal_M(
-            (diag_blocks_profile, jacobi_scale_profile),
+            packed_profile,
             AZ,
             leaf_size=LEAF_SIZE,
             jacobi_inv_diag=jacobi_inv_diag_profile,

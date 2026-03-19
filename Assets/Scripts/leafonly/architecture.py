@@ -26,7 +26,7 @@ class SparsePhysicsGCN(nn.Module):
         x_flat = x.squeeze(0) if B == 1 else x.view(B * N, C)
 
         row, col = edge_index[0], edge_index[1]
-        w = edge_values.clone().to(x.dtype)
+        w = edge_values.to(x.dtype)
 
         neighbor_features = self.linear_neighbor(x_flat)
         messages = neighbor_features[col] * w.unsqueeze(-1)
@@ -79,7 +79,7 @@ class PhysicsAwareEmbedding(nn.Module):
 class LeafBlockAttention(nn.Module):
     VALID_LAYOUTS = ("32x32", "32x33", "32x34")
 
-    def __init__(self, dim, block_size, num_heads=2, attention_layout="32x33"):
+    def __init__(self, dim, block_size, num_heads=8, attention_layout="32x33"):
         super().__init__()
         self.dim = dim
         self.block_size = block_size
@@ -192,7 +192,7 @@ class LeafBlockAttention(nn.Module):
         linear_edge_weights = linear_edge_weights.masked_fill(mask_expanded == 0, 0.0)
         combined_weights = attn_probs + linear_edge_weights
 
-        if not torch.compiler.is_compiling():
+        if not self.training and not torch.compiler.is_compiling():
             with torch.no_grad():
                 attn_viz = combined_weights.mean(dim=-1)
                 arange = torch.arange(self.block_size, device=attn_viz.device)
@@ -252,7 +252,7 @@ class LeafOnlyNet(nn.Module):
         d_model=128,
         leaf_size=32,
         num_layers=2,
-        num_heads=4,
+        num_heads=8,
         attention_layout="32x33",
         use_gcn=True,
         num_gcn_layers=PhysicsAwareEmbedding.DEFAULT_NUM_GCN_LAYERS,
@@ -337,19 +337,34 @@ class LeafOnlyNet(nn.Module):
             )
         diag_blocks = self._get_leaf_blocks(h)
         jacobi_scale = self._get_jacobi_scale(h)
-        return diag_blocks, jacobi_scale
+        B = diag_blocks.shape[0]
+        packed = diag_blocks.reshape(B, -1)
+        if jacobi_scale is not None:
+            packed = torch.cat([packed, jacobi_scale], dim=1)
+        return packed
 
 
-def apply_block_diagonal_M(precond_out, x, leaf_size=LEAF_SIZE, jacobi_inv_diag=None):
-    diag_blocks, jacobi_scale = precond_out
+def unpack_precond(precond_packed, N, leaf_size=LEAF_SIZE):
+    B = precond_packed.shape[0]
+    num_leaves = N // leaf_size
+    diag_size = num_leaves * leaf_size * leaf_size
+    diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, leaf_size, leaf_size)
+    jacobi_scale = precond_packed[:, diag_size:] if precond_packed.shape[1] > diag_size else None
+    return diag_blocks, jacobi_scale
+
+
+def apply_block_diagonal_M(precond_packed, x, leaf_size=LEAF_SIZE, jacobi_inv_diag=None):
     B, N, K = x.shape
-    num_leaves = diag_blocks.shape[1]
+    num_leaves = N // leaf_size
+    diag_size = num_leaves * leaf_size * leaf_size
+    diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, leaf_size, leaf_size)
     x_leaves = x.view(B, num_leaves, leaf_size, K)
     y = torch.matmul(diag_blocks, x_leaves).view(B, N, K)
-    if jacobi_scale is not None:
+    if precond_packed.shape[1] > diag_size:
         if jacobi_inv_diag is None:
             raise ValueError("jacobi_inv_diag is required when jacobi_scale is present.")
         if jacobi_inv_diag.shape[:2] != (B, N):
             raise ValueError(f"jacobi_inv_diag shape {jacobi_inv_diag.shape} does not match (B,N)=({B},{N}).")
+        jacobi_scale = precond_packed[:, diag_size:]
         y = y + (jacobi_scale * jacobi_inv_diag).unsqueeze(-1) * x
     return y

@@ -36,9 +36,11 @@ from leafonly import (
     LeafOnlyNet,
     load_leaf_only_weights,
     apply_block_diagonal_M,
+    unpack_precond,
     next_valid_size,
     FluidGraphDataset,
 )
+from leafonly.eval import _timed_ms
 from leafonly.checkpoint import read_leaf_only_header
 from leafonly.config import LEAF_SIZE
 
@@ -99,10 +101,10 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
 
     rho = (r * z).sum()
     b_norm_sq = (b * b).sum()
-    tol_sq = (tol * tol) * b_norm_sq
+    tol_sq_val = (tol * tol) * b_norm_sq.item()
 
     iters = 0
-    if b_norm_sq.item() > 0:
+    if tol_sq_val > 0 or b_norm_sq.item() > 0:
         for k in range(max_iter):
             Ap = (A @ p.squeeze(-1)).unsqueeze(-1)
             pAp = (p * Ap).sum()
@@ -120,7 +122,7 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
 
             if (k + 1) % check_freq == 0 or k == max_iter - 1:
                 r_sq = (r * r).sum()
-                if r_sq.item() <= tol_sq.item():
+                if r_sq.item() <= tol_sq_val:
                     if debug:
                         print(f"    [PCG GPU] converged at iter {k+1}")
                     iters = k + 1
@@ -139,16 +141,12 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
     return x, iters, wall_ms
 
 
-def pcg_gpu_cudagraph(A_gpu, b_gpu, precond_out, jacobi_inv_diag, tol=1e-8, max_iter=500, device=None, check_freq=3):
+def pcg_gpu_cudagraph(A_gpu, b_gpu, precond_packed, jacobi_inv_diag, tol=1e-8, max_iter=500, device=None, check_freq=3):
     if device is None:
         device = b_gpu.device
-    n = b_gpu.shape[0]
 
-    diag_blocks, jacobi_scale = precond_out
-    diag_blocks_4d = diag_blocks if diag_blocks.dim() == 4 else diag_blocks.unsqueeze(0)
-    jacobi_scale_2d = jacobi_scale
-    if jacobi_scale_2d is not None and jacobi_scale_2d.dim() == 1:
-        jacobi_scale_2d = jacobi_scale_2d.unsqueeze(0)
+    if precond_packed.dim() == 1:
+        precond_packed = precond_packed.unsqueeze(0)
     jacobi_inv_diag_2d = jacobi_inv_diag if jacobi_inv_diag.dim() == 2 else jacobi_inv_diag.unsqueeze(0)
 
     x_static = torch.zeros_like(b_gpu)
@@ -160,7 +158,7 @@ def pcg_gpu_cudagraph(A_gpu, b_gpu, precond_out, jacobi_inv_diag, tol=1e-8, max_
     x_static.zero_()
     r_static.copy_(b_gpu)
     z_initial = apply_block_diagonal_M(
-        (diag_blocks_4d, jacobi_scale_2d),
+        precond_packed,
         r_static.unsqueeze(0),
         leaf_size=LEAF_SIZE,
         jacobi_inv_diag=jacobi_inv_diag_2d,
@@ -169,8 +167,7 @@ def pcg_gpu_cudagraph(A_gpu, b_gpu, precond_out, jacobi_inv_diag, tol=1e-8, max_
     p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
 
-    b_norm_sq = (b_gpu * b_gpu).sum()
-    tol_sq = (tol * tol) * b_norm_sq
+    tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
 
     def one_iter():
         Ap = A_gpu @ p_static.squeeze(-1)
@@ -180,7 +177,7 @@ def pcg_gpu_cudagraph(A_gpu, b_gpu, precond_out, jacobi_inv_diag, tol=1e-8, max_
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
         z_new = apply_block_diagonal_M(
-            (diag_blocks_4d, jacobi_scale_2d),
+            precond_packed,
             r_static.unsqueeze(0),
             leaf_size=LEAF_SIZE,
             jacobi_inv_diag=jacobi_inv_diag_2d,
@@ -205,7 +202,7 @@ def pcg_gpu_cudagraph(A_gpu, b_gpu, precond_out, jacobi_inv_diag, tol=1e-8, max_
         iters = k + 1
         if (k + 1) % check_freq == 0 or k == max_iter - 1:
             r_sq = (r_static * r_static).sum()
-            if r_sq.item() <= tol_sq.item():
+            if r_sq.item() <= tol_sq_val:
                 break
     end_ev.record()
     torch.cuda.synchronize()
@@ -273,7 +270,7 @@ def main():
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
     print(f"Using device: {device}")
-    check_freq = 1
+    check_freq = 3
 
     print(f"Loading data from {data_folder}")
     dataset = FluidGraphDataset([Path(data_folder)])
@@ -326,34 +323,15 @@ def main():
         if global_feat.dim() == 1:
             global_feat = global_feat.unsqueeze(0)
 
-    with torch.no_grad():
-        for _ in range(15):
-            _ = model_leaf(
-                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
-                global_features=global_feat,
-            )
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-            inf_start = torch.cuda.Event(enable_timing=True)
-            inf_end = torch.cuda.Event(enable_timing=True)
-            inf_start.record()
-            precond_out = model_leaf(
-                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
-                global_features=global_feat,
-            )
-            inf_end.record()
-            torch.cuda.synchronize()
-            inference_ms = inf_start.elapsed_time(inf_end)
-        else:
-            t0 = time.perf_counter()
-            precond_out = model_leaf(
-                x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
-                global_features=global_feat,
-            )
-            inference_ms = (time.perf_counter() - t0) * 1000
-    diag_blocks, jacobi_scale = precond_out
-    diag_blocks = diag_blocks.to(device)
-    jacobi_scale = jacobi_scale.to(device) if jacobi_scale is not None else None
+    _last_out = [None]
+    def _fwd():
+        _last_out[0] = model_leaf(
+            x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
+            global_features=global_feat,
+        )
+    inference_ms = _timed_ms(_fwd, device, warmup=15, repeat=10)
+    precond_out = _last_out[0]
+    diag_blocks, jacobi_scale = unpack_precond(precond_out, n_pad, LEAF_SIZE)
     jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=diag_blocks.dtype)
     diag_A_tensor = torch.from_numpy(np.diag(A_viz).astype(np.float32)).to(device)
     diag_mask = diag_A_tensor.abs() > 1e-6
@@ -422,7 +400,7 @@ def main():
     with torch.no_grad():
         def apply_M_block_diag(r):
             r_batched = r.unsqueeze(0)
-            out = apply_block_diagonal_M((diag_blocks, jacobi_scale), r_batched, leaf_size=LEAF_SIZE, jacobi_inv_diag=jacobi_inv_diag)
+            out = apply_block_diagonal_M(precond_out, r_batched, leaf_size=LEAF_SIZE, jacobi_inv_diag=jacobi_inv_diag)
             return out.squeeze(0)
 
     if device.type == "cuda":
@@ -430,7 +408,7 @@ def main():
             x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph(
                 A_gpu,
                 b_gpu,
-                (diag_blocks, jacobi_scale),
+                precond_out,
                 jacobi_inv_diag,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
