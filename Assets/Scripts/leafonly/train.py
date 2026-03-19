@@ -14,7 +14,7 @@ from .architecture import (
     next_valid_size,
 )
 from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
-from .config import ATTENTION_HOPS, LEAF_SIZE, MIN_MIXED_SIZE, MAX_MIXED_SIZE
+from .config import LEAF_SIZE, MIN_MIXED_SIZE, MAX_MIXED_SIZE
 from .data import (
     FluidGraphDataset,
     build_leaf_block_connectivity,
@@ -163,8 +163,9 @@ def train_leaf_only(args, runtime):
         f" attention_layout={attention_layout}"
     )
 
-    # NOTE: keep eager mode here. torch.compile on tuple-returning model outputs
-    # can hit AOTAutograd subclass metadata assertion failures in backward.
+    if device.type == "cuda":
+        model = torch.compile(model)
+        print("  [startup] torch.compile: enabled")
 
     if args.continue_training:
         if save_path.exists():
@@ -259,11 +260,9 @@ def train_leaf_only(args, runtime):
             edge_idx_parts.append(edge_index_ctx + offset)
             edge_val_parts.append(edge_values_ctx)
 
-            leaf_mask_b, leaf_feats_b = build_leaf_block_connectivity(
-                edge_index_ctx, edge_values_ctx, x_ctx[0, :max_n_pad_step, :3], LEAF_SIZE, device, x_ctx.dtype, num_hops=ATTENTION_HOPS
-            )
-            leaf_masks_list.append(leaf_mask_b)
-            leaf_feats_list.append(leaf_feats_b)
+            pre_leaf = ctx["precomputed_leaf_connectivity"]
+            leaf_masks_list.append(pre_leaf[0])
+            leaf_feats_list.append(pre_leaf[1])
 
             gf = ctx["global_features"]
             gf_list.append(gf if gf.dim() == 1 else gf.squeeze(0))
@@ -280,7 +279,7 @@ def train_leaf_only(args, runtime):
         jacobi_inv_diag_batched = torch.stack(inv_diag_list, dim=0)
         pre_leaf_batched = (torch.stack(leaf_masks_list, dim=0), torch.stack(leaf_feats_list, dim=0))
 
-        batch_vectors = max(1024, int(round(max_n_pad_step ** 0.5)))
+        batch_vectors = max(256, int(round(max_n_pad_step ** 0.5)))
         if do_timing:
             _sync()
             t0 = time.perf_counter()
@@ -340,13 +339,18 @@ def train_leaf_only(args, runtime):
         if do_timing:
             _sync()
             t_backward += time.perf_counter() - t0
+            t0 = time.perf_counter()
 
         step_loss = step_loss_sum
         loss_history.append(step_loss)
 
         if step % print_interval == 0:
             def _grad_norm(params):
-                return (sum(p.grad.data.pow(2).sum().item() for p in params if p.grad is not None)) ** 0.5
+                total = torch.tensor(0.0, device=device)
+                for p in params:
+                    if p.grad is not None:
+                        total += p.grad.data.pow(2).sum()
+                return total.sqrt().item()
 
             _all = list(model.parameters())
             _leaf = [p for n, p in model.named_parameters() if "leaf_head" in n]

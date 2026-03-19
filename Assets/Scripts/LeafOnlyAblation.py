@@ -158,7 +158,7 @@ def _build_parser():
     p.add_argument("--target_step", type=int, default=10000)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--d_model", type=int, default=512)
-    p.add_argument("--num_heads", type=int, default=2)
+    p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--frame", type=int, default=600)
     p.add_argument("--use_single_frame", action="store_true")
     p.add_argument("--num_frames", type=int, default=50)

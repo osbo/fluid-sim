@@ -1,6 +1,7 @@
 from .architecture import (
     LeafOnlyNet,
     apply_block_diagonal_M,
+    unpack_precond,
     next_valid_size,
 )
 from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
