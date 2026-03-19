@@ -78,8 +78,7 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
         leaf_size=LEAF_SIZE,
         num_layers=cfg.num_layers,
         num_heads=cfg.num_heads,
-        mask_attention=True,
-        use_global_node=True,
+        attention_layout=cfg.attention_layout,
         use_gcn=cfg.num_gcn_layers > 0,
         num_gcn_layers=cfg.num_gcn_layers,
         use_jacobi=cfg.use_jacobi,
@@ -99,9 +98,13 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
     if n_pad > n_requested:
         A_dense[n_requested:, n_requested:] = torch.eye(n_pad - n_requested, device=device, dtype=A_small.dtype)
     AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
+    jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
+    diag_A = torch.diagonal(A_dense, 0)
+    inv_mask = diag_A.abs() > 1e-6
+    jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A[inv_mask]
 
     with torch.no_grad():
-        diag_blocks = model(
+        precond_out = model(
             x_input,
             edge_index=edge_index,
             edge_values=edge_values,
@@ -116,12 +119,12 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
             global_features=global_feat,
         ),
         device,
-        warmup=15,
-        repeat=40,
+        warmup=10,
+        repeat=10,
     )
 
     apply_ms = _avg_ms(
-        lambda: apply_block_diagonal_M(diag_blocks, AZ, leaf_size=LEAF_SIZE),
+        lambda: apply_block_diagonal_M(precond_out, AZ, leaf_size=LEAF_SIZE, jacobi_inv_diag=jacobi_inv_diag),
         device,
         warmup=5,
         repeat=40,
@@ -129,7 +132,7 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
     return forward_ms, apply_ms
 
 
-def _build_train_args(base_args, d_model, num_layers, num_gcn_layers, use_jacobi):
+def _build_train_args(base_args, d_model, num_layers, num_gcn_layers, use_jacobi, attention_layout):
     return SimpleNamespace(
         steps=base_args.target_step + 1,
         lr=base_args.lr,
@@ -145,6 +148,7 @@ def _build_train_args(base_args, d_model, num_layers, num_gcn_layers, use_jacobi
         evaluate_gradients=False,
         num_gcn_layers=num_gcn_layers,
         use_jacobi=use_jacobi,
+        attention_layout=attention_layout,
         target_step=base_args.target_step,
     )
 
@@ -152,8 +156,8 @@ def _build_train_args(base_args, d_model, num_layers, num_gcn_layers, use_jacobi
 def _build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--target_step", type=int, default=10000)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--d_model", type=int, default=256)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--d_model", type=int, default=512)
     p.add_argument("--num_heads", type=int, default=2)
     p.add_argument("--frame", type=int, default=600)
     p.add_argument("--use_single_frame", action="store_true")
@@ -172,11 +176,16 @@ def main():
     runtime["device"] = require_cuda_or_mps_device()
     runtime["use_gcn"] = True
 
-    d_model_grid = [32, 64, 128, 256, 512]
+    attention_variants = [
+        ("baseline", "32x33"),
+        ("only_32x32", "32x32"),
+        ("with_matrix_global_32x34", "32x34"),
+    ]
     baseline_num_layers = 2
     baseline_num_gcn_layers = 2
     baseline_use_jacobi = True
-    grid = d_model_grid
+    baseline_d_model = args.d_model
+    grid = attention_variants
     if args.limit > 0:
         grid = grid[: args.limit]
 
@@ -189,7 +198,8 @@ def main():
     print(f"Stopping metric at step={args.target_step}")
 
     rows = []
-    for i, d_model in enumerate(grid, start=1):
+    for i, (variant_name, attention_layout) in enumerate(grid, start=1):
+        d_model = baseline_d_model
         num_layers = baseline_num_layers
         num_gcn_layers = baseline_num_gcn_layers
         use_jacobi = baseline_use_jacobi
@@ -199,12 +209,20 @@ def main():
             f"L{num_layers}"
             f"_gcn{num_gcn_layers}"
             f"_jac{int(use_jacobi)}"
+            f"_{attention_layout}"
         )
         save_path = weights_dir / f"{tag}.bytes"
         runtime_run = dict(runtime)
         runtime_run["save_path"] = save_path
 
-        cfg = _build_train_args(args, d_model, num_layers, num_gcn_layers, use_jacobi)
+        cfg = _build_train_args(
+            args,
+            d_model,
+            num_layers,
+            num_gcn_layers,
+            use_jacobi,
+            attention_layout,
+        )
         print(f"\n[{i}/{len(grid)}] {tag}")
         metrics = train_leaf_only(cfg, runtime_run)
         fwd_ms, apply_ms = _measure_inference_ms(save_path, cfg, runtime_run, frame_idx=args.frame)
@@ -216,6 +234,8 @@ def main():
             "num_layers": num_layers,
             "num_gcn_layers": num_gcn_layers,
             "use_jacobi": int(use_jacobi),
+            "variant": variant_name,
+            "attention_layout": attention_layout,
             "target_step": metrics.get("target_step"),
             "loss_mean_at_target": metrics.get("loss_mean_at_target"),
             "loss_std_at_target": metrics.get("loss_std_at_target"),

@@ -139,13 +139,17 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
     return x, iters, wall_ms
 
 
-def pcg_gpu_cudagraph(A_gpu, b_gpu, diag_blocks, tol=1e-8, max_iter=500, device=None, check_freq=3):
+def pcg_gpu_cudagraph(A_gpu, b_gpu, precond_out, jacobi_inv_diag, tol=1e-8, max_iter=500, device=None, check_freq=3):
     if device is None:
         device = b_gpu.device
     n = b_gpu.shape[0]
-    num_leaves = n // LEAF_SIZE
 
-    diag_blocks_0 = diag_blocks[0] if diag_blocks.dim() == 4 else diag_blocks
+    diag_blocks, jacobi_scale = precond_out
+    diag_blocks_4d = diag_blocks if diag_blocks.dim() == 4 else diag_blocks.unsqueeze(0)
+    jacobi_scale_2d = jacobi_scale
+    if jacobi_scale_2d is not None and jacobi_scale_2d.dim() == 1:
+        jacobi_scale_2d = jacobi_scale_2d.unsqueeze(0)
+    jacobi_inv_diag_2d = jacobi_inv_diag if jacobi_inv_diag.dim() == 2 else jacobi_inv_diag.unsqueeze(0)
 
     x_static = torch.zeros_like(b_gpu)
     r_static = torch.zeros_like(b_gpu)
@@ -155,8 +159,12 @@ def pcg_gpu_cudagraph(A_gpu, b_gpu, diag_blocks, tol=1e-8, max_iter=500, device=
 
     x_static.zero_()
     r_static.copy_(b_gpu)
-    diag_4d = diag_blocks if diag_blocks.dim() == 4 else diag_blocks.unsqueeze(0)
-    z_initial = apply_block_diagonal_M(diag_4d, r_static.unsqueeze(0), leaf_size=LEAF_SIZE)
+    z_initial = apply_block_diagonal_M(
+        (diag_blocks_4d, jacobi_scale_2d),
+        r_static.unsqueeze(0),
+        leaf_size=LEAF_SIZE,
+        jacobi_inv_diag=jacobi_inv_diag_2d,
+    )
     z_static.copy_(z_initial.squeeze(0))
     p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
@@ -171,9 +179,13 @@ def pcg_gpu_cudagraph(A_gpu, b_gpu, diag_blocks, tol=1e-8, max_iter=500, device=
         alpha = rho_static / pAp
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
-        r_blocks = r_static.view(num_leaves, LEAF_SIZE, 1)
-        z_diag = torch.bmm(diag_blocks_0, r_blocks).view(n, 1)
-        z_static.copy_(z_diag)
+        z_new = apply_block_diagonal_M(
+            (diag_blocks_4d, jacobi_scale_2d),
+            r_static.unsqueeze(0),
+            leaf_size=LEAF_SIZE,
+            jacobi_inv_diag=jacobi_inv_diag_2d,
+        )
+        z_static.copy_(z_new.squeeze(0))
         rho_new = (r_static * z_static).sum()
         beta = rho_new / rho_static
         rho_static.fill_(rho_new)
@@ -325,7 +337,7 @@ def main():
             inf_start = torch.cuda.Event(enable_timing=True)
             inf_end = torch.cuda.Event(enable_timing=True)
             inf_start.record()
-            diag_blocks = model_leaf(
+            precond_out = model_leaf(
                 x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
                 global_features=global_feat,
             )
@@ -334,17 +346,25 @@ def main():
             inference_ms = inf_start.elapsed_time(inf_end)
         else:
             t0 = time.perf_counter()
-            diag_blocks = model_leaf(
+            precond_out = model_leaf(
                 x_leaf, edge_index=edge_index_leaf, edge_values=edge_values_leaf,
                 global_features=global_feat,
             )
             inference_ms = (time.perf_counter() - t0) * 1000
+    diag_blocks, jacobi_scale = precond_out
     diag_blocks = diag_blocks.to(device)
+    jacobi_scale = jacobi_scale.to(device) if jacobi_scale is not None else None
+    jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=diag_blocks.dtype)
+    diag_A_tensor = torch.from_numpy(np.diag(A_viz).astype(np.float32)).to(device)
+    diag_mask = diag_A_tensor.abs() > 1e-6
+    jacobi_inv_diag[0, diag_mask] = 1.0 / diag_A_tensor[diag_mask]
     num_leaves = n_pad // LEAF_SIZE
     M_neural_gpu = torch.zeros((n_pad, n_pad), dtype=torch.float32, device=device)
     for b in range(num_leaves):
         r0, r1 = b * LEAF_SIZE, (b + 1) * LEAF_SIZE
         M_neural_gpu[r0:r1, r0:r1] = diag_blocks[0, b]
+    if jacobi_scale is not None:
+        M_neural_gpu += torch.diag((jacobi_scale[0] * jacobi_inv_diag[0]).to(M_neural_gpu.dtype))
     print(f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} block-diagonal M")
 
     d = diag_blocks.detach()
@@ -402,20 +422,42 @@ def main():
     with torch.no_grad():
         def apply_M_block_diag(r):
             r_batched = r.unsqueeze(0)
-            out = apply_block_diagonal_M(diag_blocks, r_batched, leaf_size=LEAF_SIZE)
+            out = apply_block_diagonal_M((diag_blocks, jacobi_scale), r_batched, leaf_size=LEAF_SIZE, jacobi_inv_diag=jacobi_inv_diag)
             return out.squeeze(0)
 
     if device.type == "cuda":
         try:
             x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph(
-                A_gpu, b_gpu, diag_blocks,
-                tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq,
+                A_gpu,
+                b_gpu,
+                (diag_blocks, jacobi_scale),
+                jacobi_inv_diag,
+                tol=pcg_tol,
+                max_iter=pcg_max_iter,
+                device=device,
+                check_freq=check_freq,
             )
         except Exception as e:
             print(f"  LeafOnly (CUDA graph failed, using regular solve): {e}")
-            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_diag, tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq)
+            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
+                A_gpu,
+                b_gpu,
+                apply_M_block_diag,
+                tol=pcg_tol,
+                max_iter=pcg_max_iter,
+                device=device,
+                check_freq=check_freq,
+            )
     else:
-        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(A_gpu, b_gpu, apply_M_block_diag, tol=pcg_tol, max_iter=pcg_max_iter, device=device, check_freq=check_freq)
+        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
+            A_gpu,
+            b_gpu,
+            apply_M_block_diag,
+            tol=pcg_tol,
+            max_iter=pcg_max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
 
     total_leaf_ms = inference_ms + solve_leaf_ms
 

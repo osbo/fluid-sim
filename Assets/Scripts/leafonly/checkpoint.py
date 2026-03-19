@@ -37,16 +37,6 @@ def _read_into(f, param, read_fn, transpose=False):
         param.copy_(t)
 
 
-def _packed_tensor_bytes(shape):
-    num_elements = int(torch.Size(shape).numel())
-    read_len = num_elements + (1 if num_elements % 2 else 0)
-    return read_len * 2
-
-
-def _skip_packed_tensor(f, shape):
-    f.seek(_packed_tensor_bytes(shape), 1)
-
-
 def _write_gcn_layer(f, gcn_layer):
     _write_packed_tensor(f, gcn_layer.linear_self.weight.detach().cpu().float(), transpose=True)
     _write_packed_tensor(f, gcn_layer.linear_self.bias.detach().cpu().float(), transpose=False)
@@ -137,63 +127,13 @@ def load_leaf_only_weights(model, path):
             data_fp32 = data_fp32.view(shape)
         return data_fp32
 
-    d_model = model.embed.lift[0].weight.shape[0]
-    global_features_dim = model.embed.lift[0].weight.shape[1] - 6
-    legacy_film_bytes = 0
-    if global_features_dim > 0:
-        legacy_film_bytes += _packed_tensor_bytes((d_model, global_features_dim))
-        legacy_film_bytes += _packed_tensor_bytes((d_model,))
-        legacy_film_bytes += _packed_tensor_bytes((2 * d_model, d_model))
-        legacy_film_bytes += _packed_tensor_bytes((2 * d_model,))
-
-    file_size = path.stat().st_size
-
     with open(path, "rb") as f:
         f.seek(header_bytes)
         _read_into(f, model.embed.lift[0].weight, read_tensor, transpose=True)
         _read_into(f, model.embed.lift[0].bias, read_tensor, transpose=False)
         _read_into(f, model.embed.lift[2].weight, read_tensor, transpose=True)
         _read_into(f, model.embed.lift[2].bias, read_tensor, transpose=False)
-        bytes_after_lift = file_size - f.tell()
         model_gcn_layers = model.embed.gcn if model.embed.gcn is not None else []
-        bytes_needed_without_film = 0
-        for gcn_layer in model_gcn_layers:
-            bytes_needed_without_film += _packed_tensor_bytes(gcn_layer.linear_self.weight.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(gcn_layer.linear_self.bias.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(gcn_layer.linear_neighbor.weight.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(gcn_layer.linear_neighbor.bias.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(gcn_layer.update_gate[0].weight.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(gcn_layer.update_gate[0].bias.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(gcn_layer.update_gate[2].weight.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(gcn_layer.update_gate[2].bias.shape)
-        bytes_needed_without_film += _packed_tensor_bytes(model.embed.norm.weight.shape)
-        bytes_needed_without_film += _packed_tensor_bytes(model.embed.norm.bias.shape)
-        bytes_needed_without_film += _packed_tensor_bytes(model.enc_input_proj.weight.shape)
-        bytes_needed_without_film += _packed_tensor_bytes(model.enc_input_proj.bias.shape)
-        for block in model.blocks:
-            bytes_needed_without_film += _packed_tensor_bytes(block.norm1.weight.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(block.norm1.bias.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(block.attn.qkv.weight.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(block.attn.qkv.bias.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(block.attn.proj.weight.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(block.attn.proj.bias.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(block.attn.edge_gate.weight.shape)
-            bytes_needed_without_film += _packed_tensor_bytes(block.attn.edge_gate.bias.shape)
-        bytes_needed_without_film += _packed_tensor_bytes(model.leaf_head.weight.shape)
-        bytes_needed_without_film += _packed_tensor_bytes(model.leaf_head.bias.shape)
-        bytes_needed_without_film += _packed_tensor_bytes(model.jacobi_gate.weight.shape)
-        bytes_needed_without_film += _packed_tensor_bytes(model.jacobi_gate.bias.shape)
-        if bytes_after_lift == bytes_needed_without_film + legacy_film_bytes:
-            _skip_packed_tensor(f, (d_model, global_features_dim))
-            _skip_packed_tensor(f, (d_model,))
-            _skip_packed_tensor(f, (2 * d_model, d_model))
-            _skip_packed_tensor(f, (2 * d_model,))
-        elif bytes_after_lift != bytes_needed_without_film:
-            raise ValueError(
-                "Checkpoint layout mismatch after removing FiLM."
-                f" bytes_after_lift={bytes_after_lift}, expected={bytes_needed_without_film}"
-                f" or legacy+film={bytes_needed_without_film + legacy_film_bytes}"
-            )
         if num_gcn_layers_file != len(model_gcn_layers):
             raise ValueError(f"Checkpoint num_gcn_layers={num_gcn_layers_file} != model {len(model_gcn_layers)}")
         for i in range(num_gcn_layers_file):
@@ -215,3 +155,5 @@ def load_leaf_only_weights(model, path):
         _read_into(f, model.leaf_head.bias, read_tensor, transpose=False)
         _read_into(f, model.jacobi_gate.weight, read_tensor, transpose=True)
         _read_into(f, model.jacobi_gate.bias, read_tensor, transpose=False)
+        if f.read(1):
+            raise ValueError("Checkpoint has trailing bytes; unsupported legacy format.")

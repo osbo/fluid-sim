@@ -76,13 +76,13 @@ def _print_table(title, headers, rows):
 def evaluate_gradient_interference(args, runtime):
     data_folder = runtime["data_folder"]
     save_path = runtime["save_path"]
-    use_global_node = runtime["use_global_node"]
     runtime_use_gcn = runtime["use_gcn"]
     device = runtime["device"]
     args.num_layers = 2
     args.num_gcn_layers = 2
     args.use_jacobi = True
     use_jacobi = True
+    attention_layout = str(args.attention_layout)
     if not runtime_use_gcn:
         raise ValueError("Runtime has use_gcn=False, but the fixed architecture requires 2 GCN layers.")
     requested_gcn_layers = 2
@@ -97,8 +97,7 @@ def evaluate_gradient_interference(args, runtime):
         leaf_size=LEAF_SIZE,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
-        mask_attention=True,
-        use_global_node=use_global_node,
+        attention_layout=attention_layout,
         use_gcn=use_gcn,
         num_gcn_layers=effective_gcn_layers,
         use_jacobi=use_jacobi,
@@ -113,7 +112,7 @@ def evaluate_gradient_interference(args, runtime):
     model.train()
 
     num_eval = 10
-    contexts_per_step = max(1, int(getattr(args, "contexts_per_step", 4)))
+    contexts_per_step = max(1, int(args.contexts_per_step))
     eval_max_nodes = max(LEAF_SIZE * 2, int(MAX_MIXED_SIZE))
     data_path = Path(data_folder)
     run_folder = most_recent_run_folder(data_path)
@@ -128,7 +127,7 @@ def evaluate_gradient_interference(args, runtime):
         frame_indices_per_pass = [rng.choices(range(len(dataset)), k=contexts_per_step) for _ in range(num_eval)]
         print(f"Evaluating {num_eval} passes, {contexts_per_step} frames per pass (gradient accumulation like training)")
 
-    num_blocks = getattr(args, "num_layers", 3)
+    num_blocks = args.num_layers
     num_gcn = len(model.embed.gcn) if model.embed.gcn else 0
     param_groups = {}
     param_groups["Lift (linear 0)"] = lambda m: list(m.embed.lift[0].parameters())
@@ -138,6 +137,7 @@ def evaluate_gradient_interference(args, runtime):
     for b in range(num_blocks):
         param_groups[f"Transformer block {b}"] = lambda m, b=b: list(m.blocks[b].parameters())
     param_groups["Diagonal Leaf Head"] = lambda m: list(m.leaf_head.parameters())
+    param_groups["Jacobi params"] = lambda m: list(m.jacobi_gate.parameters())
 
     group_gradients = {name: [] for name in param_groups.keys()}
 
@@ -170,7 +170,7 @@ def evaluate_gradient_interference(args, runtime):
             global_feat = global_feat.to(device)
             if global_feat.dim() == 1:
                 global_feat = global_feat.unsqueeze(0)
-            diag_blocks = model(
+            precond_out = model(
                 x_input,
                 edge_index=edge_index,
                 edge_values=edge_values,
@@ -181,7 +181,11 @@ def evaluate_gradient_interference(args, runtime):
             Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
             Z[:, n_orig:, :] = 0.0
             AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
-            MAZ = apply_block_diagonal_M(diag_blocks, AZ, leaf_size=LEAF_SIZE)
+            jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
+            diag_A = torch.diagonal(A_dense, 0)
+            inv_mask = diag_A.abs() > 1e-6
+            jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A[inv_mask]
+            MAZ = apply_block_diagonal_M(precond_out, AZ, leaf_size=LEAF_SIZE, jacobi_inv_diag=jacobi_inv_diag)
             raw_loss = ((MAZ - Z) ** 2).mean()
             step_loss_sum += raw_loss.item()
             loss = raw_loss / contexts_per_step
@@ -292,7 +296,13 @@ def evaluate_gradient_interference(args, runtime):
                 attn_mask=attn_mask,
                 edge_feats=edge_feats,
             )
-        diag_blocks_profile = model._get_leaf_blocks(h_attn, x_input)
+        diag_blocks_profile = model._get_leaf_blocks(h_attn)
+        jacobi_scale_profile = model._get_jacobi_scale(h_attn)
+
+    jacobi_inv_diag_profile = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
+    diag_A_profile = torch.diagonal(A_dense, 0)
+    inv_mask_profile = diag_A_profile.abs() > 1e-6
+    jacobi_inv_diag_profile[0, inv_mask_profile] = 1.0 / diag_A_profile[inv_mask_profile]
 
     timing_rows = []
     ms_lift = _timed_ms(
@@ -343,12 +353,23 @@ def evaluate_gradient_interference(args, runtime):
                 edge_feats=edge_feats,
             )
 
-    ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_attn, x_input), device)
-    timing_rows.append(["Leaf head + Jacobi diag", ms_leaf_head])
+    ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_attn), device)
+    timing_rows.append(["Leaf head (block PSD)", ms_leaf_head])
+
+    ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_attn), device)
+    timing_rows.append(["Jacobi gate (node_scalar)", ms_jacobi])
 
     ms_AZ = _timed_ms(lambda: (A_dense @ Z.squeeze(0)).unsqueeze(0), device)
     timing_rows.append(["A @ Z", ms_AZ])
-    ms_apply_m = _timed_ms(lambda: apply_block_diagonal_M(diag_blocks_profile, AZ, leaf_size=LEAF_SIZE), device)
+    ms_apply_m = _timed_ms(
+        lambda: apply_block_diagonal_M(
+            (diag_blocks_profile, jacobi_scale_profile),
+            AZ,
+            leaf_size=LEAF_SIZE,
+            jacobi_inv_diag=jacobi_inv_diag_profile,
+        ),
+        device,
+    )
     timing_rows.append(["Apply block-diagonal M", ms_apply_m])
 
     total_ms = sum(v for _, v in timing_rows) + 1e-12
