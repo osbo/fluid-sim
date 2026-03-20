@@ -343,7 +343,7 @@ def main():
         )
     inference_ms = _timed_ms(_fwd, device, warmup=15, repeat=10)
     precond_out = _last_out[0]
-    diag_blocks, jacobi_scale = unpack_precond(precond_out, n_pad, LEAF_SIZE)
+    diag_blocks, off_diag_blocks, jacobi_scale = unpack_precond(precond_out, n_pad, LEAF_SIZE)
     jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=diag_blocks.dtype)
     diag_A_tensor = torch.from_numpy(np.diag(A_viz).astype(np.float32)).to(device)
     diag_mask = diag_A_tensor.abs() > 1e-6
@@ -353,9 +353,21 @@ def main():
     for b in range(num_leaves):
         r0, r1 = b * LEAF_SIZE, (b + 1) * LEAF_SIZE
         M_neural_gpu[r0:r1, r0:r1] = diag_blocks[0, b]
+
+    P = (num_leaves * (num_leaves - 1)) // 2
+    if P > 0 and off_diag_blocks is not None:
+        r_idx, c_idx = torch.triu_indices(num_leaves, num_leaves, offset=1, device=device)
+        for p in range(P):
+            r, c = r_idx[p].item(), c_idx[p].item()
+            r0, r1 = r * LEAF_SIZE, (r + 1) * LEAF_SIZE
+            c0, c1 = c * LEAF_SIZE, (c + 1) * LEAF_SIZE
+
+            M_neural_gpu[r0:r1, c0:c1] = off_diag_blocks[0, p]
+            M_neural_gpu[c0:c1, r0:r1] = off_diag_blocks[0, p].transpose(-1, -2)
+
     if jacobi_scale is not None:
         M_neural_gpu += torch.diag((jacobi_scale[0] * jacobi_inv_diag[0]).to(M_neural_gpu.dtype))
-    print(f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} block-diagonal M")
+    print(f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} block preconditioner M")
 
     d = diag_blocks.detach()
     if d.dim() == 3:

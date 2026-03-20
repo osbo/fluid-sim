@@ -95,10 +95,10 @@ def train_leaf_only(args, runtime):
             A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
 
             positions_ctx = x_input[0, :n_pad, :3]
-            leaf_attn_mask, leaf_edge_feats = build_leaf_block_connectivity(
+            leaf_attn_mask, leaf_edge_feats, off_attn_mask, off_edge_feats = build_leaf_block_connectivity(
                 edge_index, edge_values, positions_ctx, LEAF_SIZE, device, x_input.dtype
             )
-            precomputed_leaf_connectivity = (leaf_attn_mask, leaf_edge_feats)
+            precomputed_leaf_connectivity = (leaf_attn_mask, leaf_edge_feats, off_attn_mask, off_edge_feats)
             batch_vectors = max(128, int(round(n_pad ** 0.5)))
             global_feat = batch.get("global_features")
             if global_feat is None:
@@ -226,11 +226,14 @@ def train_leaf_only(args, runtime):
         batch_ctx = [random.choice(training_contexts) for _ in range(contexts_per_step)]
         B_step = len(batch_ctx)
         max_n_pad_step = max(ctx["n_pad"] for ctx in batch_ctx)
+        max_num_blocks = max_n_pad_step // LEAF_SIZE
+        max_P = (max_num_blocks * (max_num_blocks - 1)) // 2
         n_orig_t = batch_ctx[0]["n_orig"]
         n_pad_t = max_n_pad_step
         x_list, A_list, gf_list, inv_diag_list = [], [], [], []
         edge_idx_parts, edge_val_parts = [], []
         leaf_masks_list, leaf_feats_list = [], []
+        off_masks_list, off_feats_list = [], []
         n_orig_list = []
 
         for b_idx, ctx in enumerate(batch_ctx):
@@ -261,8 +264,26 @@ def train_leaf_only(args, runtime):
             edge_val_parts.append(edge_values_ctx)
 
             pre_leaf = ctx["precomputed_leaf_connectivity"]
-            leaf_masks_list.append(pre_leaf[0])
-            leaf_feats_list.append(pre_leaf[1])
+            leaf_mask, leaf_feats, off_mask, off_feats = pre_leaf
+
+            pad_blocks = max_num_blocks - leaf_mask.shape[0]
+            if pad_blocks > 0:
+                leaf_mask = F.pad(leaf_mask, (0, 0, 0, 0, 0, pad_blocks), value=0.0)
+                leaf_feats = F.pad(leaf_feats, (0, 0, 0, 0, 0, 0, 0, pad_blocks), value=0.0)
+
+            pad_P = max_P - (off_mask.shape[0] if off_mask is not None else 0)
+            if pad_P > 0:
+                if off_mask is None or off_mask.shape[0] == 0:
+                    off_mask = torch.zeros(max_P, LEAF_SIZE, LEAF_SIZE + 1, device=device, dtype=x_ctx.dtype)
+                    off_feats = torch.zeros(max_P, LEAF_SIZE, LEAF_SIZE + 1, 4, device=device, dtype=x_ctx.dtype)
+                else:
+                    off_mask = F.pad(off_mask, (0, 0, 0, 0, 0, pad_P), value=0.0)
+                    off_feats = F.pad(off_feats, (0, 0, 0, 0, 0, 0, 0, pad_P), value=0.0)
+
+            leaf_masks_list.append(leaf_mask)
+            leaf_feats_list.append(leaf_feats)
+            off_masks_list.append(off_mask)
+            off_feats_list.append(off_feats)
 
             gf = ctx["global_features"]
             gf_list.append(gf if gf.dim() == 1 else gf.squeeze(0))
@@ -277,7 +298,12 @@ def train_leaf_only(args, runtime):
         edge_values_batched = torch.cat(edge_val_parts, dim=0)
         global_features_batched = torch.stack(gf_list, dim=0)
         jacobi_inv_diag_batched = torch.stack(inv_diag_list, dim=0)
-        pre_leaf_batched = (torch.stack(leaf_masks_list, dim=0), torch.stack(leaf_feats_list, dim=0))
+        pre_leaf_batched = (
+            torch.stack(leaf_masks_list, dim=0),
+            torch.stack(leaf_feats_list, dim=0),
+            torch.stack(off_masks_list, dim=0),
+            torch.stack(off_feats_list, dim=0),
+        )
 
         batch_vectors = max(256, int(round(max_n_pad_step ** 0.5)))
         if do_timing:

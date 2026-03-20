@@ -137,15 +137,36 @@ class FluidGraphDataset:
         }
 
 
-def _reachable_blocks_from_edges(
-    edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype, num_hops
+def _materialize_block_attn_and_edge_feats(
+    reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
 ):
+    L = leaf_size
+    attn_mask = torch.zeros(num_blocks, L, L + 1, device=device, dtype=dtype)
+    attn_mask[:, :, :L] = reachable
+    attn_mask[:, :, L] = 1.0
+    edge_feats = torch.zeros(num_blocks, L, L + 1, 4, device=device, dtype=dtype)
+    if b_l.numel() > 0:
+        edge_feats[b_l, r_l, c_l, :] = edge_feats_flat.to(device=device, dtype=dtype)
+    return attn_mask, edge_feats
+
+
+def build_leaf_block_connectivity(
+    edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS
+):
+    N = positions.shape[0]
+    num_blocks = N // leaf_size
+    if num_blocks == 0:
+        return None, None, None, None
+
     rows, cols = edge_index[0], edge_index[1]
     block_r = rows // leaf_size
     block_c = cols // leaf_size
+
+    # --- 1. Diagonal Connectivity ---
     in_block = (block_r == block_c) & (block_r < num_blocks)
     r_l, c_l = rows[in_block] % leaf_size, cols[in_block] % leaf_size
     b_l = block_r[in_block]
+
     pos_r = positions[rows[in_block]]
     pos_c = positions[cols[in_block]]
     dx = (pos_c - pos_r).to(device=device, dtype=dtype)
@@ -160,33 +181,50 @@ def _reachable_blocks_from_edges(
     for _ in range(num_hops):
         reachable = (reachable + cur).clamp(0.0, 1.0)
         cur = torch.bmm(cur, adj)
-    return reachable, b_l, r_l, c_l, edge_feats_flat
 
-
-def _materialize_block_attn_and_edge_feats(
-    reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
-):
-    L = leaf_size
-    attn_mask = torch.zeros(num_blocks, L, L + 1, device=device, dtype=dtype)
-    attn_mask[:, :, :L] = reachable
-    attn_mask[:, :, L] = 1.0
-    edge_feats = torch.zeros(num_blocks, L, L + 1, 4, device=device, dtype=dtype)
-    if b_l.numel() > 0:
-        edge_feats[b_l, r_l, c_l, :] = edge_feats_flat.to(device=device, dtype=dtype)
-    return attn_mask, edge_feats
-
-
-def build_leaf_block_connectivity(edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS):
-    N = positions.shape[0]
-    num_blocks = N // leaf_size
-    if num_blocks == 0:
-        return None, None
-    reachable, b_l, r_l, c_l, edge_feats_flat = _reachable_blocks_from_edges(
-        edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype, num_hops
-    )
-    return _materialize_block_attn_and_edge_feats(
+    diag_mask, diag_feats = _materialize_block_attn_and_edge_feats(
         reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
     )
+
+    # --- 2. Off-Diagonal Connectivity ---
+    r_idx, c_idx = torch.triu_indices(num_blocks, num_blocks, offset=1, device=device)
+    P = r_idx.shape[0]
+
+    if P > 0:
+        lookup = torch.full((num_blocks, num_blocks), -1, device=device, dtype=torch.long)
+        lookup[r_idx, c_idx] = torch.arange(P, device=device)
+
+        off_mask = (block_r < block_c) & (block_c < num_blocks)
+        br_off, bc_off = block_r[off_mask], block_c[off_mask]
+
+        p_ids = lookup[br_off, bc_off]
+        valid_p = p_ids >= 0
+        p_l = p_ids[valid_p]
+
+        rl_off = rows[off_mask][valid_p] % leaf_size
+        cl_off = cols[off_mask][valid_p] % leaf_size
+
+        pos_r_off = positions[rows[off_mask][valid_p]]
+        pos_c_off = positions[cols[off_mask][valid_p]]
+        dx_off = (pos_c_off - pos_r_off).to(device=device, dtype=dtype)
+        w_off = edge_values[off_mask][valid_p].to(device=device, dtype=dtype)
+        edge_feats_flat_off = torch.cat([dx_off, w_off.unsqueeze(1)], dim=1)
+
+        adj_off = torch.zeros(P, leaf_size, leaf_size, device=device, dtype=dtype)
+        if p_l.numel() > 0:
+            adj_off[p_l, rl_off, cl_off] = 1.0
+
+        reachable_off = torch.eye(leaf_size, device=device, dtype=dtype).unsqueeze(0).expand(P, -1, -1).clone()
+        reachable_off = (reachable_off + adj_off).clamp(0.0, 1.0)
+
+        off_diag_mask, off_diag_feats = _materialize_block_attn_and_edge_feats(
+            reachable_off, p_l, rl_off, cl_off, edge_feats_flat_off, P, leaf_size, device, dtype
+        )
+    else:
+        off_diag_mask = torch.zeros(0, leaf_size, leaf_size + 1, device=device, dtype=dtype)
+        off_diag_feats = torch.zeros(0, leaf_size, leaf_size + 1, 4, device=device, dtype=dtype)
+
+    return diag_mask, diag_feats, off_diag_mask, off_diag_feats
 
 
 def most_recent_run_folder(base_path):

@@ -136,7 +136,10 @@ def evaluate_gradient_interference(args, runtime):
         param_groups[f"GCN layer {g}"] = lambda m, g=g: list(m.embed.gcn[g].parameters())
     for b in range(num_blocks):
         param_groups[f"Transformer block {b}"] = lambda m, b=b: list(m.blocks[b].parameters())
+    for b in range(num_blocks):
+        param_groups[f"Off-diag Transformer block {b}"] = lambda m, b=b: list(m.off_diag_blocks[b].parameters())
     param_groups["Diagonal Leaf Head"] = lambda m: list(m.leaf_head.parameters())
+    param_groups["Off-diag U/V heads"] = lambda m: list(m.off_diag_head_U.parameters()) + list(m.off_diag_head_V.parameters())
     param_groups["Jacobi params"] = lambda m: list(m.jacobi_gate.parameters())
 
     group_gradients = {name: [] for name in param_groups.keys()}
@@ -274,8 +277,12 @@ def evaluate_gradient_interference(args, runtime):
     Z[:, n_orig:, :] = 0.0
     AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
 
-    attn_mask, edge_feats = pre_leaf
+    attn_mask, edge_feats, off_attn_mask, off_edge_feats = pre_leaf
     positions = x_input[0, :, :3]
+    B_prof, N_prof, C_prof = x_input.shape
+    K_prof = N_prof // LEAF_SIZE
+    r_idx_prof, c_idx_prof = torch.triu_indices(K_prof, K_prof, offset=1, device=device)
+    P_prof = r_idx_prof.shape[0]
 
     with torch.no_grad():
         h_lift = model.embed.lift(torch.cat([x_input[..., 3:], global_feat.unsqueeze(1).expand(-1, x_input.size(1), -1)], dim=-1))
@@ -285,10 +292,10 @@ def evaluate_gradient_interference(args, runtime):
                 h_gcn = gcn_layer(h_gcn, edge_index, edge_values)
         h_norm = model.embed.norm(h_gcn)
         h_proj0 = model.enc_input_proj(h_norm)
-        h_attn = h_proj0
+        h_diag = h_proj0
         for block in model.blocks:
-            h_attn = block(
-                h_attn,
+            h_diag = block(
+                h_diag,
                 edge_index=edge_index,
                 edge_values=edge_values,
                 positions=positions,
@@ -296,8 +303,25 @@ def evaluate_gradient_interference(args, runtime):
                 attn_mask=attn_mask,
                 edge_feats=edge_feats,
             )
-        diag_blocks_profile = model._get_leaf_blocks(h_attn)
-        jacobi_scale_profile = model._get_jacobi_scale(h_attn)
+        diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
+        if P_prof > 0:
+            h_k = h_proj0.view(B_prof, K_prof, LEAF_SIZE, C_prof)
+            h_pairs = (h_k[:, r_idx_prof] + h_k[:, c_idx_prof]).view(B_prof, P_prof * LEAF_SIZE, C_prof)
+            h_off = h_pairs
+            for block in model.off_diag_blocks:
+                h_off = block(
+                    h_off,
+                    edge_index=edge_index,
+                    edge_values=edge_values,
+                    positions=positions,
+                    save_attention=False,
+                    attn_mask=off_attn_mask,
+                    edge_feats=off_edge_feats,
+                )
+            off_diag_blocks_profile = model._get_leaf_blocks(h_off, mode="off-diagonal")
+        else:
+            off_diag_blocks_profile = torch.empty((B_prof, 0, LEAF_SIZE, LEAF_SIZE), device=device, dtype=h_proj0.dtype)
+        jacobi_scale_profile = model._get_jacobi_scale(h_diag)
 
     jacobi_inv_diag_profile = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
     diag_A_profile = torch.diagonal(A_dense, 0)
@@ -381,16 +405,49 @@ def evaluate_gradient_interference(args, runtime):
                 edge_feats=edge_feats,
             )
 
-    ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_attn), device)
+    ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_block_in, mode="diagonal"), device)
     timing_rows.append(["Leaf head (block PSD)", ms_leaf_head])
 
-    ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_attn), device)
+    if P_prof > 0:
+        h_k_t = h_proj0.view(B_prof, K_prof, LEAF_SIZE, C_prof)
+        h_pairs_t = (h_k_t[:, r_idx_prof] + h_k_t[:, c_idx_prof]).view(B_prof, P_prof * LEAF_SIZE, C_prof)
+        h_off_in = h_pairs_t
+        for i, block in enumerate(model.off_diag_blocks):
+            ms_ob = _timed_ms(
+                lambda b=block, h=h_off_in: b(
+                    h,
+                    edge_index=edge_index,
+                    edge_values=edge_values,
+                    positions=positions,
+                    save_attention=False,
+                    attn_mask=off_attn_mask,
+                    edge_feats=off_edge_feats,
+                ),
+                device,
+            )
+            timing_rows.append([f"Off-diag attention block {i}", ms_ob])
+            with torch.no_grad():
+                h_off_in = block(
+                    h_off_in,
+                    edge_index=edge_index,
+                    edge_values=edge_values,
+                    positions=positions,
+                    save_attention=False,
+                    attn_mask=off_attn_mask,
+                    edge_feats=off_edge_feats,
+                )
+        ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_in, mode="off-diagonal"), device)
+        timing_rows.append(["Off-diag head (UV^T)", ms_off_head])
+
+    ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_in), device)
     timing_rows.append(["Jacobi gate (node_scalar)", ms_jacobi])
 
     ms_AZ = _timed_ms(lambda: (A_dense @ Z.squeeze(0)).unsqueeze(0), device)
     timing_rows.append(["A @ Z", ms_AZ])
-    B_prof = diag_blocks_profile.shape[0]
-    packed_profile = diag_blocks_profile.reshape(B_prof, -1)
+    B_pack = diag_blocks_profile.shape[0]
+    packed_profile = torch.cat(
+        [diag_blocks_profile.reshape(B_pack, -1), off_diag_blocks_profile.reshape(B_pack, -1)], dim=1
+    )
     if jacobi_scale_profile is not None:
         packed_profile = torch.cat([packed_profile, jacobi_scale_profile], dim=1)
     ms_apply_m = _timed_ms(
