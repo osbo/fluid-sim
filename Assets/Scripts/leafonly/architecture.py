@@ -10,6 +10,45 @@ from .config import (
 from .data import build_leaf_block_connectivity
 
 
+def _normalize_attention_layout_string(layout: str) -> str:
+    return layout.strip().lower().replace("×", "x")
+
+
+def parse_attention_layout(layout: str, block_size: int) -> tuple[bool, bool]:
+    """
+    Returns (use_block_node, use_matrix_node) for LeafBlockAttention.
+    Layout must be '{L}x{L}', '{L}x{L+1}', or '{L}x{L+2}' with L == block_size (query rows = leaf nodes).
+    """
+    parts = _normalize_attention_layout_string(layout).split("x")
+    if len(parts) != 2:
+        raise ValueError(
+            f"attention_layout {layout!r} must look like '{{L}}x{{L}}', '{{L}}x{{L+1}}', or '{{L}}x{{L+2}}'"
+        )
+    r, c = int(parts[0]), int(parts[1])
+    L = int(block_size)
+    if r != L:
+        raise ValueError(f"attention_layout first dimension ({r}) must equal leaf_size ({L})")
+    if c == L:
+        return False, False
+    if c == L + 1:
+        return True, False
+    if c == L + 2:
+        return True, True
+    raise ValueError(
+        f"attention_layout second dimension ({c}) must be L, L+1, or L+2 for leaf_size={L}; got {layout!r}"
+    )
+
+
+def attention_layout_choices(leaf_size: int) -> tuple[str, str, str]:
+    L = int(leaf_size)
+    return (f"{L}x{L}", f"{L}x{L + 1}", f"{L}x{L + 2}")
+
+
+def default_attention_layout(leaf_size: int) -> str:
+    L = int(leaf_size)
+    return f"{L}x{L + 1}"
+
+
 class SparsePhysicsGCN(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -77,14 +116,13 @@ class PhysicsAwareEmbedding(nn.Module):
 
 
 class LeafBlockAttention(nn.Module):
-    VALID_LAYOUTS = ("32x32", "32x33", "32x34")
-
-    def __init__(self, dim, block_size, num_heads=8, attention_layout="32x33"):
+    def __init__(self, dim, block_size, num_heads=8, attention_layout=None):
         super().__init__()
         self.dim = dim
         self.block_size = block_size
-        if attention_layout not in self.VALID_LAYOUTS:
-            raise ValueError(f"Unsupported attention_layout='{attention_layout}'. Expected one of {self.VALID_LAYOUTS}.")
+        if attention_layout is None:
+            attention_layout = default_attention_layout(block_size)
+        self.use_block_node, self.use_matrix_node = parse_attention_layout(attention_layout, block_size)
         self.attention_layout = attention_layout
         self.num_heads = num_heads if dim % num_heads == 0 else 1
         self.head_dim = dim // self.num_heads
@@ -120,8 +158,8 @@ class LeafBlockAttention(nn.Module):
         if edge_feats is None:
             raise ValueError("LeafBlockAttention requires edge_feats when attn_mask is provided.")
 
-        use_block_node = self.attention_layout in ("32x33", "32x34")
-        use_matrix_node = self.attention_layout == "32x34"
+        use_block_node = self.use_block_node
+        use_matrix_node = self.use_matrix_node
         kv_parts = [x_blk]
         if use_block_node:
             block_node = x_blk.mean(dim=2, keepdim=True)
@@ -247,16 +285,18 @@ class LeafOnlyNet(nn.Module):
         self,
         input_dim=9,
         d_model=128,
-        leaf_size=32,
+        leaf_size=LEAF_SIZE,
         num_layers=2,
         num_heads=8,
-        attention_layout="32x33",
+        attention_layout=None,
         use_gcn=True,
         num_gcn_layers=PhysicsAwareEmbedding.DEFAULT_NUM_GCN_LAYERS,
         use_jacobi=True,
     ):
         super().__init__()
-        self.leaf_size = leaf_size
+        self.leaf_size = int(leaf_size)
+        if attention_layout is None:
+            attention_layout = default_attention_layout(self.leaf_size)
         self.embed = PhysicsAwareEmbedding(
             input_dim,
             d_model,
@@ -265,14 +305,15 @@ class LeafOnlyNet(nn.Module):
             num_gcn_layers=num_gcn_layers,
         )
         self.enc_input_proj = nn.Linear(d_model, d_model)
+        L = self.leaf_size
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
                     d_model,
-                    block_size=leaf_size,
+                    block_size=L,
                     attn_module=LeafBlockAttention(
                         d_model,
-                        leaf_size,
+                        L,
                         num_heads=num_heads,
                         attention_layout=attention_layout,
                     ),
@@ -284,10 +325,10 @@ class LeafOnlyNet(nn.Module):
             [
                 TransformerBlock(
                     d_model,
-                    block_size=leaf_size,
+                    block_size=L,
                     attn_module=LeafBlockAttention(
                         d_model,
-                        leaf_size,
+                        L,
                         num_heads=num_heads,
                         attention_layout=attention_layout,
                     ),
@@ -295,13 +336,13 @@ class LeafOnlyNet(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.off_diag_head_U = nn.Linear(d_model, leaf_size)
-        self.off_diag_head_V = nn.Linear(d_model, leaf_size)
+        self.off_diag_head_U = nn.Linear(d_model, L)
+        self.off_diag_head_V = nn.Linear(d_model, L)
         nn.init.normal_(self.off_diag_head_U.weight, std=0.001)
         nn.init.constant_(self.off_diag_head_U.bias, 0.0)
         nn.init.normal_(self.off_diag_head_V.weight, std=0.001)
         nn.init.constant_(self.off_diag_head_V.bias, 0.0)
-        self.leaf_head = nn.Linear(d_model, leaf_size)
+        self.leaf_head = nn.Linear(d_model, L)
         nn.init.normal_(self.leaf_head.weight, std=0.001)
         nn.init.constant_(self.leaf_head.bias, 0.0)
         self.jacobi_gate = nn.Linear(d_model, 1)

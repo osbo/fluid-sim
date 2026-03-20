@@ -12,16 +12,16 @@ import math
 from pathlib import Path
 
 from NeuralPreconditioner import FluidGraphDataset
+from leafonly.config import LEAF_SIZE
 
 
-LEAF_SIZE = 32
-
-
-def get_hodlr_block_sizes(n, leaf_size=32):
+def get_hodlr_block_sizes(n, leaf_size=None):
     """Return list of (level_idx, block_size) for HODLR off-diagonal levels.
     Level 0 = coarsest (largest block_size, n/2); level num_levels-1 = finest (block_size=leaf_size).
     Requires n = leaf_size * 2^depth for some depth.
     """
+    if leaf_size is None:
+        leaf_size = LEAF_SIZE
     if n % leaf_size != 0:
         return []
     num_blocks = n // leaf_size
@@ -34,11 +34,13 @@ def get_hodlr_block_sizes(n, leaf_size=32):
     ]
 
 
-def enumerate_off_diagonal_blocks(A, leaf_size=32):
+def enumerate_off_diagonal_blocks(A, leaf_size=None):
     """
     Yield (level_idx, block_size, block_matrix, label) for each off-diagonal
     HODLR block. block_matrix is the dense 2D slice of A.
     """
+    if leaf_size is None:
+        leaf_size = LEAF_SIZE
     n = A.shape[0]
     levels = get_hodlr_block_sizes(n, leaf_size)
     for level_idx, block_size in levels:
@@ -53,8 +55,10 @@ def enumerate_off_diagonal_blocks(A, leaf_size=32):
             yield level_idx, block_size, block_upper.copy(), label
 
 
-def enumerate_diagonal_blocks(A, leaf_size=32):
+def enumerate_diagonal_blocks(A, leaf_size=None):
     """Yield (block_idx, block_matrix) for each diagonal leaf block."""
+    if leaf_size is None:
+        leaf_size = LEAF_SIZE
     n = A.shape[0]
     num_blocks = n // leaf_size
     for b in range(num_blocks):
@@ -97,7 +101,7 @@ def main():
     n = num_nodes_real
     print(f"Frame {args.frame}: N={n}")
 
-    # Full N: pad to power-of-2 multiple of leaf_size so all layers 32, 64, 128, ... exist
+    # Full N: pad to power-of-2 multiple of leaf_size so all HODLR levels exist
     viz_n = (args.viz_limit if args.viz_limit > 0 else n)
     viz_n = min(viz_n, n)
     num_blocks_min = (viz_n + LEAF_SIZE - 1) // LEAF_SIZE

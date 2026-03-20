@@ -3,7 +3,15 @@ from pathlib import Path
 import torch
 
 
-LEAF_SIZE = 32
+def _validate_leaf_size(L: int) -> int:
+    L = int(L)
+    if L < 1 or (L & (L - 1)) != 0:
+        raise ValueError(f"LEAF_SIZE must be a positive power of 2, got {L}")
+    return L
+
+
+# Set to any power of 2; training checkpoints store this in the header — match when loading.
+LEAF_SIZE = _validate_leaf_size(32)
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 

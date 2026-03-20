@@ -1,6 +1,7 @@
 import argparse
 
-from leafonly.config import fixed_runtime_config, require_cuda_or_mps_device
+from leafonly.architecture import attention_layout_choices, default_attention_layout
+from leafonly.config import LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps_device
 from leafonly.eval import evaluate_gradient_interference
 from leafonly.train import train_leaf_only as _train_leaf_only_impl
 
@@ -20,12 +21,17 @@ def _build_parser():
     parser.add_argument("--continue_training", action="store_true", help="Load initial weights from the saved .bytes file and continue training from that state.")
     parser.add_argument("--evaluate_gradients", action="store_true", help="Run gradient interference analysis then exit.")
     parser.add_argument("--num_gcn_layers", type=int, default=2, choices=[2], help="Fixed number of GCN layers (kept at 2).")
+    _al = attention_layout_choices(LEAF_SIZE)
     parser.add_argument(
         "--attention_layout",
         type=str,
-        default="32x33",
-        choices=["32x32", "32x33", "32x34"],
-        help="Attention key layout: no extra node (32x32), +block node (32x33), +block+matrix node (32x34).",
+        default=default_attention_layout(LEAF_SIZE),
+        choices=list(_al),
+        help=(
+            f"Attention keys: {LEAF_SIZE}×{LEAF_SIZE} (nodes only), "
+            f"{LEAF_SIZE}×{LEAF_SIZE + 1} (+ block node), "
+            f"{LEAF_SIZE}×{LEAF_SIZE + 2} (+ block + matrix node). Must match leafonly.config.LEAF_SIZE."
+        ),
     )
     parser.add_argument("--target_step", type=int, default=10000, help="Step index to track in logs/metrics.")
     return parser
