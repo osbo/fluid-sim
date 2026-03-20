@@ -103,9 +103,6 @@ class LeafBlockAttention(nn.Module):
 
     def forward(self, x, edge_index=None, edge_values=None, positions=None, save_attention=False, attn_mask=None, edge_feats=None):
         B, N, C = x.shape
-        if edge_index is None or edge_values is None or positions is None:
-            raise ValueError("LeafBlockAttention requires edge_index, edge_values, and positions.")
-
         device = x.device
         dtype = x.dtype
         node_pad = 0

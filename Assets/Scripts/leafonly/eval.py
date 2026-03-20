@@ -279,7 +279,7 @@ def evaluate_gradient_interference(args, runtime):
 
     attn_mask, edge_feats, off_attn_mask, off_edge_feats = pre_leaf
     positions = x_input[0, :, :3]
-    B_prof, N_prof, C_prof = x_input.shape
+    B_prof, N_prof = x_input.shape[0], x_input.shape[1]
     K_prof = N_prof // LEAF_SIZE
     r_idx_prof, c_idx_prof = torch.triu_indices(K_prof, K_prof, offset=1, device=device)
     P_prof = r_idx_prof.shape[0]
@@ -292,6 +292,7 @@ def evaluate_gradient_interference(args, runtime):
                 h_gcn = gcn_layer(h_gcn, edge_index, edge_values)
         h_norm = model.embed.norm(h_gcn)
         h_proj0 = model.enc_input_proj(h_norm)
+        C_dim = h_proj0.shape[-1]
         h_diag = h_proj0
         for block in model.blocks:
             h_diag = block(
@@ -305,8 +306,8 @@ def evaluate_gradient_interference(args, runtime):
             )
         diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
         if P_prof > 0:
-            h_k = h_proj0.view(B_prof, K_prof, LEAF_SIZE, C_prof)
-            h_pairs = (h_k[:, r_idx_prof] + h_k[:, c_idx_prof]).view(B_prof, P_prof * LEAF_SIZE, C_prof)
+            h_k = h_proj0.view(B_prof, K_prof, LEAF_SIZE, C_dim)
+            h_pairs = (h_k[:, r_idx_prof] + h_k[:, c_idx_prof]).view(B_prof, P_prof * LEAF_SIZE, C_dim)
             h_off = h_pairs
             for block in model.off_diag_blocks:
                 h_off = block(
@@ -409,8 +410,8 @@ def evaluate_gradient_interference(args, runtime):
     timing_rows.append(["Leaf head (block PSD)", ms_leaf_head])
 
     if P_prof > 0:
-        h_k_t = h_proj0.view(B_prof, K_prof, LEAF_SIZE, C_prof)
-        h_pairs_t = (h_k_t[:, r_idx_prof] + h_k_t[:, c_idx_prof]).view(B_prof, P_prof * LEAF_SIZE, C_prof)
+        h_k_t = h_proj0.view(B_prof, K_prof, LEAF_SIZE, C_dim)
+        h_pairs_t = (h_k_t[:, r_idx_prof] + h_k_t[:, c_idx_prof]).view(B_prof, P_prof * LEAF_SIZE, C_dim)
         h_off_in = h_pairs_t
         for i, block in enumerate(model.off_diag_blocks):
             ms_ob = _timed_ms(

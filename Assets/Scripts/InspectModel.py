@@ -325,6 +325,7 @@ def main():
             global_feat = global_feat.unsqueeze(0)
 
     positions_leaf = x_leaf[0, :, :3]
+    # Outside inference timer: build_leaf_block_connectivity once; _timed_ms is embed + attention + heads only.
     pre_leaf_connectivity = build_leaf_block_connectivity(
         edge_index_leaf,
         edge_values_leaf,
