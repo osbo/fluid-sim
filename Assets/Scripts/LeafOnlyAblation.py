@@ -176,10 +176,11 @@ def main():
     runtime["device"] = require_cuda_or_mps_device()
     runtime["use_gcn"] = True
 
+    L = LEAF_SIZE
     attention_variants = [
-        ("baseline", "32x33"),
-        ("only_32x32", "32x32"),
-        ("with_matrix_global_32x34", "32x34"),
+        ("baseline", f"{L}x{L + 1}"),
+        ("only_LxL", f"{L}x{L}"),
+        ("with_matrix_global_LxL2", f"{L}x{L + 2}"),
     ]
     baseline_num_layers = 2
     baseline_num_gcn_layers = 2

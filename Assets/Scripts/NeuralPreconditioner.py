@@ -9,6 +9,8 @@ import struct
 from pathlib import Path
 import time
 from collections import defaultdict
+
+from leafonly.config import LEAF_SIZE as _DEFAULT_LEAF_SIZE
 # Set True to print forward-pass diagnostics (same format as LeafOnly). Set True to disable diagnostics/arch prints.
 FORWARD_DEBUG = False
 DISABLE_EXTRA_PRINTS = True
@@ -229,8 +231,8 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, l
     """
     Build per-block attention mask and edge features for leaf blocks.
     - positions: (N, 3) normalized; edge_values normalized by scale_A at call site.
-    - Returns: attn_mask (num_blocks, 32, 33), edge_feats (num_blocks, 32, 33, 4).
-      attn_mask[b,i,j]=1 if node i in block b can attend to j (j in 0..31 = node, 32 = block node).
+    - Returns: attn_mask (num_blocks, L, L+1), edge_feats (num_blocks, L, L+1, 4) for leaf_size=L.
+      attn_mask[b,i,j]=1 if node i in block b can attend to j (j in 0..L-1 = node, L = block node).
       edge_feats[b,i,j,:] = (dx, dy, dz, w_norm) for edges; 0 elsewhere. Self and block node get weight 1 in the MLP step.
     """
     N = positions.shape[0]
@@ -258,7 +260,7 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, l
     # Self-attend
     attn_mask[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device)] = 1.0
     edge_feats[:, torch.arange(leaf_size, device=device), torch.arange(leaf_size, device=device), :] = 0.0  # MLP will not be used; we set weight=1
-    # Block node: all 32 attend to column 32
+    # Block node: all leaf nodes attend to column L
     attn_mask[:, :, leaf_size] = 1.0
     # In-block edges
     attn_mask[b_l, r_l, c_l] = 1.0
@@ -268,7 +270,7 @@ def build_leaf_block_connectivity(edge_index, edge_values, positions, scale_A, l
 
 class LeafBlockAttention(nn.Module):
     """
-    Masked attention within each leaf block of 32 nodes.
+    Masked attention within each leaf block (L nodes + optional block token; L = block_size).
 
     FIXES APPLIED:
     1. Decoupled Heads: Scores keep head dimension (bnqkh) so heads learn distinct patterns;
@@ -328,7 +330,7 @@ class LeafBlockAttention(nn.Module):
         k = k.view(B, num_blocks, 33, self.num_heads, self.head_dim)
         v = v.view(B, num_blocks, 33, self.num_heads, self.head_dim)
 
-        # Scores with head dimension preserved: (B, n, 32, 33, H)
+        # Scores with head dimension preserved: (B, n, L, L+1, H)
         scores = torch.einsum('bnqhd,bnkhd->bnqkh', q, k) * self.scale
 
         w = edge_feats[..., 3].clone()
@@ -347,7 +349,7 @@ class LeafBlockAttention(nn.Module):
         attn_probs = F.softmax(scores, dim=3)
 
         # Linear Edge Bypass: signed, unbounded per-head weights from edge values
-        linear_edge_weights = self.edge_gate(bias_physics.unsqueeze(-1))  # (num_blocks, 32, 33, H)
+        linear_edge_weights = self.edge_gate(bias_physics.unsqueeze(-1))  # (num_blocks, L, L+1, H)
         linear_edge_weights = linear_edge_weights.unsqueeze(0).masked_fill(mask_expanded == 0, 0.0)
 
         combined_weights = attn_probs + linear_edge_weights
@@ -503,7 +505,7 @@ class HGT_OL(nn.Module):
                  input_dim=1,
                  d_model=128,
                  depth=4,
-                 leaf_size=32,
+                 leaf_size=_DEFAULT_LEAF_SIZE,
                  max_rank=128,
                  rank_scale=2.0,
                  num_layers_per_scale=3):
@@ -706,7 +708,7 @@ class HGT_OL(nn.Module):
 
 # --- 4. Fast HODLR MatMul ---
 
-def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=32, off_diag_scale=None):
+def apply_neural_hodlr(leaf_blocks, factors_levels, x, leaf_size=_DEFAULT_LEAF_SIZE, off_diag_scale=None):
     B, N, K = x.shape
 
     num_leaves = N // leaf_size
@@ -949,7 +951,7 @@ def load_hgt_ol_weights_from_bytes(model, path):
 
 # --- 5. Training Loop ---
 
-def _pad_to_hodlr_size(n_real, leaf_size=32):
+def _pad_to_hodlr_size(n_real, leaf_size=_DEFAULT_LEAF_SIZE):
     num_blocks_min = max(1, (n_real + leaf_size - 1) // leaf_size)
     depth = int(math.ceil(math.log2(num_blocks_min)))
     return leaf_size * (2 ** depth)
@@ -1009,7 +1011,7 @@ def train_hgt_ol():
     parser.add_argument('--data_folder', type=str, default=str(default_data))
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--leaf_size', type=int, default=32)
+    parser.add_argument('--leaf_size', type=int, default=_DEFAULT_LEAF_SIZE)
     parser.add_argument('--frame', type=int, default=600)
     parser.add_argument('--rank_scale', type=float, default=2.0)
     parser.add_argument('--max_rank', type=int, default=128)
