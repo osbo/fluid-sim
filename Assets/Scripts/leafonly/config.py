@@ -11,7 +11,13 @@ def _validate_leaf_size(L: int) -> int:
 
 
 # Set to any power of 2; training checkpoints store this in the header — match when loading.
-LEAF_SIZE = _validate_leaf_size(32)
+LEAF_SIZE = _validate_leaf_size(64)
+ATTN_POOL_FACTOR = 2
+if LEAF_SIZE % ATTN_POOL_FACTOR != 0:
+    raise ValueError(f"LEAF_SIZE {LEAF_SIZE} must be divisible by ATTN_POOL_FACTOR {ATTN_POOL_FACTOR}")
+# Packed preconditioner blocks and apply_block_diagonal_M matmuls use this tile (e.g. 32×32 for 64 nodes/leaf).
+LEAF_APPLY_SIZE = LEAF_SIZE // ATTN_POOL_FACTOR
+# Attention runs at LEAF_APPLY_SIZE per leaf; activations are repeat_interleave’d back to LEAF_SIZE for residuals.
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 

@@ -13,7 +13,7 @@ from leafonly import (
     load_leaf_only_weights,
     next_valid_size,
 )
-from leafonly.config import LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps_device
+from leafonly.config import LEAF_APPLY_SIZE, LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps_device
 from leafonly.data import FluidGraphDataset, most_recent_run_folder
 from leafonly.train import train_leaf_only
 
@@ -124,7 +124,9 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
     )
 
     apply_ms = _avg_ms(
-        lambda: apply_block_diagonal_M(precond_out, AZ, leaf_size=LEAF_SIZE, jacobi_inv_diag=jacobi_inv_diag),
+        lambda: apply_block_diagonal_M(
+            precond_out, AZ, leaf_size=LEAF_SIZE, leaf_apply_size=LEAF_APPLY_SIZE, jacobi_inv_diag=jacobi_inv_diag
+        ),
         device,
         warmup=5,
         repeat=40,
