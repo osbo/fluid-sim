@@ -9,7 +9,7 @@ from leafonly.train import train_leaf_only as _train_leaf_only_impl
 def _build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=50000)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=2, help="Fixed architecture depth for LeafOnly (kept at 2).")
     parser.add_argument("--num_heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
@@ -19,6 +19,11 @@ def _build_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--contexts_per_step", type=int, default=4, help="Gradient accumulation: number of random cached contexts per optimizer step.")
     parser.add_argument("--continue_training", action="store_true", help="Load initial weights from the saved .bytes file and continue training from that state.")
+    parser.add_argument(
+        "--rebuild-context-cache",
+        action="store_true",
+        help="Ignore TestData/.leafonly_training_context_cache/ and rebuild contexts from frame files.",
+    )
     parser.add_argument("--evaluate_gradients", action="store_true", help="Run gradient interference analysis then exit.")
     parser.add_argument("--num_gcn_layers", type=int, default=2, choices=[2], help="Fixed number of GCN layers (kept at 2).")
     _al = attention_layout_choices(LEAF_SIZE)

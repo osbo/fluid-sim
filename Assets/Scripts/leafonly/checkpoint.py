@@ -13,8 +13,22 @@ def read_leaf_only_header(path):
         header = f.read(LEAF_ONLY_HEADER_BYTES)
     if len(header) < LEAF_ONLY_HEADER_BYTES:
         raise ValueError("LeafOnly weights file too short")
-    d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, _ = struct.unpack("<iiiiiiii", header)
-    return d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, LEAF_ONLY_HEADER_BYTES
+    d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, leaf_apply_sz = struct.unpack(
+        "<iiiiiiii", header
+    )
+    if leaf_apply_sz <= 0:
+        leaf_apply_sz = leaf_size
+    return (
+        d_model,
+        leaf_size,
+        input_dim,
+        num_layers,
+        num_heads,
+        use_gcn,
+        num_gcn_layers,
+        LEAF_ONLY_HEADER_BYTES,
+        leaf_apply_sz,
+    )
 
 
 def _write_packed_tensor(f, param, transpose=False):
@@ -66,7 +80,19 @@ def save_leaf_only_weights(model, path, input_dim=9):
     gcn_layers = model.embed.gcn if model.embed.gcn is not None else []
     num_gcn_layers = len(gcn_layers)
     with open(path, "wb") as f:
-        f.write(struct.pack("<iiiiiiii", d_model, model.leaf_size, input_dim, len(model.blocks), num_heads, 1, num_gcn_layers, 0))
+        f.write(
+            struct.pack(
+                "<iiiiiiii",
+                d_model,
+                model.leaf_size,
+                input_dim,
+                len(model.blocks),
+                num_heads,
+                1,
+                num_gcn_layers,
+                int(model.leaf_apply_size),
+            )
+        )
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.embed.lift[0].bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.embed.lift[2].weight.detach().cpu().float(), transpose=True)
@@ -110,7 +136,7 @@ def load_leaf_only_weights(model, path):
 
     path = Path(path)
     result = read_leaf_only_header(path)
-    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, num_heads_lo, use_gcn_file, num_gcn_layers_file, header_bytes = result
+    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, num_heads_lo, use_gcn_file, num_gcn_layers_file, header_bytes, leaf_apply_lo = result
     expected_d_model = model.embed.lift[0].weight.shape[0]
     expected_num_heads = model.blocks[0].attn.num_heads if model.blocks else 4
     expected_input_dim = 9
@@ -118,6 +144,10 @@ def load_leaf_only_weights(model, path):
         raise ValueError(f"Checkpoint d_model={d_model_lo} != model {expected_d_model}")
     if model.leaf_size != leaf_size_lo or len(model.blocks) != num_layers_lo:
         raise ValueError(f"Checkpoint leaf_size={leaf_size_lo} num_layers={num_layers_lo} != model {model.leaf_size} {len(model.blocks)}")
+    if int(model.leaf_apply_size) != int(leaf_apply_lo):
+        raise ValueError(
+            f"Checkpoint leaf_apply_size={leaf_apply_lo} != model {model.leaf_apply_size} (retrain or match ATTN_POOL_FACTOR / LEAF_APPLY_SIZE)"
+        )
     if input_dim_lo != expected_input_dim:
         raise ValueError(f"Checkpoint input_dim={input_dim_lo} != expected {expected_input_dim}")
     if num_heads_lo != expected_num_heads:
