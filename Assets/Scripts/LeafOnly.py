@@ -39,6 +39,25 @@ def _build_parser():
         ),
     )
     parser.add_argument("--target_step", type=int, default=10000, help="Step index to track in logs/metrics.")
+    parser.add_argument(
+        "--probe-vectors",
+        type=int,
+        default=-1,
+        metavar="K",
+        help=(
+            "Monte-Carlo probe count for ||M A Z - Z||^2 loss (columns of Z). "
+            "Default -1: use max(256, ceil(sqrt(n_pad))) as before. "
+            "Smaller K (e.g. 64, 128) speeds AZ/MAZ and backward roughly linearly; noisier gradient."
+        ),
+    )
+    parser.add_argument(
+        "--profile-backward",
+        action="store_true",
+        help=(
+            "On the same step as the detailed timing breakdown (step 300), run torch.profiler around "
+            "loss.backward() only and print top CUDA kernels (self time vs total time). CUDA only."
+        ),
+    )
     return parser
 
 

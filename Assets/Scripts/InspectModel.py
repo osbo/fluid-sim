@@ -13,7 +13,7 @@ if str(_script_dir) not in sys.path:
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, Rectangle
 from scipy.sparse import csr_matrix
 
 try:
@@ -36,54 +36,91 @@ import torch.nn.functional as F
 from leafonly import (
     LeafOnlyNet,
     load_leaf_only_weights,
+    apply_block_diagonal_m_into,
     apply_block_diagonal_M,
+    block_diagonal_m_apply_workspace,
     default_attention_layout,
     unpack_precond,
-    next_valid_size,
     FluidGraphDataset,
     build_leaf_block_connectivity,
-    pool_precomputed_leaf_connectivity,
 )
 from leafonly.eval import _timed_ms
 from leafonly.checkpoint import read_leaf_only_header
-from leafonly.config import ATTN_POOL_FACTOR, LEAF_SIZE
+from leafonly.config import HMATRIX_ETA, LEAF_SIZE, MAX_MIXED_SIZE
+from leafonly.hmatrix import (
+    HM_C0_CPU,
+    HM_POOL_W_COL_CPU,
+    HM_POOL_W_ROW_CPU,
+    HM_R0_CPU,
+    HM_S_CPU,
+    NUM_HMATRIX_OFF_BLOCKS,
+    standard_admissible_unique_blocks,
+)
 
-# Saturated bases for legend (match _leaf_block_partition_diagram)
-_LEAF_DIAG_BASE = np.array([0.20, 0.35, 0.75], dtype=np.float64)
-_LEAF_OFF_BASE = np.array([0.90, 0.40, 0.12], dtype=np.float64)
 
-
-def _leaf_block_partition_diagram(n: int, leaf_size: int) -> np.ndarray:
+def _draw_hmatrix_weak_partition_ax(ax, grid_size: int, leaf_size: int, eta: float) -> None:
     """
-    (n, n, 3) RGB in [0, 1]: each L×L leaf block is a dark border band (scaled base) inside the
-    true cell boundary, then a solid lighter interior (base blended toward white). Distance is
-    measured in pixels from the nearest block edge (Chebyshev-style min distance to a side).
+    Visualize the same weak-admissibility partition as ``leafonly.hmatrix.standard_admissible_unique_blocks``
+    (LeafOnly / neural off-diagonal structure). Row 0 at top via ``ylim(grid, 0)``.
     """
     L = int(leaf_size)
+    n = int(grid_size)
     if n % L != 0:
-        raise ValueError(f"n={n} must be divisible by leaf_size={L}")
-    ii = np.arange(n, dtype=np.float64)[:, None]
-    jj = np.arange(n, dtype=np.float64)[None, :]
-    bi = (ii // L).astype(np.int64)
-    bj = (jj // L).astype(np.int64)
-    on_diag = bi == bj
+        raise ValueError(f"grid_size={n} must be divisible by leaf_size={L}")
+    num_units = n // L
+    u = standard_admissible_unique_blocks(num_units, float(eta), torch.device("cpu"), dtype=torch.float32)
+    blocks = u.numpy()
+    max_log = int(np.log2(num_units)) if num_units > 1 else 0
+    green_cmap = plt.get_cmap("Greens")
 
-    li, lj = ii % L, jj % L
-    dist_to_edge = np.minimum(np.minimum(li, L - 1 - li), np.minimum(lj, L - 1 - lj))
-    # Band width ~10% of L, at least 1 px; shrink if L is tiny so an interior can remain.
-    border_w = min(max(1, int(round(0.10 * L))), max(1, (L - 1) // 2))
-    in_border = dist_to_edge < float(border_w)
+    for row in blocks:
+        r_leaf, c_leaf, size_leaves = int(row[0]), int(row[1]), int(row[2])
+        y = r_leaf * L
+        x = c_leaf * L
+        size_px = size_leaves * L
 
-    white = np.ones(3, dtype=np.float64)
-    diag_dark = np.clip(_LEAF_DIAG_BASE * 0.48, 0.0, 1.0)
-    diag_light = np.clip(0.40 * _LEAF_DIAG_BASE + 0.60 * white, 0.0, 1.0)
-    off_dark = np.clip(_LEAF_OFF_BASE * 0.48, 0.0, 1.0)
-    off_light = np.clip(0.40 * _LEAF_OFF_BASE + 0.60 * white, 0.0, 1.0)
+        on_diag_unit = r_leaf == c_leaf and size_leaves == 1
+        if on_diag_unit:
+            face = "#e8a0c8"
+            edge = "white"
+            lw = 1.0
+        else:
+            k = int(np.log2(size_leaves)) if size_leaves > 1 else 0
+            face = green_cmap(0.35 + 0.55 * (k / max(max_log, 1)))
+            edge = "#1a3d1a"
+            lw = 1.2
 
-    sel_dark = np.where(on_diag[:, :, np.newaxis], diag_dark, off_dark)
-    sel_light = np.where(on_diag[:, :, np.newaxis], diag_light, off_light)
-    rgb = np.where(in_border[:, :, np.newaxis], sel_dark, sel_light)
-    return np.clip(rgb, 0.0, 1.0).astype(np.float32)
+        ax.add_patch(
+            Rectangle(
+                (x, y),
+                size_px,
+                size_px,
+                linewidth=lw,
+                edgecolor=edge,
+                facecolor=face,
+                alpha=0.92,
+            )
+        )
+        if size_px >= 64 and not on_diag_unit:
+            ax.text(
+                x + size_px / 2,
+                y + size_px / 2,
+                f"{size_px}",
+                color="white",
+                ha="center",
+                va="center",
+                fontsize=8,
+                fontweight="bold",
+                alpha=0.85,
+            )
+
+    ax.set_xlim(0, n)
+    ax.set_ylim(n, 0)
+    ax.set_aspect("equal")
+    tick_step = max(L * 4, 1)
+    ticks = np.arange(0, n + 1, tick_step)
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
 
 
 def _amg_solver(A_sparse_scipy):
@@ -193,34 +230,71 @@ def pcg_gpu_cudagraph(
     check_freq=3,
     leaf_size=None,
     leaf_apply_size=None,
+    leaf_apply_off=None,
 ):
+    """
+    PCG on CUDA with a single captured graph per iteration.
+
+    Uses ``apply_block_diagonal_m_into`` (fixed scratch buffers, B=1) so replay does not
+    allocate. Requires ``leaf_apply_size == leaf_apply_off == leaf_size`` (no pooled apply).
+    """
     if device is None:
         device = b_gpu.device
+    if device.type != "cuda":
+        raise ValueError("pcg_gpu_cudagraph requires CUDA")
     if leaf_size is None:
         leaf_size = LEAF_SIZE
     if leaf_apply_size is None:
         leaf_apply_size = leaf_size
+    if leaf_apply_off is None:
+        leaf_apply_off = leaf_apply_size
+    if leaf_apply_size != leaf_size or leaf_apply_off != leaf_size:
+        raise ValueError(
+            "pcg_gpu_cudagraph requires leaf_apply_size == leaf_apply_off == leaf_size; "
+            "use pcg_gpu with torch.compile(apply) for pooled layouts."
+        )
 
     if precond_packed.dim() == 1:
         precond_packed = precond_packed.unsqueeze(0)
+    precond_packed = precond_packed.contiguous()
     jacobi_inv_diag_2d = jacobi_inv_diag if jacobi_inv_diag.dim() == 2 else jacobi_inv_diag.unsqueeze(0)
+    jacobi_inv_diag_2d = jacobi_inv_diag_2d.contiguous()
+
+    n, k_dim = b_gpu.shape[0], b_gpu.shape[1]
+    num_leaves = n // leaf_size
+    if num_leaves * leaf_size != n:
+        raise ValueError(f"b_gpu length {n} not divisible by leaf_size {leaf_size}")
+
+    dtype = b_gpu.dtype
+    Wr = HM_POOL_W_ROW_CPU[:, :num_leaves].to(device=device, dtype=dtype).contiguous()
+    Wc = HM_POOL_W_COL_CPU[:, :num_leaves].to(device=device, dtype=dtype).contiguous()
+    ws = block_diagonal_m_apply_workspace(
+        num_leaves, leaf_size, k_dim, NUM_HMATRIX_OFF_BLOCKS, leaf_apply_off, device, dtype
+    )
 
     x_static = torch.zeros_like(b_gpu)
     r_static = torch.zeros_like(b_gpu)
     p_static = torch.zeros_like(b_gpu)
     z_static = torch.zeros_like(b_gpu)
-    rho_static = torch.zeros(1, device=device, dtype=b_gpu.dtype)
+    rho_static = torch.zeros(1, device=device, dtype=dtype)
+
+    r_b1 = r_static.unsqueeze(0)
+    z_b1 = z_static.unsqueeze(0)
 
     x_static.zero_()
     r_static.copy_(b_gpu)
-    z_initial = apply_block_diagonal_M(
+    apply_block_diagonal_m_into(
         precond_packed,
-        r_static.unsqueeze(0),
+        r_b1,
+        z_b1,
+        jacobi_inv_diag_2d,
+        ws,
+        Wr,
+        Wc,
         leaf_size=leaf_size,
         leaf_apply_size=leaf_apply_size,
-        jacobi_inv_diag=jacobi_inv_diag_2d,
+        leaf_apply_off=leaf_apply_off,
     )
-    z_static.copy_(z_initial.squeeze(0))
     p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
 
@@ -233,14 +307,18 @@ def pcg_gpu_cudagraph(
         alpha = rho_static / pAp
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
-        z_new = apply_block_diagonal_M(
+        apply_block_diagonal_m_into(
             precond_packed,
-            r_static.unsqueeze(0),
+            r_b1,
+            z_b1,
+            jacobi_inv_diag_2d,
+            ws,
+            Wr,
+            Wc,
             leaf_size=leaf_size,
             leaf_apply_size=leaf_apply_size,
-            jacobi_inv_diag=jacobi_inv_diag_2d,
+            leaf_apply_off=leaf_apply_off,
         )
-        z_static.copy_(z_new.squeeze(0))
         rho_new = (r_static * z_static).sum()
         beta = rho_new / rho_static
         rho_static.fill_(rho_new)
@@ -360,7 +438,8 @@ def main():
         use_gcn_lo,
         _num_gcn_hdr,
         _header_bytes,
-        leaf_apply_ckpt,
+        leaf_apply_diag_ckpt,
+        leaf_apply_off_ckpt,
     ) = read_leaf_only_header(leaf_only_weights_path)
     if LEAF_SIZE != leaf_size_lo:
         print(
@@ -369,10 +448,10 @@ def main():
         )
     leaf_L = int(leaf_size_lo)
 
-    n_requested = 256
-    n_pad = next_valid_size(n_requested, leaf_L)
-    if n_pad != n_requested:
-        print(f"  Padding view: {n_requested} nodes -> {n_pad} (power-of-2 leaf blocks of {leaf_L})")
+    n_requested = min(MAX_MIXED_SIZE, num_nodes_real)
+    n_pad = MAX_MIXED_SIZE
+    if n_pad > n_requested:
+        print(f"  Padding view: {n_requested} active nodes -> {n_pad} (fixed H-grid MAX_MIXED_SIZE)")
 
     ei, ev = batch["edge_index"], batch["edge_values"]
     # Single mask for the n_requested subgraph — reused for A_viz, GPU edges, and connectivity.
@@ -397,10 +476,14 @@ def main():
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
     model_leaf.eval()
-    leaf_apply_L = int(model_leaf.leaf_apply_size)
-    if leaf_apply_L != int(leaf_apply_ckpt):
-        raise RuntimeError(f"header leaf_apply_size {leaf_apply_ckpt} != model.leaf_apply_size {leaf_apply_L}")
-    pool_to_full = int(leaf_L) // leaf_apply_L
+    leaf_apply_diag_L = int(model_leaf.leaf_apply_size)
+    leaf_apply_off_L = int(model_leaf.leaf_apply_off)
+    if leaf_apply_diag_L != int(leaf_apply_diag_ckpt):
+        raise RuntimeError(f"header leaf_apply_diag {leaf_apply_diag_ckpt} != model {leaf_apply_diag_L}")
+    if leaf_apply_off_L != int(leaf_apply_off_ckpt):
+        raise RuntimeError(f"header leaf_apply_off {leaf_apply_off_ckpt} != model {leaf_apply_off_L}")
+    pool_diag_to_full = int(leaf_L) // leaf_apply_diag_L
+    pool_off_to_full = int(leaf_L) // leaf_apply_off_L
 
     with torch.inference_mode():
         x_leaf = x[:, :n_requested, :].clone()
@@ -416,20 +499,18 @@ def main():
                 global_feat = global_feat.unsqueeze(0)
 
         positions_leaf = x_leaf[0, :, :3]
-        # Full graph connectivity once, then pooled masks for attention (matches training cache).
-        pre_leaf_connectivity = pool_precomputed_leaf_connectivity(
-            build_leaf_block_connectivity(
-                edge_index_leaf,
-                edge_values_leaf,
-                positions_leaf,
-                leaf_L,
-                device,
-                x_leaf.dtype,
-            ),
+        # Diagonal leaf masks/feats; off-diagonal H tiles use static buffers inside LeafOnlyNet.forward.
+        pre_leaf_connectivity = build_leaf_block_connectivity(
+            edge_index_leaf,
+            edge_values_leaf,
+            positions_leaf,
             leaf_L,
-            ATTN_POOL_FACTOR,
+            device,
+            x_leaf.dtype,
         )
-        pre_leaf_connectivity = tuple(t.contiguous() for t in pre_leaf_connectivity)
+        pre_leaf_connectivity = tuple(
+            t.contiguous() if isinstance(t, torch.Tensor) else t for t in pre_leaf_connectivity
+        )
 
         _last_out = [None]
 
@@ -451,7 +532,11 @@ def main():
         inference_ms = _timed_ms(_fwd, device, warmup=0, repeat=10)
         precond_out = _last_out[0]
         diag_blocks, off_diag_blocks, jacobi_scale = unpack_precond(
-            precond_out, n_pad, leaf_size=leaf_L, leaf_apply_size=leaf_apply_L
+            precond_out,
+            n_pad,
+            leaf_size=leaf_L,
+            leaf_apply_size=leaf_apply_diag_L,
+            leaf_apply_off=leaf_apply_off_L,
         )
         jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=diag_blocks.dtype)
         diag_A_tensor = torch.from_numpy(np.diag(A_viz).astype(np.float32)).to(device)
@@ -462,28 +547,30 @@ def main():
         for b in range(num_leaves):
             r0, r1 = b * leaf_L, (b + 1) * leaf_L
             blk = diag_blocks[0, b]
-            if pool_to_full > 1:
-                blk = blk.repeat_interleave(pool_to_full, dim=0).repeat_interleave(pool_to_full, dim=1)
+            if pool_diag_to_full > 1:
+                blk = blk.repeat_interleave(pool_diag_to_full, dim=0).repeat_interleave(pool_diag_to_full, dim=1)
             M_neural_gpu[r0:r1, r0:r1] = blk
 
-        P = (num_leaves * (num_leaves - 1)) // 2
-        if P > 0 and off_diag_blocks is not None:
-            r_idx, c_idx = torch.triu_indices(num_leaves, num_leaves, offset=1, device=device)
-            for p in range(P):
-                r, c = r_idx[p].item(), c_idx[p].item()
-                r0, r1 = r * leaf_L, (r + 1) * leaf_L
-                c0, c1 = c * leaf_L, (c + 1) * leaf_L
-                oblk = off_diag_blocks[0, p]
-                if pool_to_full > 1:
-                    oblk = oblk.repeat_interleave(pool_to_full, dim=0).repeat_interleave(pool_to_full, dim=1)
-                M_neural_gpu[r0:r1, c0:c1] = oblk
-                M_neural_gpu[c0:c1, r0:r1] = oblk.transpose(-1, -2)
+        if NUM_HMATRIX_OFF_BLOCKS > 0 and off_diag_blocks is not None:
+            for i in range(NUM_HMATRIX_OFF_BLOCKS):
+                r0i = int(HM_R0_CPU[i].item())
+                c0i = int(HM_C0_CPU[i].item())
+                si = int(HM_S_CPU[i].item())
+                br0, br1 = r0i * leaf_L, (r0i + si) * leaf_L
+                bc0, bc1 = c0i * leaf_L, (c0i + si) * leaf_L
+                oblk = off_diag_blocks[0, i]
+                rep = si if leaf_apply_off_L == leaf_L else max(1, (si * leaf_L) // leaf_apply_off_L)
+                if rep > 1:
+                    oblk = oblk.repeat_interleave(rep, dim=0).repeat_interleave(rep, dim=1)
+                M_neural_gpu[br0:br1, bc0:bc1] = oblk
+                M_neural_gpu[bc0:bc1, br0:br1] = oblk.transpose(-1, -2)
 
         if jacobi_scale is not None:
             M_neural_gpu += torch.diag((jacobi_scale[0] * jacobi_inv_diag[0]).to(M_neural_gpu.dtype))
     print(
-        f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} M (learned blocks {leaf_apply_L}×{leaf_apply_L}, "
-        f"Kronecker prolongation ×{pool_to_full} for visualization)"
+        f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} M "
+        f"(diag {leaf_apply_diag_L}×{leaf_apply_diag_L} ×{pool_diag_to_full} viz, "
+        f"off {leaf_apply_off_L}×{leaf_apply_off_L} ×{pool_off_to_full} viz)"
     )
 
     d = diag_blocks.detach()
@@ -518,14 +605,18 @@ def main():
 
     A_scipy_csr = csr_matrix(A_viz_n.astype(np.float32))
 
+    precond_s = precond_out.detach().contiguous()
+    jacobi_s = jacobi_inv_diag.detach().contiguous()
+
     def apply_M_block_diag(r):
         r_batched = r.unsqueeze(0)
         out = apply_block_diagonal_M(
-            precond_out,
+            precond_s,
             r_batched,
             leaf_size=leaf_L,
-            leaf_apply_size=leaf_apply_L,
-            jacobi_inv_diag=jacobi_inv_diag,
+            leaf_apply_size=leaf_apply_diag_L,
+            leaf_apply_off=leaf_apply_off_L,
+            jacobi_inv_diag=jacobi_s,
         )
         return out.squeeze(0)
 
@@ -564,36 +655,43 @@ def main():
             device=device,
         )
 
-        if device.type == "cuda":
-            try:
-                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph(
-                    A_gpu,
-                    b_gpu,
-                    precond_out,
-                    jacobi_inv_diag,
-                    tol=pcg_tol,
-                    max_iter=pcg_max_iter,
-                    device=device,
-                    check_freq=check_freq,
-                    leaf_size=leaf_L,
-                    leaf_apply_size=leaf_apply_L,
-                )
-            except Exception as e:
-                print(f"  LeafOnly (CUDA graph failed, using regular solve): {e}")
-                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
-                    A_gpu,
-                    b_gpu,
-                    apply_M_block_diag,
-                    tol=pcg_tol,
-                    max_iter=pcg_max_iter,
-                    device=device,
-                    check_freq=check_freq,
-                )
+        use_leaf_cudagraph = (
+            device.type == "cuda"
+            and pool_diag_to_full == 1
+            and pool_off_to_full == 1
+        )
+        if use_leaf_cudagraph:
+            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph(
+                A_gpu,
+                b_gpu,
+                precond_s,
+                jacobi_s,
+                tol=pcg_tol,
+                max_iter=pcg_max_iter,
+                device=device,
+                check_freq=check_freq,
+                leaf_size=leaf_L,
+                leaf_apply_size=leaf_apply_diag_L,
+                leaf_apply_off=leaf_apply_off_L,
+            )
+            print("  LeafOnly PCG: CUDAGraph replay (preconditioner apply in-graph, fixed buffers)")
         else:
+            apply_pcg = apply_M_block_diag
+            if device.type == "cuda":
+                apply_pcg = torch.compile(apply_M_block_diag, fullgraph=False)
+                torch.cuda.synchronize()
+                wu = torch.zeros_like(b_gpu)
+                for _ in range(12):
+                    _ = apply_pcg(wu)
+                torch.cuda.synchronize()
+                print(
+                    "  LeafOnly PCG: preconditioner apply torch.compile(d) "
+                    "(CUDAGraph needs full leaf apply — pooled layout uses compile path)"
+                )
             x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
                 A_gpu,
                 b_gpu,
-                apply_M_block_diag,
+                apply_pcg,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
@@ -776,15 +874,26 @@ def main():
         axes[0, 1].set_title(f"A^{{-1}} (viz {viz_n}x{viz_n}) log10")
         plt.colorbar(im_ainv, ax=axes[0, 1])
         ax_blk = axes[0, 2]
-        rgb_layout = _leaf_block_partition_diagram(viz_n, leaf_L)
-        ax_blk.imshow(rgb_layout, aspect="auto", interpolation="nearest")
+        _draw_hmatrix_weak_partition_ax(ax_blk, viz_n, leaf_L, HMATRIX_ETA)
         ax_blk.set_title(
-            f"Leaf partition (on-diag {leaf_L}² vs off-diag), n={viz_n}, K={viz_n // leaf_L}"
+            f"Weak-admissible H-matrix (η={HMATRIX_ETA}), LeafOnly layout\n"
+            f"Grid {viz_n}×{viz_n}, leaf {leaf_L}×{leaf_L}, K={viz_n // leaf_L} units"
         )
-        leg = ax_blk.legend(
+        _green_cmap = plt.get_cmap("Greens")
+        ax_blk.legend(
             handles=[
-                Patch(facecolor=_LEAF_DIAG_BASE, edgecolor="0.3", linewidth=0.5, label=f"On-diagonal leaf ({leaf_L}×{leaf_L})"),
-                Patch(facecolor=_LEAF_OFF_BASE, edgecolor="0.3", linewidth=0.5, label="Off-diagonal"),
+                Patch(
+                    facecolor="#e8a0c8",
+                    edgecolor="white",
+                    linewidth=1.0,
+                    label=f"On-diagonal unit leaf ({leaf_L}×{leaf_L} px)",
+                ),
+                Patch(
+                    facecolor=_green_cmap(0.65),
+                    edgecolor="#1a3d1a",
+                    linewidth=1.2,
+                    label="Merged admissible tile",
+                ),
             ],
             loc="upper right",
             fontsize=8,

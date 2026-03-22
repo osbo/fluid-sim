@@ -4,20 +4,31 @@ from pathlib import Path
 import torch
 
 
-LEAF_ONLY_HEADER_BYTES = 32
+# v1: 32 bytes (8 ints), single leaf_apply for diag+off. v2: 36 bytes (9 ints), diag + off apply sizes.
+LEAF_ONLY_HEADER_BYTES = 36
 
 
 def read_leaf_only_header(path):
     path = Path(path)
     with open(path, "rb") as f:
         header = f.read(LEAF_ONLY_HEADER_BYTES)
-    if len(header) < LEAF_ONLY_HEADER_BYTES:
+    if len(header) < 32:
         raise ValueError("LeafOnly weights file too short")
-    d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, leaf_apply_sz = struct.unpack(
-        "<iiiiiiii", header
-    )
-    if leaf_apply_sz <= 0:
-        leaf_apply_sz = leaf_size
+    if len(header) >= 36:
+        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, leaf_apply_diag, leaf_apply_off = (
+            struct.unpack("<iiiiiiiii", header[:36])
+        )
+        header_bytes = 36
+    else:
+        d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, leaf_apply_diag = struct.unpack(
+            "<iiiiiiii", header[:32]
+        )
+        leaf_apply_off = leaf_apply_diag
+        header_bytes = 32
+    if leaf_apply_diag <= 0:
+        leaf_apply_diag = leaf_size
+    if leaf_apply_off <= 0:
+        leaf_apply_off = leaf_apply_diag
     return (
         d_model,
         leaf_size,
@@ -26,8 +37,9 @@ def read_leaf_only_header(path):
         num_heads,
         use_gcn,
         num_gcn_layers,
-        LEAF_ONLY_HEADER_BYTES,
-        leaf_apply_sz,
+        header_bytes,
+        leaf_apply_diag,
+        leaf_apply_off,
     )
 
 
@@ -82,7 +94,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
     with open(path, "wb") as f:
         f.write(
             struct.pack(
-                "<iiiiiiii",
+                "<iiiiiiiii",
                 d_model,
                 model.leaf_size,
                 input_dim,
@@ -91,6 +103,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
                 1,
                 num_gcn_layers,
                 int(model.leaf_apply_size),
+                int(model.leaf_apply_off),
             )
         )
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
@@ -136,7 +149,7 @@ def load_leaf_only_weights(model, path):
 
     path = Path(path)
     result = read_leaf_only_header(path)
-    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, num_heads_lo, use_gcn_file, num_gcn_layers_file, header_bytes, leaf_apply_lo = result
+    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, num_heads_lo, use_gcn_file, num_gcn_layers_file, header_bytes, leaf_apply_diag_lo, leaf_apply_off_lo = result
     expected_d_model = model.embed.lift[0].weight.shape[0]
     expected_num_heads = model.blocks[0].attn.num_heads if model.blocks else 4
     expected_input_dim = 9
@@ -144,9 +157,13 @@ def load_leaf_only_weights(model, path):
         raise ValueError(f"Checkpoint d_model={d_model_lo} != model {expected_d_model}")
     if model.leaf_size != leaf_size_lo or len(model.blocks) != num_layers_lo:
         raise ValueError(f"Checkpoint leaf_size={leaf_size_lo} num_layers={num_layers_lo} != model {model.leaf_size} {len(model.blocks)}")
-    if int(model.leaf_apply_size) != int(leaf_apply_lo):
+    if int(model.leaf_apply_size) != int(leaf_apply_diag_lo):
         raise ValueError(
-            f"Checkpoint leaf_apply_size={leaf_apply_lo} != model {model.leaf_apply_size} (retrain or match ATTN_POOL_FACTOR / LEAF_APPLY_SIZE)"
+            f"Checkpoint leaf_apply_diag={leaf_apply_diag_lo} != model.leaf_apply_size {model.leaf_apply_size}"
+        )
+    if int(model.leaf_apply_off) != int(leaf_apply_off_lo):
+        raise ValueError(
+            f"Checkpoint leaf_apply_off={leaf_apply_off_lo} != model.leaf_apply_off {model.leaf_apply_off}"
         )
     if input_dim_lo != expected_input_dim:
         raise ValueError(f"Checkpoint input_dim={input_dim_lo} != expected {expected_input_dim}")

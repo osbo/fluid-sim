@@ -281,38 +281,37 @@ def _off_diag_pair_edge_features(edge_index, edge_values, positions, leaf_size, 
     return p_l, rl_off, cl_off, edge_feats_flat_off
 
 
-def build_leaf_block_connectivity(
+def build_diag_leaf_connectivity(
     edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS
 ):
     """
-    One global n-hop reachability matrix (ATTENTION_HOPS), then leaf-sized slices for
-    diagonal blocks and upper-triangular off-diagonal leaf pairs. Attention masks use those
-    slices; edge_feats still come from actual edges in each block/pair.
+    Per-leaf diagonal tiles only: n-hop reachability restricted to same leaf + edge features on
+    in-leaf edges. H-matrix off-diagonal tiles use fixed dense masks in the model (see hmatrix.py).
     """
     N = positions.shape[0]
     num_blocks = N // leaf_size
     if num_blocks == 0:
-        return None, None, None, None
+        return None, None
 
     R = _full_graph_hop_reachable(edge_index, N, num_hops, device, dtype)
-    diag_reachable, off_reachable = _slice_leaf_blocks_from_global_reachable(R, num_blocks, leaf_size)
+    diag_reachable, _ = _slice_leaf_blocks_from_global_reachable(R, num_blocks, leaf_size)
 
     b_l, r_l, c_l, edge_feats_flat = _diag_in_block_edge_features(
         edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype
     )
-    diag_mask, diag_feats = _materialize_block_attn_and_edge_feats(
+    return _materialize_block_attn_and_edge_feats(
         diag_reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
     )
 
-    P = off_reachable.shape[0]
-    p_l, rl_off, cl_off, edge_feats_off = _off_diag_pair_edge_features(
-        edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype
-    )
-    off_diag_mask, off_diag_feats = _materialize_block_attn_and_edge_feats(
-        off_reachable, p_l, rl_off, cl_off, edge_feats_off, P, leaf_size, device, dtype
-    )
 
-    return diag_mask, diag_feats, off_diag_mask, off_diag_feats
+def build_leaf_block_connectivity(
+    edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS
+):
+    """Returns (diag_mask, diag_feats, None, None); off blocks are static H-matrix buffers on the model."""
+    dm, df = build_diag_leaf_connectivity(
+        edge_index, edge_values, positions, leaf_size, device, dtype, num_hops=num_hops
+    )
+    return dm, df, None, None
 
 
 def most_recent_run_folder(base_path):

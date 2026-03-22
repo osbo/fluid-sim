@@ -7,9 +7,18 @@ from typing import Optional
 
 import torch
 
-from .config import ATTENTION_HOPS, ATTN_POOL_FACTOR, LEAF_SIZE, MAX_MIXED_SIZE, MIN_MIXED_SIZE
+from .config import (
+    ATTENTION_HOPS,
+    ATTN_POOL_FACTOR_DIAG,
+    ATTN_POOL_FACTOR_OFF,
+    LEAF_SIZE,
+    MAX_MIXED_SIZE,
+    MAX_NUM_LEAVES,
+    MIN_MIXED_SIZE,
+)
+from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
-CONTEXT_CACHE_VERSION = 1
+CONTEXT_CACHE_VERSION = 3
 
 
 def _mtime_ns(path: Path) -> int:
@@ -40,10 +49,13 @@ def build_training_context_cache_meta(dataset, run_folder: Path, args, frame_ind
         "seed": int(getattr(args, "seed", 0)),
         "num_frames": int(getattr(args, "num_frames", 0)),
         "leaf_size": int(LEAF_SIZE),
-        "attn_pool_factor": int(ATTN_POOL_FACTOR),
+        "attn_pool_factor_diag": int(ATTN_POOL_FACTOR_DIAG),
+        "attn_pool_factor_off": int(ATTN_POOL_FACTOR_OFF),
         "attention_hops": int(ATTENTION_HOPS),
         "min_mixed": int(MIN_MIXED_SIZE),
         "max_mixed": int(MAX_MIXED_SIZE),
+        "max_num_leaves": int(MAX_NUM_LEAVES),
+        "hmatrix_off_blocks": int(NUM_HMATRIX_OFF_BLOCKS),
         "dataset_len": int(len(dataset)),
         "fingerprints": fingerprints,
     }

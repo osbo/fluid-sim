@@ -2,20 +2,16 @@ import random
 import time
 from collections import deque
 from pathlib import Path
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from .architecture import (
-    LeafOnlyNet,
-    apply_block_diagonal_M,
-    next_valid_size,
-    pool_precomputed_leaf_connectivity,
-)
+from .architecture import LeafOnlyNet, apply_block_diagonal_M
 from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
-from .config import ATTN_POOL_FACTOR, LEAF_APPLY_SIZE, LEAF_SIZE, MIN_MIXED_SIZE, MAX_MIXED_SIZE
+from .config import LEAF_APPLY_SIZE, LEAF_APPLY_SIZE_OFF, LEAF_SIZE, MIN_MIXED_SIZE, MAX_MIXED_SIZE
 from .context_cache import (
     build_training_context_cache_meta,
     load_training_contexts_from_cache,
@@ -27,6 +23,52 @@ from .data import (
     build_leaf_block_connectivity,
     most_recent_run_folder,
 )
+from .hmatrix import NUM_HMATRIX_OFF_BLOCKS, hmatrix_off_masks_and_feats
+
+
+def _bucket_cuda_profiler_key(key: str) -> str:
+    """Coarse labels for explaining where backward GPU time goes (heuristic on op names)."""
+    k = str(key).lower()
+    if "backward" in k or "autograd" in k:
+        return "autograd-labeled"
+    if "triton" in k or "inductor" in k or "compiled_autograd" in k:
+        return "inductor/triton"
+    if "mm" in k or "matmul" in k or "bmm" in k or "addmm" in k or "mv" in k:
+        return "matmul/gemm"
+    if "softmax" in k or "sdp" in k or "flash" in k or "scaled_dot" in k:
+        return "softmax/attn"
+    if "norm" in k or "layer_norm" in k or "batch_norm" in k:
+        return "norm"
+    if "add" in k or "mul" in k or "sub" in k or "div" in k:
+        return "elementwise"
+    return "other"
+
+
+def _profiler_self_gpu_time_us(event_avg: Any) -> float:
+    """Microseconds of self GPU time; PyTorch 2.6+ uses self_device_time_total, older uses self_cuda_time_total."""
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        if hasattr(event_avg, attr):
+            return float(getattr(event_avg, attr))
+    return 0.0
+
+
+def _print_backward_cuda_bucket_summary(prof: Any) -> None:
+    """Sum self GPU time by coarse bucket (backward mixes many aten ops without 'backward' in name)."""
+    from collections import defaultdict
+
+    buckets = defaultdict(float)
+    for e in prof.key_averages():
+        dt = _profiler_self_gpu_time_us(e)
+        if dt <= 0:
+            continue
+        buckets[_bucket_cuda_profiler_key(e.key)] += dt
+    if not buckets:
+        return
+    total = sum(buckets.values())
+    print("  Backward GPU self-time by coarse bucket (heuristic):")
+    for name in sorted(buckets.keys(), key=lambda x: -buckets[x]):
+        pct = 100.0 * buckets[name] / total if total > 0 else 0.0
+        print(f"    {name:22s}  {buckets[name]:8.1f} µs  ({pct:5.1f}%)")
 
 
 def train_leaf_only(args, runtime):
@@ -85,89 +127,79 @@ def train_leaf_only(args, runtime):
                 f"({ms_contexts_total:.2f} ms) → {cache_dir.name}/"
             )
 
-    base_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
     if training_contexts is None:
         t_seg = time.perf_counter()
         training_contexts = []
         for frame_idx in frame_indices:
             batch = dataset[frame_idx]
             num_nodes_real = int(batch["num_nodes"])
-            target_sizes = []
-            for s in base_sizes:
-                if MIN_MIXED_SIZE <= s <= MAX_MIXED_SIZE and s <= num_nodes_real:
-                    target_sizes.append(s)
-            if MIN_MIXED_SIZE <= num_nodes_real <= MAX_MIXED_SIZE:
-                target_sizes.append(num_nodes_real)
-            target_sizes = sorted(set(target_sizes))
+            if num_nodes_real < MIN_MIXED_SIZE:
+                continue
+            n = min(num_nodes_real, MAX_MIXED_SIZE)
+            n_pad = MAX_MIXED_SIZE
+            t_o0 = time.perf_counter()
+            x_full = batch["x"]
+            x_input = x_full[:n].unsqueeze(0).to(device)
+            x_input = F.pad(x_input, (0, 0, 0, n_pad - n), value=0.0)
+            active_pos = x_input[0, :n, :3]
+            centroid = active_pos.mean(dim=0, keepdim=True)
+            x_input[0, :n, :3] = active_pos - centroid
 
-            for n in target_sizes:
-                if n > num_nodes_real:
-                    continue
-                t_o0 = time.perf_counter()
-                n_pad = next_valid_size(n, LEAF_SIZE)
-                x_full = batch["x"]
-                x_input = x_full[:n].unsqueeze(0).to(device)
-                if n_pad > n:
-                    x_input = F.pad(x_input, (0, 0, 0, n_pad - n), value=0.0)
-                active_pos = x_input[0, :n, :3]
-                centroid = active_pos.mean(dim=0, keepdim=True)
-                x_input[0, :n, :3] = active_pos - centroid
+            rows, cols = batch["edge_index"][0], batch["edge_index"][1]
+            mask = (rows < n) & (cols < n)
+            edge_index = batch["edge_index"][:, mask].to(device)
+            edge_values = batch["edge_values"][mask].to(device)
+            ctx_tf_ms += (time.perf_counter() - t_o0) * 1000.0
 
-                rows, cols = batch["edge_index"][0], batch["edge_index"][1]
-                mask = (rows < n) & (cols < n)
-                edge_index = batch["edge_index"][:, mask].to(device)
-                edge_values = batch["edge_values"][mask].to(device)
-                ctx_tf_ms += (time.perf_counter() - t_o0) * 1000.0
+            t_a0 = time.perf_counter()
+            A_indices = batch["edge_index"][:, mask]
+            A_vals = batch["edge_values"][mask]
+            A_sparse = torch.sparse_coo_tensor(A_indices, A_vals, (n, n)).coalesce()
+            A_small = A_sparse.to_dense().to(device) if device.type == "mps" else A_sparse.to(device).to_dense()
+            A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
+            A_dense[:n, :n] = A_small
+            A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
+            ctx_a_ms += (time.perf_counter() - t_a0) * 1000.0
 
-                t_a0 = time.perf_counter()
-                A_indices = batch["edge_index"][:, mask]
-                A_vals = batch["edge_values"][mask]
-                A_sparse = torch.sparse_coo_tensor(A_indices, A_vals, (n, n)).coalesce()
-                A_small = A_sparse.to_dense().to(device) if device.type == "mps" else A_sparse.to(device).to_dense()
-                A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
-                A_dense[:n, :n] = A_small
-                A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
-                ctx_a_ms += (time.perf_counter() - t_a0) * 1000.0
+            t_c0 = time.perf_counter()
+            positions_ctx = x_input[0, :n_pad, :3]
+            dm, df, _, _ = build_leaf_block_connectivity(
+                edge_index, edge_values, positions_ctx, LEAF_SIZE, device, x_input.dtype
+            )
+            om, oe = hmatrix_off_masks_and_feats(
+                NUM_HMATRIX_OFF_BLOCKS, LEAF_SIZE, device, x_input.dtype
+            )
+            precomputed_leaf_connectivity = (dm, df, om, oe)
+            ctx_conn_ms += (time.perf_counter() - t_c0) * 1000.0
 
-                t_c0 = time.perf_counter()
-                positions_ctx = x_input[0, :n_pad, :3]
-                precomputed_leaf_connectivity = pool_precomputed_leaf_connectivity(
-                    build_leaf_block_connectivity(
-                        edge_index, edge_values, positions_ctx, LEAF_SIZE, device, x_input.dtype
-                    ),
-                    LEAF_SIZE,
-                    ATTN_POOL_FACTOR,
-                )
-                ctx_conn_ms += (time.perf_counter() - t_c0) * 1000.0
+            t_r0 = time.perf_counter()
+            batch_vectors = max(128, int(round(n_pad ** 0.5)))
+            global_feat = batch.get("global_features")
+            if global_feat is None:
+                raise ValueError(f"Missing global_features for frame: {batch.get('frame_path', '<unknown>')}")
+            global_feat = global_feat.to(device)
 
-                t_r0 = time.perf_counter()
-                batch_vectors = max(128, int(round(n_pad ** 0.5)))
-                global_feat = batch.get("global_features")
-                if global_feat is None:
-                    raise ValueError(f"Missing global_features for frame: {batch.get('frame_path', '<unknown>')}")
-                global_feat = global_feat.to(device)
+            inv_diag = torch.ones(n_pad, device=device, dtype=A_dense.dtype)
+            diag_A = torch.diagonal(A_dense, 0)
+            inv_mask = diag_A.abs() > 1e-6
+            inv_diag[inv_mask] = 1.0 / diag_A[inv_mask]
 
-                inv_diag = torch.ones(n_pad, device=device, dtype=A_dense.dtype)
-                diag_A = torch.diagonal(A_dense, 0)
-                inv_mask = diag_A.abs() > 1e-6
-                inv_diag[inv_mask] = 1.0 / diag_A[inv_mask]
-
-                training_contexts.append(
-                    {
-                        "n_pad": n_pad,
-                        "n_orig": n,
-                        "num_leaves": n_pad // LEAF_SIZE,
-                        "x_input": x_input,
-                        "edge_index": edge_index,
-                        "edge_values": edge_values,
-                        "A_dense": A_dense,
-                        "precomputed_leaf_connectivity": precomputed_leaf_connectivity,
-                        "batch_vectors": batch_vectors,
-                        "global_features": global_feat,
-                        "jacobi_inv_diag": inv_diag,
-                    }
-                )
-                ctx_other_ms += (time.perf_counter() - t_r0) * 1000.0
+            training_contexts.append(
+                {
+                    "n_pad": n_pad,
+                    "n_orig": n,
+                    "num_leaves": n_pad // LEAF_SIZE,
+                    "x_input": x_input,
+                    "edge_index": edge_index,
+                    "edge_values": edge_values,
+                    "A_dense": A_dense,
+                    "precomputed_leaf_connectivity": precomputed_leaf_connectivity,
+                    "batch_vectors": batch_vectors,
+                    "global_features": global_feat,
+                    "jacobi_inv_diag": inv_diag,
+                }
+            )
+            ctx_other_ms += (time.perf_counter() - t_r0) * 1000.0
 
         ms_contexts_total = (time.perf_counter() - t_seg) * 1000.0
         saved = save_training_contexts_to_cache(cache_dir, cache_meta, training_contexts)
@@ -253,9 +285,24 @@ def train_leaf_only(args, runtime):
     )
     num_leaves_max = max_n_pad // LEAF_SIZE
     print(
-        f"  Block preconditioner: {num_leaves_max} leaves × {LEAF_APPLY_SIZE}×{LEAF_APPLY_SIZE} apply blocks "
-        f"({LEAF_SIZE} nodes/leaf; mean-pool / repeat prolongation in apply)"
+        f"  Block preconditioner: {num_leaves_max} leaves, diag {LEAF_APPLY_SIZE}×{LEAF_APPLY_SIZE}, "
+        f"off {LEAF_APPLY_SIZE_OFF}×{LEAF_APPLY_SIZE_OFF} ({LEAF_SIZE} nodes/leaf)"
     )
+    _pv = int(getattr(args, "probe_vectors", -1))
+    if _pv >= 0:
+        print(f"  Probe vectors (loss MC columns): fixed K={_pv} (--probe-vectors)")
+    else:
+        print(
+            "  Probe vectors (loss MC columns): auto max(256, ⌈√n_pad⌉) per step "
+            "(override with --probe-vectors K)"
+        )
+    if getattr(args, "profile_backward", False):
+        if device.type != "cuda":
+            print("  --profile-backward: ignored (CUDA only)")
+        elif print_timing:
+            print("  --profile-backward: CUDA kernel table after loss.backward() at detailed timing step")
+        else:
+            print("  --profile-backward: no effect (enable print_timing in runtime for detailed step)")
     ms_startup_to_loop = (time.perf_counter() - t_wall0) * 1000.0
     if print_timing:
         print("\n=== Startup timing (wall clock, ms) ===")
@@ -285,6 +332,7 @@ def train_leaf_only(args, runtime):
         print(
             "  Note: First loss line’s (elapsed) is wall time for that step only (after startup); "
             "with torch.compile, the first forward+backward triggers Inductor codegen (often ~10–20s).\n"
+            "  At step 299, a one-time detailed breakdown (zero_grad / forward / apply M / backward / …) is printed.\n"
         )
     model.train()
     print_interval = 100
@@ -292,7 +340,16 @@ def train_leaf_only(args, runtime):
     t_start = time.perf_counter()
     t_start_avg = None
 
+    def _cuda_sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elif device.type == "mps":
+            torch.mps.synchronize()
+
+    # Rolling `avg:` column (matches historical LeafOnly logs).
     TIMING_STEP = 300
+    # One-time wall-clock breakdown of substeps (same idea as LeafOnlyOld.py).
+    DETAILED_TIMING_STEP = 300
     target_step = int(args.target_step)
     target_loss_mean = None
     target_loss_std = None
@@ -300,14 +357,30 @@ def train_leaf_only(args, runtime):
     for step in range(args.steps):
         do_log = step % print_interval == 0
         step_loss_sum = 0.0
+        do_detailed = bool(print_timing) and (step == DETAILED_TIMING_STEP - 1)
+        wall_iter_start = None
+        if do_detailed:
+            wall_iter_start = time.perf_counter()
+            _cuda_sync()
+            print(
+                f"\n--- Detailed timing for step {DETAILED_TIMING_STEP} "
+                f"(contexts_per_step={contexts_per_step}, batched forward) ---"
+            )
+            t_mark = time.perf_counter()
+            t_zero_grad = t_batch = t_forward = t_z = t_az = t_apply = t_loss = t_backward = t_clip = t_optim = 0.0
+            n_pad_t = B_step_t = None
 
         optimizer.zero_grad()
+        if do_detailed:
+            _cuda_sync()
+            t_zero_grad = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
 
         batch_ctx = [random.choice(training_contexts) for _ in range(contexts_per_step)]
         B_step = len(batch_ctx)
         max_n_pad_step = max(ctx["n_pad"] for ctx in batch_ctx)
         max_num_blocks = max_n_pad_step // LEAF_SIZE
-        max_P = (max_num_blocks * (max_num_blocks - 1)) // 2
+        max_M_off = NUM_HMATRIX_OFF_BLOCKS
         x_list, A_list, gf_list, inv_diag_list = [], [], [], []
         edge_idx_parts, edge_val_parts = [], []
         leaf_masks_list, leaf_feats_list = [], []
@@ -349,14 +422,12 @@ def train_leaf_only(args, runtime):
                 leaf_mask = F.pad(leaf_mask, (0, 0, 0, 0, 0, pad_blocks), value=0.0)
                 leaf_feats = F.pad(leaf_feats, (0, 0, 0, 0, 0, 0, 0, pad_blocks), value=0.0)
 
-            pad_P = max_P - (off_mask.shape[0] if off_mask is not None else 0)
-            if pad_P > 0:
-                if off_mask is None or off_mask.shape[0] == 0:
-                    off_mask = torch.zeros(max_P, LEAF_APPLY_SIZE, LEAF_APPLY_SIZE + 1, device=device, dtype=x_ctx.dtype)
-                    off_feats = torch.zeros(max_P, LEAF_APPLY_SIZE, LEAF_APPLY_SIZE + 1, 4, device=device, dtype=x_ctx.dtype)
-                else:
-                    off_mask = F.pad(off_mask, (0, 0, 0, 0, 0, pad_P), value=0.0)
-                    off_feats = F.pad(off_feats, (0, 0, 0, 0, 0, 0, 0, pad_P), value=0.0)
+            pad_M = max_M_off - (off_mask.shape[0] if off_mask is not None else 0)
+            if off_mask is None or off_mask.shape[0] == 0:
+                off_mask, off_feats = hmatrix_off_masks_and_feats(max_M_off, LEAF_SIZE, device, x_ctx.dtype)
+            elif pad_M > 0:
+                off_mask = F.pad(off_mask, (0, 0, 0, 0, 0, pad_M), value=0.0)
+                off_feats = F.pad(off_feats, (0, 0, 0, 0, 0, 0, 0, pad_M), value=0.0)
 
             leaf_masks_list.append(leaf_mask)
             leaf_feats_list.append(leaf_feats)
@@ -383,7 +454,17 @@ def train_leaf_only(args, runtime):
             torch.stack(off_feats_list, dim=0),
         )
 
-        batch_vectors = max(256, int(round(max_n_pad_step ** 0.5)))
+        if do_detailed:
+            _cuda_sync()
+            t_batch = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
+            n_pad_t, B_step_t = max_n_pad_step, B_step
+
+        probe_arg = int(getattr(args, "probe_vectors", -1))
+        if probe_arg < 0:
+            batch_vectors = max(256, int(round(max_n_pad_step ** 0.5)))
+        else:
+            batch_vectors = max(1, probe_arg)
         precond_out = model(
             x_batched,
             edge_index=edge_index_batched,
@@ -392,27 +473,80 @@ def train_leaf_only(args, runtime):
             global_features=global_features_batched,
         )
 
+        if do_detailed:
+            _cuda_sync()
+            t_forward = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
+
         Z = torch.randn(B_step, max_n_pad_step, batch_vectors, device=device, dtype=x_batched.dtype)
         for b_idx, n_orig_ctx in enumerate(n_orig_list):
             if n_orig_ctx < max_n_pad_step:
                 Z[b_idx, n_orig_ctx:, :] = 0.0
 
+        if do_detailed:
+            _cuda_sync()
+            t_z = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
+
         AZ = torch.bmm(A_batched, Z)
+
+        if do_detailed:
+            _cuda_sync()
+            t_az = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
 
         MAZ = apply_block_diagonal_M(
             precond_out,
             AZ,
             leaf_size=LEAF_SIZE,
             leaf_apply_size=LEAF_APPLY_SIZE,
+            leaf_apply_off=LEAF_APPLY_SIZE_OFF,
             jacobi_inv_diag=jacobi_inv_diag_batched,
         )
+
+        if do_detailed:
+            _cuda_sync()
+            t_apply = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
 
         residual = MAZ - Z
         raw_loss = (residual ** 2).mean()
         step_loss_sum += raw_loss.item()
         loss = raw_loss
 
-        loss.backward()
+        if do_detailed:
+            _cuda_sync()
+            t_loss = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
+
+        prof: Optional[Any] = None
+        profile_bw = (
+            bool(getattr(args, "profile_backward", False))
+            and do_detailed
+            and device.type == "cuda"
+        )
+        if profile_bw:
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                with_stack=False,
+            ) as prof:
+                loss.backward()
+            _cuda_sync()
+        else:
+            # Backward: chain rule from loss → MAZ → apply_block_diagonal_M(precond, AZ) → precond_out,
+            # then through compiled LeafOnlyNet (attention/GCN/heads). AZ has no grad; matmul backward
+            # is ~2× forward FLOPs per gemm; full net backward often several× forward wall time.
+            loss.backward()
+            if do_detailed:
+                _cuda_sync()
+
+        if do_detailed:
+            t_backward = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
 
         step_loss = step_loss_sum
         loss_history.append(step_loss)
@@ -432,7 +566,54 @@ def train_leaf_only(args, runtime):
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
+        if do_detailed:
+            _cuda_sync()
+            t_clip = time.perf_counter() - t_mark
+            t_mark = time.perf_counter()
+
         optimizer.step()
+
+        if do_detailed:
+            _cuda_sync()
+            t_optim = time.perf_counter() - t_mark
+            total_s = t_zero_grad + t_batch + t_forward + t_z + t_az + t_apply + t_loss + t_backward + t_clip + t_optim
+            if n_pad_t is not None:
+                print(f"  batch: B={B_step_t}, n_pad={n_pad_t}, batch_vectors={batch_vectors}")
+            print(f"--- Step {DETAILED_TIMING_STEP} detailed timing (ms) ---")
+            print(f"  zero_grad:        {t_zero_grad * 1000:8.2f}")
+            print(f"  batch assembly:   {t_batch * 1000:8.2f}")
+            print(f"  model forward:    {t_forward * 1000:8.2f}")
+            print(f"  sample Z:         {t_z * 1000:8.2f}")
+            print(f"  A @ Z (bmm):      {t_az * 1000:8.2f}")
+            print(f"  apply M (MAZ):    {t_apply * 1000:8.2f}")
+            print(f"  residual + loss:  {t_loss * 1000:8.2f}")
+            print(f"  backward:         {t_backward * 1000:8.2f}")
+            if profile_bw:
+                print(
+                    "     (profiler on: this wall time is dominated by Kineto, not GPU work — "
+                    "omit --profile-backward to measure real backward; see table footer Self CUDA total.)"
+                )
+            print(f"  clip_grad_norm:   {t_clip * 1000:8.2f}")
+            print(f"  optimizer.step:   {t_optim * 1000:8.2f}")
+            print(f"  total:            {total_s * 1000:8.2f}")
+            if wall_iter_start is not None:
+                _cuda_sync()
+                wall_ms = (time.perf_counter() - wall_iter_start) * 1000.0
+                overhead_ms = wall_ms - total_s * 1000.0
+                print(
+                    f"  full iter (wall): {wall_ms:8.2f} ms  "
+                    f"(Python / scheduler / print overhead ≈ {overhead_ms:+.2f} ms vs sum above)"
+                )
+            if prof is not None:
+                print(
+                    "  --- torch.profiler: backward() only (op mix / relative cost; "
+                    "aggregated Self CUDA total can be << wall ms due to launch overlap + profiler CPU) ---"
+                )
+                print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=35))
+                print("  --- same events, top by inclusive cuda_time_total ---")
+                print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+                _print_backward_cuda_bucket_summary(prof)
+            print("----------------------------------------\n")
 
         if step % print_interval == 0:
             if device.type == "cuda":
