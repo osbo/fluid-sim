@@ -11,18 +11,27 @@ def _validate_leaf_size(L: int) -> int:
 
 
 # Set to any power of 2; training checkpoints store this in the header — match when loading.
-LEAF_SIZE = _validate_leaf_size(64)
-ATTN_POOL_FACTOR = 2
-if LEAF_SIZE % ATTN_POOL_FACTOR != 0:
-    raise ValueError(f"LEAF_SIZE {LEAF_SIZE} must be divisible by ATTN_POOL_FACTOR {ATTN_POOL_FACTOR}")
-# Packed preconditioner blocks and apply_block_diagonal_M matmuls use this tile (e.g. 32×32 for 64 nodes/leaf).
-LEAF_APPLY_SIZE = LEAF_SIZE // ATTN_POOL_FACTOR
-# Attention runs at LEAF_APPLY_SIZE per leaf; activations are repeat_interleave’d back to LEAF_SIZE for residuals.
+LEAF_SIZE = _validate_leaf_size(32)
+# Diagonal leaf attention + diagonal preconditioner blocks (no downsample when 1).
+ATTN_POOL_FACTOR_DIAG = 1
+# Off-diagonal pair attention + off blocks (2 ⇒ half resolution inside each 32-node chunk).
+ATTN_POOL_FACTOR_OFF = 1
+for _name, _pf in (("ATTN_POOL_FACTOR_DIAG", ATTN_POOL_FACTOR_DIAG), ("ATTN_POOL_FACTOR_OFF", ATTN_POOL_FACTOR_OFF)):
+    if LEAF_SIZE % _pf != 0:
+        raise ValueError(f"LEAF_SIZE {LEAF_SIZE} must be divisible by {_name} {_pf}")
+LEAF_APPLY_SIZE = LEAF_SIZE // ATTN_POOL_FACTOR_DIAG
+LEAF_APPLY_SIZE_OFF = LEAF_SIZE // ATTN_POOL_FACTOR_OFF
+# Back-compat alias (single factor); prefer ATTN_POOL_FACTOR_DIAG / _OFF.
+ATTN_POOL_FACTOR = ATTN_POOL_FACTOR_DIAG
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 
 MIN_MIXED_SIZE = 256
 MAX_MIXED_SIZE = 256
+# Leaf grid for H-matrix partition (must match padded training N = MAX_MIXED_SIZE).
+MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE
+# Weak admissibility parameter (same as analytical reference).
+HMATRIX_ETA = 1.0
 
 
 def require_cuda_or_mps_device():

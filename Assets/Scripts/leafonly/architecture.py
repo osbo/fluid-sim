@@ -5,13 +5,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import (
-    ATTN_POOL_FACTOR,
+    ATTN_POOL_FACTOR_DIAG,
+    ATTN_POOL_FACTOR_OFF,
     ATTENTION_HOPS,
     GLOBAL_FEATURES_DIM,
     LEAF_APPLY_SIZE,
+    LEAF_APPLY_SIZE_OFF,
     LEAF_SIZE,
+    MAX_NUM_LEAVES,
 )
 from .data import build_leaf_block_connectivity
+from .hmatrix import (
+    HM_C0_CPU,
+    HM_POOL_W_COL_CPU,
+    HM_POOL_W_ROW_CPU,
+    HM_PROLONG_COL_LEAF_IDX,
+    HM_PROLONG_GATHER_IDX,
+    HM_PROLONG_ROW_LEAF_IDX,
+    HM_R0_CPU,
+    HM_S_CPU,
+    NUM_HMATRIX_OFF_BLOCKS,
+    hm_leaf_mean_pool_weights,
+    hmatrix_off_masks_and_feats,
+)
+
+# Prolongation indices live on CPU in hmatrix; copy once per device. CUDAGraph capture must not call .to().
+_HM_PROLONG_GPU: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _hm_prolong_scatter_indices(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    key = str(device)
+    got = _HM_PROLONG_GPU.get(key)
+    if got is None:
+        dt = torch.long
+        _HM_PROLONG_GPU[key] = got = (
+            HM_PROLONG_ROW_LEAF_IDX.to(device=device, dtype=dt),
+            HM_PROLONG_COL_LEAF_IDX.to(device=device, dtype=dt),
+            HM_PROLONG_GATHER_IDX.to(device=device, dtype=dt),
+        )
+    return got
 
 
 def _merge_batch_blocks(t: torch.Tensor, merge: bool) -> Tuple[torch.Tensor, Optional[Tuple[int, int]]]:
@@ -97,6 +129,19 @@ def pool_precomputed_leaf_connectivity(precomputed, leaf_size: int, pool: int):
         off_attn_mask = pool_leaf_attn_mask(off_attn_mask, leaf_size, pool)
         off_edge_feats = pool_leaf_edge_feats(off_edge_feats, leaf_size, pool)
     return (attn_mask, edge_feats, off_attn_mask, off_edge_feats)
+
+
+def pool_off_leaf_connectivity_if_needed(off_attn_mask, off_edge_feats, leaf_size: int, pool: int):
+    """Pool off-diagonal masks from full leaf resolution when off-diagonal attention uses pool>1."""
+    if pool <= 1 or off_attn_mask is None or off_edge_feats is None or off_attn_mask.numel() == 0:
+        return off_attn_mask, off_edge_feats
+    q = off_attn_mask.shape[2] if off_attn_mask.dim() == 4 else off_attn_mask.shape[1]
+    if q != leaf_size:
+        return off_attn_mask, off_edge_feats
+    return (
+        pool_leaf_attn_mask(off_attn_mask, leaf_size, pool),
+        pool_leaf_edge_feats(off_edge_feats, leaf_size, pool),
+    )
 
 
 def _normalize_attention_layout_string(layout: str) -> str:
@@ -402,8 +447,8 @@ class LeafOnlyNet(nn.Module):
     ):
         super().__init__()
         self.leaf_size = int(leaf_size)
-        if attention_layout is None:
-            attention_layout = default_attention_layout(self.leaf_size)
+        # H-matrix stack uses fixed L×(L+1) attention (block node); required for static compile.
+        attention_layout = f"{self.leaf_size}x{self.leaf_size + 1}"
         self.embed = PhysicsAwareEmbedding(
             input_dim,
             d_model,
@@ -413,10 +458,12 @@ class LeafOnlyNet(nn.Module):
         )
         self.enc_input_proj = nn.Linear(d_model, d_model)
         L = self.leaf_size
-        apf = int(ATTN_POOL_FACTOR)
-        if L % apf != 0:
-            raise ValueError(f"leaf_size {L} must be divisible by ATTN_POOL_FACTOR {apf}")
-        self.attn_pool_factor = apf
+        apd = int(ATTN_POOL_FACTOR_DIAG)
+        apo = int(ATTN_POOL_FACTOR_OFF)
+        if L % apd != 0 or L % apo != 0:
+            raise ValueError(f"leaf_size {L} must be divisible by ATTN_POOL_FACTOR_DIAG {apd} and OFF {apo}")
+        self.attn_pool_diag = apd
+        self.attn_pool_off = apo
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -427,7 +474,7 @@ class LeafOnlyNet(nn.Module):
                         L,
                         num_heads=num_heads,
                         attention_layout=attention_layout,
-                        attn_pool_factor=apf,
+                        attn_pool_factor=apd,
                     ),
                 )
                 for _ in range(num_layers)
@@ -443,21 +490,23 @@ class LeafOnlyNet(nn.Module):
                         L,
                         num_heads=num_heads,
                         attention_layout=attention_layout,
-                        attn_pool_factor=apf,
+                        attn_pool_factor=apo,
                     ),
                 )
                 for _ in range(num_layers)
             ]
         )
         self.leaf_apply_size = int(LEAF_APPLY_SIZE)
-        La = self.leaf_apply_size
-        self.off_diag_head_U = nn.Linear(d_model, La)
-        self.off_diag_head_V = nn.Linear(d_model, La)
+        self.leaf_apply_off = int(LEAF_APPLY_SIZE_OFF)
+        La_d = self.leaf_apply_size
+        La_o = self.leaf_apply_off
+        self.off_diag_head_U = nn.Linear(d_model, La_o)
+        self.off_diag_head_V = nn.Linear(d_model, La_o)
         nn.init.normal_(self.off_diag_head_U.weight, std=0.001)
         nn.init.constant_(self.off_diag_head_U.bias, 0.0)
         nn.init.normal_(self.off_diag_head_V.weight, std=0.001)
         nn.init.constant_(self.off_diag_head_V.bias, 0.0)
-        self.leaf_head = nn.Linear(d_model, La)
+        self.leaf_head = nn.Linear(d_model, La_d)
         nn.init.normal_(self.leaf_head.weight, std=0.001)
         nn.init.constant_(self.leaf_head.bias, 0.0)
         self.jacobi_gate = nn.Linear(d_model, 1)
@@ -465,18 +514,44 @@ class LeafOnlyNet(nn.Module):
         nn.init.constant_(self.jacobi_gate.bias, 0.0)
         self.use_jacobi = use_jacobi
 
-    def _get_leaf_blocks(self, h, mode="diagonal"):
-        B, N_or_P_len, _ = h.shape
-        num_leaves = N_or_P_len // self.leaf_size
-        h_leaves = h.view(B, num_leaves, self.leaf_size, -1)
-        h_a = mean_pool_leaf_tokens(h_leaves, self.leaf_size, self.attn_pool_factor)
+        self.register_buffer("h_block_r0", HM_R0_CPU.clone(), persistent=False)
+        self.register_buffer("h_block_c0", HM_C0_CPU.clone(), persistent=False)
+        self.register_buffer("h_block_S", HM_S_CPU.clone(), persistent=False)
+        self.num_h_off = int(self.h_block_r0.shape[0])
+        wr, wc = hm_leaf_mean_pool_weights(
+            self.h_block_r0.cpu(), self.h_block_c0.cpu(), self.h_block_S.cpu(), MAX_NUM_LEAVES
+        )
+        self.register_buffer("hm_pool_w_row", wr, persistent=False)
+        self.register_buffer("hm_pool_w_col", wc, persistent=False)
+        om, oe = hmatrix_off_masks_and_feats(self.num_h_off, self.leaf_size, torch.device("cpu"), dtype=torch.float32)
+        self.register_buffer("hm_off_attn_mask", om.unsqueeze(0), persistent=False)
+        self.register_buffer("hm_off_edge_feats", oe.unsqueeze(0), persistent=False)
 
+    def _get_leaf_blocks(self, h, mode="diagonal"):
+        # Diagonal: (B, N, C) with N = K * L. Off: (B, M_off, L, C) one L-token tile per H block — fold to (B*M, L, C).
+        off_bm = None
+        if mode == "off-diagonal" and h.dim() == 4:
+            B0, M0, Ln, C = h.shape
+            if Ln != self.leaf_size:
+                raise ValueError(f"off-diagonal h expected L={self.leaf_size}, got {Ln}")
+            off_bm = (B0, M0)
+            h = h.reshape(B0 * M0, self.leaf_size, C)
+        Bf, N_or_P_len, _ = h.shape
+        num_leaves = N_or_P_len // self.leaf_size
+        h_leaves = h.view(Bf, num_leaves, self.leaf_size, -1)
         if mode == "diagonal":
+            h_a = mean_pool_leaf_tokens(h_leaves, self.leaf_size, self.attn_pool_diag)
             u_leaf = self.leaf_head(h_a)
-            return torch.matmul(u_leaf, u_leaf.transpose(-1, -2))
-        u_leaf = self.off_diag_head_U(h_a)
-        v_leaf = self.off_diag_head_V(h_a)
-        return torch.matmul(u_leaf, v_leaf.transpose(-1, -2))
+            out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2))
+        else:
+            h_a = mean_pool_leaf_tokens(h_leaves, self.leaf_size, self.attn_pool_off)
+            u_leaf = self.off_diag_head_U(h_a)
+            v_leaf = self.off_diag_head_V(h_a)
+            out = torch.matmul(u_leaf, v_leaf.transpose(-1, -2))
+        if off_bm is not None:
+            B0, M0 = off_bm
+            out = out.view(B0, M0, out.shape[-2], out.shape[-1])
+        return out
 
     def _get_jacobi_scale(self, h):
         if not self.use_jacobi:
@@ -496,14 +571,15 @@ class LeafOnlyNet(nn.Module):
         positions = x[0, :, :3] if x.dim() == 3 else x[:, :3]
         h = self.embed(x, edge_index, edge_values, global_features=global_features)
         h = self.enc_input_proj(h)
-        attn_mask, edge_feats, off_attn_mask, off_edge_feats = None, None, None, None
+        attn_mask, edge_feats = None, None
 
         if edge_index is not None and edge_values is not None:
             device, dtype = x.device, x.dtype
             if precomputed_leaf_connectivity is not None:
-                attn_mask, edge_feats, off_attn_mask, off_edge_feats = precomputed_leaf_connectivity
+                pcs = precomputed_leaf_connectivity
+                attn_mask, edge_feats = pcs[0], pcs[1]
             else:
-                attn_mask, edge_feats, off_attn_mask, off_edge_feats = build_leaf_block_connectivity(
+                attn_mask, edge_feats, _, _ = build_leaf_block_connectivity(
                     edge_index,
                     edge_values,
                     positions,
@@ -512,23 +588,34 @@ class LeafOnlyNet(nn.Module):
                     dtype,
                     num_hops=ATTENTION_HOPS,
                 )
-            # Pool once: skip if caller already stored pooled masks (query dim == L // pool).
-            def _mask_q_dim(m):
-                if m is None or m.numel() == 0:
-                    return None
-                return m.shape[2] if m.dim() == 4 else m.shape[1]
+            if self.attn_pool_diag > 1 and attn_mask is not None:
+                attn_mask = pool_leaf_attn_mask(attn_mask, self.leaf_size, self.attn_pool_diag)
+                edge_feats = pool_leaf_edge_feats(edge_feats, self.leaf_size, self.attn_pool_diag)
 
-            if self.attn_pool_factor > 1 and attn_mask is not None:
-                if _mask_q_dim(attn_mask) == self.leaf_size:
-                    attn_mask = pool_leaf_attn_mask(attn_mask, self.leaf_size, self.attn_pool_factor)
-                    edge_feats = pool_leaf_edge_feats(edge_feats, self.leaf_size, self.attn_pool_factor)
-                if (
-                    off_attn_mask is not None
-                    and off_attn_mask.numel() > 0
-                    and _mask_q_dim(off_attn_mask) == self.leaf_size
-                ):
-                    off_attn_mask = pool_leaf_attn_mask(off_attn_mask, self.leaf_size, self.attn_pool_factor)
-                    off_edge_feats = pool_leaf_edge_feats(off_edge_feats, self.leaf_size, self.attn_pool_factor)
+        B, N_h, C_h = h.shape
+        L = self.leaf_size
+        K = N_h // L
+        if K != MAX_NUM_LEAVES:
+            raise ValueError(
+                f"LeafOnlyNet: expected N/leaf_size == MAX_NUM_LEAVES ({MAX_NUM_LEAVES}), got K={K} (N={N_h}). "
+                "Pad/truncate to MAX_MIXED_SIZE nodes for a static H-grid."
+            )
+
+        off_attn_mask = off_edge_feats = None
+        M_off = self.num_h_off
+        if M_off > 0:
+            # LeafBlockAttention sees x as (B*M_off, L, C) → num_blocks=1; masks must be (B*M_off, 1, L, L+1).
+            om = self.hm_off_attn_mask[0].to(device=h.device, dtype=h.dtype)
+            oe = self.hm_off_edge_feats[0].to(device=h.device, dtype=h.dtype)
+            off_attn_mask = (
+                om.unsqueeze(0).expand(B, M_off, L, L + 1).contiguous().reshape(B * M_off, 1, L, L + 1)
+            )
+            off_edge_feats = (
+                oe.unsqueeze(0)
+                .expand(B, M_off, L, L + 1, 4)
+                .contiguous()
+                .reshape(B * M_off, 1, L, L + 1, 4)
+            )
 
         h_diag = h
         for block in self.blocks:
@@ -543,16 +630,13 @@ class LeafOnlyNet(nn.Module):
             )
         diag_blocks = self._get_leaf_blocks(h_diag, mode="diagonal")
 
-        B_h, N_h, C_h = h.shape
-        K = N_h // self.leaf_size
-        r_idx, c_idx = torch.triu_indices(K, K, offset=1, device=h.device)
-        P = r_idx.shape[0]
-
-        if P > 0:
-            h_k = h.view(B_h, K, self.leaf_size, C_h)
-            h_pairs = (h_k[:, r_idx] + h_k[:, c_idx]).view(B_h, P * self.leaf_size, C_h)
-
-            h_off = h_pairs
+        if M_off > 0:
+            h_k = h.view(B, K, L, C_h)
+            Wr = self.hm_pool_w_row.to(device=h.device, dtype=h.dtype)
+            Wc = self.hm_pool_w_col.to(device=h.device, dtype=h.dtype)
+            row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
+            col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+            h_off = (row_p + col_p).reshape(B * M_off, L, C_h)
             for block in self.off_diag_blocks:
                 h_off = block(
                     h_off,
@@ -563,17 +647,18 @@ class LeafOnlyNet(nn.Module):
                     attn_mask=off_attn_mask,
                     edge_feats=off_edge_feats,
                 )
+            h_off = h_off.view(B, M_off, L, C_h)
             off_diag_blocks = self._get_leaf_blocks(h_off, mode="off-diagonal")
         else:
             off_diag_blocks = torch.empty(
-                (B_h, 0, self.leaf_apply_size, self.leaf_apply_size), device=h.device, dtype=h.dtype
+                (B, 0, self.leaf_apply_off, self.leaf_apply_off), device=h.device, dtype=h.dtype
             )
 
         jacobi_scale = self._get_jacobi_scale(h_diag)
 
-        B = diag_blocks.shape[0]
-        packed_diag = diag_blocks.reshape(B, -1)
-        packed_off = off_diag_blocks.reshape(B, -1)
+        Bb = diag_blocks.shape[0]
+        packed_diag = diag_blocks.reshape(Bb, -1)
+        packed_off = off_diag_blocks.reshape(Bb, -1)
 
         packed = torch.cat([packed_diag, packed_off], dim=1)
         if jacobi_scale is not None:
@@ -582,20 +667,23 @@ class LeafOnlyNet(nn.Module):
         return packed
 
 
-def unpack_precond(precond_packed, N, leaf_size=LEAF_SIZE, leaf_apply_size=None):
+def unpack_precond(precond_packed, N, leaf_size=LEAF_SIZE, leaf_apply_size=None, leaf_apply_off=None):
     if leaf_apply_size is None:
         leaf_apply_size = leaf_size
+    if leaf_apply_off is None:
+        leaf_apply_off = leaf_apply_size
     B = precond_packed.shape[0]
     num_leaves = N // leaf_size
-    La = leaf_apply_size
-    diag_size = num_leaves * La * La
-    P = (num_leaves * (num_leaves - 1)) // 2
-    off_size = P * La * La
+    La_d = leaf_apply_size
+    La_o = leaf_apply_off
+    diag_size = num_leaves * La_d * La_d
+    M_h = NUM_HMATRIX_OFF_BLOCKS
+    off_size = M_h * La_o * La_o
 
-    diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, La, La)
+    diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, La_d, La_d)
     off_diag_blocks = None
-    if P > 0:
-        off_diag_blocks = precond_packed[:, diag_size : diag_size + off_size].view(B, P, La, La)
+    if M_h > 0:
+        off_diag_blocks = precond_packed[:, diag_size : diag_size + off_size].view(B, M_h, La_o, La_o)
 
     jacobi_scale = precond_packed[:, diag_size + off_size :] if precond_packed.shape[1] > diag_size + off_size else None
     return diag_blocks, off_diag_blocks, jacobi_scale
@@ -606,47 +694,60 @@ def apply_block_diagonal_M(
     x,
     leaf_size=LEAF_SIZE,
     leaf_apply_size=None,
+    leaf_apply_off=None,
     jacobi_inv_diag=None,
 ):
     """
-    Diagonal/off blocks are La×La with La = leaf_apply_size (e.g. 32); node layout is still leaf_size (e.g. 64) per leaf.
-    Per leaf: mean-pool x to La, matmul blocks, repeat_interleave prolongation back to leaf_size.
+    Diagonal blocks are La_d×La_d; off-diagonal blocks La_o×La_o; node layout is leaf_size per leaf.
+    Per leaf: mean-pool x to La_*, matmul, repeat_interleave prolongation back to leaf_size.
     """
     if leaf_apply_size is None:
         leaf_apply_size = leaf_size
+    if leaf_apply_off is None:
+        leaf_apply_off = leaf_apply_size
     B, N, K_dim = x.shape
     num_leaves = N // leaf_size
-    La = leaf_apply_size
-    pool = leaf_size // La
-    if pool * La != leaf_size:
-        raise ValueError(f"leaf_size {leaf_size} not divisible by leaf_apply_size {La}")
+    La_d = leaf_apply_size
+    La_o = leaf_apply_off
+    pool_d = leaf_size // La_d
+    pool_o = leaf_size // La_o
+    if pool_d * La_d != leaf_size:
+        raise ValueError(f"leaf_size {leaf_size} not divisible by leaf_apply_size {La_d}")
+    if pool_o * La_o != leaf_size:
+        raise ValueError(f"leaf_size {leaf_size} not divisible by leaf_apply_off {La_o}")
 
-    diag_size = num_leaves * La * La
-    P = (num_leaves * (num_leaves - 1)) // 2
-    off_size = P * La * La
+    diag_size = num_leaves * La_d * La_d
+    M_h = NUM_HMATRIX_OFF_BLOCKS
+    off_size = M_h * La_o * La_o
 
-    diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, La, La)
+    diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, La_d, La_d)
     x_leaves = x.view(B, num_leaves, leaf_size, K_dim)
-    x_pool = (
+    x_pool_d = (
         x_leaves
-        if pool == 1
-        else x_leaves.view(B, num_leaves, La, pool, K_dim).mean(dim=3)
+        if pool_d == 1
+        else x_leaves.view(B, num_leaves, La_d, pool_d, K_dim).mean(dim=3)
     )
 
-    y_pool = torch.matmul(diag_blocks, x_pool)
-    y_leaves = y_pool if pool == 1 else y_pool.repeat_interleave(pool, dim=2)
+    y_pool = torch.matmul(diag_blocks, x_pool_d)
+    y_leaves = y_pool if pool_d == 1 else y_pool.repeat_interleave(pool_d, dim=2)
 
-    if P > 0:
-        off_diag_blocks = precond_packed[:, diag_size : diag_size + off_size].view(B, P, La, La)
-        r_idx, c_idx = torch.triu_indices(num_leaves, num_leaves, offset=1, device=x.device)
-
-        y_r_add = torch.matmul(off_diag_blocks, x_pool[:, c_idx])
-        y_c_add = torch.matmul(off_diag_blocks.transpose(-1, -2), x_pool[:, r_idx])
-        y_r_full = y_r_add if pool == 1 else y_r_add.repeat_interleave(pool, dim=2)
-        y_c_full = y_c_add if pool == 1 else y_c_add.repeat_interleave(pool, dim=2)
-
-        y_leaves.index_add_(1, r_idx, y_r_full)
-        y_leaves.index_add_(1, c_idx, y_c_full)
+    if M_h > 0:
+        off_diag_blocks = precond_packed[:, diag_size : diag_size + off_size].view(B, M_h, La_o, La_o)
+        Wr = HM_POOL_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
+        Wc = HM_POOL_W_COL_CPU.to(device=x.device, dtype=x.dtype)
+        x_row_strips = torch.einsum("mk,bkle->bmle", Wr, x_leaves)
+        x_col_strips = torch.einsum("mk,bkle->bmle", Wc, x_leaves)
+        flat = B * M_h
+        Br = off_diag_blocks.reshape(flat, La_o, La_o)
+        xr = x_row_strips.reshape(flat, La_o, K_dim)
+        xc = x_col_strips.reshape(flat, La_o, K_dim)
+        y_r = torch.bmm(Br, xc)
+        y_c = torch.bmm(Br.transpose(-1, -2), xr)
+        y_r = y_r.view(B, M_h, La_o, K_dim)
+        y_c = y_c.view(B, M_h, La_o, K_dim)
+        ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
+        y_leaves.index_add_(1, ridx, y_r[:, gidx, :, :])
+        y_leaves.index_add_(1, cidx, y_c[:, gidx, :, :])
 
     y = y_leaves.view(B, N, K_dim)
 
@@ -658,3 +759,84 @@ def apply_block_diagonal_M(
         jacobi_scale = precond_packed[:, diag_size + off_size :]
         y = y + (jacobi_scale * jacobi_inv_diag).unsqueeze(-1) * x
     return y
+
+
+def block_diagonal_m_apply_workspace(num_leaves: int, leaf_size: int, K_dim: int, M_h: int, La_o: int, device, dtype):
+    """Fixed buffers for apply_block_diagonal_m_into (B=1, no allocs in CUDAGraph replay)."""
+    lc = leaf_size * K_dim
+    t_pro = int(HM_PROLONG_GATHER_IDX.shape[0])
+    return {
+        "x_flat": torch.empty(num_leaves, lc, device=device, dtype=dtype),
+        "row_flat": torch.empty(M_h, lc, device=device, dtype=dtype),
+        "col_flat": torch.empty(M_h, lc, device=device, dtype=dtype),
+        "y_r": torch.empty(1, M_h, La_o, K_dim, device=device, dtype=dtype),
+        "y_c": torch.empty(1, M_h, La_o, K_dim, device=device, dtype=dtype),
+        "y_scatter_r": torch.empty(1, t_pro, La_o, K_dim, device=device, dtype=dtype),
+        "y_scatter_c": torch.empty(1, t_pro, La_o, K_dim, device=device, dtype=dtype),
+    }
+
+
+def apply_block_diagonal_m_into(
+    precond_packed,
+    x,
+    out,
+    jacobi_inv_diag,
+    ws,
+    Wr,
+    Wc,
+    leaf_size=LEAF_SIZE,
+    leaf_apply_size=None,
+    leaf_apply_off=None,
+):
+    """
+    B=1 only. Writes Mx into ``out`` (same shape as ``x``) using preallocated ``ws`` and device ``Wr,Wc``.
+    No internal tensor allocations — safe inside ``torch.cuda.graph`` replay when buffers are fixed.
+    Requires leaf_apply_size == leaf_apply_off == leaf_size (no pool-down inside apply).
+    """
+    if leaf_apply_size is None:
+        leaf_apply_size = leaf_size
+    if leaf_apply_off is None:
+        leaf_apply_off = leaf_apply_size
+    if leaf_apply_size != leaf_size or leaf_apply_off != leaf_size:
+        raise ValueError("apply_block_diagonal_m_into only supports full-resolution leaf apply (pool factor 1).")
+    B, N, K_dim = x.shape
+    if B != 1:
+        raise ValueError(f"apply_block_diagonal_m_into expects B=1, got {B}")
+    num_leaves = N // leaf_size
+    La_d = leaf_apply_size
+    La_o = leaf_apply_off
+    M_h = NUM_HMATRIX_OFF_BLOCKS
+    diag_size = num_leaves * La_d * La_d
+    off_size = M_h * La_o * La_o
+
+    diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, La_d, La_d)
+    x_leaves = x.view(B, num_leaves, leaf_size, K_dim)
+    y_leaves = out.view(B, num_leaves, leaf_size, K_dim)
+    torch.matmul(diag_blocks, x_leaves, out=y_leaves)
+
+    if M_h > 0:
+        off_diag_blocks = precond_packed[:, diag_size : diag_size + off_size].view(B, M_h, La_o, La_o)
+        ws["x_flat"].copy_(x_leaves[0].reshape(num_leaves, leaf_size * K_dim))
+        torch.matmul(Wr, ws["x_flat"], out=ws["row_flat"])
+        torch.matmul(Wc, ws["x_flat"], out=ws["col_flat"])
+        Br = off_diag_blocks.reshape(M_h, La_o, La_o)
+        xc = ws["col_flat"].view(M_h, La_o, K_dim)
+        xr = ws["row_flat"].view(M_h, La_o, K_dim)
+        torch.bmm(Br, xc, out=ws["y_r"][0])
+        torch.bmm(Br.transpose(-1, -2), xr, out=ws["y_c"][0])
+        y_r = ws["y_r"]
+        y_c = ws["y_c"]
+        ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
+        torch.index_select(y_r, 1, gidx, out=ws["y_scatter_r"])
+        torch.index_select(y_c, 1, gidx, out=ws["y_scatter_c"])
+        y_leaves.index_add_(1, ridx, ws["y_scatter_r"])
+        y_leaves.index_add_(1, cidx, ws["y_scatter_c"])
+
+    if precond_packed.shape[1] > diag_size + off_size:
+        if jacobi_inv_diag is None:
+            raise ValueError("jacobi_inv_diag is required when jacobi_scale is present.")
+        if jacobi_inv_diag.shape[:2] != (B, N):
+            raise ValueError(f"jacobi_inv_diag shape {jacobi_inv_diag.shape} does not match (B,N)=({B},{N}).")
+        jacobi_scale = precond_packed[:, diag_size + off_size :]
+        out.addcmul_(x, (jacobi_scale * jacobi_inv_diag).unsqueeze(-1))
+    return out

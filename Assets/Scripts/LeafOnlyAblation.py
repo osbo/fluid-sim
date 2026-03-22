@@ -11,9 +11,15 @@ from leafonly import (
     LeafOnlyNet,
     apply_block_diagonal_M,
     load_leaf_only_weights,
-    next_valid_size,
 )
-from leafonly.config import LEAF_APPLY_SIZE, LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps_device
+from leafonly.config import (
+    LEAF_APPLY_SIZE,
+    LEAF_APPLY_SIZE_OFF,
+    LEAF_SIZE,
+    MAX_MIXED_SIZE,
+    fixed_runtime_config,
+    require_cuda_or_mps_device,
+)
 from leafonly.data import FluidGraphDataset, most_recent_run_folder
 from leafonly.train import train_leaf_only
 
@@ -50,13 +56,12 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
     frame_idx = min(int(frame_idx), len(dataset) - 1)
     batch = dataset[frame_idx]
     num_nodes_real = int(batch["num_nodes"])
-    n_requested = min(256, num_nodes_real)
-    n_pad = next_valid_size(n_requested, LEAF_SIZE)
+    n_requested = min(MAX_MIXED_SIZE, num_nodes_real)
+    n_pad = MAX_MIXED_SIZE
 
     x = batch["x"].unsqueeze(0).to(device)
     x_input = x[:, :n_requested, :].clone()
-    if n_pad > n_requested:
-        x_input = F.pad(x_input, (0, 0, 0, n_pad - n_requested), value=0.0)
+    x_input = F.pad(x_input, (0, 0, 0, n_pad - n_requested), value=0.0)
     active_pos = x_input[0, :n_requested, :3]
     x_input[0, :n_requested, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
 
@@ -125,7 +130,12 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
 
     apply_ms = _avg_ms(
         lambda: apply_block_diagonal_M(
-            precond_out, AZ, leaf_size=LEAF_SIZE, leaf_apply_size=LEAF_APPLY_SIZE, jacobi_inv_diag=jacobi_inv_diag
+            precond_out,
+            AZ,
+            leaf_size=LEAF_SIZE,
+            leaf_apply_size=LEAF_APPLY_SIZE,
+            leaf_apply_off=LEAF_APPLY_SIZE_OFF,
+            jacobi_inv_diag=jacobi_inv_diag,
         ),
         device,
         warmup=5,

@@ -5,15 +5,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .architecture import (
-    LeafOnlyNet,
-    apply_block_diagonal_M,
-    next_valid_size,
-    pool_precomputed_leaf_connectivity,
-)
+from .architecture import LeafOnlyNet, apply_block_diagonal_M
 from .checkpoint import load_leaf_only_weights
-from .config import ATTN_POOL_FACTOR, LEAF_APPLY_SIZE, LEAF_SIZE, MAX_MIXED_SIZE
+from .config import LEAF_APPLY_SIZE, LEAF_APPLY_SIZE_OFF, LEAF_SIZE, MAX_MIXED_SIZE, MAX_NUM_LEAVES
 from .data import FluidGraphDataset, build_leaf_block_connectivity, most_recent_run_folder
+from .hmatrix import NUM_HMATRIX_OFF_BLOCKS, hmatrix_off_masks_and_feats
 
 
 def _sync_device(device):
@@ -151,11 +147,10 @@ def evaluate_gradient_interference(args, runtime):
         for micro in range(contexts_per_step):
             frame_idx = frame_indices_per_pass[step][micro]
             batch = dataset[frame_idx]
-            n_orig = min(int(batch["num_nodes"]), eval_max_nodes)
-            n_pad = next_valid_size(n_orig, LEAF_SIZE)
+            n_pad = MAX_MIXED_SIZE
+            n_orig = min(int(batch["num_nodes"]), eval_max_nodes, n_pad)
             x_input = batch["x"][:n_orig].unsqueeze(0).to(device)
-            if n_pad > n_orig:
-                x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
+            x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
             active_pos = x_input[0, :n_orig, :3]
             x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
             rows, cols = batch["edge_index"][0], batch["edge_index"][1]
@@ -167,13 +162,11 @@ def evaluate_gradient_interference(args, runtime):
             A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
             A_dense[:n_orig, :n_orig] = A_small
             A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
-            pre_leaf = pool_precomputed_leaf_connectivity(
-                build_leaf_block_connectivity(
-                    edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
-                ),
-                LEAF_SIZE,
-                ATTN_POOL_FACTOR,
+            dm, df, _, _ = build_leaf_block_connectivity(
+                edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
             )
+            om, oe = hmatrix_off_masks_and_feats(NUM_HMATRIX_OFF_BLOCKS, LEAF_SIZE, device, x_input.dtype)
+            pre_leaf = (dm, df, om, oe)
             global_feat = batch.get("global_features")
             if global_feat is None:
                 raise ValueError(f"Missing global_features for frame: {batch.get('frame_path', '<unknown>')}")
@@ -196,7 +189,12 @@ def evaluate_gradient_interference(args, runtime):
             inv_mask = diag_A.abs() > 1e-6
             jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A[inv_mask]
             MAZ = apply_block_diagonal_M(
-                precond_out, AZ, leaf_size=LEAF_SIZE, leaf_apply_size=LEAF_APPLY_SIZE, jacobi_inv_diag=jacobi_inv_diag
+                precond_out,
+                AZ,
+                leaf_size=LEAF_SIZE,
+                leaf_apply_size=LEAF_APPLY_SIZE,
+                leaf_apply_off=LEAF_APPLY_SIZE_OFF,
+                jacobi_inv_diag=jacobi_inv_diag,
             )
             raw_loss = ((MAZ - Z) ** 2).mean()
             step_loss_sum += raw_loss.item()
@@ -255,24 +253,21 @@ def evaluate_gradient_interference(args, runtime):
     # Component-level timing on one representative context.
     profile_frame_idx = frame_indices_per_pass[0][0]
     batch = dataset[profile_frame_idx]
-    n_orig = min(int(batch["num_nodes"]), eval_max_nodes)
-    n_pad = next_valid_size(n_orig, LEAF_SIZE)
+    n_pad = MAX_MIXED_SIZE
+    n_orig = min(int(batch["num_nodes"]), eval_max_nodes, n_pad)
     x_input = batch["x"][:n_orig].unsqueeze(0).to(device)
-    if n_pad > n_orig:
-        x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
+    x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
     active_pos = x_input[0, :n_orig, :3]
     x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
     rows, cols = batch["edge_index"][0], batch["edge_index"][1]
     mask = (rows < n_orig) & (cols < n_orig)
     edge_index = batch["edge_index"][:, mask].to(device)
     edge_values = batch["edge_values"][mask].to(device)
-    pre_leaf = pool_precomputed_leaf_connectivity(
-        build_leaf_block_connectivity(
-            edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
-        ),
-        LEAF_SIZE,
-        ATTN_POOL_FACTOR,
+    dm, df, _, _ = build_leaf_block_connectivity(
+        edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
     )
+    om, oe = hmatrix_off_masks_and_feats(NUM_HMATRIX_OFF_BLOCKS, LEAF_SIZE, device, x_input.dtype)
+    pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")
     if global_feat is None:
         raise ValueError(f"Missing global_features for frame: {batch.get('frame_path', '<unknown>')}")
@@ -290,12 +285,26 @@ def evaluate_gradient_interference(args, runtime):
     Z[:, n_orig:, :] = 0.0
     AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
 
-    attn_mask, edge_feats, off_attn_mask, off_edge_feats = pre_leaf
+    attn_mask, edge_feats, _, _ = pre_leaf
     positions = x_input[0, :, :3]
     B_prof, N_prof = x_input.shape[0], x_input.shape[1]
-    K_prof = N_prof // LEAF_SIZE
-    r_idx_prof, c_idx_prof = torch.triu_indices(K_prof, K_prof, offset=1, device=device)
-    P_prof = r_idx_prof.shape[0]
+    assert N_prof == MAX_NUM_LEAVES * LEAF_SIZE, "Profile expects N == MAX_MIXED_SIZE"
+    Lf = LEAF_SIZE
+    Mh = model.num_h_off
+    if Mh > 0:
+        om = model.hm_off_attn_mask[0].to(device=device, dtype=x_input.dtype)
+        oe = model.hm_off_edge_feats[0].to(device=device, dtype=x_input.dtype)
+        off_attn_mask = om.unsqueeze(0).expand(B_prof, Mh, Lf, Lf + 1).contiguous().reshape(
+            B_prof * Mh, 1, Lf, Lf + 1
+        )
+        off_edge_feats = (
+            oe.unsqueeze(0)
+            .expand(B_prof, Mh, Lf, Lf + 1, 4)
+            .contiguous()
+            .reshape(B_prof * Mh, 1, Lf, Lf + 1, 4)
+        )
+    else:
+        off_attn_mask = off_edge_feats = None
 
     with torch.no_grad():
         h_lift = model.embed.lift(torch.cat([x_input[..., 3:], global_feat.unsqueeze(1).expand(-1, x_input.size(1), -1)], dim=-1))
@@ -318,10 +327,13 @@ def evaluate_gradient_interference(args, runtime):
                 edge_feats=edge_feats,
             )
         diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
-        if P_prof > 0:
-            h_k = h_proj0.view(B_prof, K_prof, LEAF_SIZE, C_dim)
-            h_pairs = (h_k[:, r_idx_prof] + h_k[:, c_idx_prof]).view(B_prof, P_prof * LEAF_SIZE, C_dim)
-            h_off = h_pairs
+        if Mh > 0:
+            h_k = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+            Wr = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
+            Wc = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
+            row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
+            col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+            h_off = (row_p + col_p).reshape(B_prof * Mh, Lf, C_dim)
             for block in model.off_diag_blocks:
                 h_off = block(
                     h_off,
@@ -332,10 +344,11 @@ def evaluate_gradient_interference(args, runtime):
                     attn_mask=off_attn_mask,
                     edge_feats=off_edge_feats,
                 )
+            h_off = h_off.view(B_prof, Mh, Lf, C_dim)
             off_diag_blocks_profile = model._get_leaf_blocks(h_off, mode="off-diagonal")
         else:
             off_diag_blocks_profile = torch.empty(
-                (B_prof, 0, LEAF_APPLY_SIZE, LEAF_APPLY_SIZE), device=device, dtype=h_proj0.dtype
+                (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
             )
         jacobi_scale_profile = model._get_jacobi_scale(h_diag)
 
@@ -424,10 +437,13 @@ def evaluate_gradient_interference(args, runtime):
     ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_block_in, mode="diagonal"), device)
     timing_rows.append(["Leaf head (block PSD)", ms_leaf_head])
 
-    if P_prof > 0:
-        h_k_t = h_proj0.view(B_prof, K_prof, LEAF_SIZE, C_dim)
-        h_pairs_t = (h_k_t[:, r_idx_prof] + h_k_t[:, c_idx_prof]).view(B_prof, P_prof * LEAF_SIZE, C_dim)
-        h_off_in = h_pairs_t
+    if Mh > 0:
+        h_k_t = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+        Wr_t = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
+        Wc_t = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
+        row_pt = torch.einsum("mk,bklc->bmlc", Wr_t, h_k_t)
+        col_pt = torch.einsum("mk,bklc->bmlc", Wc_t, h_k_t)
+        h_off_in = (row_pt + col_pt).reshape(B_prof * Mh, Lf, C_dim)
         for i, block in enumerate(model.off_diag_blocks):
             ms_ob = _timed_ms(
                 lambda b=block, h=h_off_in: b(
@@ -441,7 +457,7 @@ def evaluate_gradient_interference(args, runtime):
                 ),
                 device,
             )
-            timing_rows.append([f"Off-diag attention block {i}", ms_ob])
+            timing_rows.append([f"H off attention block {i}", ms_ob])
             with torch.no_grad():
                 h_off_in = block(
                     h_off_in,
@@ -452,8 +468,9 @@ def evaluate_gradient_interference(args, runtime):
                     attn_mask=off_attn_mask,
                     edge_feats=off_edge_feats,
                 )
+        h_off_in = h_off_in.view(B_prof, Mh, Lf, C_dim)
         ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_in, mode="off-diagonal"), device)
-        timing_rows.append(["Off-diag head (UV^T)", ms_off_head])
+        timing_rows.append(["H off head (UV^T)", ms_off_head])
 
     ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_in), device)
     timing_rows.append(["Jacobi gate (node_scalar)", ms_jacobi])
@@ -472,6 +489,7 @@ def evaluate_gradient_interference(args, runtime):
             AZ,
             leaf_size=LEAF_SIZE,
             leaf_apply_size=LEAF_APPLY_SIZE,
+            leaf_apply_off=LEAF_APPLY_SIZE_OFF,
             jacobi_inv_diag=jacobi_inv_diag_profile,
         ),
         device,
