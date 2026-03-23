@@ -24,7 +24,6 @@ from .hmatrix import (
     HM_S_CPU,
     NUM_HMATRIX_OFF_BLOCKS,
     hm_leaf_mean_pool_weights,
-    hmatrix_off_masks_and_feats,
 )
 
 # Prolongation indices live on CPU in hmatrix; copy once per device. CUDAGraph capture must not call .to().
@@ -523,9 +522,6 @@ class LeafOnlyNet(nn.Module):
         )
         self.register_buffer("hm_pool_w_row", wr, persistent=False)
         self.register_buffer("hm_pool_w_col", wc, persistent=False)
-        om, oe = hmatrix_off_masks_and_feats(self.num_h_off, self.leaf_size, torch.device("cpu"), dtype=torch.float32)
-        self.register_buffer("hm_off_attn_mask", om.unsqueeze(0), persistent=False)
-        self.register_buffer("hm_off_edge_feats", oe.unsqueeze(0), persistent=False)
 
     def _get_leaf_blocks(self, h, mode="diagonal"):
         # Diagonal: (B, N, C) with N = K * L. Off: (B, M_off, L, C) one L-token tile per H block — fold to (B*M, L, C).
@@ -572,14 +568,22 @@ class LeafOnlyNet(nn.Module):
         h = self.embed(x, edge_index, edge_values, global_features=global_features)
         h = self.enc_input_proj(h)
         attn_mask, edge_feats = None, None
+        off_om_pre, off_oe_pre = None, None
 
         if edge_index is not None and edge_values is not None:
             device, dtype = x.device, x.dtype
             if precomputed_leaf_connectivity is not None:
                 pcs = precomputed_leaf_connectivity
                 attn_mask, edge_feats = pcs[0], pcs[1]
+                if len(pcs) >= 4:
+                    off_om_pre, off_oe_pre = pcs[2], pcs[3]
+                elif self.num_h_off > 0:
+                    raise ValueError(
+                        "precomputed_leaf_connectivity must be a 4-tuple "
+                        "(diag_mask, diag_feats, off_attn_mask, off_edge_feats) when num_h_off > 0."
+                    )
             else:
-                attn_mask, edge_feats, _, _ = build_leaf_block_connectivity(
+                attn_mask, edge_feats, off_om_pre, off_oe_pre = build_leaf_block_connectivity(
                     edge_index,
                     edge_values,
                     positions,
@@ -605,17 +609,40 @@ class LeafOnlyNet(nn.Module):
         M_off = self.num_h_off
         if M_off > 0:
             # LeafBlockAttention sees x as (B*M_off, L, C) → num_blocks=1; masks must be (B*M_off, 1, L, L+1).
-            om = self.hm_off_attn_mask[0].to(device=h.device, dtype=h.dtype)
-            oe = self.hm_off_edge_feats[0].to(device=h.device, dtype=h.dtype)
-            off_attn_mask = (
-                om.unsqueeze(0).expand(B, M_off, L, L + 1).contiguous().reshape(B * M_off, 1, L, L + 1)
-            )
-            off_edge_feats = (
-                oe.unsqueeze(0)
-                .expand(B, M_off, L, L + 1, 4)
-                .contiguous()
-                .reshape(B * M_off, 1, L, L + 1, 4)
-            )
+            if off_om_pre is None or off_om_pre.numel() == 0:
+                raise ValueError(
+                    "LeafOnlyNet: H off-diagonal attention mask missing. "
+                    "Pass build_leaf_block_connectivity(...) (4-tuple) as precomputed_leaf_connectivity, "
+                    "or provide edge_index/edge_values so it can be built."
+                )
+            if off_oe_pre is None or off_oe_pre.numel() == 0:
+                raise ValueError(
+                    "LeafOnlyNet: H off-diagonal edge_feats missing (precomputed[...,3] or build_leaf_block_connectivity)."
+                )
+            om_m = int(off_om_pre.shape[0]) if off_om_pre.dim() == 3 else int(off_om_pre.shape[1])
+            if om_m != M_off:
+                raise ValueError(
+                    f"LeafOnlyNet: off attn_mask has M={om_m}, expected num_h_off={M_off}."
+                )
+            om = off_om_pre.to(device=h.device, dtype=h.dtype)
+            oe = off_oe_pre.to(device=h.device, dtype=h.dtype)
+            if self.attn_pool_off > 1:
+                om, oe = pool_off_leaf_connectivity_if_needed(om, oe, self.leaf_size, self.attn_pool_off)
+            if om.dim() == 3:
+                om4 = om.unsqueeze(0).expand(B, M_off, -1, -1).contiguous()
+            else:
+                om4 = om.contiguous()
+                if om4.shape[0] == 1 and B > 1:
+                    om4 = om4.expand(B, -1, -1, -1).contiguous()
+            Lq, Kq = om4.shape[-2], om4.shape[-1]
+            if oe.dim() == 4:
+                oe5 = oe.unsqueeze(0).expand(B, M_off, -1, -1, -1).contiguous()
+            else:
+                oe5 = oe.contiguous()
+                if oe5.shape[0] == 1 and B > 1:
+                    oe5 = oe5.expand(B, -1, -1, -1, -1, -1).contiguous()
+            off_attn_mask = om4.reshape(B * M_off, 1, Lq, Kq)
+            off_edge_feats = oe5.reshape(B * M_off, 1, Lq, Kq, 4)
 
         h_diag = h
         for block in self.blocks:

@@ -6,6 +6,12 @@ import torch
 
 from .config import ATTENTION_HOPS, LEAF_SIZE
 
+# Imported where needed for H off masks (hmatrix does not import data).
+def _hmatrix_static():
+    from . import hmatrix as _hm
+
+    return _hm.HM_R0_CPU, _hm.HM_C0_CPU, _hm.HM_S_CPU
+
 
 NODE_DTYPE = np.dtype(
     [
@@ -137,6 +143,27 @@ class FluidGraphDataset:
         }
 
 
+def _edge_feats_LxL_mean_scatter(
+    r_l: torch.Tensor,
+    c_l: torch.Tensor,
+    edge_feats_flat: torch.Tensor,
+    leaf_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Mean-aggregate [dx(3), w(1)] into (L, L, 4) by local row/col index."""
+    L = int(leaf_size)
+    if r_l.numel() == 0:
+        return torch.zeros(L, L, 4, device=device, dtype=dtype)
+    idx = r_l.long() * L + c_l.long()
+    sum_flat = torch.zeros(L * L, 4, device=device, dtype=dtype)
+    cnt_flat = torch.zeros(L * L, device=device, dtype=dtype)
+    f = edge_feats_flat.to(device=device, dtype=dtype)
+    sum_flat.index_add_(0, idx, f)
+    cnt_flat.index_add_(0, idx, torch.ones((idx.shape[0],), device=device, dtype=dtype))
+    return (sum_flat / cnt_flat.unsqueeze(-1).clamp(min=1.0)).view(L, L, 4)
+
+
 def _materialize_block_attn_and_edge_feats(
     reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
 ):
@@ -146,7 +173,13 @@ def _materialize_block_attn_and_edge_feats(
     attn_mask[:, :, L] = 1.0
     edge_feats = torch.zeros(num_blocks, L, L + 1, 4, device=device, dtype=dtype)
     if b_l.numel() > 0:
-        edge_feats[b_l, r_l, c_l, :] = edge_feats_flat.to(device=device, dtype=dtype)
+        for b in range(int(num_blocks)):
+            sel = b_l == b
+            if not sel.any():
+                continue
+            edge_feats[b, :L, :L, :] = _edge_feats_LxL_mean_scatter(
+                r_l[sel], c_l[sel], edge_feats_flat[sel], L, device, dtype
+            )
     return attn_mask, edge_feats
 
 
@@ -246,39 +279,23 @@ def _diag_in_block_edge_features(edge_index, edge_values, positions, leaf_size, 
     return b_l, r_l, c_l, edge_feats_flat
 
 
-def _off_diag_pair_edge_features(edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype):
-    """
-    Scatter lists for cross-leaf edges (block_r < block_c), mapped to upper-triangular pair index.
-    Used only to fill edge_feats at matrix entries where a direct edge exists.
-    """
-    rows, cols = edge_index[0], edge_index[1]
-    block_r = rows // leaf_size
-    block_c = cols // leaf_size
-    L = leaf_size
-
-    r_idx, c_idx = torch.triu_indices(num_blocks, num_blocks, offset=1, device=device)
-    P = r_idx.shape[0]
-    if P == 0:
-        empty = torch.tensor([], device=device, dtype=torch.long)
-        zf = torch.zeros(0, 4, device=device, dtype=dtype)
-        return empty, empty, empty, zf
-
-    lookup = torch.full((num_blocks, num_blocks), -1, device=device, dtype=torch.long)
-    lookup[r_idx, c_idx] = torch.arange(P, device=device)
-
-    off_mask = (block_r < block_c) & (block_c < num_blocks)
-    br_off, bc_off = block_r[off_mask], block_c[off_mask]
-    p_ids = lookup[br_off, bc_off]
-    valid_p = p_ids >= 0
-    p_l = p_ids[valid_p]
-    rl_off = rows[off_mask][valid_p] % leaf_size
-    cl_off = cols[off_mask][valid_p] % leaf_size
-    pos_r_off = positions[rows[off_mask][valid_p]]
-    pos_c_off = positions[cols[off_mask][valid_p]]
-    dx_off = (pos_c_off - pos_r_off).to(device=device, dtype=dtype)
-    w_off = edge_values[off_mask][valid_p].to(device=device, dtype=dtype)
-    edge_feats_flat_off = torch.cat([dx_off, w_off.unsqueeze(1)], dim=1)
-    return p_l, rl_off, cl_off, edge_feats_flat_off
+def _reachable_and_diag_materialize(
+    edge_index, edge_values, positions, leaf_size, device, dtype, num_hops
+):
+    """One full-graph hop pass; diagonal masks/feats; returns (R, dm, df, num_blocks) or (None, None, None, 0)."""
+    N = positions.shape[0]
+    num_blocks = N // leaf_size
+    if num_blocks == 0:
+        return None, None, None, 0
+    R = _full_graph_hop_reachable(edge_index, N, num_hops, device, dtype)
+    diag_reachable, _ = _slice_leaf_blocks_from_global_reachable(R, num_blocks, leaf_size)
+    b_l, r_l, c_l, edge_feats_flat = _diag_in_block_edge_features(
+        edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype
+    )
+    dm, df = _materialize_block_attn_and_edge_feats(
+        diag_reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
+    )
+    return R, dm, df, num_blocks
 
 
 def build_diag_leaf_connectivity(
@@ -286,32 +303,150 @@ def build_diag_leaf_connectivity(
 ):
     """
     Per-leaf diagonal tiles only: n-hop reachability restricted to same leaf + edge features on
-    in-leaf edges. H-matrix off-diagonal tiles use fixed dense masks in the model (see hmatrix.py).
+    in-leaf edges. (H off masks come from the same reachability in build_leaf_block_connectivity.)
     """
-    N = positions.shape[0]
-    num_blocks = N // leaf_size
+    _, dm, df, num_blocks = _reachable_and_diag_materialize(
+        edge_index, edge_values, positions, leaf_size, device, dtype, num_hops
+    )
     if num_blocks == 0:
         return None, None
+    return dm, df
 
-    R = _full_graph_hop_reachable(edge_index, N, num_hops, device, dtype)
-    diag_reachable, _ = _slice_leaf_blocks_from_global_reachable(R, num_blocks, leaf_size)
 
-    b_l, r_l, c_l, edge_feats_flat = _diag_in_block_edge_features(
-        edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype
-    )
-    return _materialize_block_attn_and_edge_feats(
-        diag_reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
-    )
+def build_hmatrix_off_attn_masks_from_reachable(
+    reachable: torch.Tensor,
+    r0: torch.Tensor,
+    c0: torch.Tensor,
+    s: torch.Tensor,
+    num_blocks: int,
+    leaf_size: int,
+    dtype_out: torch.dtype,
+) -> torch.Tensor:
+    """
+    Aggregate global n-hop reachability into H-matrix off-block attention masks.
+
+    For each admissible tile (r0, c0, S), OR together all L×L leaf-pair slices
+    R[rr*L:(rr+1)*L, cc*L:(cc+1)*L] for rr in [r0, r0+S), cc in [c0, c0+S).
+
+    Returns (M_off, L, L+1); last key column is 1 (block node), matching diagonal layout.
+    """
+    L = int(leaf_size)
+    K = int(num_blocks)
+    N = K * L
+    if reachable.shape != (N, N):
+        raise ValueError(f"reachable must be ({N}, {N}), got {tuple(reachable.shape)}")
+    device = reachable.device
+    M = int(r0.shape[0])
+    if M == 0:
+        return torch.zeros(0, L, L + 1, device=device, dtype=dtype_out)
+    r0_l = r0.long().to(device)
+    c0_l = c0.long().to(device)
+    s_l = s.long().to(device)
+    out = torch.zeros(M, L, L + 1, device=device, dtype=dtype_out)
+    for m in range(M):
+        rr0 = int(r0_l[m].item())
+        cc0 = int(c0_l[m].item())
+        sval = int(s_l[m].item())
+        subs = []
+        for rr in range(rr0, rr0 + sval):
+            for cc in range(cc0, cc0 + sval):
+                if 0 <= rr < K and 0 <= cc < K:
+                    subs.append(reachable[rr * L : (rr + 1) * L, cc * L : (cc + 1) * L])
+        if subs:
+            acc = torch.stack(subs, dim=0).amax(dim=0).to(dtype_out)
+            out[m, :, :L] = acc
+        out[m, :, L] = 1.0
+    return out
+
+
+def build_hmatrix_off_edge_feats_from_edges(
+    edge_index: torch.Tensor,
+    edge_values: torch.Tensor,
+    positions: torch.Tensor,
+    r0: torch.Tensor,
+    c0: torch.Tensor,
+    s: torch.Tensor,
+    num_blocks: int,
+    leaf_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Per H-tile (r0, c0, S): aggregate direct graph edges whose src lies in the row-strip leaves
+    and dst in the col-strip leaves into local (L, L, 4) with [Δx(3), A_ij(1)], mean over duplicates.
+
+    Layout matches diagonal per-leaf cells; last key column (block node) stays zero.
+    """
+    L = int(leaf_size)
+    K = int(num_blocks)
+    N = K * L
+    device = edge_index.device
+    pos = positions.to(device=device, dtype=dtype)
+    rows = edge_index[0].long()
+    cols = edge_index[1].long()
+    valid = (rows >= 0) & (cols >= 0) & (rows < N) & (cols < N)
+    rows = rows[valid]
+    cols = cols[valid]
+    if rows.numel() == 0:
+        M = int(r0.shape[0])
+        return torch.zeros(M, L, L + 1, 4, device=device, dtype=dtype)
+    ev = edge_values[valid].to(dtype=dtype)
+    br = rows // L
+    bc = cols // L
+    rl = rows % L
+    cl = cols % L
+    pos_r = pos[rows]
+    pos_c = pos[cols]
+    dx = pos_c - pos_r
+    feats = torch.cat([dx, ev.unsqueeze(1)], dim=1)
+
+    M = int(r0.shape[0])
+    if M == 0:
+        return torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
+    r0_l = r0.long().to(device)
+    c0_l = c0.long().to(device)
+    s_l = s.long().to(device)
+    out = torch.zeros(M, L, L + 1, 4, device=device, dtype=dtype)
+    for m in range(M):
+        rr0 = int(r0_l[m].item())
+        cc0 = int(c0_l[m].item())
+        sv = int(s_l[m].item())
+        strip_r = (br >= rr0) & (br < rr0 + sv)
+        strip_c = (bc >= cc0) & (bc < cc0 + sv)
+        msk = strip_r & strip_c
+        if not msk.any():
+            continue
+        out[m, :L, :L, :] = _edge_feats_LxL_mean_scatter(rl[msk], cl[msk], feats[msk], L, device, dtype)
+    return out
 
 
 def build_leaf_block_connectivity(
     edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS
 ):
-    """Returns (diag_mask, diag_feats, None, None); off blocks are static H-matrix buffers on the model."""
-    dm, df = build_diag_leaf_connectivity(
-        edge_index, edge_values, positions, leaf_size, device, dtype, num_hops=num_hops
+    """
+    Returns (diag_mask, diag_feats, off_attn_mask, off_edge_feats).
+
+    Diagonal: same-leaf n-hop reachability and in-leaf edge features (mean if multiple edges per cell).
+    Off-diagonal: H-tile reachability masks (OR over leaf-pair slices) and edge features from all
+    direct edges crossing row-strip × col-strip leaves (mean per local L×L cell).
+    """
+    R, dm, df, num_blocks = _reachable_and_diag_materialize(
+        edge_index, edge_values, positions, leaf_size, device, dtype, num_hops
     )
-    return dm, df, None, None
+    HM_R0_CPU, HM_C0_CPU, HM_S_CPU = _hmatrix_static()
+    L = int(leaf_size)
+    if num_blocks == 0 or R is None:
+        zm = torch.zeros(0, L, L + 1, device=device, dtype=dtype)
+        zf = torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
+        return None, None, zm, zf
+
+    hm_r0 = HM_R0_CPU.to(device)
+    hm_c0 = HM_C0_CPU.to(device)
+    hm_s = HM_S_CPU.to(device)
+    om = build_hmatrix_off_attn_masks_from_reachable(R, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype)
+    oe = build_hmatrix_off_edge_feats_from_edges(
+        edge_index, edge_values, positions, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype
+    )
+    return dm, df, om, oe
 
 
 def most_recent_run_folder(base_path):

@@ -9,7 +9,6 @@ from .architecture import LeafOnlyNet, apply_block_diagonal_M
 from .checkpoint import load_leaf_only_weights
 from .config import LEAF_APPLY_SIZE, LEAF_APPLY_SIZE_OFF, LEAF_SIZE, MAX_MIXED_SIZE, MAX_NUM_LEAVES
 from .data import FluidGraphDataset, build_leaf_block_connectivity, most_recent_run_folder
-from .hmatrix import NUM_HMATRIX_OFF_BLOCKS, hmatrix_off_masks_and_feats
 
 
 def _sync_device(device):
@@ -162,10 +161,9 @@ def evaluate_gradient_interference(args, runtime):
             A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
             A_dense[:n_orig, :n_orig] = A_small
             A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
-            dm, df, _, _ = build_leaf_block_connectivity(
+            dm, df, om, oe = build_leaf_block_connectivity(
                 edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
             )
-            om, oe = hmatrix_off_masks_and_feats(NUM_HMATRIX_OFF_BLOCKS, LEAF_SIZE, device, x_input.dtype)
             pre_leaf = (dm, df, om, oe)
             global_feat = batch.get("global_features")
             if global_feat is None:
@@ -267,10 +265,9 @@ def evaluate_gradient_interference(args, runtime):
     mask = (rows < n_orig) & (cols < n_orig)
     edge_index = batch["edge_index"][:, mask].to(device)
     edge_values = batch["edge_values"][mask].to(device)
-    dm, df, _, _ = build_leaf_block_connectivity(
+    dm, df, om, oe = build_leaf_block_connectivity(
         edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
     )
-    om, oe = hmatrix_off_masks_and_feats(NUM_HMATRIX_OFF_BLOCKS, LEAF_SIZE, device, x_input.dtype)
     pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")
     if global_feat is None:
@@ -289,15 +286,15 @@ def evaluate_gradient_interference(args, runtime):
     Z[:, n_orig:, :] = 0.0
     AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
 
-    attn_mask, edge_feats, _, _ = pre_leaf
+    attn_mask, edge_feats, om_prof, oe_prof = pre_leaf
     positions = x_input[0, :, :3]
     B_prof, N_prof = x_input.shape[0], x_input.shape[1]
     assert N_prof == MAX_NUM_LEAVES * LEAF_SIZE, "Profile expects N == MAX_MIXED_SIZE"
     Lf = LEAF_SIZE
     Mh = model.num_h_off
     if Mh > 0:
-        om = model.hm_off_attn_mask[0].to(device=device, dtype=x_input.dtype)
-        oe = model.hm_off_edge_feats[0].to(device=device, dtype=x_input.dtype)
+        om = om_prof.to(device=device, dtype=x_input.dtype)
+        oe = oe_prof.to(device=device, dtype=x_input.dtype)
         off_attn_mask = om.unsqueeze(0).expand(B_prof, Mh, Lf, Lf + 1).contiguous().reshape(
             B_prof * Mh, 1, Lf, Lf + 1
         )
@@ -586,10 +583,9 @@ def evaluate_estimator_variance(args, runtime):
     A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
     A_dense[:n_orig, :n_orig] = A_small
     A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
-    dm, df, _, _ = build_leaf_block_connectivity(
+    dm, df, om, oe = build_leaf_block_connectivity(
         edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
     )
-    om, oe = hmatrix_off_masks_and_feats(NUM_HMATRIX_OFF_BLOCKS, LEAF_SIZE, device, x_input.dtype)
     pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")
     if global_feat is None:

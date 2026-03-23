@@ -18,7 +18,7 @@ from .config import (
 )
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
-CONTEXT_CACHE_VERSION = 3
+CONTEXT_CACHE_VERSION = 5
 
 
 def _mtime_ns(path: Path) -> int:
