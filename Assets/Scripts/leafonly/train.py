@@ -23,7 +23,7 @@ from .data import (
     build_leaf_block_connectivity,
     most_recent_run_folder,
 )
-from .hmatrix import NUM_HMATRIX_OFF_BLOCKS, hmatrix_off_masks_and_feats
+from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
 
 def _bucket_cuda_profiler_key(key: str) -> str:
@@ -163,11 +163,8 @@ def train_leaf_only(args, runtime):
 
             t_c0 = time.perf_counter()
             positions_ctx = x_input[0, :n_pad, :3]
-            dm, df, _, _ = build_leaf_block_connectivity(
+            dm, df, om, oe = build_leaf_block_connectivity(
                 edge_index, edge_values, positions_ctx, LEAF_SIZE, device, x_input.dtype
-            )
-            om, oe = hmatrix_off_masks_and_feats(
-                NUM_HMATRIX_OFF_BLOCKS, LEAF_SIZE, device, x_input.dtype
             )
             precomputed_leaf_connectivity = (dm, df, om, oe)
             ctx_conn_ms += (time.perf_counter() - t_c0) * 1000.0
@@ -424,8 +421,11 @@ def train_leaf_only(args, runtime):
 
             pad_M = max_M_off - (off_mask.shape[0] if off_mask is not None else 0)
             if off_mask is None or off_mask.shape[0] == 0:
-                off_mask, off_feats = hmatrix_off_masks_and_feats(max_M_off, LEAF_SIZE, device, x_ctx.dtype)
-            elif pad_M > 0:
+                raise RuntimeError(
+                    "Context missing H off-diagonal masks/feats (expected from build_leaf_block_connectivity). "
+                    "Rebuild training context cache with --rebuild-context-cache."
+                )
+            if pad_M > 0:
                 off_mask = F.pad(off_mask, (0, 0, 0, 0, 0, pad_M), value=0.0)
                 off_feats = F.pad(off_feats, (0, 0, 0, 0, 0, 0, 0, pad_M), value=0.0)
 

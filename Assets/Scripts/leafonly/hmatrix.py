@@ -96,8 +96,10 @@ def hmatrix_off_masks_and_feats(
     dtype=torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Dense admissible attention: all query–key pairs allowed; edge_feats zero (physics bias from edge_gate only on zeros).
-    Shapes (M_off, L, L+1) and (M_off, L, L+1, 4).
+    Legacy helper: dense all-ones mask and zero edge_feats of shape (M_off, L, L+1) / (..., 4).
+
+    Training/inference use ``build_leaf_block_connectivity``, which builds masks and edge_feats from
+    the graph (reachability + per-cell mean edge features) instead of calling this.
     """
     L = int(leaf_size)
     if num_off_blocks <= 0:
