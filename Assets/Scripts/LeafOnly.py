@@ -2,7 +2,7 @@ import argparse
 
 from leafonly.architecture import attention_layout_choices, default_attention_layout
 from leafonly.config import LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps_device
-from leafonly.eval import evaluate_gradient_interference
+from leafonly.eval import evaluate_estimator_variance, evaluate_gradient_interference
 from leafonly.train import train_leaf_only as _train_leaf_only_impl
 
 
@@ -47,7 +47,8 @@ def _build_parser():
         help=(
             "Monte-Carlo probe count for ||M A Z - Z||^2 loss (columns of Z). "
             "Default -1: use max(256, ceil(sqrt(n_pad))) as before. "
-            "Smaller K (e.g. 64, 128) speeds AZ/MAZ and backward roughly linearly; noisier gradient."
+            "Smaller K (e.g. 64, 128) speeds AZ/MAZ and backward roughly linearly; noisier gradient. "
+            "With --evaluate_gradients, the fixed-frame Hutchinson variance probe uses K=256 when this is -1."
         ),
     )
     parser.add_argument(
@@ -70,6 +71,7 @@ def train_leaf_only():
     runtime["device"] = require_cuda_or_mps_device()
     if args.evaluate_gradients:
         evaluate_gradient_interference(args, runtime)
+        evaluate_estimator_variance(args, runtime)
         return
     _train_leaf_only_impl(args, runtime)
 

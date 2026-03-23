@@ -20,5 +20,5 @@ from .config import (
     LEAF_SIZE,
 )
 from .data import FluidGraphDataset, build_leaf_block_connectivity
-from .eval import evaluate_gradient_interference
+from .eval import evaluate_estimator_variance, evaluate_gradient_interference
 from .train import train_leaf_only

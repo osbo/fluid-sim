@@ -517,3 +517,156 @@ def evaluate_gradient_interference(args, runtime):
             "\nNote: Rows above time each submodule alone in eager mode; their sum is not comparable to "
             "a single fused torch.compile forward (see InspectModel 'Inference')."
         )
+
+
+def evaluate_estimator_variance(args, runtime):
+    """
+    Fix one frame and resample probe matrix Z many times. Measures gradient SNR across Z samples:
+    if Hutchinson noise dominates, low-rank off-diagonal heads see signal-to-noise ratio below ~1.
+    """
+    data_folder = runtime["data_folder"]
+    save_path = runtime["save_path"]
+    runtime_use_gcn = runtime["use_gcn"]
+    device = runtime["device"]
+    args.num_layers = 2
+    args.num_gcn_layers = 2
+    args.use_jacobi = True
+    use_jacobi = True
+    attention_layout = str(args.attention_layout)
+    if not runtime_use_gcn:
+        raise ValueError("Runtime has use_gcn=False, but the fixed architecture requires 2 GCN layers.")
+
+    print("\n--- Isolating Hutchinson Estimator Variance ---")
+
+    model = LeafOnlyNet(
+        input_dim=9,
+        d_model=args.d_model,
+        leaf_size=LEAF_SIZE,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        attention_layout=attention_layout,
+        use_gcn=True,
+        num_gcn_layers=2,
+        use_jacobi=use_jacobi,
+    ).to(device)
+
+    if save_path.exists():
+        load_leaf_only_weights(model, str(save_path))
+        print(f"Loaded weights from {save_path}")
+    else:
+        print("WARNING: No saved weights found. Analyzing randomly initialized gradients.")
+
+    model.train()
+
+    num_samples = 20
+    pv = int(getattr(args, "probe_vectors", -1))
+    batch_vectors = pv if pv > 0 else 256
+
+    eval_max_nodes = max(LEAF_SIZE * 2, int(MAX_MIXED_SIZE))
+    data_path = Path(data_folder)
+    run_folder = most_recent_run_folder(data_path)
+    dataset = FluidGraphDataset([run_folder])
+    if len(dataset) == 0:
+        raise ValueError("No frames in dataset for estimator variance test.")
+
+    frame_idx = 0
+    batch = dataset[frame_idx]
+    n_pad = MAX_MIXED_SIZE
+    n_orig = min(int(batch["num_nodes"]), eval_max_nodes, n_pad)
+    x_input = batch["x"][:n_orig].unsqueeze(0).to(device)
+    x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
+    active_pos = x_input[0, :n_orig, :3]
+    x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
+    rows, cols = batch["edge_index"][0], batch["edge_index"][1]
+    mask = (rows < n_orig) & (cols < n_orig)
+    edge_index = batch["edge_index"][:, mask].to(device)
+    edge_values = batch["edge_values"][mask].to(device)
+    A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
+    A_small = A_sparse.to_dense().to(device) if device.type == "mps" else A_sparse.to(device).to_dense()
+    A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
+    A_dense[:n_orig, :n_orig] = A_small
+    A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
+    dm, df, _, _ = build_leaf_block_connectivity(
+        edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
+    )
+    om, oe = hmatrix_off_masks_and_feats(NUM_HMATRIX_OFF_BLOCKS, LEAF_SIZE, device, x_input.dtype)
+    pre_leaf = (dm, df, om, oe)
+    global_feat = batch.get("global_features")
+    if global_feat is None:
+        raise ValueError(f"Missing global_features for frame: {batch.get('frame_path', '<unknown>')}")
+    global_feat = global_feat.to(device)
+    if global_feat.dim() == 1:
+        global_feat = global_feat.unsqueeze(0)
+
+    print(
+        f"Sampling Z {num_samples} times with {batch_vectors} vectors each on FIXED frame index {frame_idx} "
+        f"(probe_vectors arg: {pv if pv > 0 else 'default 256'})."
+    )
+
+    precond_out = model(
+        x_input,
+        edge_index=edge_index,
+        edge_values=edge_values,
+        precomputed_leaf_connectivity=pre_leaf,
+        global_features=global_feat,
+    )
+
+    jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
+    diag_A = torch.diagonal(A_dense, 0)
+    inv_mask = diag_A.abs() > 1e-6
+    jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A[inv_mask]
+
+    param_groups = {
+        "Diagonal Leaf Head": lambda m: list(m.leaf_head.parameters()),
+        "Off-diag U/V heads": lambda m: list(m.off_diag_head_U.parameters()) + list(m.off_diag_head_V.parameters()),
+        "Transformer block 0": lambda m: list(m.blocks[0].parameters()),
+        "Off-diag Transformer block 0": lambda m: list(m.off_diag_blocks[0].parameters()),
+    }
+    group_gradients = {name: [] for name in param_groups.keys()}
+
+    for step in range(num_samples):
+        model.zero_grad()
+        Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
+        Z[:, n_orig:, :] = 0.0
+        AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
+        MAZ = apply_block_diagonal_M(
+            precond_out,
+            AZ,
+            leaf_size=LEAF_SIZE,
+            leaf_apply_size=LEAF_APPLY_SIZE,
+            leaf_apply_off=LEAF_APPLY_SIZE_OFF,
+            jacobi_inv_diag=jacobi_inv_diag,
+        )
+        B_ctx = MAZ.size(0)
+        MAZ_flat = MAZ.view(B_ctx, -1)
+        Z_flat = Z.view(B_ctx, -1)
+        cos_sim = F.cosine_similarity(MAZ_flat, Z_flat, dim=1)
+        loss = (1.0 - cos_sim).mean()
+        loss.backward(retain_graph=(step < num_samples - 1))
+
+        for group_name, get_params in param_groups.items():
+            params = get_params(model)
+            grads = []
+            for p in params:
+                if p.grad is not None:
+                    grads.append(p.grad.detach().clone().view(-1))
+                else:
+                    grads.append(torch.zeros_like(p).view(-1))
+            group_gradients[group_name].append(torch.cat(grads))
+
+    print("\n=== Estimator Variance Report (Fixed Frame) ===")
+    for group_name, grads in group_gradients.items():
+        grads_stack = torch.stack(grads)
+        mean_grad = grads_stack.mean(dim=0)
+        var_grad = grads_stack.var(dim=0, unbiased=False)
+        signal_norm = mean_grad.norm().item()
+        noise_norm = torch.sqrt(var_grad.mean() + 1e-12).item()
+        snr = signal_norm / noise_norm if noise_norm > 0 else float("inf")
+        print(
+            f"Group: {group_name:<30} | Signal Norm: {signal_norm:.4e} | "
+            f"Noise Norm: {noise_norm:.4e} | SNR: {snr:.4f}"
+        )
+    print(
+        "\nIf SNR < 1.0 for Off-diag U/V heads (or off-diag block 0), probe noise may dominate the "
+        "low-rank off-diagonal signal; try more probe vectors (--probe-vectors) or a variance-reduced estimator."
+    )
