@@ -1,4 +1,10 @@
-"""Inspect LeafOnly preconditioner: load weights, build M, compare A·M with AMG. Run with python3 InspectModel.py."""
+"""Inspect LeafOnly preconditioner: load weights, build M, compare A·M with AMG. Run with python3 InspectModel.py.
+
+H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
+blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
+plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. If σ_k does not decay by
+those indices, increase apply rank or decrease ``HMATRIX_ETA`` for smaller tiles.
+"""
 import sys
 import time
 import os
@@ -121,6 +127,169 @@ def _draw_hmatrix_weak_partition_ax(ax, grid_size: int, leaf_size: int, eta: flo
     ticks = np.arange(0, n + 1, tick_step)
     ax.set_xticks(ticks)
     ax.set_yticks(ticks)
+
+
+def _hmatrix_rank_profiler_bands(
+    A_inv: np.ndarray,
+    leaf_L: int,
+    num_leaves: int,
+    leaf_apply_diag: int,
+    leaf_apply_off: int,
+    max_samples: int = 4,
+    rng: np.random.Generator | None = None,
+):
+    """
+    Extract true A^-1 blocks matching the LeafOnly HM tile layout; SVD each sampled block.
+
+    Bands: on-diagonal leaf blocks, then off-diagonal blocks grouped by tile size S (leaf units).
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+    L = int(leaf_L)
+    nu = int(num_leaves)
+    n = int(A_inv.shape[0])
+    if A_inv.shape != (n, n) or nu * L > n:
+        raise ValueError("A_inv and leaf grid mismatch")
+
+    bands: list[dict] = []
+
+    on_idx = np.arange(nu)
+    if len(on_idx) > max_samples:
+        on_idx = rng.choice(on_idx, size=max_samples, replace=False)
+    on_curves: list[np.ndarray] = []
+    for li in on_idx:
+        sl = slice(int(li) * L, (int(li) + 1) * L)
+        B = A_inv[sl, sl]
+        _, s, _ = np.linalg.svd(B, full_matrices=False)
+        s = np.maximum(s, 0.0)
+        on_curves.append(s / (s[0] + 1e-30))
+    bands.append(
+        {
+            "key": "on_diag",
+            "title": f"On-diagonal leaf\n{L}×{L}",
+            "rank_line": int(leaf_apply_diag),
+            "rank_label": f"leaf_apply_diag={leaf_apply_diag}",
+            "curves": on_curves,
+            "num_blocks_layout": int(nu),
+        }
+    )
+
+    off_by_S: dict[int, list[tuple[int, int, int]]] = {}
+    for i in range(int(NUM_HMATRIX_OFF_BLOCKS)):
+        r0 = int(HM_R0_CPU[i].item())
+        c0 = int(HM_C0_CPU[i].item())
+        S = int(HM_S_CPU[i].item())
+        if r0 + S > nu or c0 + S > nu:
+            continue
+        off_by_S.setdefault(S, []).append((r0, c0, S))
+
+    for S in sorted(off_by_S.keys(), reverse=True):
+        pairs = off_by_S[S]
+        pix = S * L
+        idxs = np.arange(len(pairs))
+        if len(idxs) > max_samples:
+            idxs = rng.choice(idxs, size=max_samples, replace=False)
+        curves: list[np.ndarray] = []
+        for j in idxs:
+            r0, c0, _ = pairs[int(j)]
+            rs = slice(r0 * L, (r0 + S) * L)
+            cs = slice(c0 * L, (c0 + S) * L)
+            B = A_inv[rs, cs]
+            _, s, _ = np.linalg.svd(B, full_matrices=False)
+            s = np.maximum(s, 0.0)
+            curves.append(s / (s[0] + 1e-30))
+        bands.append(
+            {
+                "key": f"off_S{S}",
+                "title": f"Off-diagonal S={S}\n{pix}×{pix}",
+                "rank_line": int(leaf_apply_off),
+                "rank_label": f"leaf_apply_off={leaf_apply_off}",
+                "curves": curves,
+                "num_blocks_layout": len(pairs),
+            }
+        )
+
+    return bands
+
+
+def _print_hmatrix_rank_profiler(bands: list[dict], eta: float, max_plot_bands: int = 5) -> None:
+    print("\n=== H-Matrix Rank Profiler ===")
+    print(
+        "True dense A^-1; blocks from HM_R0_CPU / HM_C0_CPU (weak admissibility). "
+        "If σ_k/σ_0 at k = leaf_apply_* is not small, raise leaf_apply_* or decrease HMATRIX_ETA (smaller tiles)."
+    )
+    print(f"HMATRIX_ETA={eta}")
+    if len(bands) > max_plot_bands:
+        print(
+            f"(inspect_model_plot.png row shows first {max_plot_bands} bands: on-diagonal then largest off-diagonal S; "
+            f"{len(bands) - max_plot_bands} more band(s) listed below only.)\n"
+        )
+    else:
+        print()
+    for b in bands:
+        curves: list[np.ndarray] = b["curves"]
+        title_one_line = b["title"].replace("\n", " ")
+        if not curves:
+            print(f"{title_one_line}: (no blocks)\n")
+            continue
+        rl = int(b["rank_line"])
+        ratios_past_cap: list[float] = []
+        tail_ratios: list[float] = []
+        for s_arr in curves:
+            tail_ratios.append(float(s_arr[-1] / (s_arr[0] + 1e-30)))
+            if len(s_arr) > rl:
+                ratios_past_cap.append(float(s_arr[rl] / (s_arr[0] + 1e-30)))
+        smax = max(len(c) for c in curves)
+        nlay = int(b["num_blocks_layout"])
+        print(f"Band: {title_one_line}")
+        print(f"  Blocks in layout: {nlay}, sampled for SVD: {len(curves)}")
+        print(f"  Max singular value count in band: {smax}")
+        if ratios_past_cap:
+            n_short = len(curves) - len(ratios_past_cap)
+            extra = f" ({n_short} sample(s) with ≤{rl} SVs omitted)" if n_short else ""
+            print(
+                f"  σ[{rl}]/σ[0] past rank cap ({b['rank_label']}){extra}: "
+                f"min={np.min(ratios_past_cap):.3e} mean={np.mean(ratios_past_cap):.3e} max={np.max(ratios_past_cap):.3e}"
+            )
+        else:
+            print(
+                f"  σ[{rl}]/σ[0]: N/A — each block has ≤{rl} singular values "
+                f"(indices 0…{smax - 1}); rank cap does not truncate (see σ_last/σ[0])."
+            )
+        print(
+            f"  σ_last/σ[0] (tail): "
+            f"min={np.min(tail_ratios):.3e} mean={np.mean(tail_ratios):.3e} max={np.max(tail_ratios):.3e}"
+        )
+        print()
+
+
+def _plot_hmatrix_rank_profiler_row(axes_row, bands_head: list[dict]) -> None:
+    """One subplot per column; up to len(axes_row) bands (on-diag first, then off sizes descending)."""
+    for ax in axes_row:
+        ax.clear()
+    n_col = len(axes_row)
+    for j in range(n_col):
+        ax = axes_row[j]
+        if j >= len(bands_head):
+            ax.axis("off")
+            continue
+        b = bands_head[j]
+        curves = b["curves"]
+        rl = int(b["rank_line"])
+        if not curves:
+            ax.text(0.5, 0.5, "No blocks", transform=ax.transAxes, ha="center", va="center")
+            ax.set_title(b["title"], fontsize=9)
+            continue
+        for k, srel in enumerate(curves):
+            x = np.arange(len(srel))
+            ax.semilogy(x, np.maximum(srel, 1e-16), alpha=0.75, linewidth=1.2, label=f"sample {k + 1}")
+        if rl > 0 and any(len(c) > rl for c in curves):
+            ax.axvline(rl, color="crimson", linestyle="--", linewidth=1.5, alpha=0.9, label=f"rank cap ({rl})")
+        ax.set_xlabel("Singular value index")
+        ax.set_ylabel(r"$\sigma_k / \sigma_0$")
+        ax.set_title(f"H-matrix rank profiler\n{b['title']}", fontsize=9)
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(loc="upper right", fontsize=7)
 
 
 def _amg_solver(A_sparse_scipy):
@@ -852,13 +1021,25 @@ def main():
     print(f"Condition number (block A): {cond_A:.2e}")
     print(f"Leaf boundaries: every {leaf_L}")
 
+    num_leaves_viz = viz_n // leaf_L
+    hm_rank_bands = _hmatrix_rank_profiler_bands(
+        A_inv_viz,
+        leaf_L,
+        num_leaves_viz,
+        leaf_apply_diag_L,
+        leaf_apply_off_L,
+        max_samples=4,
+        rng=np.random.default_rng(123),
+    )
+    _print_hmatrix_rank_profiler(hm_rank_bands, HMATRIX_ETA)
+
     PLOT_MATRICES = True
 
     if PLOT_MATRICES:
         M_neural_n = M_gpu.detach().cpu().numpy()
         methods = [("LeafOnly", M_neural_n), ("AMG", M_amg_n)]
         n_cols = 5
-        n_rows = 1 + len(methods)
+        n_rows = 1 + len(methods) + 1
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows), constrained_layout=True)
 
         log_ainv = np.log10(np.abs(A_inv_viz) + 1e-9)
@@ -979,6 +1160,8 @@ def main():
             color = 'green' if cond_A / cond_AM > 1.0 else 'red'
             for i, line in enumerate(msg):
                 ax_t.text(0.1, 0.8 - i * 0.15, line, fontsize=12, color='black' if i != 2 else color, fontfamily='monospace')
+
+        _plot_hmatrix_rank_profiler_row(axes[n_rows - 1, :], hm_rank_bands[:n_cols])
 
         plt.savefig(out_path, dpi=100, bbox_inches='tight')
         print(f"Plot saved to: {out_path}")
