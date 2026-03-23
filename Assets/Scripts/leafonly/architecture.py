@@ -9,8 +9,6 @@ from .config import (
     ATTN_POOL_FACTOR_OFF,
     ATTENTION_HOPS,
     GLOBAL_FEATURES_DIM,
-    LEAF_APPLY_SIZE,
-    LEAF_APPLY_SIZE_OFF,
     LEAF_SIZE,
     MAX_NUM_LEAVES,
 )
@@ -496,8 +494,10 @@ class LeafOnlyNet(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.leaf_apply_size = int(LEAF_APPLY_SIZE)
-        self.leaf_apply_off = int(LEAF_APPLY_SIZE_OFF)
+        # Must follow this instance's leaf_size + pool factors (not global LEAF_APPLY_* from config),
+        # otherwise checkpoints built with a different config.LEAF_SIZE fail to load.
+        self.leaf_apply_size = L // apd
+        self.leaf_apply_off = L // apo
         La_d = self.leaf_apply_size
         La_o = self.leaf_apply_off
         self.off_diag_head_U = nn.Linear(d_model, La_o)

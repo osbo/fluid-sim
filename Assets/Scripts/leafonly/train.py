@@ -509,8 +509,10 @@ def train_leaf_only(args, runtime):
             t_apply = time.perf_counter() - t_mark
             t_mark = time.perf_counter()
 
-        residual = MAZ - Z
-        raw_loss = (residual ** 2).mean()
+        MAZ_flat = MAZ.view(B_step, -1)
+        Z_flat = Z.view(B_step, -1)
+        cos_sim = F.cosine_similarity(MAZ_flat, Z_flat, dim=1)
+        raw_loss = (1.0 - cos_sim).mean()
         step_loss_sum += raw_loss.item()
         loss = raw_loss
 
