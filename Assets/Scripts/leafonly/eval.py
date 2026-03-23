@@ -196,7 +196,11 @@ def evaluate_gradient_interference(args, runtime):
                 leaf_apply_off=LEAF_APPLY_SIZE_OFF,
                 jacobi_inv_diag=jacobi_inv_diag,
             )
-            raw_loss = ((MAZ - Z) ** 2).mean()
+            B_ctx = MAZ.size(0)
+            MAZ_flat = MAZ.view(B_ctx, -1)
+            Z_flat = Z.view(B_ctx, -1)
+            cos_sim = F.cosine_similarity(MAZ_flat, Z_flat, dim=1)
+            raw_loss = (1.0 - cos_sim).mean()
             step_loss_sum += raw_loss.item()
             loss = raw_loss / contexts_per_step
             loss.backward()

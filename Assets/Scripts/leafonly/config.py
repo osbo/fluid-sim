@@ -11,6 +11,7 @@ def _validate_leaf_size(L: int) -> int:
 
 
 # Set to any power of 2; training checkpoints store this in the header — match when loading.
+# H-matrix static buffers use MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE; wrong LEAF_SIZE breaks apply vs checkpoint.
 LEAF_SIZE = _validate_leaf_size(32)
 # Diagonal leaf attention + diagonal preconditioner blocks (no downsample when 1).
 ATTN_POOL_FACTOR_DIAG = 1
@@ -26,8 +27,8 @@ ATTN_POOL_FACTOR = ATTN_POOL_FACTOR_DIAG
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 
-MIN_MIXED_SIZE = 256
-MAX_MIXED_SIZE = 256
+MIN_MIXED_SIZE = 512
+MAX_MIXED_SIZE = 512
 # Leaf grid for H-matrix partition (must match padded training N = MAX_MIXED_SIZE).
 MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE
 # Weak admissibility parameter (same as analytical reference).
