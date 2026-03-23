@@ -555,7 +555,7 @@ class LeafOnlyNet(nn.Module):
         B, N, C = h.shape
         num_leaves = N // self.leaf_size
         h_leaves = h.view(B, num_leaves, self.leaf_size, C)
-        j_gate = torch.sigmoid(self.jacobi_gate(h_leaves)).squeeze(-1) * 2.0
+        j_gate = torch.sigmoid(self.jacobi_gate(h_leaves)).squeeze(-1)
         self._last_j_gate = j_gate.detach()
         return j_gate.view(B, N)
 

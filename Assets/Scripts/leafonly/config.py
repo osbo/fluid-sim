@@ -27,8 +27,8 @@ ATTN_POOL_FACTOR = ATTN_POOL_FACTOR_DIAG
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 
-MIN_MIXED_SIZE = 512
-MAX_MIXED_SIZE = 512
+MIN_MIXED_SIZE = 4096
+MAX_MIXED_SIZE = 4096
 # Leaf grid for H-matrix partition (must match padded training N = MAX_MIXED_SIZE).
 MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE
 # Weak admissibility parameter (same as analytical reference).
