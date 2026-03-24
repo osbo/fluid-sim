@@ -2,6 +2,7 @@ from .architecture import (
     LeafOnlyNet,
     apply_block_diagonal_m_into,
     apply_block_diagonal_M,
+    apply_block_diagonal_M_physical,
     block_diagonal_m_apply_workspace,
     attention_layout_choices,
     default_attention_layout,

@@ -27,10 +27,20 @@ ATTN_POOL_FACTOR = ATTN_POOL_FACTOR_DIAG
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 
-MIN_MIXED_SIZE = 4096
-MAX_MIXED_SIZE = 4096
+# Padded problem size for LeafOnlyNet (static H-grid). Checkpoints and MAX_NUM_LEAVES follow this.
+MAX_MIXED_SIZE = 8192
+# Minimum **aligned** active nodes to keep a frame: n_active = ⌊min(num_nodes, MAX)/LEAF⌋·LEAF.
+# Must be ≤ your smallest frame's aligned count. Do not set this to MAX_MIXED_SIZE unless every frame has ≥ that many nodes.
+MIN_MIXED_SIZE = LEAF_SIZE
 # Leaf grid for H-matrix partition (must match padded training N = MAX_MIXED_SIZE).
 MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE
+
+
+def effective_aligned_num_nodes(num_nodes_real: int) -> int:
+    """How many nodes from a frame are used before padding to MAX_MIXED_SIZE (full leaves only)."""
+    n = int(num_nodes_real)
+    cap = min(n, int(MAX_MIXED_SIZE))
+    return (cap // int(LEAF_SIZE)) * int(LEAF_SIZE)
 # Weak admissibility parameter (same as analytical reference).
 HMATRIX_ETA = 1.0
 

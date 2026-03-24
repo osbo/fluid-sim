@@ -11,7 +11,14 @@ import torch.optim as optim
 
 from .architecture import LeafOnlyNet, apply_block_diagonal_M
 from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
-from .config import LEAF_APPLY_SIZE, LEAF_APPLY_SIZE_OFF, LEAF_SIZE, MIN_MIXED_SIZE, MAX_MIXED_SIZE
+from .config import (
+    LEAF_APPLY_SIZE,
+    LEAF_APPLY_SIZE_OFF,
+    LEAF_SIZE,
+    MAX_MIXED_SIZE,
+    MIN_MIXED_SIZE,
+    effective_aligned_num_nodes,
+)
 from .context_cache import (
     build_training_context_cache_meta,
     load_training_contexts_from_cache,
@@ -133,9 +140,9 @@ def train_leaf_only(args, runtime):
         for frame_idx in frame_indices:
             batch = dataset[frame_idx]
             num_nodes_real = int(batch["num_nodes"])
-            if num_nodes_real < MIN_MIXED_SIZE:
+            n = effective_aligned_num_nodes(num_nodes_real)
+            if n < MIN_MIXED_SIZE:
                 continue
-            n = min(num_nodes_real, MAX_MIXED_SIZE)
             n_pad = MAX_MIXED_SIZE
             t_o0 = time.perf_counter()
             x_full = batch["x"]
@@ -209,7 +216,11 @@ def train_leaf_only(args, runtime):
     n_ctx = len(training_contexts)
 
     if len(training_contexts) == 0:
-        raise SystemExit("No valid (frame, size) pairs: ensure frames have at least MIN_MIXED_SIZE nodes.")
+        raise SystemExit(
+            "No valid training contexts: every frame was skipped. "
+            f"Need aligned size n ≥ MIN_MIXED_SIZE ({MIN_MIXED_SIZE}) after capping by MAX_MIXED_SIZE ({MAX_MIXED_SIZE}); "
+            "lower MIN_MIXED_SIZE in leafonly/config.py if your frames are smaller."
+        )
     global_max_edges = max(ctx["edge_index"].shape[1] for ctx in training_contexts)
     print(f"  [startup] global_max_edges = {global_max_edges}")
     contexts_per_step = max(1, int(args.contexts_per_step))
