@@ -1,5 +1,13 @@
 """Inspect LeafOnly preconditioner: load weights, build M, compare A·M with AMG. Run with python3 InspectModel.py.
 
+Also reports classical PCG baselines aligned with Yang et al., *Learning Sparse Approximate Inverse
+Preconditioners for Conjugate Gradient Solvers on GPUs* (NeurIPS 2025;
+`arXiv:2510.27517 <https://arxiv.org/abs/2510.27517>`_, code
+`LearningSparsePreconditioner4GPU <https://github.com/Adversarr/LearningSparsePreconditioner4GPU>`_):
+Diag (Jacobi), IC-class (``ilupp.IChol0`` or scipy ``spilu`` fallback), PyAMG / AMGX. On CUDA, the benchmark always runs a second AMGX session: PCG with ``MULTICOLOR_DILU`` (scalar CSR; AMGX ``MULTICOLOR_ILU`` GPU path is 4×4-only).
+
+Use ``--test_only`` to run the PCG benchmark path and print only that summary (no plots, profiling, or dense AMG build).
+
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
 plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. If σ_k does not decay by
@@ -9,6 +17,7 @@ Block-wise band summary (``profile_blockwise_preconditioner_spectral_bands``): o
 off-diagonal uses pooled Frobenius misfit and SVD tail / rank-cap ratios (κ is omitted as misleading
 when σ_min is at roundoff).
 """
+import argparse
 import sys
 import time
 import os
@@ -21,24 +30,30 @@ _script_dir = Path(__file__).resolve().parent
 if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
 
+# Used before main() so optional-dependency import warnings stay quiet in test-only runs.
+_TEST_ONLY_CLI = "--test_only" in sys.argv
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch, Rectangle
 from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import spilu
 
 try:
     import pyamg
     HAS_AMG = True
 except ImportError:
     HAS_AMG = False
-    print("Warning: 'pyamg' not installed. AMG baseline will be skipped.")
+    if not _TEST_ONLY_CLI:
+        print("Warning: 'pyamg' not installed. AMG baseline will be skipped.")
 
 try:
     import pyamgx
     HAS_AMGX = True
 except (ImportError, OSError) as e:
     HAS_AMGX = False
-    print("Warning: 'pyamgx' not available. AMGX (GPU) comparison will be skipped.", e)
+    if not _TEST_ONLY_CLI:
+        print("Warning: 'pyamgx' not available. AMGX (GPU) comparison will be skipped.", e)
 import torch
 
 import torch.nn.functional as F
@@ -48,6 +63,7 @@ from leafonly import (
     load_leaf_only_weights,
     apply_block_diagonal_m_into,
     apply_block_diagonal_M,
+    apply_block_diagonal_M_physical,
     block_diagonal_m_apply_workspace,
     default_attention_layout,
     unpack_precond,
@@ -585,13 +601,22 @@ def pcg_gpu_cudagraph(
     jacobi_inv_diag_2d = jacobi_inv_diag_2d.contiguous()
 
     n, k_dim = b_gpu.shape[0], b_gpu.shape[1]
+    if jacobi_inv_diag_2d.shape[1] != n:
+        if jacobi_inv_diag_2d.shape[1] < n:
+            raise ValueError(
+                f"jacobi_inv_diag length {jacobi_inv_diag_2d.shape[1]} < PCG n={n}"
+            )
+        # Packed precond / Jacobi are built on MAX_MIXED_SIZE; physical PCG uses n < n_pad.
+        jacobi_inv_diag_2d = jacobi_inv_diag_2d[:, :n].contiguous()
+
     num_leaves = n // leaf_size
     if num_leaves * leaf_size != n:
         raise ValueError(f"b_gpu length {n} not divisible by leaf_size {leaf_size}")
 
     dtype = b_gpu.dtype
-    Wr = HM_POOL_W_ROW_CPU[:, :num_leaves].to(device=device, dtype=dtype).contiguous()
-    Wc = HM_POOL_W_COL_CPU[:, :num_leaves].to(device=device, dtype=dtype).contiguous()
+    # Full (M_h, MAX_NUM_LEAVES); apply_block_diagonal_m_into zero-pads x_flat when num_leaves < MAX.
+    Wr = HM_POOL_W_ROW_CPU.to(device=device, dtype=dtype).contiguous()
+    Wc = HM_POOL_W_COL_CPU.to(device=device, dtype=dtype).contiguous()
     ws = block_diagonal_m_apply_workspace(
         num_leaves, leaf_size, k_dim, NUM_HMATRIX_OFF_BLOCKS, leaf_apply_off, device, dtype
     )
@@ -717,7 +742,208 @@ def pcg_cpu(A, b, apply_precond, tol=1e-8, max_iter=500, debug=False):
     return x, iters, (time.perf_counter() - t0) * 1000
 
 
+def _cpu_jacobi_apply_fn(A_dense_f64: np.ndarray):
+    inv = 1.0 / np.maximum(np.abs(np.diag(A_dense_f64).astype(np.float64)), 1e-30)
+
+    def apply_j(r: np.ndarray) -> np.ndarray:
+        return (np.asarray(r, dtype=np.float64).ravel() * inv).reshape(-1, 1)
+
+    return apply_j
+
+
+def _gpu_jacobi_apply_fn(A_dense_f64: np.ndarray, device: torch.device):
+    inv = (1.0 / np.maximum(np.abs(np.diag(A_dense_f64).astype(np.float64)), 1e-30)).astype(np.float32)
+    inv_t = torch.from_numpy(inv).to(device=device)
+
+    def apply_j(r: torch.Tensor) -> torch.Tensor:
+        return r * inv_t.unsqueeze(1)
+
+    return apply_j
+
+
+def _build_cpu_ic_apply(A_dense_f64: np.ndarray):
+    """
+    Incomplete-Cholesky-class preconditioner for SPD-ish systems: prefer ``ilupp.IChol0Preconditioner``,
+    else scipy ``spilu`` (ILU, common fallback when IChol is unavailable).
+    Returns (setup_ms, apply_fn_or_none, backend_label_or_none).
+    """
+    A_csr = csr_matrix(A_dense_f64)
+    A_csr.sort_indices()
+    t0 = time.perf_counter()
+    try:
+        import ilupp
+
+        prec = ilupp.IChol0Preconditioner(A_csr)
+        setup_ms = (time.perf_counter() - t0) * 1000
+
+        def apply_ic(r: np.ndarray) -> np.ndarray:
+            z = prec @ np.asarray(r, dtype=np.float64).ravel()
+            return z.reshape(-1, 1)
+
+        return setup_ms, apply_ic, "ilupp IChol0"
+    except Exception:
+        pass
+    try:
+        t0 = time.perf_counter()
+        lu = spilu(
+            A_csr.tocsc(),
+            drop_tol=1e-8,
+            fill_factor=30,
+            permc_spec="COLAMD",
+            diag_pivot_thresh=0.0,
+        )
+        setup_ms = (time.perf_counter() - t0) * 1000
+
+        def apply_ilu(r: np.ndarray) -> np.ndarray:
+            return lu.solve(np.asarray(r, dtype=np.float64).ravel()).reshape(-1, 1)
+
+        return setup_ms, apply_ilu, "scipy spilu (ILU fallback)"
+    except Exception:
+        return (time.perf_counter() - t0) * 1000, None, None
+
+
+def _amgx_safe_destroy(obj) -> None:
+    if obj is None:
+        return
+    try:
+        obj.destroy()
+    except Exception:
+        pass
+
+
+def _run_amgx_pcg_session(
+    A_amgx_csr: csr_matrix,
+    b_flat: np.ndarray,
+    x_init: np.ndarray,
+    pcg_tol: float,
+    pcg_max_iter: int,
+    preconditioner_block: dict,
+    *,
+    num_warmup: int = 3,
+    warn_fn=None,
+    session_label: str = "AMGX",
+) -> tuple[float, float, int]:
+    """One full pyamgx initialize → PCG → finalize cycle. Returns (setup_ms, solve_ms, iterations)."""
+    cfg = None
+    rsc = None
+    A_amgx = None
+    b_amgx = None
+    x_amgx = None
+    solver = None
+    initialized = False
+
+    def _finalize_amgx_lib() -> None:
+        _stderr_fd = os.dup(2)
+        _devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(_devnull, 2)
+            pyamgx.finalize()
+        finally:
+            os.dup2(_stderr_fd, 2)
+            os.close(_stderr_fd)
+            os.close(_devnull)
+
+    try:
+        _stderr_fd = os.dup(2)
+        _devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(_devnull, 2)
+            pyamgx.initialize()
+        finally:
+            os.dup2(_stderr_fd, 2)
+            os.close(_stderr_fd)
+            os.close(_devnull)
+        initialized = True
+
+        cfg = pyamgx.Config().create_from_dict(
+            {
+                "config_version": 2,
+                "determinism_flag": 1,
+                "exception_handling": 1,
+                "solver": {
+                    "solver": "PCG",
+                    "max_iters": pcg_max_iter,
+                    "convergence": "RELATIVE_INI",
+                    "tolerance": float(pcg_tol),
+                    "monitor_residual": 1,
+                    "preconditioner": preconditioner_block,
+                },
+            }
+        )
+        rsc = pyamgx.Resources().create_simple(cfg)
+        A_amgx = pyamgx.Matrix().create(rsc)
+        A_amgx.upload_CSR(A_amgx_csr)
+        b_amgx = pyamgx.Vector().create(rsc)
+        b_amgx.upload(b_flat)
+        x_amgx = pyamgx.Vector().create(rsc)
+        x_amgx.upload(x_init)
+
+        solver = pyamgx.Solver().create(rsc, cfg)
+
+        t0 = time.perf_counter()
+        solver.setup(A_amgx)
+        torch.cuda.synchronize()
+        setup_ms = (time.perf_counter() - t0) * 1000
+
+        for _ in range(num_warmup):
+            torch.cuda.synchronize()
+            x_amgx.upload(x_init)
+            solver.solve(b_amgx, x_amgx)
+        torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        x_amgx.upload(x_init)
+        solver.solve(b_amgx, x_amgx)
+        torch.cuda.synchronize()
+        solve_ms = (time.perf_counter() - t0) * 1000
+        iters = int(solver.iterations_number)
+
+        _amgx_safe_destroy(solver)
+        solver = None
+        _amgx_safe_destroy(x_amgx)
+        x_amgx = None
+        _amgx_safe_destroy(b_amgx)
+        b_amgx = None
+        _amgx_safe_destroy(A_amgx)
+        A_amgx = None
+        _amgx_safe_destroy(rsc)
+        rsc = None
+        _amgx_safe_destroy(cfg)
+        cfg = None
+        _finalize_amgx_lib()
+        initialized = False
+        return setup_ms, solve_ms, iters
+    except Exception as e:
+        if warn_fn is not None:
+            warn_fn(f"Warning: AMGX ({session_label}) failed: {e}")
+        _amgx_safe_destroy(solver)
+        _amgx_safe_destroy(x_amgx)
+        _amgx_safe_destroy(b_amgx)
+        _amgx_safe_destroy(A_amgx)
+        _amgx_safe_destroy(rsc)
+        _amgx_safe_destroy(cfg)
+        if initialized:
+            try:
+                _finalize_amgx_lib()
+            except Exception:
+                pass
+        return 0.0, 0.0, 0
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Inspect LeafOnly preconditioner and compare solvers.")
+    parser.add_argument(
+        "--test_only",
+        action="store_true",
+        help="Only print the PCG benchmark summary; skip plots, spectral/HM profiling, and dense AMG build.",
+    )
+    args = parser.parse_args()
+    test_only = bool(args.test_only)
+
+    def _info(*a, **k):
+        if not test_only:
+            print(*a, **k)
+
     script_dir = _script_dir
     # Persist torch.compile / Inductor artifacts across runs (speeds repeat InspectModel invocations).
     _inductor_cache = script_dir / ".torch_inductor_cache"
@@ -737,10 +963,10 @@ def main():
         device = torch.device('mps')
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
-    print(f"Using device: {device}")
+    _info(f"Using device: {device}")
     check_freq = 3
 
-    print(f"Loading data from {data_folder}")
+    _info(f"Loading data from {data_folder}")
     dataset = FluidGraphDataset([Path(data_folder)])
     if len(dataset) == 0:
         raise SystemExit("No frames found (need nodes.bin, edge_index_*.bin, A_values.bin).")
@@ -749,7 +975,7 @@ def main():
 
     x = batch['x'].unsqueeze(0).to(device)
     num_nodes_real = int(batch['num_nodes'])
-    print(f"System N={num_nodes_real}")
+    _info(f"System N={num_nodes_real}")
 
     if not leaf_only_weights_path.exists():
         raise SystemExit(f"Leaf-only weights not found: {leaf_only_weights_path}. Run LeafOnly.py first.")
@@ -766,28 +992,36 @@ def main():
         leaf_apply_off_ckpt,
     ) = read_leaf_only_header(leaf_only_weights_path)
     if LEAF_SIZE != leaf_size_lo:
-        print(
+        _info(
             f"  Note: leafonly.config.LEAF_SIZE={LEAF_SIZE} != checkpoint leaf_size={leaf_size_lo}; "
             "using checkpoint leaf size for padding and preconditioner layout."
         )
     leaf_L = int(leaf_size_lo)
 
-    n_requested = min(MAX_MIXED_SIZE, num_nodes_real)
+    n_requested = (min(MAX_MIXED_SIZE, num_nodes_real) // leaf_L) * leaf_L
     n_pad = MAX_MIXED_SIZE
-    if n_pad > n_requested:
-        print(f"  Padding view: {n_requested} active nodes -> {n_pad} (fixed H-grid MAX_MIXED_SIZE)")
+    # Physical linear system for PCG / baselines / plots (no identity tail): leaf-aligned, ≤ MAX_MIXED_SIZE.
+    viz_n = n_requested
+    if n_requested < num_nodes_real:
+        _info(
+            f"  Leaf-aligned subgraph: {n_requested} nodes (frame has {num_nodes_real}; "
+            f"truncated to full {leaf_L}-node leaves); LeafOnly forward padded to {n_pad}"
+        )
+    elif n_pad > n_requested:
+        _info(
+            f"  Physical system {n_requested}×{n_requested}; LeafOnly forward padded to {n_pad} (MAX_MIXED_SIZE)"
+        )
 
     ei, ev = batch["edge_index"], batch["edge_values"]
-    # Single mask for the n_requested subgraph — reused for A_viz, GPU edges, and connectivity.
+    # Single mask for the n_requested subgraph — reused for A, GPU edges, and connectivity.
     em = (ei[0] < n_requested) & (ei[1] < n_requested)
     A_small = torch.sparse_coo_tensor(ei[:, em], ev[em], (n_requested, n_requested)).coalesce().to_dense().numpy()
-    A_viz = np.zeros((n_pad, n_pad), dtype=np.float64)
-    A_viz[:n_requested, :n_requested] = A_small
-    if n_pad > n_requested:
-        A_viz[n_requested:, n_requested:] = np.eye(n_pad - n_requested, dtype=np.float64)
-    viz_n = n_pad
+    A_phys_f64 = A_small.astype(np.float64, copy=False)
+    # Diagonal of expanded training-style A (identity on padded tail) for Jacobi inside full n_pad apply.
+    jacobi_diag_np = np.ones(n_pad, dtype=np.float32)
+    jacobi_diag_np[:n_requested] = np.diag(A_small).astype(np.float32, copy=False)
 
-    print("\nLeafOnly (GPU)...")
+    _info("\nLeafOnly (GPU)...")
     model_leaf = LeafOnlyNet(
         input_dim=input_dim_lo,
         d_model=d_model_lo,
@@ -863,7 +1097,7 @@ def main():
             leaf_apply_off=leaf_apply_off_L,
         )
         jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=diag_blocks.dtype)
-        diag_A_tensor = torch.from_numpy(np.diag(A_viz).astype(np.float32)).to(device)
+        diag_A_tensor = torch.from_numpy(jacobi_diag_np).to(device)
         diag_mask = diag_A_tensor.abs() > 1e-6
         jacobi_inv_diag[0, diag_mask] = 1.0 / diag_A_tensor[diag_mask]
         num_leaves = n_pad // leaf_L
@@ -891,10 +1125,11 @@ def main():
 
         if jacobi_scale is not None:
             M_neural_gpu += torch.diag((jacobi_scale[0] * jacobi_inv_diag[0]).to(M_neural_gpu.dtype))
-    print(
-        f"  LeafOnly: {num_leaves} leaves, {n_pad}x{n_pad} M "
-        f"(diag {leaf_apply_diag_L}×{leaf_apply_diag_L} ×{pool_diag_to_full} viz, "
-        f"off {leaf_apply_off_L}×{leaf_apply_off_L} ×{pool_off_to_full} viz)"
+    _info(
+        f"  LeafOnly: static grid {n_pad}×{n_pad} ({num_leaves} leaves); "
+        f"assembled M sliced to physical {viz_n}×{viz_n} for benchmarks "
+        f"(diag {leaf_apply_diag_L}×{leaf_apply_diag_L} ×{pool_diag_to_full}, "
+        f"off {leaf_apply_off_L}×{leaf_apply_off_L} ×{pool_off_to_full})"
     )
 
     d = diag_blocks.detach()
@@ -902,10 +1137,10 @@ def main():
         d = d.unsqueeze(0)
     frobs = (d ** 2).sum(dim=(-2, -1)).sqrt()
     flat = d.reshape(-1)
-    print(f"  Diagonal blocks: Frob mean={frobs.mean().item():.6f} std={frobs.std().item():.6f}")
-    print(f"  Elements: mean={flat.mean().item():.6e} std={flat.std().item():.6e} min={flat.min().item():.6e} max={flat.max().item():.6e}")
+    _info(f"  Diagonal blocks: Frob mean={frobs.mean().item():.6f} std={frobs.std().item():.6f}")
+    _info(f"  Elements: mean={flat.mean().item():.6e} std={flat.std().item():.6e} min={flat.min().item():.6e} max={flat.max().item():.6e}")
 
-    A_scipy = csr_matrix(A_viz.astype(np.float64))
+    A_scipy = csr_matrix(A_phys_f64)
     ml_amg = None
     amg_setup_ms = 0.0
     if HAS_AMG:
@@ -913,12 +1148,14 @@ def main():
         ml_amg = _amg_solver(A_scipy)
         amg_setup_ms = (time.perf_counter() - t0) * 1000
 
-    M_amg = get_dense_amg(A_scipy, viz_limit=viz_n, tol=1e-6, progress_interval=200, ml=ml_amg)
+    if not test_only:
+        M_amg = get_dense_amg(A_scipy, viz_limit=viz_n, tol=1e-6, progress_interval=200, ml=ml_amg)
 
-    A_viz_n = A_viz[:viz_n, :viz_n]
+    A_viz_n = A_phys_f64
     assert A_viz_n.shape[0] == viz_n and A_viz_n.shape[1] == viz_n
     M_gpu = M_neural_gpu[:viz_n, :viz_n]
-    M_amg_n = M_amg[:viz_n, :viz_n]
+    if not test_only:
+        M_amg_n = M_amg[:viz_n, :viz_n]
 
     pcg_tol = 1e-8
     pcg_max_iter = 5000
@@ -931,19 +1168,23 @@ def main():
 
     precond_s = precond_out.detach().contiguous()
     jacobi_s = jacobi_inv_diag.detach().contiguous()
+    jacobi_s_phys = jacobi_s[:, :viz_n].contiguous()
 
     def apply_M_block_diag(r):
+        # True physical apply: no padding to MAX_MIXED_SIZE inside PCG (see apply_block_diagonal_M_physical).
         r_batched = r.unsqueeze(0)
-        out = apply_block_diagonal_M(
+        out = apply_block_diagonal_M_physical(
             precond_s,
             r_batched,
             leaf_size=leaf_L,
             leaf_apply_size=leaf_apply_diag_L,
             leaf_apply_off=leaf_apply_off_L,
-            jacobi_inv_diag=jacobi_s,
+            jacobi_inv_diag=jacobi_s_phys,
         )
         return out.squeeze(0)
 
+    A_f64 = A_viz_n.astype(np.float64)
+    leaf_rel_res = float("nan")
     with torch.inference_mode():
         if device.type == "cuda":
             with warnings.catch_warnings():
@@ -979,6 +1220,17 @@ def main():
             device=device,
         )
 
+        apply_diag_gpu = _gpu_jacobi_apply_fn(A_f64, device)
+        _, iters_diag_gpu, solve_diag_gpu_ms = pcg_gpu(
+            A_gpu,
+            b_gpu,
+            apply_diag_gpu,
+            tol=pcg_tol,
+            max_iter=pcg_max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+
         use_leaf_cudagraph = (
             device.type == "cuda"
             and pool_diag_to_full == 1
@@ -998,7 +1250,11 @@ def main():
                 leaf_apply_size=leaf_apply_diag_L,
                 leaf_apply_off=leaf_apply_off_L,
             )
-            print("  LeafOnly PCG: CUDAGraph replay (preconditioner apply in-graph, fixed buffers)")
+            _info(
+                "  LeafOnly PCG: CUDAGraph replay (preconditioner apply in-graph, fixed buffers"
+                + (f"; physical n={viz_n}" if viz_n != n_pad else "")
+                + ")"
+            )
         else:
             apply_pcg = apply_M_block_diag
             if device.type == "cuda":
@@ -1008,9 +1264,9 @@ def main():
                 for _ in range(12):
                     _ = apply_pcg(wu)
                 torch.cuda.synchronize()
-                print(
+                _info(
                     "  LeafOnly PCG: preconditioner apply torch.compile(d) "
-                    "(CUDAGraph needs full leaf apply — pooled layout uses compile path)"
+                    "(pooled leaf apply — CUDAGraph requires full-resolution diag/off pools)"
                 )
             x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
                 A_gpu,
@@ -1022,9 +1278,27 @@ def main():
                 check_freq=check_freq,
             )
 
+        _bf = b_gpu.squeeze(-1)
+        _Ax = A_gpu @ x_gpu.squeeze(-1)
+        leaf_rel_res = float(((_Ax - _bf).norm() / (_bf.norm() + 1e-30)).item())
+
     x_cpu_none, iters_none_cpu, solve_none_cpu_ms = pcg_cpu(
-        A_viz_n.astype(np.float64), b_np, lambda r: r, tol=pcg_tol, max_iter=pcg_max_iter
+        A_f64, b_np, lambda r: r, tol=pcg_tol, max_iter=pcg_max_iter
     )
+
+    setup_diag_cpu_ms = 0.0
+    setup_diag_gpu_ms = 0.0
+    apply_diag_cpu = _cpu_jacobi_apply_fn(A_f64)
+    _, iters_diag_cpu, solve_diag_cpu_ms = pcg_cpu(
+        A_f64, b_np, apply_diag_cpu, tol=pcg_tol, max_iter=pcg_max_iter
+    )
+
+    ic_setup_ms, ic_apply, ic_backend = _build_cpu_ic_apply(A_f64)
+    if ic_apply is not None:
+        _, iters_ic_cpu, solve_ic_cpu_ms = pcg_cpu(A_f64, b_np, ic_apply, tol=pcg_tol, max_iter=pcg_max_iter)
+    else:
+        iters_ic_cpu = 0
+        solve_ic_cpu_ms = 0.0
 
     setup_none_ms = 0.0
     total_none_gpu_ms = setup_none_ms + solve_none_gpu_ms
@@ -1039,13 +1313,16 @@ def main():
             r_flat = np.asarray(r, dtype=np.float64).ravel()
             x0 = np.zeros(A_scipy.shape[0], dtype=np.float64)
             z_full = ml_amg.solve(r_flat, x0=x0, maxiter=1, cycle='V', tol=1e-6)
-            return z_full[:viz_n].reshape(-1, 1).astype(np.float64)
+            return z_full.reshape(-1, 1).astype(np.float64)
         x_cpu, iters_amg, solve_amg_ms = pcg_cpu(A_viz_n.astype(np.float64), b_np, apply_M_amg, tol=pcg_tol, max_iter=pcg_max_iter)
     total_amg_ms = amg_setup_ms + solve_amg_ms
 
-    solve_amgx_ms = 0.0
-    iters_amgx = 0
-    amgx_setup_ms = 0.0
+    amgx_ilu_setup_ms = 0.0
+    amgx_ilu_solve_ms = 0.0
+    amgx_ilu_iters = 0
+    amgx_amg_setup_ms = 0.0
+    amgx_amg_solve_ms = 0.0
+    amgx_amg_iters = 0
     if HAS_AMGX and device.type == 'cuda':
         A_amgx_csr = csr_matrix(A_viz_n.astype(np.float64))
         A_amgx_csr.indptr = np.ascontiguousarray(A_amgx_csr.indptr.astype(np.int32))
@@ -1055,118 +1332,87 @@ def main():
         b_flat = np.ascontiguousarray(b_np.ravel().astype(np.float64))
         x_init = np.zeros(viz_n, dtype=np.float64)
 
-        try:
-            _stderr_fd = os.dup(2)
-            _devnull = os.open(os.devnull, os.O_WRONLY)
-            try:
-                os.dup2(_devnull, 2)
-                pyamgx.initialize()
-            finally:
-                os.dup2(_stderr_fd, 2)
-                os.close(_stderr_fd)
-                os.close(_devnull)
+        # MULTICOLOR_ILU GPU LU only supports 4×4 blocks in AMGX; scalar CSR → MULTICOLOR_DILU.
+        amgx_ilu_setup_ms, amgx_ilu_solve_ms, amgx_ilu_iters = _run_amgx_pcg_session(
+            A_amgx_csr,
+            b_flat,
+            x_init,
+            pcg_tol,
+            pcg_max_iter,
+            {
+                "scope": "precond",
+                "solver": "MULTICOLOR_DILU",
+                "coloring_level": 2,
+                "matrix_coloring_scheme": "MIN_MAX",
+                "max_uncolored_percentage": 0.0,
+            },
+            warn_fn=_info,
+            session_label="PCG+MULTICOLOR_DILU",
+        )
+        amgx_amg_setup_ms, amgx_amg_solve_ms, amgx_amg_iters = _run_amgx_pcg_session(
+            A_amgx_csr,
+            b_flat,
+            x_init,
+            pcg_tol,
+            pcg_max_iter,
+            {
+                "solver": "AMG",
+                "algorithm": "AGGREGATION",
+                "selector": "SIZE_2",
+                "cycle": "V",
+                "smoother": "MULTICOLOR_GS",
+                "presweeps": 1,
+                "postsweeps": 1,
+            },
+            warn_fn=_info,
+            session_label="PCG+AMG",
+        )
+    total_amgx_ilu_ms = amgx_ilu_setup_ms + amgx_ilu_solve_ms
+    total_amgx_amg_ms = amgx_amg_setup_ms + amgx_amg_solve_ms
 
-            cfg = pyamgx.Config().create_from_dict({
-                "config_version": 2,
-                "determinism_flag": 1,
-                "exception_handling": 1,
-                "solver": {
-                    "solver": "PCG",
-                    "max_iters": pcg_max_iter,
-                    "convergence": "RELATIVE_INI",
-                    "tolerance": float(pcg_tol),
-                    "monitor_residual": 1,
-                    "preconditioner": {
-                        "solver": "AMG",
-                        "algorithm": "AGGREGATION",
-                        "selector": "SIZE_2",
-                        "cycle": "V",
-                        "smoother": "MULTICOLOR_GS",
-                        "presweeps": 1,
-                        "postsweeps": 1
-                    }
-                }
-            })
-            rsc = pyamgx.Resources().create_simple(cfg)
-            A_amgx = pyamgx.Matrix().create(rsc)
-            A_amgx.upload_CSR(A_amgx_csr)
-            b_amgx = pyamgx.Vector().create(rsc)
-            b_amgx.upload(b_flat)
-            x_amgx = pyamgx.Vector().create(rsc)
-            x_amgx.upload(x_init)
-
-            solver = pyamgx.Solver().create(rsc, cfg)
-
-            t0 = time.perf_counter()
-            solver.setup(A_amgx)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            amgx_setup_ms = (time.perf_counter() - t0) * 1000
-
-            num_amgx_warmup = 3
-            for _ in range(num_amgx_warmup):
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
-                x_amgx.upload(x_init)
-                solver.solve(b_amgx, x_amgx)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-
-            t0 = time.perf_counter()
-            x_amgx.upload(x_init)
-            solver.solve(b_amgx, x_amgx)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            solve_amgx_ms = (time.perf_counter() - t0) * 1000
-
-            iters_amgx = solver.iterations_number
-
-            solver.destroy()
-            x_amgx.destroy()
-            b_amgx.destroy()
-            A_amgx.destroy()
-            rsc.destroy()
-            cfg.destroy()
-            _stderr_fd = os.dup(2)
-            _devnull = os.open(os.devnull, os.O_WRONLY)
-            try:
-                os.dup2(_devnull, 2)
-                pyamgx.finalize()
-            finally:
-                os.dup2(_stderr_fd, 2)
-                os.close(_stderr_fd)
-                os.close(_devnull)
-        except Exception as e:
-            if HAS_AMGX:
-                print(f"Warning: AMGX failed: {e}")
-            iters_amgx = 0
-            solve_amgx_ms = 0.0
-            amgx_setup_ms = 0.0
-            try:
-                _stderr_fd = os.dup(2)
-                _devnull = os.open(os.devnull, os.O_WRONLY)
-                try:
-                    os.dup2(_devnull, 2)
-                    pyamgx.finalize()
-                finally:
-                    os.dup2(_stderr_fd, 2)
-                    os.close(_stderr_fd)
-                    os.close(_devnull)
-            except Exception:
-                pass
-    total_amgx_ms = amgx_setup_ms + solve_amgx_ms
+    total_diag_cpu_ms = setup_diag_cpu_ms + solve_diag_cpu_ms
+    total_diag_gpu_ms = setup_diag_gpu_ms + solve_diag_gpu_ms
+    total_ic_cpu_ms = ic_setup_ms + solve_ic_cpu_ms
 
     print("\nPCG solve A x = b (relative residual tol={:.0e})".format(pcg_tol))
     print("Unpreconditioned (CG):")
     print(f"  Setup: {setup_none_ms:.2f} ms, solve (GPU): {solve_none_gpu_ms:.2f} ms, {iters_none_gpu} iterations, total: {total_none_gpu_ms:.2f} ms")
     print(f"  Setup: {setup_none_ms:.2f} ms, solve (CPU): {solve_none_cpu_ms:.2f} ms, {iters_none_cpu} iterations, total: {total_none_cpu_ms:.2f} ms")
+    print("Diag (Jacobi; paper Table 7: Eigen CPU / custom GPU):")
+    print(f"  Setup: {setup_diag_cpu_ms:.2f} ms, solve (CPU): {solve_diag_cpu_ms:.2f} ms, {iters_diag_cpu} iterations, total: {total_diag_cpu_ms:.2f} ms")
+    print(f"  Setup: {setup_diag_gpu_ms:.2f} ms, solve (GPU): {solve_diag_gpu_ms:.2f} ms, {iters_diag_gpu} iterations, total: {total_diag_gpu_ms:.2f} ms")
+    print("IC (paper: Eigen CPU / cuSPARSE GPU; here ilupp or scipy CPU; GPU line uses AMGX MULTICOLOR_DILU for scalar CSR):")
+    if ic_apply is not None:
+        print(
+            f"  Setup: {ic_setup_ms:.2f} ms, solve (CPU): {solve_ic_cpu_ms:.2f} ms, {iters_ic_cpu} iterations, "
+            f"total: {total_ic_cpu_ms:.2f} ms  [{ic_backend}]"
+        )
+    else:
+        print(
+            f"  Setup: {ic_setup_ms:.2f} ms, solve (CPU): {solve_ic_cpu_ms:.2f} ms, {iters_ic_cpu} iterations "
+            f"(IC factorization unavailable; try pip install ilupp)"
+        )
+    if HAS_AMGX and device.type == "cuda":
+        print(
+            f"  Setup: {amgx_ilu_setup_ms:.2f} ms, solve (GPU): {amgx_ilu_solve_ms:.2f} ms, {amgx_ilu_iters} iterations, "
+            f"total: {total_amgx_ilu_ms:.2f} ms  [AMGX MULTICOLOR_DILU]"
+        )
     print("LeafOnly:")
-    print(f"  Inference: {inference_ms:.2f} ms, solve: {solve_leaf_ms:.2f} ms, {iters_leaf} iterations, total: {total_leaf_ms:.2f} ms")
+    print(
+        f"  Inference: {inference_ms:.2f} ms, solve: {solve_leaf_ms:.2f} ms, {iters_leaf} iterations, "
+        f"total: {total_leaf_ms:.2f} ms; true rel residual ||Ax-b||/||b||={leaf_rel_res:.3e} (PCG tol {pcg_tol:.0e})"
+    )
     print("AMG (CPU):")
     print(f"  Setup: {amg_setup_ms:.2f} ms, solve: {solve_amg_ms:.2f} ms, {iters_amg} iterations, total: {total_amg_ms:.2f} ms")
-    if HAS_AMGX and device.type == 'cuda' and (iters_amgx > 0 or amgx_setup_ms > 0):
+    if HAS_AMGX and device.type == "cuda":
         print("AMGX (GPU) [PCG + AMG]:")
-        print(f"  Setup: {amgx_setup_ms:.2f} ms, solve: {solve_amgx_ms:.2f} ms, {iters_amgx} iterations, total: {total_amgx_ms:.2f} ms")
+        print(
+            f"  Setup: {amgx_amg_setup_ms:.2f} ms, solve: {amgx_amg_solve_ms:.2f} ms, {amgx_amg_iters} iterations, "
+            f"total: {total_amgx_amg_ms:.2f} ms"
+        )
+
+    if test_only:
+        return
 
     A_inv_viz = np.linalg.inv(A_viz_n)
     profile_blockwise_preconditioner_spectral_bands(

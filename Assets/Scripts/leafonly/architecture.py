@@ -788,12 +788,112 @@ def apply_block_diagonal_M(
     return y
 
 
+def apply_block_diagonal_M_physical(
+    precond_packed,
+    x,
+    leaf_size=LEAF_SIZE,
+    leaf_apply_size=None,
+    leaf_apply_off=None,
+    jacobi_inv_diag=None,
+):
+    """
+    Apply the packed LeafOnly preconditioner to a **physical** residual (no padded tail).
+
+    ``x`` has shape ``(B, N_active, K_dim)`` with ``N_active = num_leaves_active * leaf_size`` and
+    ``num_leaves_active <= MAX_NUM_LEAVES``. ``precond_packed`` is the usual forward output built on
+    the full ``MAX_MIXED_SIZE`` grid.
+
+    Diagonal blocks for the first ``num_leaves_active`` leaves match the full packed layout.
+    Off-diagonal H tiles that are not **fully** inside the active leaf index range are skipped
+    (zeroed coefficients) so pooling and scatter never read past the active leaves.
+    """
+    if leaf_apply_size is None:
+        leaf_apply_size = leaf_size
+    if leaf_apply_off is None:
+        leaf_apply_off = leaf_apply_size
+    B, N, K_dim = x.shape
+    L = int(leaf_size)
+    if N % L != 0:
+        raise ValueError(f"apply_block_diagonal_M_physical: N={N} not divisible by leaf_size={L}")
+    num_leaves_active = N // L
+    if num_leaves_active > MAX_NUM_LEAVES:
+        raise ValueError(
+            f"num_leaves_active={num_leaves_active} exceeds MAX_NUM_LEAVES={MAX_NUM_LEAVES}"
+        )
+    La_d = leaf_apply_size
+    La_o = leaf_apply_off
+    pool_d = L // La_d
+    pool_o = L // La_o
+    if pool_d * La_d != L:
+        raise ValueError(f"leaf_size {L} not divisible by leaf_apply_size {La_d}")
+    if pool_o * La_o != L:
+        raise ValueError(f"leaf_size {L} not divisible by leaf_apply_off {La_o}")
+
+    diag_size_active = num_leaves_active * La_d * La_d
+    diag_size_full = MAX_NUM_LEAVES * La_d * La_d
+    M_h = NUM_HMATRIX_OFF_BLOCKS
+    off_size = M_h * La_o * La_o
+
+    diag_blocks = precond_packed[:, :diag_size_active].view(B, num_leaves_active, La_d, La_d)
+    x_leaves = x.view(B, num_leaves_active, L, K_dim)
+    x_pool_d = (
+        x_leaves
+        if pool_d == 1
+        else x_leaves.view(B, num_leaves_active, La_d, pool_d, K_dim).mean(dim=3)
+    )
+    y_pool = torch.matmul(diag_blocks, x_pool_d)
+    y_leaves = y_pool if pool_d == 1 else y_pool.repeat_interleave(pool_d, dim=2)
+
+    if M_h > 0:
+        off_diag_blocks = precond_packed[:, diag_size_full : diag_size_full + off_size].view(B, M_h, La_o, La_o)
+        na = int(num_leaves_active)
+        valid = ((HM_R0_CPU + HM_S_CPU) <= na) & ((HM_C0_CPU + HM_S_CPU) <= na)
+        valid = valid.to(device=off_diag_blocks.device, dtype=off_diag_blocks.dtype).view(1, M_h, 1, 1)
+        off_diag_blocks = off_diag_blocks * valid
+
+        # Scatter indices address leaf slots up to MAX_NUM_LEAVES-1; y_leaves only has na leaves.
+        # Pool with full Wr/Wc on zero-padded x, accumulate into y_full, then slice.
+        Wr = HM_POOL_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
+        Wc = HM_POOL_W_COL_CPU.to(device=x.device, dtype=x.dtype)
+        x_full = x.new_zeros(B, MAX_NUM_LEAVES, L, K_dim)
+        x_full[:, :na] = x_leaves
+        x_row_strips = torch.einsum("mk,bkle->bmle", Wr, x_full)
+        x_col_strips = torch.einsum("mk,bkle->bmle", Wc, x_full)
+        flat = B * M_h
+        Br = off_diag_blocks.reshape(flat, La_o, La_o)
+        xr = x_row_strips.reshape(flat, La_o, K_dim)
+        xc = x_col_strips.reshape(flat, La_o, K_dim)
+        y_r = torch.bmm(Br, xc)
+        y_c = torch.bmm(Br.transpose(-1, -2), xr)
+        y_r = y_r.view(B, M_h, La_o, K_dim)
+        y_c = y_c.view(B, M_h, La_o, K_dim)
+        ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
+        y_full = x.new_zeros(B, MAX_NUM_LEAVES, L, K_dim)
+        y_full[:, :na] = y_leaves
+        y_full.index_add_(1, ridx, y_r[:, gidx, :, :])
+        y_full.index_add_(1, cidx, y_c[:, gidx, :, :])
+        y_leaves.copy_(y_full[:, :na])
+
+    y = y_leaves.view(B, N, K_dim)
+
+    if precond_packed.shape[1] > diag_size_full + off_size:
+        if jacobi_inv_diag is None:
+            raise ValueError("jacobi_inv_diag is required when jacobi_scale is present.")
+        if jacobi_inv_diag.shape[:2] != (B, N):
+            raise ValueError(f"jacobi_inv_diag shape {jacobi_inv_diag.shape} does not match (B,N)=({B},{N}).")
+        jacobi_scale = precond_packed[:, diag_size_full + off_size :][:, :N]
+        y = y + (jacobi_scale * jacobi_inv_diag).unsqueeze(-1) * x
+    return y
+
+
 def block_diagonal_m_apply_workspace(num_leaves: int, leaf_size: int, K_dim: int, M_h: int, La_o: int, device, dtype):
     """Fixed buffers for apply_block_diagonal_m_into (B=1, no allocs in CUDAGraph replay)."""
     lc = leaf_size * K_dim
     t_pro = int(HM_PROLONG_GATHER_IDX.shape[0])
-    return {
-        "x_flat": torch.empty(num_leaves, lc, device=device, dtype=dtype),
+    # Off-diagonal path uses Wr/Wc with MAX_NUM_LEAVES columns; pad x_flat and scatter into y_leaves_pad.
+    n_flat = MAX_NUM_LEAVES if M_h > 0 else num_leaves
+    out = {
+        "x_flat": torch.empty(n_flat, lc, device=device, dtype=dtype),
         "row_flat": torch.empty(M_h, lc, device=device, dtype=dtype),
         "col_flat": torch.empty(M_h, lc, device=device, dtype=dtype),
         "y_r": torch.empty(1, M_h, La_o, K_dim, device=device, dtype=dtype),
@@ -801,6 +901,14 @@ def block_diagonal_m_apply_workspace(num_leaves: int, leaf_size: int, K_dim: int
         "y_scatter_r": torch.empty(1, t_pro, La_o, K_dim, device=device, dtype=dtype),
         "y_scatter_c": torch.empty(1, t_pro, La_o, K_dim, device=device, dtype=dtype),
     }
+    if M_h > 0:
+        out["y_leaves_pad"] = torch.empty(1, MAX_NUM_LEAVES, leaf_size, K_dim, device=device, dtype=dtype)
+        # Precompute on device before CUDAGraph capture; .to(device) inside capture is not allowed.
+        if num_leaves < MAX_NUM_LEAVES:
+            na = int(num_leaves)
+            valid = ((HM_R0_CPU + HM_S_CPU) <= na) & ((HM_C0_CPU + HM_S_CPU) <= na)
+            out["off_valid"] = valid.to(device=device, dtype=dtype).view(1, M_h, 1, 1)
+    return out
 
 
 def apply_block_diagonal_m_into(
@@ -833,17 +941,27 @@ def apply_block_diagonal_m_into(
     La_d = leaf_apply_size
     La_o = leaf_apply_off
     M_h = NUM_HMATRIX_OFF_BLOCKS
-    diag_size = num_leaves * La_d * La_d
+    diag_size_active = num_leaves * La_d * La_d
+    diag_size_full = MAX_NUM_LEAVES * La_d * La_d
     off_size = M_h * La_o * La_o
 
-    diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, La_d, La_d)
+    diag_blocks = precond_packed[:, :diag_size_active].view(B, num_leaves, La_d, La_d)
     x_leaves = x.view(B, num_leaves, leaf_size, K_dim)
     y_leaves = out.view(B, num_leaves, leaf_size, K_dim)
     torch.matmul(diag_blocks, x_leaves, out=y_leaves)
 
     if M_h > 0:
-        off_diag_blocks = precond_packed[:, diag_size : diag_size + off_size].view(B, M_h, La_o, La_o)
-        ws["x_flat"].copy_(x_leaves[0].reshape(num_leaves, leaf_size * K_dim))
+        off_diag_blocks = precond_packed[:, diag_size_full : diag_size_full + off_size].view(
+            B, M_h, La_o, La_o
+        )
+        na = int(num_leaves)
+        if na < MAX_NUM_LEAVES:
+            off_valid = ws["off_valid"]
+            off_diag_blocks = off_diag_blocks * off_valid
+
+        lc = leaf_size * K_dim
+        ws["x_flat"].zero_()
+        ws["x_flat"][:na].copy_(x_leaves[0].reshape(na, lc))
         torch.matmul(Wr, ws["x_flat"], out=ws["row_flat"])
         torch.matmul(Wc, ws["x_flat"], out=ws["col_flat"])
         Br = off_diag_blocks.reshape(M_h, La_o, La_o)
@@ -856,14 +974,22 @@ def apply_block_diagonal_m_into(
         ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
         torch.index_select(y_r, 1, gidx, out=ws["y_scatter_r"])
         torch.index_select(y_c, 1, gidx, out=ws["y_scatter_c"])
-        y_leaves.index_add_(1, ridx, ws["y_scatter_r"])
-        y_leaves.index_add_(1, cidx, ws["y_scatter_c"])
+        if na < MAX_NUM_LEAVES:
+            y_pad = ws["y_leaves_pad"]
+            y_pad.zero_()
+            y_pad[0, :na].copy_(y_leaves[0])
+            y_pad.index_add_(1, ridx, ws["y_scatter_r"])
+            y_pad.index_add_(1, cidx, ws["y_scatter_c"])
+            y_leaves[0].copy_(y_pad[0, :na])
+        else:
+            y_leaves.index_add_(1, ridx, ws["y_scatter_r"])
+            y_leaves.index_add_(1, cidx, ws["y_scatter_c"])
 
-    if precond_packed.shape[1] > diag_size + off_size:
+    if precond_packed.shape[1] > diag_size_full + off_size:
         if jacobi_inv_diag is None:
             raise ValueError("jacobi_inv_diag is required when jacobi_scale is present.")
         if jacobi_inv_diag.shape[:2] != (B, N):
             raise ValueError(f"jacobi_inv_diag shape {jacobi_inv_diag.shape} does not match (B,N)=({B},{N}).")
-        jacobi_scale = precond_packed[:, diag_size + off_size :]
+        jacobi_scale = precond_packed[:, diag_size_full + off_size :][:, :N]
         out.addcmul_(x, (jacobi_scale * jacobi_inv_diag).unsqueeze(-1))
     return out
