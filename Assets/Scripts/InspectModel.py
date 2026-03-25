@@ -1213,9 +1213,15 @@ def main():
         if device.type == "cuda":
             torch.cuda.synchronize()
 
-        # First BSR build: dummy COO→BSR fills ``_BSR_TOPOLOGY_CACHE`` (not timed with inference_ms below).
+        # Time pure forward only (same idea as leafonly.eval ``--evaluate_gradients``). Running
+        # ``build_sparse_bsr_preconditioner`` first allocates large sparse COO/BSR buffers and can
+        # leave the GPU in a different memory state, skewing this line ~tens of percent vs eval.
+        inference_ms = _timed_ms(_fwd, device, warmup=0, repeat=10)
+        precond_out = _last_out[0]
+
+        # First BSR build: fills ``_BSR_TOPOLOGY_CACHE`` for the later PCG path (not part of inference_ms).
         build_sparse_bsr_preconditioner(
-            _last_out[0].detach().contiguous(),
+            precond_out.detach().contiguous(),
             viz_n,
             leaf_L,
             leaf_apply_diag_L,
@@ -1225,10 +1231,7 @@ def main():
         )
         if device.type == "cuda":
             torch.cuda.synchronize()
-
-        inference_ms = _timed_ms(_fwd, device, warmup=0, repeat=10)
-        precond_out = _last_out[0]
-        diag_blocks, off_diag_blocks, jacobi_scale = unpack_precond(
+        diag_blocks, off_diag_blocks, node_U, node_V, jacobi_scale = unpack_precond(
             precond_out,
             n_pad,
             leaf_size=leaf_L,
@@ -1244,19 +1247,20 @@ def main():
                 blk = blk.repeat_interleave(pool_diag_to_full, dim=0).repeat_interleave(pool_diag_to_full, dim=1)
             M_neural_gpu[r0:r1, r0:r1] = blk
 
-        if NUM_HMATRIX_OFF_BLOCKS > 0 and off_diag_blocks is not None:
+        if NUM_HMATRIX_OFF_BLOCKS > 0 and off_diag_blocks is not None and node_U is not None and node_V is not None:
             for i in range(NUM_HMATRIX_OFF_BLOCKS):
                 r0i = int(HM_R0_CPU[i].item())
                 c0i = int(HM_C0_CPU[i].item())
                 si = int(HM_S_CPU[i].item())
                 br0, br1 = r0i * leaf_L, (r0i + si) * leaf_L
                 bc0, bc1 = c0i * leaf_L, (c0i + si) * leaf_L
-                oblk = off_diag_blocks[0, i]
-                rep = si if leaf_apply_off_L == leaf_L else max(1, (si * leaf_L) // leaf_apply_off_L)
-                if rep > 1:
-                    oblk = oblk.repeat_interleave(rep, dim=0).repeat_interleave(rep, dim=1)
-                M_neural_gpu[br0:br1, bc0:bc1] = oblk
-                M_neural_gpu[bc0:bc1, br0:br1] = oblk.transpose(-1, -2)
+                C_m = off_diag_blocks[0, i]
+                U_strip = node_U[0, r0i : r0i + si].reshape(si * leaf_L, leaf_apply_off_L)
+                V_strip = node_V[0, c0i : c0i + si].reshape(si * leaf_L, leaf_apply_off_L)
+                U_C = torch.matmul(U_strip, C_m)
+                oblk_dense = torch.matmul(U_C, V_strip.transpose(0, 1))
+                M_neural_gpu[br0:br1, bc0:bc1] = oblk_dense
+                M_neural_gpu[bc0:bc1, br0:br1] = oblk_dense.transpose(-1, -2)
 
         if jacobi_scale is not None:
             M_neural_gpu += torch.diag((jacobi_scale[0] * jacobi_inv_diag[0]).to(M_neural_gpu.dtype))

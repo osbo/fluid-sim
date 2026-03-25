@@ -16,13 +16,13 @@ from .config import (
 from .data import build_leaf_block_connectivity
 from .hmatrix import (
     HM_C0_CPU,
-    HM_POOL_W_COL_CPU,
-    HM_POOL_W_ROW_CPU,
     HM_PROLONG_COL_LEAF_IDX,
     HM_PROLONG_GATHER_IDX,
     HM_PROLONG_ROW_LEAF_IDX,
     HM_R0_CPU,
     HM_S_CPU,
+    HM_SUM_W_COL_CPU,
+    HM_SUM_W_ROW_CPU,
     NUM_HMATRIX_OFF_BLOCKS,
     hm_leaf_mean_pool_weights,
 )
@@ -512,6 +512,14 @@ class LeafOnlyNet(nn.Module):
         self.leaf_head = nn.Linear(d_model, La_d)
         nn.init.normal_(self.leaf_head.weight, std=0.001)
         nn.init.constant_(self.leaf_head.bias, 0.0)
+
+        self.node_u = nn.Linear(d_model, La_o)
+        self.node_v = nn.Linear(d_model, La_o)
+        nn.init.normal_(self.node_u.weight, std=0.001)
+        nn.init.constant_(self.node_u.bias, 0.0)
+        nn.init.normal_(self.node_v.weight, std=0.001)
+        nn.init.constant_(self.node_v.bias, 0.0)
+
         self.jacobi_gate = nn.Linear(d_model, 1)
         nn.init.normal_(self.jacobi_gate.weight, std=0.01)
         nn.init.constant_(self.jacobi_gate.bias, 0.0)
@@ -526,6 +534,9 @@ class LeafOnlyNet(nn.Module):
         )
         self.register_buffer("hm_pool_w_row", wr, persistent=False)
         self.register_buffer("hm_pool_w_col", wc, persistent=False)
+        wr_sum, wc_sum = HM_SUM_W_ROW_CPU.clone(), HM_SUM_W_COL_CPU.clone()
+        self.register_buffer("hm_sum_w_row", wr_sum, persistent=False)
+        self.register_buffer("hm_sum_w_col", wc_sum, persistent=False)
 
     def _get_leaf_blocks(self, h, mode="diagonal"):
         # Diagonal: (B, N, C) with N = K * L. Off: (B, M_off, L, C) one L-token tile per H block — fold to (B*M, L, C).
@@ -687,11 +698,16 @@ class LeafOnlyNet(nn.Module):
 
         jacobi_scale = self._get_jacobi_scale(h_diag)
 
+        node_U = self.node_u(h_diag)
+        node_V = self.node_v(h_diag)
+
         Bb = diag_blocks.shape[0]
         packed_diag = diag_blocks.reshape(Bb, -1)
         packed_off = off_diag_blocks.reshape(Bb, -1)
+        packed_U = node_U.reshape(Bb, -1)
+        packed_V = node_V.reshape(Bb, -1)
 
-        packed = torch.cat([packed_diag, packed_off], dim=1)
+        packed = torch.cat([packed_diag, packed_off, packed_U, packed_V], dim=1)
         if jacobi_scale is not None:
             packed = torch.cat([packed, jacobi_scale], dim=1)
 
@@ -710,14 +726,21 @@ def unpack_precond(precond_packed, N, leaf_size=LEAF_SIZE, leaf_apply_size=None,
     diag_size = num_leaves * La_d * La_d
     M_h = NUM_HMATRIX_OFF_BLOCKS
     off_size = M_h * La_o * La_o
+    node_size = num_leaves * leaf_size * La_o
 
     diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, La_d, La_d)
     off_diag_blocks = None
+    idx = diag_size
     if M_h > 0:
-        off_diag_blocks = precond_packed[:, diag_size : diag_size + off_size].view(B, M_h, La_o, La_o)
+        off_diag_blocks = precond_packed[:, idx : idx + off_size].view(B, M_h, La_o, La_o)
+        idx += off_size
+    node_U = precond_packed[:, idx : idx + node_size].view(B, num_leaves, leaf_size, La_o)
+    idx += node_size
+    node_V = precond_packed[:, idx : idx + node_size].view(B, num_leaves, leaf_size, La_o)
+    idx += node_size
 
-    jacobi_scale = precond_packed[:, diag_size + off_size :] if precond_packed.shape[1] > diag_size + off_size else None
-    return diag_blocks, off_diag_blocks, jacobi_scale
+    jacobi_scale = precond_packed[:, idx:] if precond_packed.shape[1] > idx else None
+    return diag_blocks, off_diag_blocks, node_U, node_V, jacobi_scale
 
 
 def build_sparse_bsr_preconditioner(
@@ -760,16 +783,21 @@ def build_sparse_bsr_preconditioner(
     diag_size_full = MAX_NUM_LEAVES * La_d * La_d
     M_h = NUM_HMATRIX_OFF_BLOCKS
     off_size = M_h * La_o * La_o
+    node_size_full = MAX_NUM_LEAVES * L * La_o
 
     diag_blocks = precond_packed[:, :diag_size_active].view(1, num_leaves, La_d, La_d)
 
-    jacobi_scale = None
-    if precond_packed.shape[1] > diag_size_full + off_size:
-        jacobi_scale = precond_packed[:, diag_size_full + off_size :][:, :N]
-
-    off_diag_blocks = None
+    off_diag_blocks = node_U = node_V = None
+    idx = diag_size_full
     if M_h > 0:
-        off_diag_blocks = precond_packed[:, diag_size_full : diag_size_full + off_size].view(1, M_h, La_o, La_o)
+        off_diag_blocks = precond_packed[:, idx : idx + off_size].view(1, M_h, La_o, La_o)
+        idx += off_size
+    node_U = precond_packed[:, idx : idx + node_size_full].view(1, MAX_NUM_LEAVES, L, La_o)
+    idx += node_size_full
+    node_V = precond_packed[:, idx : idx + node_size_full].view(1, MAX_NUM_LEAVES, L, La_o)
+    idx += node_size_full
+
+    jacobi_scale = precond_packed[:, idx :][:, :N] if precond_packed.shape[1] > idx else None
 
     if jacobi_inv_diag.dim() == 1:
         jinv = jacobi_inv_diag[:N].to(device=device, dtype=dtype)
@@ -802,11 +830,12 @@ def build_sparse_bsr_preconditioner(
             if r0i + si > num_leaves or c0i + si > num_leaves:
                 continue
 
-            oblk = off_diag_blocks[0, i]
-            rep = si if La_o == L else max(1, (si * L) // La_o)
-            if rep > 1:
-                oblk = oblk.repeat_interleave(rep, dim=0).repeat_interleave(rep, dim=1)
-                oblk = oblk / float(rep)
+            C_m = off_diag_blocks[0, i]
+            U_strip = node_U[0, r0i : r0i + si].reshape(si * L, La_o)
+            V_strip = node_V[0, c0i : c0i + si].reshape(si * L, La_o)
+
+            U_C = torch.matmul(U_strip, C_m)
+            oblk_dense = torch.matmul(U_C, V_strip.transpose(0, 1))
 
             S_px = si * L
             br0, bc0 = r0i * L, c0i * L
@@ -814,13 +843,13 @@ def build_sparse_bsr_preconditioner(
             r_idx_u = torch.arange(br0, br0 + S_px, device=device, dtype=torch.long).view(-1, 1).expand(-1, S_px)
             c_idx_u = torch.arange(bc0, bc0 + S_px, device=device, dtype=torch.long).view(1, -1).expand(S_px, -1)
             indices_list.append(torch.stack([r_idx_u.reshape(-1), c_idx_u.reshape(-1)], dim=0))
-            values_list.append(oblk.reshape(-1))
+            values_list.append(oblk_dense.reshape(-1))
 
-            oblk_t = oblk.t()
+            oblk_t_dense = oblk_dense.t()
             r_idx_l = torch.arange(bc0, bc0 + S_px, device=device, dtype=torch.long).view(-1, 1).expand(-1, S_px)
             c_idx_l = torch.arange(br0, br0 + S_px, device=device, dtype=torch.long).view(1, -1).expand(S_px, -1)
             indices_list.append(torch.stack([r_idx_l.reshape(-1), c_idx_l.reshape(-1)], dim=0))
-            values_list.append(oblk_t.reshape(-1))
+            values_list.append(oblk_t_dense.reshape(-1))
 
     all_indices = torch.cat(indices_list, dim=1)
     all_values = torch.cat(values_list, dim=0)
@@ -872,8 +901,8 @@ def apply_block_diagonal_M(
     jacobi_inv_diag=None,
 ):
     """
-    Diagonal blocks are La_d×La_d; off-diagonal blocks La_o×La_o; node layout is leaf_size per leaf.
-    Per leaf: mean-pool x to La_*, matmul, repeat_interleave prolongation back to leaf_size.
+    Diagonal blocks are La_d×La_d; off-diagonal H tiles use FMM form U C V^T with coarse C (La_o×La_o);
+    node U,V are per-node (leaf × La_o); Jacobi scaling optional at end of packed layout.
     """
     if leaf_apply_size is None:
         leaf_apply_size = leaf_size
@@ -905,32 +934,54 @@ def apply_block_diagonal_M(
     y_pool = torch.matmul(diag_blocks, x_pool_d)
     y_leaves = y_pool if pool_d == 1 else y_pool.repeat_interleave(pool_d, dim=2)
 
+    idx = diag_size
+    node_size = num_leaves * leaf_size * La_o
     if M_h > 0:
-        off_diag_blocks = precond_packed[:, diag_size : diag_size + off_size].view(B, M_h, La_o, La_o)
-        Wr = HM_POOL_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
-        Wc = HM_POOL_W_COL_CPU.to(device=x.device, dtype=x.dtype)
-        x_row_strips = torch.einsum("mk,bkle->bmle", Wr, x_leaves)
-        x_col_strips = torch.einsum("mk,bkle->bmle", Wc, x_leaves)
+        off_diag_blocks = precond_packed[:, idx : idx + off_size].view(B, M_h, La_o, La_o)
+        idx += off_size
+        node_U = precond_packed[:, idx : idx + node_size].view(B, num_leaves, leaf_size, La_o)
+        idx += node_size
+        node_V = precond_packed[:, idx : idx + node_size].view(B, num_leaves, leaf_size, La_o)
+        idx += node_size
+
+        Wr_sum = HM_SUM_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
+        Wc_sum = HM_SUM_W_COL_CPU.to(device=x.device, dtype=x.dtype)
+
+        x_proj_U = torch.matmul(node_U.transpose(-1, -2), x_leaves)
+        x_proj_V = torch.matmul(node_V.transpose(-1, -2), x_leaves)
+
+        x_row_strips = torch.einsum("mk,bkld->bmld", Wr_sum, x_proj_U)
+        x_col_strips = torch.einsum("mk,bkld->bmld", Wc_sum, x_proj_V)
+
         flat = B * M_h
         Br = off_diag_blocks.reshape(flat, La_o, La_o)
         xr = x_row_strips.reshape(flat, La_o, K_dim)
         xc = x_col_strips.reshape(flat, La_o, K_dim)
-        y_r = torch.bmm(Br, xc)
-        y_c = torch.bmm(Br.transpose(-1, -2), xr)
-        y_r = y_r.view(B, M_h, La_o, K_dim)
-        y_c = y_c.view(B, M_h, La_o, K_dim)
+        y_r_coarse = torch.bmm(Br, xc).view(B, M_h, La_o, K_dim)
+        y_c_coarse = torch.bmm(Br.transpose(-1, -2), xr).view(B, M_h, La_o, K_dim)
+
         ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
-        y_leaves.index_add_(1, ridx, y_r[:, gidx, :, :])
-        y_leaves.index_add_(1, cidx, y_c[:, gidx, :, :])
+        y_r_leaves = torch.zeros(B, num_leaves, La_o, K_dim, device=x.device, dtype=x.dtype)
+        y_c_leaves = torch.zeros(B, num_leaves, La_o, K_dim, device=x.device, dtype=x.dtype)
+
+        y_r_leaves.index_add_(1, ridx, y_r_coarse[:, gidx, :, :])
+        y_c_leaves.index_add_(1, cidx, y_c_coarse[:, gidx, :, :])
+
+        y_r_final = torch.matmul(node_U, y_r_leaves)
+        y_c_final = torch.matmul(node_V, y_c_leaves)
+
+        y_leaves = y_leaves + y_r_final + y_c_final
+    else:
+        idx += 2 * node_size
 
     y = y_leaves.view(B, N, K_dim)
 
-    if precond_packed.shape[1] > diag_size + off_size:
+    if precond_packed.shape[1] > idx:
         if jacobi_inv_diag is None:
             raise ValueError("jacobi_inv_diag is required when jacobi_scale is present.")
         if jacobi_inv_diag.shape[:2] != (B, N):
             raise ValueError(f"jacobi_inv_diag shape {jacobi_inv_diag.shape} does not match (B,N)=({B},{N}).")
-        jacobi_scale = precond_packed[:, diag_size + off_size :]
+        jacobi_scale = precond_packed[:, idx:]
         y = y + (jacobi_scale * jacobi_inv_diag).unsqueeze(-1) * x
     return y
 
@@ -991,69 +1042,93 @@ def apply_block_diagonal_M_physical(
     y_pool = torch.matmul(diag_blocks, x_pool_d)
     y_leaves = y_pool if pool_d == 1 else y_pool.repeat_interleave(pool_d, dim=2)
 
+    node_size_full = MAX_NUM_LEAVES * L * La_o
+    idx = diag_size_full
     if M_h > 0:
-        off_diag_blocks = precond_packed[:, diag_size_full : diag_size_full + off_size].view(B, M_h, La_o, La_o)
+        off_diag_blocks = precond_packed[:, idx : idx + off_size].view(B, M_h, La_o, La_o)
+        idx += off_size
+        node_U_full = precond_packed[:, idx : idx + node_size_full].view(B, MAX_NUM_LEAVES, L, La_o)
+        idx += node_size_full
+        node_V_full = precond_packed[:, idx : idx + node_size_full].view(B, MAX_NUM_LEAVES, L, La_o)
+        idx += node_size_full
+
         na = int(num_leaves_active)
         valid = ((HM_R0_CPU + HM_S_CPU) <= na) & ((HM_C0_CPU + HM_S_CPU) <= na)
         valid = valid.to(device=off_diag_blocks.device, dtype=off_diag_blocks.dtype).view(1, M_h, 1, 1)
         off_diag_blocks = off_diag_blocks * valid
 
-        # Scatter indices address leaf slots up to MAX_NUM_LEAVES-1; y_leaves only has na leaves.
-        # Pool with full Wr/Wc on zero-padded x, accumulate into y_full, then slice.
-        Wr = HM_POOL_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
-        Wc = HM_POOL_W_COL_CPU.to(device=x.device, dtype=x.dtype)
-        x_full = x.new_zeros(B, MAX_NUM_LEAVES, L, K_dim)
-        x_full[:, :na] = x_leaves
-        x_row_strips = torch.einsum("mk,bkle->bmle", Wr, x_full)
-        x_col_strips = torch.einsum("mk,bkle->bmle", Wc, x_full)
+        node_U_active = node_U_full[:, :na]
+        node_V_active = node_V_full[:, :na]
+
+        x_proj_U = torch.matmul(node_U_active.transpose(-1, -2), x_leaves)
+        x_proj_V = torch.matmul(node_V_active.transpose(-1, -2), x_leaves)
+
+        x_full_U = x.new_zeros(B, MAX_NUM_LEAVES, La_o, K_dim)
+        x_full_V = x.new_zeros(B, MAX_NUM_LEAVES, La_o, K_dim)
+        x_full_U[:, :na] = x_proj_U
+        x_full_V[:, :na] = x_proj_V
+
+        Wr_sum = HM_SUM_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
+        Wc_sum = HM_SUM_W_COL_CPU.to(device=x.device, dtype=x.dtype)
+        x_row_strips = torch.einsum("mk,bkld->bmld", Wr_sum, x_full_U)
+        x_col_strips = torch.einsum("mk,bkld->bmld", Wc_sum, x_full_V)
+
         flat = B * M_h
         Br = off_diag_blocks.reshape(flat, La_o, La_o)
         xr = x_row_strips.reshape(flat, La_o, K_dim)
         xc = x_col_strips.reshape(flat, La_o, K_dim)
-        y_r = torch.bmm(Br, xc)
-        y_c = torch.bmm(Br.transpose(-1, -2), xr)
-        y_r = y_r.view(B, M_h, La_o, K_dim)
-        y_c = y_c.view(B, M_h, La_o, K_dim)
+
+        y_r_coarse = torch.bmm(Br, xc).view(B, M_h, La_o, K_dim)
+        y_c_coarse = torch.bmm(Br.transpose(-1, -2), xr).view(B, M_h, La_o, K_dim)
+
         ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
-        y_full = x.new_zeros(B, MAX_NUM_LEAVES, L, K_dim)
-        y_full[:, :na] = y_leaves
-        y_full.index_add_(1, ridx, y_r[:, gidx, :, :])
-        y_full.index_add_(1, cidx, y_c[:, gidx, :, :])
-        y_leaves.copy_(y_full[:, :na])
+        y_r_full = x.new_zeros(B, MAX_NUM_LEAVES, La_o, K_dim)
+        y_c_full = x.new_zeros(B, MAX_NUM_LEAVES, La_o, K_dim)
+
+        y_r_full.index_add_(1, ridx, y_r_coarse[:, gidx, :, :])
+        y_c_full.index_add_(1, cidx, y_c_coarse[:, gidx, :, :])
+
+        y_r_active = y_r_full[:, :na]
+        y_c_active = y_c_full[:, :na]
+
+        y_r_final = torch.matmul(node_U_active, y_r_active)
+        y_c_final = torch.matmul(node_V_active, y_c_active)
+
+        y_leaves.copy_(y_leaves + y_r_final + y_c_final)
+    else:
+        idx += 2 * node_size_full
 
     y = y_leaves.view(B, N, K_dim)
 
-    if precond_packed.shape[1] > diag_size_full + off_size:
+    if precond_packed.shape[1] > idx:
         if jacobi_inv_diag is None:
             raise ValueError("jacobi_inv_diag is required when jacobi_scale is present.")
         if jacobi_inv_diag.shape[:2] != (B, N):
             raise ValueError(f"jacobi_inv_diag shape {jacobi_inv_diag.shape} does not match (B,N)=({B},{N}).")
-        jacobi_scale = precond_packed[:, diag_size_full + off_size :][:, :N]
+        jacobi_scale = precond_packed[:, idx:][:, :N]
         y = y + (jacobi_scale * jacobi_inv_diag).unsqueeze(-1) * x
     return y
 
 
 def block_diagonal_m_apply_workspace(num_leaves: int, leaf_size: int, K_dim: int, M_h: int, La_o: int, device, dtype):
-    """Fixed buffers for apply_block_diagonal_m_into (B=1, no allocs in CUDAGraph replay)."""
-    lc = leaf_size * K_dim
+    la_c = La_o * K_dim
     t_pro = int(HM_PROLONG_GATHER_IDX.shape[0])
-    # Off-diagonal path: pad x_flat to MAX_NUM_LEAVES, gather–scatter pooling (no dense Wr/Wc matmul).
     n_flat = MAX_NUM_LEAVES if M_h > 0 else num_leaves
     out = {
-        "x_flat": torch.empty(n_flat, lc, device=device, dtype=dtype),
-        "row_flat": torch.empty(M_h, lc, device=device, dtype=dtype),
-        "col_flat": torch.empty(M_h, lc, device=device, dtype=dtype),
+        "x_proj_U_flat": torch.empty(n_flat, la_c, device=device, dtype=dtype),
+        "x_proj_V_flat": torch.empty(n_flat, la_c, device=device, dtype=dtype),
+        "row_flat": torch.empty(M_h, la_c, device=device, dtype=dtype),
+        "col_flat": torch.empty(M_h, la_c, device=device, dtype=dtype),
         "y_r": torch.empty(1, M_h, La_o, K_dim, device=device, dtype=dtype),
         "y_c": torch.empty(1, M_h, La_o, K_dim, device=device, dtype=dtype),
         "y_scatter_r": torch.empty(1, t_pro, La_o, K_dim, device=device, dtype=dtype),
         "y_scatter_c": torch.empty(1, t_pro, La_o, K_dim, device=device, dtype=dtype),
-        "x_gather_r": torch.empty(t_pro, lc, device=device, dtype=dtype),
-        "x_gather_c": torch.empty(t_pro, lc, device=device, dtype=dtype),
-        "inv_S": (1.0 / HM_S_CPU.to(device=device, dtype=dtype)).view(M_h, 1),
+        "x_gather_r": torch.empty(t_pro, la_c, device=device, dtype=dtype),
+        "x_gather_c": torch.empty(t_pro, la_c, device=device, dtype=dtype),
     }
     if M_h > 0:
-        out["y_leaves_pad"] = torch.empty(1, MAX_NUM_LEAVES, leaf_size, K_dim, device=device, dtype=dtype)
-        # Precompute on device before CUDAGraph capture; .to(device) inside capture is not allowed.
+        out["y_r_leaves_pad"] = torch.empty(1, MAX_NUM_LEAVES, La_o, K_dim, device=device, dtype=dtype)
+        out["y_c_leaves_pad"] = torch.empty(1, MAX_NUM_LEAVES, La_o, K_dim, device=device, dtype=dtype)
         if num_leaves < MAX_NUM_LEAVES:
             na = int(num_leaves)
             valid = ((HM_R0_CPU + HM_S_CPU) <= na) & ((HM_C0_CPU + HM_S_CPU) <= na)
@@ -1073,7 +1148,7 @@ def apply_block_diagonal_m_into(
 ):
     """
     B=1 only. Writes Mx into ``out`` (same shape as ``x``) using preallocated ``ws``.
-    Pooling uses gather–scatter (HM prolongation indices); no dense Wr/Wc matmul.
+    FMM off-diagonal: sum-pooled moments, coarse BMM, scatter, node re-projection.
     No internal tensor allocations — safe inside ``torch.cuda.graph`` replay when buffers are fixed.
     Requires leaf_apply_size == leaf_apply_off == leaf_size (no pool-down inside apply).
     """
@@ -1087,62 +1162,83 @@ def apply_block_diagonal_m_into(
     if B != 1:
         raise ValueError(f"apply_block_diagonal_m_into expects B=1, got {B}")
     num_leaves = N // leaf_size
-    La_d = leaf_apply_size
-    La_o = leaf_apply_off
+    La_d, La_o = leaf_apply_size, leaf_apply_off
     M_h = NUM_HMATRIX_OFF_BLOCKS
+
     diag_size_active = num_leaves * La_d * La_d
     diag_size_full = MAX_NUM_LEAVES * La_d * La_d
     off_size = M_h * La_o * La_o
+    node_size_full = MAX_NUM_LEAVES * leaf_size * La_o
 
     diag_blocks = precond_packed[:, :diag_size_active].view(B, num_leaves, La_d, La_d)
     x_leaves = x.view(B, num_leaves, leaf_size, K_dim)
     y_leaves = out.view(B, num_leaves, leaf_size, K_dim)
     torch.matmul(diag_blocks, x_leaves, out=y_leaves)
 
+    idx = diag_size_full
     if M_h > 0:
-        off_diag_blocks = precond_packed[:, diag_size_full : diag_size_full + off_size].view(
-            B, M_h, La_o, La_o
-        )
+        off_diag_blocks = precond_packed[:, idx : idx + off_size].view(B, M_h, La_o, La_o)
+        idx += off_size
+        node_U = precond_packed[:, idx : idx + node_size_full].view(B, MAX_NUM_LEAVES, leaf_size, La_o)
+        idx += node_size_full
+        node_V = precond_packed[:, idx : idx + node_size_full].view(B, MAX_NUM_LEAVES, leaf_size, La_o)
+        idx += node_size_full
+
         na = int(num_leaves)
         if na < MAX_NUM_LEAVES:
-            off_valid = ws["off_valid"]
-            off_diag_blocks = off_diag_blocks * off_valid
+            off_diag_blocks = off_diag_blocks * ws["off_valid"]
 
-        lc = leaf_size * K_dim
-        ws["x_flat"].zero_()
-        ws["x_flat"][:na].copy_(x_leaves[0].reshape(na, lc))
+        node_U_active = node_U[:, :na]
+        node_V_active = node_V[:, :na]
+
+        x_proj_U = torch.matmul(node_U_active.transpose(-1, -2), x_leaves)
+        x_proj_V = torch.matmul(node_V_active.transpose(-1, -2), x_leaves)
+
+        la_c = La_o * K_dim
+        ws["x_proj_U_flat"].zero_()
+        ws["x_proj_V_flat"].zero_()
+        ws["x_proj_U_flat"][:na].copy_(x_proj_U[0].reshape(na, la_c))
+        ws["x_proj_V_flat"][:na].copy_(x_proj_V[0].reshape(na, la_c))
+
         ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
-        torch.index_select(ws["x_flat"], 0, ridx, out=ws["x_gather_r"])
-        ws["row_flat"].zero_().index_add_(0, gidx, ws["x_gather_r"])
-        ws["row_flat"].mul_(ws["inv_S"])
-        torch.index_select(ws["x_flat"], 0, cidx, out=ws["x_gather_c"])
-        ws["col_flat"].zero_().index_add_(0, gidx, ws["x_gather_c"])
-        ws["col_flat"].mul_(ws["inv_S"])
+
+        torch.index_select(ws["x_proj_U_flat"], 0, ridx, out=ws["x_gather_r"])
+        ws["row_flat"].zero_()
+        ws["row_flat"].index_add_(0, gidx, ws["x_gather_r"])
+
+        torch.index_select(ws["x_proj_V_flat"], 0, cidx, out=ws["x_gather_c"])
+        ws["col_flat"].zero_()
+        ws["col_flat"].index_add_(0, gidx, ws["x_gather_c"])
+
         Br = off_diag_blocks.reshape(M_h, La_o, La_o)
         xc = ws["col_flat"].view(M_h, La_o, K_dim)
         xr = ws["row_flat"].view(M_h, La_o, K_dim)
+
         torch.bmm(Br, xc, out=ws["y_r"][0])
         torch.bmm(Br.transpose(-1, -2), xr, out=ws["y_c"][0])
-        y_r = ws["y_r"]
-        y_c = ws["y_c"]
-        torch.index_select(y_r, 1, gidx, out=ws["y_scatter_r"])
-        torch.index_select(y_c, 1, gidx, out=ws["y_scatter_c"])
-        if na < MAX_NUM_LEAVES:
-            y_pad = ws["y_leaves_pad"]
-            y_pad.zero_()
-            y_pad[0, :na].copy_(y_leaves[0])
-            y_pad.index_add_(1, ridx, ws["y_scatter_r"])
-            y_pad.index_add_(1, cidx, ws["y_scatter_c"])
-            y_leaves[0].copy_(y_pad[0, :na])
-        else:
-            y_leaves.index_add_(1, ridx, ws["y_scatter_r"])
-            y_leaves.index_add_(1, cidx, ws["y_scatter_c"])
 
-    if precond_packed.shape[1] > diag_size_full + off_size:
+        torch.index_select(ws["y_r"], 1, gidx, out=ws["y_scatter_r"])
+        torch.index_select(ws["y_c"], 1, gidx, out=ws["y_scatter_c"])
+
+        y_r_pad = ws["y_r_leaves_pad"]
+        y_c_pad = ws["y_c_leaves_pad"]
+        y_r_pad.zero_()
+        y_c_pad.zero_()
+
+        y_r_pad.index_add_(1, ridx, ws["y_scatter_r"])
+        y_c_pad.index_add_(1, cidx, ws["y_scatter_c"])
+
+        y_r_final = torch.matmul(node_U_active, y_r_pad[:, :na])
+        y_c_final = torch.matmul(node_V_active, y_c_pad[:, :na])
+        out.add_(y_r_final.view(1, N, K_dim) + y_c_final.view(1, N, K_dim))
+    else:
+        idx += 2 * node_size_full
+
+    if precond_packed.shape[1] > idx:
         if jacobi_inv_diag is None:
             raise ValueError("jacobi_inv_diag is required when jacobi_scale is present.")
         if jacobi_inv_diag.shape[:2] != (B, N):
             raise ValueError(f"jacobi_inv_diag shape {jacobi_inv_diag.shape} does not match (B,N)=({B},{N}).")
-        jacobi_scale = precond_packed[:, diag_size_full + off_size :][:, :N]
+        jacobi_scale = precond_packed[:, idx:][:, :N]
         out.addcmul_(x, (jacobi_scale * jacobi_inv_diag).unsqueeze(-1))
     return out

@@ -140,6 +140,10 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.off_diag_head_V.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.leaf_head.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.leaf_head.bias.detach().cpu().float(), transpose=False)
+        _write_packed_tensor(f, model.node_u.weight.detach().cpu().float(), transpose=True)
+        _write_packed_tensor(f, model.node_u.bias.detach().cpu().float(), transpose=False)
+        _write_packed_tensor(f, model.node_v.weight.detach().cpu().float(), transpose=True)
+        _write_packed_tensor(f, model.node_v.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.jacobi_gate.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.jacobi_gate.bias.detach().cpu().float(), transpose=False)
 
@@ -226,6 +230,10 @@ def load_leaf_only_weights(model, path):
         _read_into(f, model.off_diag_head_V.bias, read_tensor, transpose=False)
         _read_into(f, model.leaf_head.weight, read_tensor, transpose=True)
         _read_into(f, model.leaf_head.bias, read_tensor, transpose=False)
+        _read_into(f, model.node_u.weight, read_tensor, transpose=True)
+        _read_into(f, model.node_u.bias, read_tensor, transpose=False)
+        _read_into(f, model.node_v.weight, read_tensor, transpose=True)
+        _read_into(f, model.node_v.bias, read_tensor, transpose=False)
         _read_into(f, model.jacobi_gate.weight, read_tensor, transpose=True)
         _read_into(f, model.jacobi_gate.bias, read_tensor, transpose=False)
         if f.read(1):

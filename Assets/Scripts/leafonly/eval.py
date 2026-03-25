@@ -1,5 +1,6 @@
 import random
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -69,6 +70,33 @@ def _print_table(title, headers, rows):
     print(sep)
 
 
+def leafonly_grad_param_groups(model: LeafOnlyNet, num_blocks: Optional[int] = None):
+    """
+    One entry per LeafOnlyNet submodule with trainable weights, for gradient interference / Hutchinson variance.
+    Order follows the forward data path (lift → GCN → norm → enc proj → …).
+    """
+    if num_blocks is None:
+        num_blocks = len(model.blocks)
+    num_gcn = len(model.embed.gcn) if model.embed.gcn else 0
+    g = {}
+    g["Lift (linear 0)"] = lambda m: list(m.embed.lift[0].parameters())
+    g["Lift (linear 2)"] = lambda m: list(m.embed.lift[2].parameters())
+    for gi in range(num_gcn):
+        g[f"GCN layer {gi}"] = lambda m, gi=gi: list(m.embed.gcn[gi].parameters())
+    g["Embedding LayerNorm"] = lambda m: list(m.embed.norm.parameters())
+    g["Encoder input projection"] = lambda m: list(m.enc_input_proj.parameters())
+    for b in range(num_blocks):
+        g[f"Transformer block {b}"] = lambda m, b=b: list(m.blocks[b].parameters())
+    for b in range(num_blocks):
+        g[f"Off-diag Transformer block {b}"] = lambda m, b=b: list(m.off_diag_blocks[b].parameters())
+    g["Diagonal Leaf Head"] = lambda m: list(m.leaf_head.parameters())
+    g["Off-diag U/V heads"] = lambda m: list(m.off_diag_head_U.parameters()) + list(m.off_diag_head_V.parameters())
+    g["Global node U linear"] = lambda m: list(m.node_u.parameters())
+    g["Global node V linear"] = lambda m: list(m.node_v.parameters())
+    g["Jacobi params"] = lambda m: list(m.jacobi_gate.parameters())
+    return g
+
+
 def evaluate_gradient_interference(args, runtime):
     data_folder = runtime["data_folder"]
     save_path = runtime["save_path"]
@@ -123,20 +151,7 @@ def evaluate_gradient_interference(args, runtime):
         frame_indices_per_pass = [rng.choices(range(len(dataset)), k=contexts_per_step) for _ in range(num_eval)]
         print(f"Evaluating {num_eval} passes, {contexts_per_step} frames per pass (gradient accumulation like training)")
 
-    num_blocks = args.num_layers
-    num_gcn = len(model.embed.gcn) if model.embed.gcn else 0
-    param_groups = {}
-    param_groups["Lift (linear 0)"] = lambda m: list(m.embed.lift[0].parameters())
-    param_groups["Lift (linear 2)"] = lambda m: list(m.embed.lift[2].parameters())
-    for g in range(num_gcn):
-        param_groups[f"GCN layer {g}"] = lambda m, g=g: list(m.embed.gcn[g].parameters())
-    for b in range(num_blocks):
-        param_groups[f"Transformer block {b}"] = lambda m, b=b: list(m.blocks[b].parameters())
-    for b in range(num_blocks):
-        param_groups[f"Off-diag Transformer block {b}"] = lambda m, b=b: list(m.off_diag_blocks[b].parameters())
-    param_groups["Diagonal Leaf Head"] = lambda m: list(m.leaf_head.parameters())
-    param_groups["Off-diag U/V heads"] = lambda m: list(m.off_diag_head_U.parameters()) + list(m.off_diag_head_V.parameters())
-    param_groups["Jacobi params"] = lambda m: list(m.jacobi_gate.parameters())
+    param_groups = leafonly_grad_param_groups(model, num_blocks=args.num_layers)
 
     group_gradients = {name: [] for name in param_groups.keys()}
 
@@ -351,6 +366,8 @@ def evaluate_gradient_interference(args, runtime):
             off_diag_blocks_profile = torch.empty(
                 (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
             )
+        node_U_profile = model.node_u(h_diag)
+        node_V_profile = model.node_v(h_diag)
         jacobi_scale_profile = model._get_jacobi_scale(h_diag)
 
     jacobi_inv_diag_profile = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
@@ -362,18 +379,19 @@ def evaluate_gradient_interference(args, runtime):
     model.eval()
     try:
         compiled_model = torch.compile(model)
-        ms_end_to_end = _timed_ms(
-            lambda: compiled_model(
-                x_input,
-                edge_index=edge_index,
-                edge_values=edge_values,
-                global_features=global_feat,
-                precomputed_leaf_connectivity=pre_leaf,
-            ),
-            device,
-            warmup=15,
-            repeat=10,
-        )
+        with torch.inference_mode():
+            ms_end_to_end = _timed_ms(
+                lambda: compiled_model(
+                    x_input,
+                    edge_index=edge_index,
+                    edge_values=edge_values,
+                    global_features=global_feat,
+                    precomputed_leaf_connectivity=pre_leaf,
+                ),
+                device,
+                warmup=15,
+                repeat=10,
+            )
     except Exception as e:
         ms_end_to_end = None
         print(f"\nEnd-to-end torch.compile timing skipped: {e}")
@@ -382,8 +400,8 @@ def evaluate_gradient_interference(args, runtime):
 
     if ms_end_to_end is not None:
         print(
-            f"\nEnd-to-end forward (torch.compile, precomputed masks, n_pad={n_pad}): "
-            f"{ms_end_to_end:.2f} ms — same style as InspectModel 'Inference'"
+            f"\nEnd-to-end forward (torch.compile, inference_mode, precomputed masks, n_pad={n_pad}): "
+            f"{ms_end_to_end:.2f} ms — aligned with InspectModel 'Inference' (timed before BSR warmup)"
         )
 
     timing_rows = []
@@ -473,6 +491,11 @@ def evaluate_gradient_interference(args, runtime):
         ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_in, mode="off-diagonal"), device)
         timing_rows.append(["H off head (UV^T)", ms_off_head])
 
+    ms_node_u = _timed_ms(lambda: model.node_u(h_block_in), device)
+    timing_rows.append(["Global node U linear", ms_node_u])
+    ms_node_v = _timed_ms(lambda: model.node_v(h_block_in), device)
+    timing_rows.append(["Global node V linear", ms_node_v])
+
     ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_in), device)
     timing_rows.append(["Jacobi gate (node_scalar)", ms_jacobi])
 
@@ -480,7 +503,13 @@ def evaluate_gradient_interference(args, runtime):
     timing_rows.append(["A @ Z", ms_AZ])
     B_pack = diag_blocks_profile.shape[0]
     packed_profile = torch.cat(
-        [diag_blocks_profile.reshape(B_pack, -1), off_diag_blocks_profile.reshape(B_pack, -1)], dim=1
+        [
+            diag_blocks_profile.reshape(B_pack, -1),
+            off_diag_blocks_profile.reshape(B_pack, -1),
+            node_U_profile.reshape(B_pack, -1),
+            node_V_profile.reshape(B_pack, -1),
+        ],
+        dim=1,
     )
     if jacobi_scale_profile is not None:
         packed_profile = torch.cat([packed_profile, jacobi_scale_profile], dim=1)
@@ -503,6 +532,12 @@ def evaluate_gradient_interference(args, runtime):
         "Component Timing (--evaluate_gradients)",
         ["Component", "ms/call", "% of measured total"],
         timed_rows,
+    )
+    print(
+        "\nTiming coverage: per-component eager micro-benchmarks omit "
+        "build_leaf_block_connectivity, optional diag attn/edge pool, second lift linear’s GELU (no weights), "
+        "and final torch.cat of the packed preconditioner. Gradient interference uses leafonly_grad_param_groups() "
+        "so every trainable LeafOnlyNet submodule is included (embedding norm, enc_input_proj, global node U/V, …)."
     )
     if ms_end_to_end is not None:
         print(
@@ -612,12 +647,7 @@ def evaluate_estimator_variance(args, runtime):
     inv_mask = diag_A.abs() > 1e-6
     jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A[inv_mask]
 
-    param_groups = {
-        "Diagonal Leaf Head": lambda m: list(m.leaf_head.parameters()),
-        "Off-diag U/V heads": lambda m: list(m.off_diag_head_U.parameters()) + list(m.off_diag_head_V.parameters()),
-        "Transformer block 0": lambda m: list(m.blocks[0].parameters()),
-        "Off-diag Transformer block 0": lambda m: list(m.off_diag_blocks[0].parameters()),
-    }
+    param_groups = leafonly_grad_param_groups(model)
     group_gradients = {name: [] for name in param_groups.keys()}
 
     for step in range(num_samples):
@@ -663,6 +693,7 @@ def evaluate_estimator_variance(args, runtime):
             f"Noise Norm: {noise_norm:.4e} | SNR: {snr:.4f}"
         )
     print(
-        "\nIf SNR < 1.0 for Off-diag U/V heads (or off-diag block 0), probe noise may dominate the "
-        "low-rank off-diagonal signal; try more probe vectors (--probe-vectors) or a variance-reduced estimator."
+        "\nIf SNR < 1.0 for Off-diag U/V heads, global node U/V linears, or off-diag Transformer blocks, "
+        "probe noise may dominate the low-rank / FMM signal; try more probe vectors (--probe-vectors) "
+        "or a variance-reduced estimator."
     )
