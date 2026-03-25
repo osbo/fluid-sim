@@ -80,6 +80,51 @@ from leafonly.hmatrix import (
 )
 
 
+def _torch_bsr_to_scipy_csr_cpu(M: torch.Tensor) -> csr_matrix:
+    """Expand CPU ``torch.sparse_bsr`` to SciPy CSR (``to_sparse_coo`` is broken on BSR in some PyTorch builds)."""
+    crow = M.crow_indices().numpy()
+    ccol = M.col_indices().numpy()
+    vals = M.values().numpy()
+    nrows, ncols = int(M.shape[0]), int(M.shape[1])
+    n_br = crow.shape[0] - 1
+    nnz_blk = ccol.shape[0]
+    vt = M.values()
+    if vt.dim() == 3:
+        bh, bw = int(vt.shape[1]), int(vt.shape[2])
+    else:
+        # 1D packed blocks; PyTorch versions without ``Tensor.blocksize()`` (e.g. some 2.2–2.4 builds).
+        bh = nrows // n_br if n_br else 0
+        if n_br <= 0 or bh * n_br != nrows:
+            raise ValueError(f"cannot infer BSR block height from shape=({nrows},{ncols}), n_block_rows={n_br}")
+        ne = int(vt.numel())
+        if nnz_blk == 0 or ne % nnz_blk != 0:
+            raise ValueError("BSR values length inconsistent with col_indices")
+        epb = ne // nnz_blk
+        if epb % bh != 0:
+            raise ValueError(f"BSR elements-per-block {epb} not divisible by inferred bh={bh}")
+        bw = epb // bh
+        if ncols % bw != 0:
+            raise ValueError(f"BSR ncol {ncols} not divisible by inferred bw={bw}")
+        vals = vals.reshape(nnz_blk, bh, bw)
+    gr, gc = np.mgrid[0:bh, 0:bw]
+    gr = gr.ravel()
+    gc = gc.ravel()
+    row_parts: list[np.ndarray] = []
+    col_parts: list[np.ndarray] = []
+    dat_parts: list[np.ndarray] = []
+    for br in range(n_br):
+        r0 = br * bh
+        for k in range(int(crow[br]), int(crow[br + 1])):
+            c0 = int(ccol[k]) * bw
+            row_parts.append(gr + r0)
+            col_parts.append(gc + c0)
+            dat_parts.append(vals[k].ravel())
+    rows = np.concatenate(row_parts)
+    cols = np.concatenate(col_parts)
+    data = np.concatenate(dat_parts)
+    return csr_matrix((data, (rows, cols)), shape=(nrows, ncols))
+
+
 def _torch_sparse_precond_to_scipy_csr(M: torch.Tensor) -> csr_matrix:
     """Convert CPU ``torch.sparse_csr`` or ``torch.sparse_bsr`` to SciPy ``csr_matrix`` for analysis."""
     M = M.detach().cpu()
@@ -89,10 +134,7 @@ def _torch_sparse_precond_to_scipy_csr(M: torch.Tensor) -> csr_matrix:
         val = M.values().numpy()
         return csr_matrix((val, col, crow), shape=tuple(M.shape))
     if M.layout == torch.sparse_bsr:
-        Mc = M.to_sparse_coo().coalesce()
-        idx = Mc.indices().numpy()
-        val = Mc.values().numpy()
-        return csr_matrix((val, (idx[0], idx[1])), shape=tuple(M.shape))
+        return _torch_bsr_to_scipy_csr_cpu(M)
     raise TypeError(f"expected sparse_csr or sparse_bsr, got {M.layout}")
 
 
@@ -137,8 +179,10 @@ def verify_leafonly_preconditioner_spd(
     dtype = M_t.values().dtype
     for _ in range(quad_samples):
         v = torch.randn(viz_n, 1, dtype=dtype)
-        Mv = torch.sparse.mm(M_t, v)
-        q = float((v * Mv).sum())
+        # ``torch.sparse.mm`` does not support BSR on some PyTorch builds (IndexError on dim -2).
+        v_np = v.detach().numpy()
+        Mv_np = M_sp @ v_np
+        q = float((v_np * Mv_np).sum())
         if q <= 0:
             neg_q += 1
 
@@ -1138,9 +1182,28 @@ def main():
                 precomputed_leaf_connectivity=pre_leaf_connectivity,
             )
 
+        # Jacobi diagonal for BSR / padded apply (from true A diag only; independent of precond unpack).
+        jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=x_leaf.dtype)
+        diag_A_tensor = torch.from_numpy(jacobi_diag_np).to(device)
+        diag_mask = diag_A_tensor.abs() > 1e-6
+        jacobi_inv_diag[0, diag_mask] = 1.0 / diag_A_tensor[diag_mask]
+
         # Prime torch.compile / CUDA allocator; Inductor kernels also land in TORCHINDUCTOR_CACHE_DIR (see above).
         for _ in range(15):
             _fwd()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+        # First BSR build: dummy COO→BSR fills ``_BSR_TOPOLOGY_CACHE`` (not timed with inference_ms below).
+        build_sparse_bsr_preconditioner(
+            _last_out[0].detach().contiguous(),
+            viz_n,
+            leaf_L,
+            leaf_apply_diag_L,
+            leaf_apply_off_L,
+            jacobi_inv_diag[:, :viz_n].contiguous(),
+            device,
+        )
         if device.type == "cuda":
             torch.cuda.synchronize()
 
@@ -1153,10 +1216,6 @@ def main():
             leaf_apply_size=leaf_apply_diag_L,
             leaf_apply_off=leaf_apply_off_L,
         )
-        jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=diag_blocks.dtype)
-        diag_A_tensor = torch.from_numpy(jacobi_diag_np).to(device)
-        diag_mask = diag_A_tensor.abs() > 1e-6
-        jacobi_inv_diag[0, diag_mask] = 1.0 / diag_A_tensor[diag_mask]
         num_leaves = n_pad // leaf_L
         M_neural_gpu = torch.zeros((n_pad, n_pad), dtype=torch.float32, device=device)
         for b in range(num_leaves):
@@ -1275,6 +1334,7 @@ def main():
             check_freq=check_freq,
         )
 
+        # Uses cached BSR crow/col/perm from warmup build (after 15× forward); only permutes values.
         M_sparse_bsr = build_sparse_bsr_preconditioner(
             precond_s,
             viz_n,
