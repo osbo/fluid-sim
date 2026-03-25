@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -716,7 +716,7 @@ def unpack_precond(precond_packed, N, leaf_size=LEAF_SIZE, leaf_apply_size=None,
     return diag_blocks, off_diag_blocks, jacobi_scale
 
 
-def build_sparse_csr_preconditioner(
+def build_sparse_bsr_preconditioner(
     precond_packed,
     N,
     leaf_size,
@@ -727,8 +727,9 @@ def build_sparse_csr_preconditioner(
 ):
     """
     Assemble H-matrix diagonal/off blocks (unpooled), fuse optional Jacobi scaling into diagonals,
-    return CSR for SpMV ``z = M @ r``. Uses padded forward packing (``diag_size_full`` gap), same as
-    ``apply_block_diagonal_M_physical``.
+    return BSR (block size ``leaf_size``) for block SpMV ``z = M @ r``. Built with
+    ``torch.sparse_bsr_tensor`` on ``device`` (avoids PyTorch's CPU COO→BSR conversion). Uses padded
+    forward packing (``diag_size_full`` gap), same as ``apply_block_diagonal_M_physical``.
     """
     if precond_packed.dim() == 1:
         precond_packed = precond_packed.unsqueeze(0)
@@ -738,7 +739,7 @@ def build_sparse_csr_preconditioner(
     L = int(leaf_size)
     num_leaves = N // L
     if num_leaves * L != N:
-        raise ValueError(f"build_sparse_csr_preconditioner: N={N} not divisible by leaf_size={L}")
+        raise ValueError(f"build_sparse_bsr_preconditioner: N={N} not divisible by leaf_size={L}")
     La_d = int(leaf_apply_size)
     La_o = int(leaf_apply_off)
     pool_diag = L // La_d
@@ -768,9 +769,6 @@ def build_sparse_csr_preconditioner(
     else:
         jinv = jacobi_inv_diag[0, :N].to(device=device, dtype=dtype)
 
-    indices_list = []
-    values_list = []
-
     diag_b = diag_blocks[0, :num_leaves].clone()
     if pool_diag > 1:
         diag_b = diag_b.repeat_interleave(pool_diag, dim=1).repeat_interleave(pool_diag, dim=2)
@@ -781,10 +779,19 @@ def build_sparse_csr_preconditioner(
         j_scale = (jacobi_scale[0, :N] * jinv).view(num_leaves, L)
         diag_b = diag_b + torch.diag_embed(j_scale)
 
-    row_idx = torch.arange(N, device=device, dtype=torch.long).view(num_leaves, L, 1).expand(-1, -1, L)
-    col_idx = torch.arange(N, device=device, dtype=torch.long).view(num_leaves, 1, L).expand(-1, L, -1)
-    indices_list.append(torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)], dim=0))
-    values_list.append(diag_b.reshape(-1))
+    # Assemble BSR (L×L blocks) on ``device`` directly. PyTorch's COO→BSR path
+    # (``sparse_coo_tensor(...).to_sparse_bsr``) runs conversion on CPU and warns.
+    block_acc: Dict[Tuple[int, int], torch.Tensor] = {}
+
+    def _bsr_block_add(br: int, bc: int, blk: torch.Tensor) -> None:
+        k = (br, bc)
+        if k in block_acc:
+            block_acc[k] = block_acc[k] + blk
+        else:
+            block_acc[k] = blk.clone()
+
+    for k in range(num_leaves):
+        _bsr_block_add(k, k, diag_b[k])
 
     if off_diag_blocks is not None and M_h > 0:
         for i in range(M_h):
@@ -800,24 +807,33 @@ def build_sparse_csr_preconditioner(
                 oblk = oblk.repeat_interleave(rep, dim=0).repeat_interleave(rep, dim=1)
                 oblk = oblk / float(rep)
 
-            S_px = si * L
-            br0, bc0 = r0i * L, c0i * L
+            for bi in range(si):
+                for bj in range(si):
+                    piece = oblk[bi * L : (bi + 1) * L, bj * L : (bj + 1) * L]
+                    _bsr_block_add(r0i + bi, c0i + bj, piece)
+                    _bsr_block_add(c0i + bj, r0i + bi, piece.t())
 
-            r_idx_u = torch.arange(br0, br0 + S_px, device=device, dtype=torch.long).view(-1, 1).expand(-1, S_px)
-            c_idx_u = torch.arange(bc0, bc0 + S_px, device=device, dtype=torch.long).view(1, -1).expand(S_px, -1)
-            indices_list.append(torch.stack([r_idx_u.reshape(-1), c_idx_u.reshape(-1)], dim=0))
-            values_list.append(oblk.reshape(-1))
+    crow: list[int] = [0]
+    col_indices_list: list[int] = []
+    values_list: list[torch.Tensor] = []
+    for br in range(num_leaves):
+        cols_br = sorted(bc for (brow, bc) in block_acc if brow == br)
+        for bc in cols_br:
+            values_list.append(block_acc[(br, bc)])
+        crow.append(crow[-1] + len(cols_br))
+        col_indices_list.extend(cols_br)
 
-            oblk_t = oblk.t()
-            r_idx_l = torch.arange(bc0, bc0 + S_px, device=device, dtype=torch.long).view(-1, 1).expand(-1, S_px)
-            c_idx_l = torch.arange(br0, br0 + S_px, device=device, dtype=torch.long).view(1, -1).expand(S_px, -1)
-            indices_list.append(torch.stack([r_idx_l.reshape(-1), c_idx_l.reshape(-1)], dim=0))
-            values_list.append(oblk_t.reshape(-1))
-
-    all_indices = torch.cat(indices_list, dim=1)
-    all_values = torch.cat(values_list, dim=0)
-    M_coo = torch.sparse_coo_tensor(all_indices, all_values, (N, N), device=device, dtype=dtype).coalesce()
-    return M_coo.to_sparse_csr()
+    crow_indices = torch.tensor(crow, device=device, dtype=torch.int64)
+    col_indices = torch.tensor(col_indices_list, device=device, dtype=torch.int64)
+    values = torch.stack(values_list, dim=0)
+    return torch.sparse_bsr_tensor(
+        crow_indices,
+        col_indices,
+        values,
+        size=(N, N),
+        dtype=dtype,
+        device=device,
+    )
 
 
 def apply_block_diagonal_M(
