@@ -119,8 +119,29 @@ def num_hmatrix_off_blocks(num_units=None, eta=None) -> int:
 # CPU indices for apply/unpack (static layout); import from here in InspectModel / tests.
 HM_R0_CPU, HM_C0_CPU, HM_S_CPU = precompute_hmatrix_off_buffers(device=torch.device("cpu"))
 NUM_HMATRIX_OFF_BLOCKS = int(HM_R0_CPU.shape[0])
-# Same row/column strip means as forward einsum; used by apply_block_diagonal_M (no per-block GPU .item()).
+# Row/column strip mean weights for building pooled H off-diagonal token streams; sum weights below for FMM moments.
 HM_POOL_W_ROW_CPU, HM_POOL_W_COL_CPU = hm_leaf_mean_pool_weights(
+    HM_R0_CPU, HM_C0_CPU, HM_S_CPU, MAX_NUM_LEAVES
+)
+
+
+def hm_leaf_sum_pool_weights(
+    r0: torch.Tensor, c0: torch.Tensor, S: torch.Tensor, num_leaves: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M = int(r0.shape[0])
+    K = int(num_leaves)
+    W_row = torch.zeros(M, K, dtype=torch.float32)
+    W_col = torch.zeros(M, K, dtype=torch.float32)
+    r0_l, c0_l, S_l = r0.long().cpu().tolist(), c0.long().cpu().tolist(), S.long().cpu().tolist()
+    for i in range(M):
+        rr, cc, ss = r0_l[i], c0_l[i], S_l[i]
+        W_row[i, rr : rr + ss] = 1.0
+        W_col[i, cc : cc + ss] = 1.0
+    return W_row, W_col
+
+
+# Export sum weights for FMM-style pooling
+HM_SUM_W_ROW_CPU, HM_SUM_W_COL_CPU = hm_leaf_sum_pool_weights(
     HM_R0_CPU, HM_C0_CPU, HM_S_CPU, MAX_NUM_LEAVES
 )
 # Plain Python ints for strip bounds (no Tensor.item / Dynamo graph breaks in apply).
