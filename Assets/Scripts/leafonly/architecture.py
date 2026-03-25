@@ -716,6 +716,110 @@ def unpack_precond(precond_packed, N, leaf_size=LEAF_SIZE, leaf_apply_size=None,
     return diag_blocks, off_diag_blocks, jacobi_scale
 
 
+def build_sparse_csr_preconditioner(
+    precond_packed,
+    N,
+    leaf_size,
+    leaf_apply_size,
+    leaf_apply_off,
+    jacobi_inv_diag,
+    device,
+):
+    """
+    Assemble H-matrix diagonal/off blocks (unpooled), fuse optional Jacobi scaling into diagonals,
+    return CSR for SpMV ``z = M @ r``. Uses padded forward packing (``diag_size_full`` gap), same as
+    ``apply_block_diagonal_M_physical``.
+    """
+    if precond_packed.dim() == 1:
+        precond_packed = precond_packed.unsqueeze(0)
+    dtype = precond_packed.dtype
+    precond_packed = precond_packed.to(device=device, dtype=dtype).contiguous()
+
+    L = int(leaf_size)
+    num_leaves = N // L
+    if num_leaves * L != N:
+        raise ValueError(f"build_sparse_csr_preconditioner: N={N} not divisible by leaf_size={L}")
+    La_d = int(leaf_apply_size)
+    La_o = int(leaf_apply_off)
+    pool_diag = L // La_d
+    pool_off = L // La_o
+    if pool_diag * La_d != L:
+        raise ValueError(f"leaf_size {L} not divisible by leaf_apply_size {La_d}")
+    if pool_off * La_o != L:
+        raise ValueError(f"leaf_size {L} not divisible by leaf_apply_off {La_o}")
+
+    diag_size_active = num_leaves * La_d * La_d
+    diag_size_full = MAX_NUM_LEAVES * La_d * La_d
+    M_h = NUM_HMATRIX_OFF_BLOCKS
+    off_size = M_h * La_o * La_o
+
+    diag_blocks = precond_packed[:, :diag_size_active].view(1, num_leaves, La_d, La_d)
+
+    jacobi_scale = None
+    if precond_packed.shape[1] > diag_size_full + off_size:
+        jacobi_scale = precond_packed[:, diag_size_full + off_size :][:, :N]
+
+    off_diag_blocks = None
+    if M_h > 0:
+        off_diag_blocks = precond_packed[:, diag_size_full : diag_size_full + off_size].view(1, M_h, La_o, La_o)
+
+    if jacobi_inv_diag.dim() == 1:
+        jinv = jacobi_inv_diag[:N].to(device=device, dtype=dtype)
+    else:
+        jinv = jacobi_inv_diag[0, :N].to(device=device, dtype=dtype)
+
+    indices_list = []
+    values_list = []
+
+    diag_b = diag_blocks[0, :num_leaves].clone()
+    if pool_diag > 1:
+        diag_b = diag_b.repeat_interleave(pool_diag, dim=1).repeat_interleave(pool_diag, dim=2)
+        # repeat_interleave duplicates rows/cols like sum-pooling x; divide so SpMV matches mean-pool + matmul.
+        diag_b = diag_b / float(pool_diag)
+
+    if jacobi_scale is not None:
+        j_scale = (jacobi_scale[0, :N] * jinv).view(num_leaves, L)
+        diag_b = diag_b + torch.diag_embed(j_scale)
+
+    row_idx = torch.arange(N, device=device, dtype=torch.long).view(num_leaves, L, 1).expand(-1, -1, L)
+    col_idx = torch.arange(N, device=device, dtype=torch.long).view(num_leaves, 1, L).expand(-1, L, -1)
+    indices_list.append(torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)], dim=0))
+    values_list.append(diag_b.reshape(-1))
+
+    if off_diag_blocks is not None and M_h > 0:
+        for i in range(M_h):
+            r0i = int(HM_R0_CPU[i].item())
+            c0i = int(HM_C0_CPU[i].item())
+            si = int(HM_S_CPU[i].item())
+            if r0i + si > num_leaves or c0i + si > num_leaves:
+                continue
+
+            oblk = off_diag_blocks[0, i]
+            rep = si if La_o == L else max(1, (si * L) // La_o)
+            if rep > 1:
+                oblk = oblk.repeat_interleave(rep, dim=0).repeat_interleave(rep, dim=1)
+                oblk = oblk / float(rep)
+
+            S_px = si * L
+            br0, bc0 = r0i * L, c0i * L
+
+            r_idx_u = torch.arange(br0, br0 + S_px, device=device, dtype=torch.long).view(-1, 1).expand(-1, S_px)
+            c_idx_u = torch.arange(bc0, bc0 + S_px, device=device, dtype=torch.long).view(1, -1).expand(S_px, -1)
+            indices_list.append(torch.stack([r_idx_u.reshape(-1), c_idx_u.reshape(-1)], dim=0))
+            values_list.append(oblk.reshape(-1))
+
+            oblk_t = oblk.t()
+            r_idx_l = torch.arange(bc0, bc0 + S_px, device=device, dtype=torch.long).view(-1, 1).expand(-1, S_px)
+            c_idx_l = torch.arange(br0, br0 + S_px, device=device, dtype=torch.long).view(1, -1).expand(S_px, -1)
+            indices_list.append(torch.stack([r_idx_l.reshape(-1), c_idx_l.reshape(-1)], dim=0))
+            values_list.append(oblk_t.reshape(-1))
+
+    all_indices = torch.cat(indices_list, dim=1)
+    all_values = torch.cat(values_list, dim=0)
+    M_coo = torch.sparse_coo_tensor(all_indices, all_values, (N, N), device=device, dtype=dtype).coalesce()
+    return M_coo.to_sparse_csr()
+
+
 def apply_block_diagonal_M(
     precond_packed,
     x,
