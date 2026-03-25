@@ -890,7 +890,7 @@ def block_diagonal_m_apply_workspace(num_leaves: int, leaf_size: int, K_dim: int
     """Fixed buffers for apply_block_diagonal_m_into (B=1, no allocs in CUDAGraph replay)."""
     lc = leaf_size * K_dim
     t_pro = int(HM_PROLONG_GATHER_IDX.shape[0])
-    # Off-diagonal path uses Wr/Wc with MAX_NUM_LEAVES columns; pad x_flat and scatter into y_leaves_pad.
+    # Off-diagonal path: pad x_flat to MAX_NUM_LEAVES, gather–scatter pooling (no dense Wr/Wc matmul).
     n_flat = MAX_NUM_LEAVES if M_h > 0 else num_leaves
     out = {
         "x_flat": torch.empty(n_flat, lc, device=device, dtype=dtype),
@@ -900,6 +900,9 @@ def block_diagonal_m_apply_workspace(num_leaves: int, leaf_size: int, K_dim: int
         "y_c": torch.empty(1, M_h, La_o, K_dim, device=device, dtype=dtype),
         "y_scatter_r": torch.empty(1, t_pro, La_o, K_dim, device=device, dtype=dtype),
         "y_scatter_c": torch.empty(1, t_pro, La_o, K_dim, device=device, dtype=dtype),
+        "x_gather_r": torch.empty(t_pro, lc, device=device, dtype=dtype),
+        "x_gather_c": torch.empty(t_pro, lc, device=device, dtype=dtype),
+        "inv_S": (1.0 / HM_S_CPU.to(device=device, dtype=dtype)).view(M_h, 1),
     }
     if M_h > 0:
         out["y_leaves_pad"] = torch.empty(1, MAX_NUM_LEAVES, leaf_size, K_dim, device=device, dtype=dtype)
@@ -917,14 +920,13 @@ def apply_block_diagonal_m_into(
     out,
     jacobi_inv_diag,
     ws,
-    Wr,
-    Wc,
     leaf_size=LEAF_SIZE,
     leaf_apply_size=None,
     leaf_apply_off=None,
 ):
     """
-    B=1 only. Writes Mx into ``out`` (same shape as ``x``) using preallocated ``ws`` and device ``Wr,Wc``.
+    B=1 only. Writes Mx into ``out`` (same shape as ``x``) using preallocated ``ws``.
+    Pooling uses gather–scatter (HM prolongation indices); no dense Wr/Wc matmul.
     No internal tensor allocations — safe inside ``torch.cuda.graph`` replay when buffers are fixed.
     Requires leaf_apply_size == leaf_apply_off == leaf_size (no pool-down inside apply).
     """
@@ -962,8 +964,13 @@ def apply_block_diagonal_m_into(
         lc = leaf_size * K_dim
         ws["x_flat"].zero_()
         ws["x_flat"][:na].copy_(x_leaves[0].reshape(na, lc))
-        torch.matmul(Wr, ws["x_flat"], out=ws["row_flat"])
-        torch.matmul(Wc, ws["x_flat"], out=ws["col_flat"])
+        ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
+        torch.index_select(ws["x_flat"], 0, ridx, out=ws["x_gather_r"])
+        ws["row_flat"].zero_().index_add_(0, gidx, ws["x_gather_r"])
+        ws["row_flat"].mul_(ws["inv_S"])
+        torch.index_select(ws["x_flat"], 0, cidx, out=ws["x_gather_c"])
+        ws["col_flat"].zero_().index_add_(0, gidx, ws["x_gather_c"])
+        ws["col_flat"].mul_(ws["inv_S"])
         Br = off_diag_blocks.reshape(M_h, La_o, La_o)
         xc = ws["col_flat"].view(M_h, La_o, K_dim)
         xr = ws["row_flat"].view(M_h, La_o, K_dim)
@@ -971,7 +978,6 @@ def apply_block_diagonal_m_into(
         torch.bmm(Br.transpose(-1, -2), xr, out=ws["y_c"][0])
         y_r = ws["y_r"]
         y_c = ws["y_c"]
-        ridx, cidx, gidx = _hm_prolong_scatter_indices(x.device)
         torch.index_select(y_r, 1, gidx, out=ws["y_scatter_r"])
         torch.index_select(y_c, 1, gidx, out=ws["y_scatter_c"])
         if na < MAX_NUM_LEAVES:
