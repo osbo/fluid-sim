@@ -14,8 +14,9 @@ plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. If σ_k
 those indices, increase apply rank or decrease ``HMATRIX_ETA`` for smaller tiles.
 
 Block-wise band summary (``profile_blockwise_preconditioner_spectral_bands``): on-diagonal κ only;
-off-diagonal uses pooled Frobenius misfit and SVD tail / rank-cap ratios (κ is omitted as misleading
-when σ_min is at roundoff).
+off-diagonal reports SVD tail ratios and **Frobenius tail-energy** past ``leaf_apply_off`` (fraction of
+``Σ σ_i²`` in singular modes at index ≥ r; low ⇒ most energy in the first r directions). The H-matrix
+rank profiler plots σ_k/σ_0 and σ[r]/σ[0] on **A^-1** samples only; it does not print cumulative tail energy.
 """
 import argparse
 import sys
@@ -314,17 +315,18 @@ def profile_blockwise_preconditioner_spectral_bands(
     leaf_apply_off: int,
 ):
     """
-    HM band report (same tiling as rank profiler). Global scale c minimizes ||A^-1 - c M||_F.
+    HM band report (same tiling as rank profiler). Global scale c minimizes ||A^-1 - c M||_F (for scaling M).
 
     On-diagonal leaf blocks: κ = σ_max/σ_min (interpretable; blocks are usually full numerical rank).
 
-    Off-diagonal: κ omitted — true A^-1 tiles are often numerically low-rank (σ_min ~ roundoff), so
-    κ explodes without meaning. Instead: pooled relative Frobenius misfit, σ_last/σ_0, and σ_r/σ_0
-    at r = leaf_apply_off when that index exists (same idea as the rank profiler).
+    Off-diagonal: κ omitted — σ_min can hit roundoff. Reports SVD tail ratios, σ[rank_cap]/σ_0, and
+    **tail energy** ``(Σ_{i≥r} σ_i²) / (Σ_i σ_i²)`` for A^-1 and c·M (r = ``leaf_apply_off``): low means
+    most Frobenius mass lives in the first r singular directions; high means substantial energy beyond the
+    model’s rank budget.
     """
     print("\n=== Block-wise preconditioner vs A^-1 (by HM band) ===")
     print(
-        "On-diagonal: κ(2-norm). Off-diagonal: Frobenius misfit + SVD tail/cap (not κ). "
+        "On-diagonal: κ(2-norm). Off-diagonal: SVD tail + tail-energy past rank cap (not κ). "
         "M scaled by c minimizing ||A^-1 - c M||_F."
     )
 
@@ -381,22 +383,30 @@ def profile_blockwise_preconditioner_spectral_bands(
             return tail, float(s[rank_cap] / s0)
         return tail, None
 
+    def _svd_tail_energy_frac(s: np.ndarray, rank_cap: int) -> float:
+        """Fraction of Frobenius energy in singular modes with index ≥ rank_cap: Σ_{i≥r} σ_i² / Σ_i σ_i²."""
+        s = np.maximum(np.asarray(s, dtype=np.float64), 0.0)
+        if s.size == 0:
+            return float("nan")
+        den = float(np.sum(s**2)) + 1e-30
+        if rank_cap >= s.size:
+            return 0.0
+        return float(np.sum(s[rank_cap:] ** 2) / den)
+
     for S in sorted(off_by_S.keys(), reverse=True):
         pairs = off_by_S[S]
         pix = S * L
-        err_sq = 0.0
-        norm_sq = 0.0
         tail_a: list[float] = []
         tail_m: list[float] = []
         cap_a: list[float] = []
         cap_m: list[float] = []
+        et_a: list[float] = []
+        et_m: list[float] = []
         for r0, c0, _ in pairs:
             rs = slice(r0 * L, (r0 + S) * L)
             cs = slice(c0 * L, (c0 + S) * L)
             A_blk = A_inv[rs, cs]
             M_blk = M_scaled[rs, cs]
-            err_sq += float(np.sum((A_blk - M_blk) ** 2))
-            norm_sq += float(np.sum(A_blk**2))
             _sa = np.linalg.svd(A_blk, full_matrices=False, compute_uv=False)
             _sm = np.linalg.svd(M_blk, full_matrices=False, compute_uv=False)
             ta, ca = _svd_tail_cap(_sa, r_off)
@@ -409,15 +419,22 @@ def profile_blockwise_preconditioner_spectral_bands(
                 cap_a.append(ca)
             if cm is not None:
                 cap_m.append(cm)
+            et_a.append(_svd_tail_energy_frac(_sa, r_off))
+            et_m.append(_svd_tail_energy_frac(_sm, r_off))
 
-        rel_frob = np.sqrt(err_sq) / (np.sqrt(norm_sq) + 1e-16)
         _, tmn_a, tmed_a, tmean_a, tmx_a = _finite_scalar_stats(tail_a)
         _, tmn_m, tmed_m, tmean_m, tmx_m = _finite_scalar_stats(tail_m)
         nc_a, cmn_a, cmed_a, cmean_a, cmx_a = _finite_scalar_stats(cap_a)
         nc_m, cmn_m, cmed_m, cmean_m, cmx_m = _finite_scalar_stats(cap_m)
+        _, emn_a, emed_a, emean_a, emx_a = _finite_scalar_stats(et_a)
+        _, emn_m, emed_m, emean_m, emx_m = _finite_scalar_stats(et_m)
 
         print(f"\nOff-diagonal S={S} ({pix}×{pix}), {len(pairs)} tile(s)")
-        print(f"  Pooled rel. Frobenius misfit ||A^-1 - c·M||_F / ||A^-1||_F: {rel_frob * 100:.2f}%")
+        print(
+            f"  Tail energy (Σ_i≥{r_off} σ_i²)/(Σ σ_i²)  A^-1: min={emn_a} median={emed_a} mean={emean_a} max={emx_a}\n"
+            f"                                      c·M: min={emn_m} median={emed_m} mean={emean_m} max={emx_m}\n"
+            f"  (low ⇒ most mass in first {r_off} singular directions; high ⇒ energy beyond rank budget)"
+        )
         print(
             f"  σ_last/σ_0:  A^-1  min={tmn_a} median={tmed_a} mean={tmean_a} max={tmx_a}\n"
             f"               c·M   min={tmn_m} median={tmed_m} mean={tmean_m} max={tmx_m}"
@@ -529,7 +546,9 @@ def _hmatrix_rank_profiler_bands(
 def _print_hmatrix_rank_profiler(bands: list[dict], eta: float, max_plot_bands: int = 5) -> None:
     print("\n=== H-Matrix Rank Profiler ===")
     print(
-        "True dense A^-1; blocks from HM_R0_CPU / HM_C0_CPU (weak admissibility). "
+        "True dense A^-1 only (no M); blocks from HM_R0_CPU / HM_C0_CPU (weak admissibility). "
+        "Plots σ_k/σ_0 vs index; reports σ[r]/σ[0] at r = leaf_apply_* and σ_last/σ[0]. "
+        "Cumulative tail Frobenius fraction (Σ_{i≥r} σ_i²)/(Σ σ_i²) is in the block-wise band report. "
         "If σ_k/σ_0 at k = leaf_apply_* is not small, raise leaf_apply_* or decrease HMATRIX_ETA (smaller tiles)."
     )
     print(f"HMATRIX_ETA={eta}")
