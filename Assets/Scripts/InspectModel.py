@@ -61,10 +61,8 @@ import torch.nn.functional as F
 from leafonly import (
     LeafOnlyNet,
     load_leaf_only_weights,
-    apply_block_diagonal_m_into,
     apply_block_diagonal_M,
-    apply_block_diagonal_M_physical,
-    block_diagonal_m_apply_workspace,
+    build_sparse_csr_preconditioner,
     default_attention_layout,
     unpack_precond,
     FluidGraphDataset,
@@ -557,117 +555,70 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
     return x, iters, wall_ms
 
 
-def pcg_gpu_cudagraph(
+def pcg_gpu_cudagraph_csr(
     A_gpu,
     b_gpu,
-    precond_packed,
-    jacobi_inv_diag,
+    M_sparse_csr,
     tol=1e-8,
     max_iter=500,
     device=None,
     check_freq=3,
-    leaf_size=None,
-    leaf_apply_size=None,
-    leaf_apply_off=None,
 ):
     """
-    PCG on CUDA with a single captured graph per iteration.
+    PCG using CSR SpMV for ``z = M @ r``, with one iteration captured in a CUDA Graph.
 
-    Uses ``apply_block_diagonal_m_into`` (fixed scratch buffers, B=1) so replay does not
-    allocate. Requires ``leaf_apply_size == leaf_apply_off == leaf_size`` (no pooled apply).
+    ``M_sparse_csr`` must keep the same shape and sparsity pattern across replays. ``A_gpu`` should be
+    CSR for best performance. After capture, state is reset so replays start from the true initial iterate.
     """
     if device is None:
         device = b_gpu.device
     if device.type != "cuda":
-        raise ValueError("pcg_gpu_cudagraph requires CUDA")
-    if leaf_size is None:
-        leaf_size = LEAF_SIZE
-    if leaf_apply_size is None:
-        leaf_apply_size = leaf_size
-    if leaf_apply_off is None:
-        leaf_apply_off = leaf_apply_size
-    if leaf_apply_size != leaf_size or leaf_apply_off != leaf_size:
-        raise ValueError(
-            "pcg_gpu_cudagraph requires leaf_apply_size == leaf_apply_off == leaf_size; "
-            "use pcg_gpu with torch.compile(apply) for pooled layouts."
-        )
-
-    if precond_packed.dim() == 1:
-        precond_packed = precond_packed.unsqueeze(0)
-    precond_packed = precond_packed.contiguous()
-    jacobi_inv_diag_2d = jacobi_inv_diag if jacobi_inv_diag.dim() == 2 else jacobi_inv_diag.unsqueeze(0)
-    jacobi_inv_diag_2d = jacobi_inv_diag_2d.contiguous()
-
-    n, k_dim = b_gpu.shape[0], b_gpu.shape[1]
-    if jacobi_inv_diag_2d.shape[1] != n:
-        if jacobi_inv_diag_2d.shape[1] < n:
-            raise ValueError(
-                f"jacobi_inv_diag length {jacobi_inv_diag_2d.shape[1]} < PCG n={n}"
-            )
-        # Packed precond / Jacobi are built on MAX_MIXED_SIZE; physical PCG uses n < n_pad.
-        jacobi_inv_diag_2d = jacobi_inv_diag_2d[:, :n].contiguous()
-
-    num_leaves = n // leaf_size
-    if num_leaves * leaf_size != n:
-        raise ValueError(f"b_gpu length {n} not divisible by leaf_size {leaf_size}")
+        raise ValueError("pcg_gpu_cudagraph_csr requires CUDA")
 
     dtype = b_gpu.dtype
-    # Full (M_h, MAX_NUM_LEAVES); apply_block_diagonal_m_into zero-pads x_flat when num_leaves < MAX.
-    ws = block_diagonal_m_apply_workspace(
-        num_leaves, leaf_size, k_dim, NUM_HMATRIX_OFF_BLOCKS, leaf_apply_off, device, dtype
-    )
-
     x_static = torch.zeros_like(b_gpu)
-    r_static = torch.zeros_like(b_gpu)
-    p_static = torch.zeros_like(b_gpu)
+    r_static = b_gpu.clone()
     z_static = torch.zeros_like(b_gpu)
+    z_static.copy_(M_sparse_csr @ r_static)
+    p_static = z_static.clone()
     rho_static = torch.zeros(1, device=device, dtype=dtype)
-
-    r_b1 = r_static.unsqueeze(0)
-    z_b1 = z_static.unsqueeze(0)
-
-    x_static.zero_()
-    r_static.copy_(b_gpu)
-    apply_block_diagonal_m_into(
-        precond_packed,
-        r_b1,
-        z_b1,
-        jacobi_inv_diag_2d,
-        ws,
-        leaf_size=leaf_size,
-        leaf_apply_size=leaf_apply_size,
-        leaf_apply_off=leaf_apply_off,
-    )
-    p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
 
     tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
 
     def one_iter():
-        Ap = A_gpu @ p_static.squeeze(-1)
-        Ap = Ap.unsqueeze(-1)
+        Ap = A_gpu @ p_static
         pAp = (p_static * Ap).sum()
         alpha = rho_static / pAp
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
-        apply_block_diagonal_m_into(
-            precond_packed,
-            r_b1,
-            z_b1,
-            jacobi_inv_diag_2d,
-            ws,
-            leaf_size=leaf_size,
-            leaf_apply_size=leaf_apply_size,
-            leaf_apply_off=leaf_apply_off,
-        )
+        z_static.copy_(M_sparse_csr @ r_static)
         rho_new = (r_static * z_static).sum()
         beta = rho_new / rho_static
         rho_static.fill_(rho_new)
         p_static.mul_(beta).add_(z_static)
 
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        one_iter()
+    try:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            one_iter()
+    except RuntimeError:
+        return pcg_gpu(
+            A_gpu,
+            b_gpu,
+            lambda r: M_sparse_csr @ r,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+
+    # ``one_iter`` ran once during capture; restore true PCG initial state before replay.
+    x_static.zero_()
+    r_static.copy_(b_gpu)
+    z_static.copy_(M_sparse_csr @ r_static)
+    p_static.copy_(z_static)
+    rho_static.fill_((r_static * z_static).sum())
 
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
@@ -1162,19 +1113,6 @@ def main():
     jacobi_s = jacobi_inv_diag.detach().contiguous()
     jacobi_s_phys = jacobi_s[:, :viz_n].contiguous()
 
-    def apply_M_block_diag(r):
-        # True physical apply: no padding to MAX_MIXED_SIZE inside PCG (see apply_block_diagonal_M_physical).
-        r_batched = r.unsqueeze(0)
-        out = apply_block_diagonal_M_physical(
-            precond_s,
-            r_batched,
-            leaf_size=leaf_L,
-            leaf_apply_size=leaf_apply_diag_L,
-            leaf_apply_off=leaf_apply_off_L,
-            jacobi_inv_diag=jacobi_s_phys,
-        )
-        return out.squeeze(0)
-
     A_f64 = A_viz_n.astype(np.float64)
     leaf_rel_res = float("nan")
     with torch.inference_mode():
@@ -1223,52 +1161,45 @@ def main():
             check_freq=check_freq,
         )
 
-        use_leaf_cudagraph = (
-            device.type == "cuda"
-            and pool_diag_to_full == 1
-            and pool_off_to_full == 1
+        M_sparse_csr = build_sparse_csr_preconditioner(
+            precond_s,
+            viz_n,
+            leaf_L,
+            leaf_apply_diag_L,
+            leaf_apply_off_L,
+            jacobi_s_phys,
+            device,
         )
-        if use_leaf_cudagraph:
-            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph(
+
+        if device.type == "cuda":
+            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph_csr(
                 A_gpu,
                 b_gpu,
-                precond_s,
-                jacobi_s,
+                M_sparse_csr,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=check_freq,
-                leaf_size=leaf_L,
-                leaf_apply_size=leaf_apply_diag_L,
-                leaf_apply_off=leaf_apply_off_L,
             )
             _info(
-                "  LeafOnly PCG: CUDAGraph replay (preconditioner apply in-graph, fixed buffers"
-                + (f"; physical n={viz_n}" if viz_n != n_pad else "")
-                + ")"
+                "  LeafOnly PCG: CUDAGraph + CSR preconditioner SpMV (z.copy_(M @ r))"
+                + (f"; n={viz_n}" if viz_n != n_pad else "")
             )
         else:
-            apply_pcg = apply_M_block_diag
-            if device.type == "cuda":
-                apply_pcg = torch.compile(apply_M_block_diag, fullgraph=False)
-                torch.cuda.synchronize()
-                wu = torch.zeros_like(b_gpu)
-                for _ in range(12):
-                    _ = apply_pcg(wu)
-                torch.cuda.synchronize()
-                _info(
-                    "  LeafOnly PCG: preconditioner apply torch.compile(d) "
-                    "(pooled leaf apply — CUDAGraph requires full-resolution diag/off pools)"
-                )
+
+            def apply_pcg_fast(r):
+                return M_sparse_csr @ r
+
             x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
                 A_gpu,
                 b_gpu,
-                apply_pcg,
+                apply_pcg_fast,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=check_freq,
             )
+            _info("  LeafOnly PCG: CSR preconditioner + pcg_gpu (no CUDA graph on this device)")
 
         _bf = b_gpu.squeeze(-1)
         _Ax = A_gpu @ x_gpu.squeeze(-1)
