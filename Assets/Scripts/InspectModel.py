@@ -75,8 +75,6 @@ from leafonly.checkpoint import read_leaf_only_header
 from leafonly.config import HMATRIX_ETA, LEAF_SIZE, MAX_MIXED_SIZE
 from leafonly.hmatrix import (
     HM_C0_CPU,
-    HM_POOL_W_COL_CPU,
-    HM_POOL_W_ROW_CPU,
     HM_R0_CPU,
     HM_S_CPU,
     NUM_HMATRIX_OFF_BLOCKS,
@@ -615,8 +613,6 @@ def pcg_gpu_cudagraph(
 
     dtype = b_gpu.dtype
     # Full (M_h, MAX_NUM_LEAVES); apply_block_diagonal_m_into zero-pads x_flat when num_leaves < MAX.
-    Wr = HM_POOL_W_ROW_CPU.to(device=device, dtype=dtype).contiguous()
-    Wc = HM_POOL_W_COL_CPU.to(device=device, dtype=dtype).contiguous()
     ws = block_diagonal_m_apply_workspace(
         num_leaves, leaf_size, k_dim, NUM_HMATRIX_OFF_BLOCKS, leaf_apply_off, device, dtype
     )
@@ -638,8 +634,6 @@ def pcg_gpu_cudagraph(
         z_b1,
         jacobi_inv_diag_2d,
         ws,
-        Wr,
-        Wc,
         leaf_size=leaf_size,
         leaf_apply_size=leaf_apply_size,
         leaf_apply_off=leaf_apply_off,
@@ -662,8 +656,6 @@ def pcg_gpu_cudagraph(
             z_b1,
             jacobi_inv_diag_2d,
             ws,
-            Wr,
-            Wc,
             leaf_size=leaf_size,
             leaf_apply_size=leaf_apply_size,
             leaf_apply_off=leaf_apply_off,
