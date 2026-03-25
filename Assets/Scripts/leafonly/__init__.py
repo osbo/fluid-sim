@@ -4,7 +4,7 @@ from .architecture import (
     apply_block_diagonal_M,
     apply_block_diagonal_M_physical,
     block_diagonal_m_apply_workspace,
-    build_sparse_csr_preconditioner,
+    build_sparse_bsr_preconditioner,
     attention_layout_choices,
     default_attention_layout,
     next_valid_size,

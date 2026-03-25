@@ -37,7 +37,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch, Rectangle
 from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import spilu
+from scipy.sparse.linalg import eigsh, norm as sparse_norm, spilu
 
 try:
     import pyamg
@@ -62,7 +62,7 @@ from leafonly import (
     LeafOnlyNet,
     load_leaf_only_weights,
     apply_block_diagonal_M,
-    build_sparse_csr_preconditioner,
+    build_sparse_bsr_preconditioner,
     default_attention_layout,
     unpack_precond,
     FluidGraphDataset,
@@ -78,6 +78,109 @@ from leafonly.hmatrix import (
     NUM_HMATRIX_OFF_BLOCKS,
     standard_admissible_unique_blocks,
 )
+
+
+def _torch_sparse_precond_to_scipy_csr(M: torch.Tensor) -> csr_matrix:
+    """Convert CPU ``torch.sparse_csr`` or ``torch.sparse_bsr`` to SciPy ``csr_matrix`` for analysis."""
+    M = M.detach().cpu()
+    if M.layout == torch.sparse_csr:
+        crow = M.crow_indices().numpy()
+        col = M.col_indices().numpy()
+        val = M.values().numpy()
+        return csr_matrix((val, col, crow), shape=tuple(M.shape))
+    if M.layout == torch.sparse_bsr:
+        Mc = M.to_sparse_coo().coalesce()
+        idx = Mc.indices().numpy()
+        val = Mc.values().numpy()
+        return csr_matrix((val, (idx[0], idx[1])), shape=tuple(M.shape))
+    raise TypeError(f"expected sparse_csr or sparse_bsr, got {M.layout}")
+
+
+def verify_leafonly_preconditioner_spd(
+    M_sparse_torch: torch.Tensor,
+    viz_n: int,
+    *,
+    sym_rtol: float = 1e-3,
+    min_eig_floor: float = -5e-2,
+    n_dense_max: int = 3000,
+    quad_samples: int = 48,
+    print_fn=print,
+) -> None:
+    """
+    Check whether the LeafOnly sparse preconditioner ``M`` (CSR or BSR, the PCG operator) is numerically
+    symmetric and whether its symmetrization ``S = (M + M^T) / 2`` is positive definite enough for CG theory.
+
+    - Symmetry: relative Frobenius ``||M - S||_F / ||M||_F``.
+    - Spectrum of ``S``: full ``eigvalsh`` if ``viz_n <= n_dense_max``, else a few Lanczos steps via
+      ``eigsh`` (may miss pathological interior modes).
+    - Heuristic: fraction of random samples with ``v^T M v <= 0`` (necessary for true PD of the action
+      on those directions).
+    """
+    M_t = M_sparse_torch.detach().cpu()
+    if M_t.layout not in (torch.sparse_csr, torch.sparse_bsr):
+        print_fn(f"  LeafOnly SPD check: skipped (expected sparse CSR/BSR, got {M_t.layout})")
+        return
+
+    M_sp = _torch_sparse_precond_to_scipy_csr(M_t)
+    S = (M_sp + M_sp.T) * 0.5
+    diff = M_sp - S
+    try:
+        nM = sparse_norm(M_sp, "fro")
+        nd = sparse_norm(diff, "fro")
+    except Exception:
+        nM = float(np.sqrt(M_sp.power(2).sum()))
+        nd = float(np.sqrt(diff.power(2).sum()))
+    sym_rel = float(nd / (float(nM) + 1e-30))
+
+    torch.manual_seed(0)
+    neg_q = 0
+    dtype = M_t.values().dtype
+    for _ in range(quad_samples):
+        v = torch.randn(viz_n, 1, dtype=dtype)
+        Mv = torch.sparse.mm(M_t, v)
+        q = float((v * Mv).sum())
+        if q <= 0:
+            neg_q += 1
+
+    layout_tag = "BSR" if M_t.layout == torch.sparse_bsr else "CSR"
+    print_fn(
+        f"  LeafOnly preconditioner SPD check ({layout_tag} in PCG, n={viz_n}): "
+        f"||M-S||_F/||M||_F={sym_rel:.3e} with S=(M+M^T)/2; "
+        f"v^T M v ≤ 0 for {neg_q}/{quad_samples} random v"
+    )
+
+    lam_min = lam_max = float("nan")
+    if viz_n <= n_dense_max:
+        w = np.linalg.eigvalsh(S.toarray())
+        lam_min, lam_max = float(w[0]), float(w[-1])
+        cond_est = lam_max / max(abs(lam_min), 1e-30)
+        print_fn(
+            f"    Symmetrized S: λ_min={lam_min:.6e}, λ_max={lam_max:.6e}, λ_max/|λ_min|≈{cond_est:.3e}"
+        )
+    else:
+        maxiter = min(8000, max(200, 40 * viz_n))
+        try:
+            lam_min = float(eigsh(S, k=1, which="SA", tol=1e-3, maxiter=maxiter, return_eigenvectors=False)[0])
+        except Exception as ex:
+            print_fn(f"    eigsh(S, which='SA') failed: {ex}")
+        try:
+            lam_max = float(eigsh(S, k=1, which="LA", tol=1e-3, maxiter=maxiter, return_eigenvectors=False)[0])
+        except Exception as ex:
+            print_fn(f"    eigsh(S, which='LA') failed: {ex}")
+        if not np.isnan(lam_min) and not np.isnan(lam_max):
+            print_fn(f"    Symmetrized S (Lanczos): λ_min≈{lam_min:.6e}, λ_max≈{lam_max:.6e}")
+
+    sym_ok = sym_rel < sym_rtol
+    eig_ok = not np.isnan(lam_min) and lam_min > min_eig_floor
+    verdict = sym_ok and eig_ok
+    quad_note = "all random v^T M v > 0" if neg_q == 0 else f"{neg_q} samples with v^T M v ≤ 0 (indefinite directions possible)"
+    print_fn(
+        "    Verdict: "
+        + ("PASS " if verdict else "FAIL ")
+        + f"for symmetrized S being near-SPD (sym_rel<{sym_rtol:g}, λ_min>{min_eig_floor:g}); "
+        + quad_note
+        + ". Standard PCG assumes a fixed SPD preconditioner; nonsymmetric M can still work in practice."
+    )
 
 
 def _draw_hmatrix_weak_partition_ax(ax, grid_size: int, leaf_size: int, eta: float) -> None:
@@ -555,31 +658,32 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
     return x, iters, wall_ms
 
 
-def pcg_gpu_cudagraph_csr(
+def pcg_gpu_cudagraph_bsr(
     A_gpu,
     b_gpu,
-    M_sparse_csr,
+    M_sparse_bsr,
     tol=1e-8,
     max_iter=500,
     device=None,
     check_freq=3,
 ):
     """
-    PCG using CSR SpMV for ``z = M @ r``, with one iteration captured in a CUDA Graph.
+    PCG using sparse block-row ``M`` (BSR from ``build_sparse_bsr_preconditioner``) for ``z = M @ r``,
+    with one iteration captured in a CUDA Graph.
 
-    ``M_sparse_csr`` must keep the same shape and sparsity pattern across replays. ``A_gpu`` should be
-    CSR for best performance. After capture, state is reset so replays start from the true initial iterate.
+    ``M_sparse_bsr`` must keep the same shape and block sparsity pattern across replays. ``A_gpu`` should
+    be CSR for best performance. After capture, state is reset so replays start from the true initial iterate.
     """
     if device is None:
         device = b_gpu.device
     if device.type != "cuda":
-        raise ValueError("pcg_gpu_cudagraph_csr requires CUDA")
+        raise ValueError("pcg_gpu_cudagraph_bsr requires CUDA")
 
     dtype = b_gpu.dtype
     x_static = torch.zeros_like(b_gpu)
     r_static = b_gpu.clone()
     z_static = torch.zeros_like(b_gpu)
-    z_static.copy_(M_sparse_csr @ r_static)
+    z_static.copy_(M_sparse_bsr @ r_static)
     p_static = z_static.clone()
     rho_static = torch.zeros(1, device=device, dtype=dtype)
     rho_static.fill_((r_static * z_static).sum())
@@ -592,11 +696,21 @@ def pcg_gpu_cudagraph_csr(
         alpha = rho_static / pAp
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
-        z_static.copy_(M_sparse_csr @ r_static)
+        z_static.copy_(M_sparse_bsr @ r_static)
         rho_new = (r_static * z_static).sum()
         beta = rho_new / rho_static
         rho_static.fill_(rho_new)
         p_static.mul_(beta).add_(z_static)
+
+    n = int(b_gpu.shape[0])
+    # cuSPARSE may allocate on first SpMV per matrix; do that outside capture, immediately before graph.
+    torch.cuda.synchronize()
+    z_static.copy_(M_sparse_bsr @ r_static)
+    if getattr(A_gpu, "layout", None) == torch.sparse_csr:
+        _ = torch.sparse.mm(A_gpu, p_static.view(n, 1))
+    else:
+        _ = A_gpu @ p_static
+    torch.cuda.synchronize()
 
     try:
         g = torch.cuda.CUDAGraph()
@@ -606,7 +720,7 @@ def pcg_gpu_cudagraph_csr(
         return pcg_gpu(
             A_gpu,
             b_gpu,
-            lambda r: M_sparse_csr @ r,
+            lambda r: M_sparse_bsr @ r,
             tol=tol,
             max_iter=max_iter,
             device=device,
@@ -616,7 +730,7 @@ def pcg_gpu_cudagraph_csr(
     # ``one_iter`` ran once during capture; restore true PCG initial state before replay.
     x_static.zero_()
     r_static.copy_(b_gpu)
-    z_static.copy_(M_sparse_csr @ r_static)
+    z_static.copy_(M_sparse_bsr @ r_static)
     p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
 
@@ -1161,7 +1275,7 @@ def main():
             check_freq=check_freq,
         )
 
-        M_sparse_csr = build_sparse_csr_preconditioner(
+        M_sparse_bsr = build_sparse_bsr_preconditioner(
             precond_s,
             viz_n,
             leaf_L,
@@ -1171,24 +1285,26 @@ def main():
             device,
         )
 
+        verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
+
         if device.type == "cuda":
-            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph_csr(
+            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph_bsr(
                 A_gpu,
                 b_gpu,
-                M_sparse_csr,
+                M_sparse_bsr,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=check_freq,
             )
             _info(
-                "  LeafOnly PCG: CUDAGraph + CSR preconditioner SpMV (z.copy_(M @ r))"
+                "  LeafOnly PCG: CUDAGraph + BSR preconditioner (z.copy_(M @ r))"
                 + (f"; n={viz_n}" if viz_n != n_pad else "")
             )
         else:
 
             def apply_pcg_fast(r):
-                return M_sparse_csr @ r
+                return M_sparse_bsr @ r
 
             x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
                 A_gpu,
@@ -1199,7 +1315,7 @@ def main():
                 device=device,
                 check_freq=check_freq,
             )
-            _info("  LeafOnly PCG: CSR preconditioner + pcg_gpu (no CUDA graph on this device)")
+            _info("  LeafOnly PCG: BSR preconditioner + pcg_gpu (no CUDA graph on this device)")
 
         _bf = b_gpu.squeeze(-1)
         _Ax = A_gpu @ x_gpu.squeeze(-1)
