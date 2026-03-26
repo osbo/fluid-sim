@@ -407,6 +407,13 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = attn_module
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden),
+            nn.GELU(),
+            nn.Linear(mlp_hidden, dim),
+        )
 
     def forward(self, x, edge_index=None, edge_values=None, positions=None, save_attention=False, attn_mask=None, edge_feats=None):
         x = x + self.attn(
@@ -418,6 +425,7 @@ class TransformerBlock(nn.Module):
             attn_mask=attn_mask,
             edge_feats=edge_feats,
         )
+        x = x + self.mlp(self.norm2(x))
         return x
 
 

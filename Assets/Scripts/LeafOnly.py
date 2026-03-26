@@ -67,6 +67,17 @@ def _build_parser():
             "loss.backward() only and print top CUDA kernels (self time vs total time). CUDA only."
         ),
     )
+    parser.add_argument(
+        "--leafonly-pcg",
+        type=str,
+        choices=("bsr", "matrix_free"),
+        default="bsr",
+        help=(
+            "How to apply M in the probe loss (AZ then MAZ): both use batched apply_block_diagonal_M "
+            "(same operator as InspectModel’s expanded M; autograd cannot use BSR sparse.mm). "
+            "bsr = default, eager apply; matrix_free = torch.compile on bmm + apply (faster on CUDA)."
+        ),
+    )
     return parser
 
 
