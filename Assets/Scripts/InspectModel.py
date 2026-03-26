@@ -57,7 +57,8 @@ import torch.nn.functional as F
 from leafonly import (
     LeafOnlyNet,
     load_leaf_only_weights,
-    apply_block_diagonal_M,
+    apply_block_diagonal_m_into,
+    block_diagonal_m_apply_workspace,
     build_sparse_bsr_preconditioner,
     default_attention_layout,
     unpack_precond,
@@ -642,6 +643,103 @@ def pcg_gpu_cudagraph_bsr(
     return x_static.clone(), iters, wall_ms
 
 
+def pcg_gpu_cudagraph_matrix_free(
+    A_gpu,
+    b_gpu,
+    apply_precond_into,
+    tol=1e-8,
+    max_iter=500,
+    device=None,
+    check_freq=3,
+):
+    """
+    Matrix-free PCG ``z = M @ r`` with one iteration captured in a CUDA Graph.
+    ``apply_precond_into(r, z_out)`` must write in-place into ``z_out`` without allocations.
+    ``A_gpu`` should be CSR for best performance. After capture, state is reset so replays
+    start from the true initial iterate.
+    """
+    if device is None:
+        device = b_gpu.device
+    if device.type != "cuda":
+        raise ValueError("pcg_gpu_cudagraph_matrix_free requires CUDA")
+
+    dtype = b_gpu.dtype
+    x_static = torch.zeros_like(b_gpu)
+    r_static = b_gpu.clone()
+    z_static = torch.zeros_like(b_gpu)
+    apply_precond_into(r_static, z_static)
+    p_static = z_static.clone()
+    rho_static = torch.zeros(1, device=device, dtype=dtype)
+    rho_static.fill_((r_static * z_static).sum())
+
+    tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
+
+    def one_iter():
+        Ap = A_gpu @ p_static
+        pAp = (p_static * Ap).sum()
+        alpha = rho_static / pAp
+        x_static.add_(p_static * alpha)
+        r_static.sub_(Ap * alpha)
+        apply_precond_into(r_static, z_static)
+        rho_new = (r_static * z_static).sum()
+        beta = rho_new / rho_static
+        rho_static.fill_(rho_new)
+        p_static.mul_(beta).add_(z_static)
+
+    n = int(b_gpu.shape[0])
+    # cuSPARSE may allocate on first SpMV per matrix; do that outside capture, immediately before graph.
+    torch.cuda.synchronize()
+    apply_precond_into(r_static, z_static)
+    if getattr(A_gpu, "layout", None) == torch.sparse_csr:
+        _ = torch.sparse.mm(A_gpu, p_static.view(n, 1))
+    else:
+        _ = A_gpu @ p_static
+    torch.cuda.synchronize()
+
+    try:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            one_iter()
+    except RuntimeError:
+        def _apply_precond_fallback(r: torch.Tensor) -> torch.Tensor:
+            z = torch.empty_like(r)
+            return apply_precond_into(r, z)
+
+        return pcg_gpu(
+            A_gpu,
+            b_gpu,
+            _apply_precond_fallback,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+
+    # ``one_iter`` ran once during capture; restore true PCG initial state before replay.
+    x_static.zero_()
+    r_static.copy_(b_gpu)
+    apply_precond_into(r_static, z_static)
+    p_static.copy_(z_static)
+    rho_static.fill_((r_static * z_static).sum())
+
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start_ev.record()
+    iters = 0
+    for k in range(max_iter):
+        g.replay()
+        iters = k + 1
+        if (k + 1) % check_freq == 0 or k == max_iter - 1:
+            r_sq = (r_static * r_static).sum()
+            if r_sq.item() <= tol_sq_val:
+                break
+    end_ev.record()
+    torch.cuda.synchronize()
+    wall_ms = start_ev.elapsed_time(end_ev)
+    return x_static.clone(), iters, wall_ms
+
+
 def pcg_cpu(A, b, apply_precond, tol=1e-8, max_iter=500, debug=False):
     n = b.shape[0]
     x = np.zeros((n, 1), dtype=np.float64)
@@ -884,6 +982,15 @@ def main():
         action="store_true",
         help="Only print the PCG benchmark summary; skip plots, spectral/HM profiling, and dense AMG build.",
     )
+    parser.add_argument(
+        "--leafonly_pcg",
+        choices=("bsr", "matrix_free"),
+        default="bsr",
+        help=(
+            "LeafOnly PCG preconditioner apply: bsr = materialized BSR + SpMV (default); "
+            "matrix_free = apply_block_diagonal_m_into with preallocated workspace (scales for large H off-diagonal)."
+        ),
+    )
     args = parser.parse_args()
     test_only = bool(args.test_only)
 
@@ -1041,23 +1148,25 @@ def main():
             torch.cuda.synchronize()
 
         # Time pure forward only (same idea as leafonly.eval ``--evaluate_gradients``). Running
-        # ``build_sparse_bsr_preconditioner`` first allocates large sparse COO/BSR buffers and can
-        # leave the GPU in a different memory state, skewing this line ~tens of percent vs eval.
+        # ``build_sparse_bsr_preconditioner`` (when ``--leafonly_pcg bsr``) or other large materialization
+        # first allocates big buffers and can leave the GPU in a different memory state, skewing this line.
         inference_ms = _timed_ms(_fwd, device, warmup=0, repeat=10)
         precond_out = _last_out[0]
 
-        # First BSR build: fills ``_BSR_TOPOLOGY_CACHE`` for the later PCG path (not part of inference_ms).
-        build_sparse_bsr_preconditioner(
-            precond_out.detach().contiguous(),
-            viz_n,
-            leaf_L,
-            leaf_apply_diag_L,
-            leaf_apply_off_L,
-            jacobi_inv_diag[:, :viz_n].contiguous(),
-            device,
-        )
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if args.leafonly_pcg == "bsr":
+            # First BSR build: fills ``_BSR_TOPOLOGY_CACHE`` for the later PCG path (not part of inference_ms).
+            build_sparse_bsr_preconditioner(
+                precond_out.detach().contiguous(),
+                viz_n,
+                leaf_L,
+                leaf_apply_diag_L,
+                leaf_apply_off_L,
+                jacobi_inv_diag[:, :viz_n].contiguous(),
+                device,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
         diag_blocks, off_diag_blocks, node_U, node_V, jacobi_scale = unpack_precond(
             precond_out,
             n_pad,
@@ -1184,48 +1293,105 @@ def main():
             check_freq=check_freq,
         )
 
-        # Uses cached BSR crow/col/perm from warmup build (after 15× forward); only permutes values.
-        M_sparse_bsr = build_sparse_bsr_preconditioner(
-            precond_s,
-            viz_n,
-            leaf_L,
-            leaf_apply_diag_L,
-            leaf_apply_off_L,
-            jacobi_s_phys,
-            device,
-        )
-
-        verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
-
-        if device.type == "cuda":
-            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph_bsr(
-                A_gpu,
-                b_gpu,
-                M_sparse_bsr,
-                tol=pcg_tol,
-                max_iter=pcg_max_iter,
-                device=device,
-                check_freq=check_freq,
-            )
-            _info(
-                "  LeafOnly PCG: CUDAGraph + BSR preconditioner (z.copy_(M @ r))"
-                + (f"; n={viz_n}" if viz_n != n_pad else "")
-            )
+        if test_only:
+            print(f"  LeafOnly PCG mode: {args.leafonly_pcg}")
         else:
+            _info(f"  LeafOnly PCG mode: {args.leafonly_pcg}")
 
-            def apply_pcg_fast(r):
-                return M_sparse_bsr @ r
-
-            x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
-                A_gpu,
-                b_gpu,
-                apply_pcg_fast,
-                tol=pcg_tol,
-                max_iter=pcg_max_iter,
-                device=device,
-                check_freq=check_freq,
+        if args.leafonly_pcg == "bsr":
+            M_sparse_bsr = build_sparse_bsr_preconditioner(
+                precond_s,
+                viz_n,
+                leaf_L,
+                leaf_apply_diag_L,
+                leaf_apply_off_L,
+                jacobi_s_phys,
+                device,
             )
-            _info("  LeafOnly PCG: BSR preconditioner + pcg_gpu (no CUDA graph on this device)")
+            verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
+
+            if device.type == "cuda":
+                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph_bsr(
+                    A_gpu,
+                    b_gpu,
+                    M_sparse_bsr,
+                    tol=pcg_tol,
+                    max_iter=pcg_max_iter,
+                    device=device,
+                    check_freq=check_freq,
+                )
+                _info(
+                    "  LeafOnly PCG: CUDAGraph + BSR preconditioner (z.copy_(M @ r))"
+                    + (f"; n={viz_n}" if viz_n != n_pad else "")
+                )
+            else:
+
+                def apply_pcg_fast(r):
+                    return M_sparse_bsr @ r
+
+                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
+                    A_gpu,
+                    b_gpu,
+                    apply_pcg_fast,
+                    tol=pcg_tol,
+                    max_iter=pcg_max_iter,
+                    device=device,
+                    check_freq=check_freq,
+                )
+                _info("  LeafOnly PCG: BSR preconditioner + pcg_gpu (no CUDA graph on this device)")
+        else:
+            precond_ws = block_diagonal_m_apply_workspace(
+                num_leaves=viz_n // leaf_L,
+                leaf_size=leaf_L,
+                K_dim=1,
+                M_h=NUM_HMATRIX_OFF_BLOCKS,
+                La_o=leaf_apply_off_L,
+                device=device,
+                dtype=b_gpu.dtype,
+            )
+
+            def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                return apply_block_diagonal_m_into(
+                    precond_s,
+                    r.reshape(1, viz_n, 1),
+                    out.reshape(1, viz_n, 1),
+                    jacobi_s_phys,
+                    precond_ws,
+                    leaf_size=leaf_L,
+                    leaf_apply_size=leaf_apply_diag_L,
+                    leaf_apply_off=leaf_apply_off_L,
+                ).reshape(viz_n, 1)
+
+            if device.type == "cuda":
+                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph_matrix_free(
+                    A_gpu,
+                    b_gpu,
+                    apply_pcg_fast_into,
+                    tol=pcg_tol,
+                    max_iter=pcg_max_iter,
+                    device=device,
+                    check_freq=check_freq,
+                )
+                _info(
+                    "  LeafOnly PCG: CUDAGraph + matrix-free apply_block_diagonal_m_into preconditioner"
+                    + (f"; n={viz_n}" if viz_n != n_pad else "")
+                )
+            else:
+
+                def apply_pcg_fast(r):
+                    z = torch.empty_like(r)
+                    return apply_pcg_fast_into(r, z)
+
+                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
+                    A_gpu,
+                    b_gpu,
+                    apply_pcg_fast,
+                    tol=pcg_tol,
+                    max_iter=pcg_max_iter,
+                    device=device,
+                    check_freq=check_freq,
+                )
+                _info("  LeafOnly PCG: matrix-free preconditioner + pcg_gpu (no CUDA graph on this device)")
 
         _bf = b_gpu.squeeze(-1)
         _Ax = A_gpu @ x_gpu.squeeze(-1)
