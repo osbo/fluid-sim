@@ -264,6 +264,38 @@ def train_leaf_only(args, runtime):
         ms_compile = (time.perf_counter() - t_seg) * 1000.0
         print("  [startup] torch.compile: enabled")
 
+    leafonly_pcg = str(getattr(args, "leafonly_pcg", "bsr"))
+
+    la_d_model = int(model.leaf_apply_size)
+    la_o_model = int(model.leaf_apply_off)
+
+    def _probe_bmm(A: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(A, Z)
+
+    def _probe_apply_m(
+        precond_out: torch.Tensor,
+        AZ: torch.Tensor,
+        jacobi_inv_diag_batched: torch.Tensor,
+    ) -> torch.Tensor:
+        return apply_block_diagonal_M(
+            precond_out,
+            AZ,
+            leaf_size=LEAF_SIZE,
+            leaf_apply_size=la_d_model,
+            leaf_apply_off=la_o_model,
+            jacobi_inv_diag=jacobi_inv_diag_batched,
+        )
+
+    if device.type == "cuda":
+        compiled_probe_bmm = torch.compile(_probe_bmm)
+        # Training cannot use cuSPARSE BSR sparse.mm for MAZ: backward is unsupported for
+        # SparseBsr @ dense (see sparse_addmm_sparse_backward). Both modes use batched
+        # apply_block_diagonal_M (same operator as expanded M); matrix_free also compiles it.
+        compiled_probe_apply_m = torch.compile(_probe_apply_m) if leafonly_pcg == "matrix_free" else None
+    else:
+        compiled_probe_bmm = _probe_bmm
+        compiled_probe_apply_m = _probe_apply_m if leafonly_pcg == "matrix_free" else None
+
     ms_load = 0.0
     if args.continue_training:
         if save_path.exists():
@@ -311,6 +343,13 @@ def train_leaf_only(args, runtime):
             print("  --profile-backward: CUDA kernel table after loss.backward() at detailed timing step")
         else:
             print("  --profile-backward: no effect (enable print_timing in runtime for detailed step)")
+    _pcg_tail = (
+        "apply_block_diagonal_M torch.compile (matrix_free)"
+        if leafonly_pcg == "matrix_free"
+        else "apply_block_diagonal_M eager (bsr; matches expanded M, autograd-safe)"
+    )
+    _bmm_desc = "bmm torch.compile" if device.type == "cuda" else "bmm eager"
+    print(f"  Probe MAZ path: --leafonly-pcg={leafonly_pcg} ({_bmm_desc}; {_pcg_tail})")
     ms_startup_to_loop = (time.perf_counter() - t_wall0) * 1000.0
     if print_timing:
         print("\n=== Startup timing (wall clock, ms) ===")
@@ -499,21 +538,18 @@ def train_leaf_only(args, runtime):
             t_z = time.perf_counter() - t_mark
             t_mark = time.perf_counter()
 
-        AZ = torch.bmm(A_batched, Z)
+        AZ = compiled_probe_bmm(A_batched, Z)
 
         if do_detailed:
             _cuda_sync()
             t_az = time.perf_counter() - t_mark
             t_mark = time.perf_counter()
 
-        MAZ = apply_block_diagonal_M(
-            precond_out,
-            AZ,
-            leaf_size=LEAF_SIZE,
-            leaf_apply_size=LEAF_APPLY_SIZE,
-            leaf_apply_off=LEAF_APPLY_SIZE_OFF,
-            jacobi_inv_diag=jacobi_inv_diag_batched,
-        )
+        if leafonly_pcg == "matrix_free":
+            assert compiled_probe_apply_m is not None
+            MAZ = compiled_probe_apply_m(precond_out, AZ, jacobi_inv_diag_batched)
+        else:
+            MAZ = _probe_apply_m(precond_out, AZ, jacobi_inv_diag_batched)
 
         if do_detailed:
             _cuda_sync()

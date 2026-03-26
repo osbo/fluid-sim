@@ -1044,6 +1044,7 @@ def main():
         _header_bytes,
         leaf_apply_diag_ckpt,
         leaf_apply_off_ckpt,
+        _attention_layout_code,
     ) = read_leaf_only_header(leaf_only_weights_path)
     if LEAF_SIZE != leaf_size_lo:
         _info(
