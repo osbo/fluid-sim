@@ -97,6 +97,157 @@ def leafonly_grad_param_groups(model: LeafOnlyNet, num_blocks: Optional[int] = N
     return g
 
 
+def _float_tensor_distribution_stats(t: torch.Tensor):
+    """
+    Mean, dispersion, quantiles, norms, and simple tail mass on CPU float32.
+    Returns None if empty.
+    """
+    x = t.detach().float().cpu().reshape(-1)
+    n = int(x.numel())
+    if n == 0:
+        return None
+    mean = float(x.mean())
+    std = float(x.std(unbiased=False))
+    min_v = float(x.min())
+    max_v = float(x.max())
+    if n == 1:
+        p01 = p50 = p99 = mean
+    else:
+        q = torch.quantile(x, torch.tensor([0.01, 0.5, 0.99], dtype=torch.float32))
+        p01, p50, p99 = float(q[0].item()), float(q[1].item()), float(q[2].item())
+    l2 = float(torch.linalg.norm(x))
+    frac_abs_gt_1 = float((x.abs() > 1.0).float().mean())
+    frac_near_zero = float((x.abs() < 1e-7).float().mean())
+    return mean, std, min_v, max_v, p01, p50, p99, l2, frac_abs_gt_1, frac_near_zero
+
+
+def print_leafonly_parameter_and_buffer_report(model: LeafOnlyNet) -> None:
+    """
+    Report means, spreads, quantiles, and tail fractions for every trainable parameter
+    and every registered buffer (things you might initialize or precompute).
+    """
+    print(
+        "\n=== Tensor statistics (after checkpoint load) ===\n"
+        "Trainable parameters: compare std to your nn.init (e.g. normal std=0.001); "
+        "p01/p50/p99 describe mass; frac|x|>1 and near-zero highlight tails/sparsity.\n"
+        "Buffers: static H-matrix / pooling weights (not updated by optimizer)."
+    )
+
+    p_headers = [
+        "name",
+        "shape",
+        "n",
+        "mean",
+        "std",
+        "min",
+        "max",
+        "p01",
+        "p50",
+        "p99",
+        "L2",
+        "frac|x|>1",
+        "frac|x|<1e-7",
+    ]
+    param_rows = []
+    total_trainable = 0
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        st = _float_tensor_distribution_stats(p)
+        if st is None:
+            continue
+        mean, std, min_v, max_v, p01, p50, p99, l2, f1, fz = st
+        total_trainable += int(p.numel())
+        param_rows.append(
+            [
+                name,
+                tuple(p.shape),
+                int(p.numel()),
+                mean,
+                std,
+                min_v,
+                max_v,
+                p01,
+                p50,
+                p99,
+                l2,
+                f1,
+                fz,
+            ]
+        )
+    _print_table("Trainable parameters", p_headers, param_rows)
+    print(f"  Total trainable scalars: {total_trainable}")
+
+    fbuf_headers = p_headers
+    fbuf_rows = []
+    for name, b in model.named_buffers():
+        if not b.dtype.is_floating_point:
+            continue
+        st = _float_tensor_distribution_stats(b)
+        if st is None:
+            continue
+        mean, std, min_v, max_v, p01, p50, p99, l2, f1, fz = st
+        fbuf_rows.append(
+            [
+                name,
+                tuple(b.shape),
+                int(b.numel()),
+                mean,
+                std,
+                min_v,
+                max_v,
+                p01,
+                p50,
+                p99,
+                l2,
+                f1,
+                fz,
+            ]
+        )
+    if fbuf_rows:
+        _print_table("Floating-point buffers (fixed / precomputed)", fbuf_headers, fbuf_rows)
+
+    ibuf_headers = ["name", "shape", "n", "dtype", "min", "max", "mean(as float)"]
+    ibuf_rows = []
+    for name, b in model.named_buffers():
+        if b.dtype.is_floating_point:
+            continue
+        x = b.detach().cpu().reshape(-1)
+        n = int(x.numel())
+        if n == 0:
+            continue
+        xf = x.float()
+        ibuf_rows.append(
+            [
+                name,
+                tuple(b.shape),
+                n,
+                str(b.dtype).replace("torch.", ""),
+                float(xf.min().item()),
+                float(xf.max().item()),
+                float(xf.mean().item()),
+            ]
+        )
+    if ibuf_rows:
+        _print_table("Integer / index buffers", ibuf_headers, ibuf_rows)
+
+    nh = model.blocks[0].attn.num_heads if model.blocks else 0
+    print(
+        f"\nHyperparameters tied to default init / layout: "
+        f"d_model={model.embed.lift[0].out_features}, "
+        f"leaf_size={model.leaf_size}, "
+        f"leaf_apply_size(diag)={model.leaf_apply_size}, "
+        f"leaf_apply_off={model.leaf_apply_off}, "
+        f"attn_pool_diag={model.attn_pool_diag}, "
+        f"attn_pool_off={model.attn_pool_off}, "
+        f"num_leaf_blocks={len(model.blocks)}, "
+        f"num_off_blocks={len(model.off_diag_blocks)}, "
+        f"num_heads={nh}, "
+        f"num_h_off={model.num_h_off}, "
+        f"use_jacobi={model.use_jacobi}."
+    )
+
+
 def evaluate_gradient_interference(args, runtime):
     data_folder = runtime["data_folder"]
     save_path = runtime["save_path"]
@@ -134,6 +285,8 @@ def evaluate_gradient_interference(args, runtime):
         print("WARNING: No saved weights found. Analyzing randomly initialized gradients.")
 
     model.train()
+    if getattr(args, "peek_parameters", False):
+        print_leafonly_parameter_and_buffer_report(model)
 
     num_eval = 10
     contexts_per_step = max(1, int(args.contexts_per_step))
