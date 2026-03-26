@@ -25,6 +25,14 @@ def _build_parser():
         help="Ignore TestData/.leafonly_training_context_cache/ and rebuild contexts from frame files.",
     )
     parser.add_argument("--evaluate_gradients", action="store_true", help="Run gradient interference analysis then exit.")
+    parser.add_argument(
+        "--peek_parameters",
+        action="store_true",
+        help=(
+            "With --evaluate_gradients: print tensor statistics (trainable weights, float/index buffers, "
+            "layout hyperparameters). No effect without --evaluate_gradients."
+        ),
+    )
     parser.add_argument("--num_gcn_layers", type=int, default=2, choices=[2], help="Fixed number of GCN layers (kept at 2).")
     _al = attention_layout_choices(LEAF_SIZE)
     parser.add_argument(
