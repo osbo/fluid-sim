@@ -1046,21 +1046,20 @@ def main():
         leaf_apply_off_ckpt,
         _attention_layout_code,
     ) = read_leaf_only_header(leaf_only_weights_path)
-    if LEAF_SIZE != leaf_size_lo:
-        _info(
-            f"  Note: leafonly.config.LEAF_SIZE={LEAF_SIZE} != checkpoint leaf_size={leaf_size_lo}; "
-            "using checkpoint leaf size for padding and preconditioner layout."
+    if int(leaf_size_lo) != int(LEAF_SIZE):
+        raise ValueError(
+            f"Checkpoint leaf_size={leaf_size_lo} != leafonly.config.LEAF_SIZE={LEAF_SIZE}. "
+            "Set LEAF_SIZE in leafonly/config.py to match the weights header so MAX_MIXED_SIZE and MAX_NUM_LEAVES stay consistent."
         )
-    leaf_L = int(leaf_size_lo)
-
+    leaf_L = int(LEAF_SIZE)
+    n_pad = int(MAX_MIXED_SIZE)
     n_requested = (min(MAX_MIXED_SIZE, num_nodes_real) // leaf_L) * leaf_L
-    n_pad = MAX_MIXED_SIZE
     # Physical linear system for PCG / baselines / plots (no identity tail): leaf-aligned, ≤ MAX_MIXED_SIZE.
     viz_n = n_requested
     if n_requested < num_nodes_real:
         _info(
             f"  Leaf-aligned subgraph: {n_requested} nodes (frame has {num_nodes_real}; "
-            f"truncated to full {leaf_L}-node leaves); LeafOnly forward padded to {n_pad}"
+            f"truncated to full {leaf_L}-node leaves); LeafOnly forward padded to {n_pad} (MAX_MIXED_SIZE)"
         )
     elif n_pad > n_requested:
         _info(
