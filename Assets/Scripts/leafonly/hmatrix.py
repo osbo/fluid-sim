@@ -160,35 +160,3 @@ HM_PROLONG_REPEAT_PER_BLOCK = torch.tensor(HM_S_LIST, dtype=torch.long)
 HM_PROLONG_GATHER_IDX = torch.cat(
     [torch.full((int(s),), int(i), dtype=torch.long) for i, s in enumerate(HM_S_LIST)]
 )
-
-
-def build_hm_adjacency(num_leaves: int, r0_off: torch.Tensor, c0_off: torch.Tensor, S_off: torch.Tensor) -> torch.Tensor:
-    K = int(num_leaves)
-    M = int(r0_off.shape[0])
-    N_nodes = K + M
-    adj = torch.zeros((N_nodes, N_nodes), dtype=torch.float32)
-
-    blocks = [(i, i, 1) for i in range(K)]
-    for i in range(M):
-        blocks.append((int(r0_off[i]), int(c0_off[i]), int(S_off[i])))
-
-    for i in range(N_nodes):
-        r1, c1, s1 = blocks[i]
-        for j in range(i + 1, N_nodes):
-            r2, c2, s2 = blocks[j]
-            h_adj = (r1 + s1 == r2) or (r2 + s2 == r1)
-            v_over = max(c1, c2) < min(c1 + s1, c2 + s2)
-            v_adj = (c1 + s1 == c2) or (c2 + s2 == c1)
-            h_over = max(r1, r2) < min(r1 + s1, r2 + s2)
-
-            if (h_adj and v_over) or (v_adj and h_over):
-                adj[i, j] = 1.0
-                adj[j, i] = 1.0
-
-    adj.fill_diagonal_(1.0)
-    deg = adj.sum(dim=1, keepdim=True)
-    adj = adj / deg.clamp(min=1.0)
-    return adj
-
-
-HM_ADJ_CPU = build_hm_adjacency(MAX_NUM_LEAVES, HM_R0_CPU, HM_C0_CPU, HM_S_CPU)

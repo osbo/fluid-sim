@@ -119,8 +119,6 @@ def leafonly_grad_param_groups(model: LeafOnlyNet, num_blocks: Optional[int] = N
         g[f"Transformer block {b}"] = lambda m, b=b: list(m.blocks[b].parameters())
     for b in range(num_blocks):
         g[f"Off-diag Transformer block {b}"] = lambda m, b=b: list(m.off_diag_blocks[b].parameters())
-    g["Tree GNN Layers"] = lambda m: [p for layer in m.tree_gnn_layers for p in layer.parameters()]
-    g["Tree GNN Norm"] = lambda m: list(m.tree_gnn_norm.parameters())
     g["Diagonal Leaf Head"] = lambda m: list(m.leaf_head.parameters())
     g["Off-diag U/V heads"] = lambda m: list(m.off_diag_head_U.parameters()) + list(m.off_diag_head_V.parameters())
     g["Global node U linear"] = lambda m: list(m.node_u.parameters())
@@ -520,123 +518,54 @@ def evaluate_gradient_interference(args, runtime):
         h_norm = model.embed.norm(h_gcn)
         h_proj0 = model.enc_input_proj(h_norm)
         C_dim = h_proj0.shape[-1]
-        K_prof = MAX_NUM_LEAVES
-        qhb = model.blocks[0].attn.query_has_block
-        h_diag_view = h_proj0.view(B_prof, K_prof, Lf, C_dim)
-        if qhb:
-            bn_diag = h_diag_view.mean(dim=2, keepdim=True)
-            h_diag_in = torch.cat([h_diag_view, bn_diag], dim=2).view(B_prof, K_prof * (Lf + 1), C_dim)
-        else:
-            h_diag_in = h_proj0.view(B_prof, K_prof * Lf, C_dim)
-        h_off_in = None
+        h_diag = h_proj0
+        for block in model.blocks:
+            h_diag = block(
+                h_diag,
+                edge_index=edge_index,
+                edge_values=edge_values,
+                positions=positions,
+                save_attention=False,
+                attn_mask=attn_mask,
+                edge_feats=edge_feats,
+            )
+        diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
         if Mh > 0:
+            h_k = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
             if getattr(model, "strip_build_mode", "einsum") == "einsum":
                 Wr = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
                 Wc = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
-                row_p = torch.einsum("mk,bklc->bmlc", Wr, h_diag_view)
-                col_p = torch.einsum("mk,bklc->bmlc", Wc, h_diag_view)
+                row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
+                col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
             else:
                 ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
-                h_k_t = h_diag_view.transpose(0, 1)
+                hk_trans = h_k.transpose(0, 1)
                 r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
                 c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                r_sum.index_add_(0, gidx, h_k_t[ridx])
-                c_sum.index_add_(0, gidx, h_k_t[cidx])
+                r_sum.index_add_(0, gidx, hk_trans[ridx])
+                c_sum.index_add_(0, gidx, hk_trans[cidx])
                 S_view = model.h_block_S.view(Mh, 1, 1, 1).to(device=device, dtype=x_input.dtype)
                 row_p = (r_sum / S_view).transpose(0, 1)
                 col_p = (c_sum / S_view).transpose(0, 1)
-            h_off_base = (row_p + col_p).reshape(B_prof * Mh, Lf, C_dim)
+            h_off = (row_p + col_p).reshape(B_prof * Mh, Lf, C_dim)
             if otp > 1:
-                h_off_base = h_off_base.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
-            if qhb:
-                h_off_view = h_off_base.view(B_prof, Mh, Ls_off, C_dim)
-                bn_off = h_off_view.mean(dim=2, keepdim=True)
-                h_off_in = torch.cat([h_off_view, bn_off], dim=2).reshape(B_prof * Mh, Ls_off + 1, C_dim)
-            else:
-                h_off_in = h_off_base
-
-        if qhb:
-            for i in range(len(model.blocks)):
-                h_diag_in = model.blocks[i](
-                    h_diag_in,
+                h_off = h_off.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
+            for block in model.off_diag_blocks:
+                h_off = block(
+                    h_off,
                     edge_index=edge_index,
                     edge_values=edge_values,
                     positions=positions,
                     save_attention=False,
-                    attn_mask=attn_mask,
-                    edge_feats=edge_feats,
+                    attn_mask=off_attn_mask,
+                    edge_feats=off_edge_feats,
                 )
-                if Mh > 0:
-                    h_off_in = model.off_diag_blocks[i](
-                        h_off_in,
-                        edge_index=edge_index,
-                        edge_values=edge_values,
-                        positions=positions,
-                        save_attention=False,
-                        attn_mask=off_attn_mask,
-                        edge_feats=off_edge_feats,
-                    )
-                if i == 0 and not model._legacy_no_gnn:
-                    h_d_v = h_diag_in.view(B_prof, K_prof, Lf + 1, C_dim)
-                    bnd = h_d_v[:, :, -1, :]
-                    if Mh > 0:
-                        h_o_v = h_off_in.view(B_prof, Mh, Ls_off + 1, C_dim)
-                        bno = h_o_v[:, :, -1, :]
-                        V = torch.cat([bnd, bno], dim=1)
-                    else:
-                        V = bnd
-                    adj = model.hm_adj.to(device=V.device, dtype=V.dtype)
-                    for layer in model.tree_gnn_layers:
-                        msg = torch.matmul(adj, V)
-                        V = V + layer(msg)
-                    V = model.tree_gnn_norm(V)
-                    h_d_v = h_d_v.clone()
-                    h_d_v[:, :, -1, :] = V[:, :K_prof, :]
-                    h_diag_in = h_d_v.view(B_prof, K_prof * (Lf + 1), C_dim)
-                    if Mh > 0:
-                        h_o_v = h_o_v.clone()
-                        h_o_v[:, :, -1, :] = V[:, K_prof:, :]
-                        h_off_in = h_o_v.reshape(B_prof * Mh, Ls_off + 1, C_dim)
-
-            h_diag = h_diag_in.view(B_prof, K_prof, Lf + 1, C_dim)[:, :, :-1, :].reshape(B_prof, K_prof * Lf, C_dim)
-            diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
-            if Mh > 0:
-                h_off = h_off_in.view(B_prof, Mh, Ls_off + 1, C_dim)[:, :, :-1, :].reshape(B_prof, Mh, Ls_off, C_dim)
-                off_diag_blocks_profile = model._get_leaf_blocks(h_off, mode="off-diagonal")
-            else:
-                off_diag_blocks_profile = torch.empty(
-                    (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
-                )
+            h_off = h_off.view(B_prof, Mh, Ls_off, C_dim)
+            off_diag_blocks_profile = model._get_leaf_blocks(h_off, mode="off-diagonal")
         else:
-            h_diag = h_diag_in
-            for block in model.blocks:
-                h_diag = block(
-                    h_diag,
-                    edge_index=edge_index,
-                    edge_values=edge_values,
-                    positions=positions,
-                    save_attention=False,
-                    attn_mask=attn_mask,
-                    edge_feats=edge_feats,
-                )
-            diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
-            if Mh > 0:
-                for block in model.off_diag_blocks:
-                    h_off_in = block(
-                        h_off_in,
-                        edge_index=edge_index,
-                        edge_values=edge_values,
-                        positions=positions,
-                        save_attention=False,
-                        attn_mask=off_attn_mask,
-                        edge_feats=off_edge_feats,
-                    )
-                h_off = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
-                off_diag_blocks_profile = model._get_leaf_blocks(h_off, mode="off-diagonal")
-            else:
-                off_diag_blocks_profile = torch.empty(
-                    (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
-                )
+            off_diag_blocks_profile = torch.empty(
+                (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
+            )
         node_U_profile = model.node_u(h_diag)
         node_V_profile = model.node_v(h_diag)
         jacobi_scale_profile = model._get_jacobi_scale(h_diag)
@@ -712,6 +641,15 @@ def evaluate_gradient_interference(args, runtime):
             attn_mask=attn_mask,
             edge_feats=edge_feats,
         )
+        h_block_in = h_proj0
+        for i, block in enumerate(model.blocks):
+            h_block_in = _time_transformer_attn_and_mlp(
+                timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
+            )
+
+        ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_block_in, mode="diagonal"), device)
+        timing_rows.append(["Diagonal leaf head (U U^T)", ms_leaf_head])
+
         off_attn_kw = dict(
             edge_index=edge_index,
             edge_values=edge_values,
@@ -720,27 +658,18 @@ def evaluate_gradient_interference(args, runtime):
             attn_mask=off_attn_mask,
             edge_feats=off_edge_feats,
         )
-        K_prof = MAX_NUM_LEAVES
-        qhb_t = model.blocks[0].attn.query_has_block
-        h_diag_view = h_proj0.view(B_prof, K_prof, Lf, C_dim)
-        if qhb_t:
-            bn_diag = h_diag_view.mean(dim=2, keepdim=True)
-            h_diag_in = torch.cat([h_diag_view, bn_diag], dim=2).view(B_prof, K_prof * (Lf + 1), C_dim)
-        else:
-            h_diag_in = h_proj0.view(B_prof, K_prof * Lf, C_dim)
-        h_off_in = None
-
         if Mh > 0:
 
             def _build_h_off_strip():
+                h_k_t = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
                 if getattr(model, "strip_build_mode", "einsum") == "einsum":
                     Wr_t = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
                     Wc_t = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
-                    row_pt = torch.einsum("mk,bklc->bmlc", Wr_t, h_diag_view)
-                    col_pt = torch.einsum("mk,bklc->bmlc", Wc_t, h_diag_view)
+                    row_pt = torch.einsum("mk,bklc->bmlc", Wr_t, h_k_t)
+                    col_pt = torch.einsum("mk,bklc->bmlc", Wc_t, h_k_t)
                 else:
                     ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
-                    hk_trans = h_diag_view.transpose(0, 1)
+                    hk_trans = h_k_t.transpose(0, 1)
                     r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
                     c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
                     r_sum.index_add_(0, gidx, hk_trans[ridx])
@@ -751,10 +680,6 @@ def evaluate_gradient_interference(args, runtime):
                 h_ = (row_pt + col_pt).reshape(B_prof * Mh, Lf, C_dim)
                 if otp > 1:
                     h_ = h_.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
-                if qhb_t:
-                    h_ov = h_.view(B_prof, Mh, Ls_off, C_dim)
-                    bn_o = h_ov.mean(dim=2, keepdim=True)
-                    return torch.cat([h_ov, bn_o], dim=2).reshape(B_prof * Mh, Ls_off + 1, C_dim)
                 return h_
 
             _strip_label = (
@@ -765,79 +690,20 @@ def evaluate_gradient_interference(args, runtime):
             ms_strip = _timed_ms(_build_h_off_strip, device)
             timing_rows.append([_strip_label, ms_strip])
             h_off_in = _build_h_off_strip()
-
-        if qhb_t:
-            for i, block in enumerate(model.blocks):
-                h_diag_in = _time_transformer_attn_and_mlp(
-                    timing_rows, "Leaf", i, block, h_diag_in, device, **leaf_attn_kw
+            for i, block in enumerate(model.off_diag_blocks):
+                h_off_in = _time_transformer_attn_and_mlp(
+                    timing_rows, "H off", i, block, h_off_in, device, **off_attn_kw
                 )
-                if Mh > 0:
-                    h_off_in = _time_transformer_attn_and_mlp(
-                        timing_rows, "H off", i, model.off_diag_blocks[i], h_off_in, device, **off_attn_kw
-                    )
-                if i == 0 and not model._legacy_no_gnn:
-                    with torch.no_grad():
-                        h_d_v = h_diag_in.view(B_prof, K_prof, Lf + 1, C_dim)
-                        bnd = h_d_v[:, :, -1, :]
-                        if Mh > 0:
-                            h_o_v = h_off_in.view(B_prof, Mh, Ls_off + 1, C_dim)
-                            bno = h_o_v[:, :, -1, :]
-                            V = torch.cat([bnd, bno], dim=1)
-                        else:
-                            V = bnd
-                        V_bench = V.detach()
-                    adj = model.hm_adj.to(device=V_bench.device, dtype=V_bench.dtype)
-                    ms_gnn = _timed_ms(lambda: torch.matmul(adj, V_bench), device)
-                    timing_rows.append(["Flat Tree GNN Pass", ms_gnn])
-                    with torch.no_grad():
-                        V_run = V
-                        adj2 = model.hm_adj.to(device=V_run.device, dtype=V_run.dtype)
-                        for gnn_layer in model.tree_gnn_layers:
-                            msg = torch.matmul(adj2, V_run)
-                            V_run = V_run + gnn_layer(msg)
-                        V_run = model.tree_gnn_norm(V_run)
-                        h_d_v2 = h_diag_in.view(B_prof, K_prof, Lf + 1, C_dim).clone()
-                        h_d_v2[:, :, -1, :] = V_run[:, :K_prof, :]
-                        h_diag_in = h_d_v2.view(B_prof, K_prof * (Lf + 1), C_dim)
-                        if Mh > 0:
-                            h_o_v2 = h_off_in.view(B_prof, Mh, Ls_off + 1, C_dim).clone()
-                            h_o_v2[:, :, -1, :] = V_run[:, K_prof:, :]
-                            h_off_in = h_o_v2.reshape(B_prof * Mh, Ls_off + 1, C_dim)
-
-            h_block_stripped = h_diag_in.view(B_prof, K_prof, Lf + 1, C_dim)[:, :, :-1, :].reshape(
-                B_prof, K_prof * Lf, C_dim
-            )
-        else:
-            h_block_stripped = h_diag_in
-            for i, block in enumerate(model.blocks):
-                h_block_stripped = _time_transformer_attn_and_mlp(
-                    timing_rows, "Leaf", i, block, h_block_stripped, device, **leaf_attn_kw
-                )
-            if Mh > 0:
-                for i, block in enumerate(model.off_diag_blocks):
-                    h_off_in = _time_transformer_attn_and_mlp(
-                        timing_rows, "H off", i, block, h_off_in, device, **off_attn_kw
-                    )
-
-        ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_block_stripped, mode="diagonal"), device)
-        timing_rows.append(["Diagonal leaf head (U U^T)", ms_leaf_head])
-
-        if Mh > 0:
-            if qhb_t:
-                h_off_for_head = h_off_in.view(B_prof, Mh, Ls_off + 1, C_dim)[:, :, :-1, :].reshape(
-                    B_prof, Mh, Ls_off, C_dim
-                )
-            else:
-                h_off_for_head = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
-            ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_for_head, mode="off-diagonal"), device)
+            h_off_in = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
+            ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_in, mode="off-diagonal"), device)
             timing_rows.append(["H off head (U V^T)", ms_off_head])
 
-        ms_node_u = _timed_ms(lambda: model.node_u(h_block_stripped), device)
+        ms_node_u = _timed_ms(lambda: model.node_u(h_block_in), device)
         timing_rows.append(["Global node U linear", ms_node_u])
-        ms_node_v = _timed_ms(lambda: model.node_v(h_block_stripped), device)
+        ms_node_v = _timed_ms(lambda: model.node_v(h_block_in), device)
         timing_rows.append(["Global node V linear", ms_node_v])
 
-        ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_stripped), device)
+        ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_in), device)
         timing_rows.append(["Jacobi gate (node_scalar)", ms_jacobi])
 
         ms_AZ = _timed_ms(lambda: (A_dense @ Z.squeeze(0)).unsqueeze(0), device)
@@ -893,9 +759,8 @@ def evaluate_gradient_interference(args, runtime):
     )
     print(
         "\nTiming coverage: micro-benchmarks use eval() and omit build_leaf_block_connectivity only "
-        "(masks are precomputed). Rows cover lift linears, GCN, embed norm, enc_input_proj, interleaved leaf and "
-        "H-off attention vs MLP (and Flat Tree GNN matmul when query_has_block and weights are not legacy), "
-        "strip pool, both low-rank heads, node U/V, Jacobi gate, pack cat, A@Z, and M apply. "
+        "(masks are precomputed). Rows cover lift linears, GCN, embed norm, enc_input_proj, per-layer leaf and "
+        "H-off attention vs MLP, strip pool, both low-rank heads, node U/V, Jacobi gate, pack cat, A@Z, and M apply. "
         "Gradient interference uses leafonly_grad_param_groups() for trainable coverage."
     )
     if ms_end_to_end is not None:
