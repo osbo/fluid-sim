@@ -41,9 +41,11 @@ def _build_parser():
         default=default_attention_layout(LEAF_SIZE),
         choices=list(_al),
         help=(
-            f"Attention keys: {LEAF_SIZE}×{LEAF_SIZE} (nodes only), "
-            f"{LEAF_SIZE}×{LEAF_SIZE + 1} (+ block node), "
-            f"{LEAF_SIZE}×{LEAF_SIZE + 2} (+ block + matrix node). Must match leafonly.config.LEAF_SIZE."
+            f"Attention layout: {LEAF_SIZE}×{LEAF_SIZE} (nodes only), "
+            f"{LEAF_SIZE}×{LEAF_SIZE + 1} (+ block key), "
+            f"{LEAF_SIZE}×{LEAF_SIZE + 2} (+ block + matrix key), "
+            f"{LEAF_SIZE + 1}×{LEAF_SIZE + 1} (query+key block token; flat-tree GNN). "
+            f"Must match leafonly.config.LEAF_SIZE."
         ),
     )
     parser.add_argument("--target_step", type=int, default=10000, help="Step index to track in logs/metrics.")
