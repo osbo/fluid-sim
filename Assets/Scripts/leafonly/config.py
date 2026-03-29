@@ -10,9 +10,9 @@ def _validate_leaf_size(L: int) -> int:
     return L
 
 
-# Set to any power of 2; training checkpoints store this in the header — match when loading.
-# H-matrix static buffers use MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE; wrong LEAF_SIZE breaks apply vs checkpoint.
-LEAF_SIZE = _validate_leaf_size(128)
+# Power of 2; must match ``leaf_size`` in leaf_only_weights header (``read_leaf_only_header``).
+# Padded graph size is MAX_MIXED_SIZE; leaf count is MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE (static H-grid).
+LEAF_SIZE = _validate_leaf_size(32)
 # Diagonal leaf attention + diagonal preconditioner blocks (no downsample when 1).
 ATTN_POOL_FACTOR_DIAG = 1
 # Off-diagonal pair attention + off blocks (2 ⇒ half resolution inside each 32-node chunk).
@@ -27,7 +27,8 @@ ATTN_POOL_FACTOR = ATTN_POOL_FACTOR_DIAG
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 
-# Padded problem size for LeafOnlyNet (static H-grid). Checkpoints and MAX_NUM_LEAVES follow this.
+# Padded problem size for LeafOnlyNet / training contexts / InspectModel (single source of truth).
+# MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE must match the checkpoint layout (same as at train time).
 MAX_MIXED_SIZE = 2048
 # Minimum **aligned** active nodes to keep a frame: n_active = ⌊min(num_nodes, MAX)/LEAF⌋·LEAF.
 # Must be ≤ your smallest frame's aligned count. Do not set this to MAX_MIXED_SIZE unless every frame has ≥ that many nodes.
