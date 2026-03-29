@@ -78,6 +78,16 @@ def _build_parser():
             "bsr = default, eager apply; matrix_free = torch.compile on bmm + apply (faster on CUDA)."
         ),
     )
+    parser.add_argument(
+        "--strip_build_mode",
+        type=str,
+        choices=("einsum", "no_einsum"),
+        default="no_einsum",
+        help=(
+            "How to build H off-diagonal row/column strip means from per-leaf features: "
+            "einsum (default) or no_einsum (gather/scatter index_add_, lower asymptotic work for large K)."
+        ),
+    )
     return parser
 
 

@@ -6,7 +6,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .architecture import LeafOnlyNet, apply_block_diagonal_M, pool_leaf_attn_mask, pool_leaf_edge_feats
+from .architecture import (
+    LeafOnlyNet,
+    _hm_prolong_scatter_indices,
+    apply_block_diagonal_M,
+    pool_leaf_attn_mask,
+    pool_leaf_edge_feats,
+)
 from .checkpoint import load_leaf_only_weights
 from .config import LEAF_APPLY_SIZE, LEAF_APPLY_SIZE_OFF, LEAF_SIZE, MAX_MIXED_SIZE, MAX_NUM_LEAVES
 from .data import FluidGraphDataset, build_leaf_block_connectivity, most_recent_run_folder
@@ -298,6 +304,7 @@ def evaluate_gradient_interference(args, runtime):
         use_gcn=use_gcn,
         num_gcn_layers=effective_gcn_layers,
         use_jacobi=use_jacobi,
+        strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
     ).to(device)
 
     if save_path.exists():
@@ -525,10 +532,21 @@ def evaluate_gradient_interference(args, runtime):
         diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
         if Mh > 0:
             h_k = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
-            Wr = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
-            Wc = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
-            row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
-            col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+            if getattr(model, "strip_build_mode", "einsum") == "einsum":
+                Wr = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
+                Wc = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
+                row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
+                col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+            else:
+                ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
+                hk_trans = h_k.transpose(0, 1)
+                r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
+                c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
+                r_sum.index_add_(0, gidx, hk_trans[ridx])
+                c_sum.index_add_(0, gidx, hk_trans[cidx])
+                S_view = model.h_block_S.view(Mh, 1, 1, 1).to(device=device, dtype=x_input.dtype)
+                row_p = (r_sum / S_view).transpose(0, 1)
+                col_p = (c_sum / S_view).transpose(0, 1)
             h_off = (row_p + col_p).reshape(B_prof * Mh, Lf, C_dim)
             if otp > 1:
                 h_off = h_off.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
@@ -644,17 +662,33 @@ def evaluate_gradient_interference(args, runtime):
 
             def _build_h_off_strip():
                 h_k_t = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
-                Wr_t = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
-                Wc_t = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
-                row_pt = torch.einsum("mk,bklc->bmlc", Wr_t, h_k_t)
-                col_pt = torch.einsum("mk,bklc->bmlc", Wc_t, h_k_t)
+                if getattr(model, "strip_build_mode", "einsum") == "einsum":
+                    Wr_t = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
+                    Wc_t = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
+                    row_pt = torch.einsum("mk,bklc->bmlc", Wr_t, h_k_t)
+                    col_pt = torch.einsum("mk,bklc->bmlc", Wc_t, h_k_t)
+                else:
+                    ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
+                    hk_trans = h_k_t.transpose(0, 1)
+                    r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
+                    c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
+                    r_sum.index_add_(0, gidx, hk_trans[ridx])
+                    c_sum.index_add_(0, gidx, hk_trans[cidx])
+                    S_view = model.h_block_S.view(Mh, 1, 1, 1).to(device=device, dtype=x_input.dtype)
+                    row_pt = (r_sum / S_view).transpose(0, 1)
+                    col_pt = (c_sum / S_view).transpose(0, 1)
                 h_ = (row_pt + col_pt).reshape(B_prof * Mh, Lf, C_dim)
                 if otp > 1:
                     h_ = h_.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
                 return h_
 
+            _strip_label = (
+                "H off strip pool (einsum row+col + token mean)"
+                if getattr(model, "strip_build_mode", "einsum") == "einsum"
+                else "H off strip pool (index_add row+col + token mean)"
+            )
             ms_strip = _timed_ms(_build_h_off_strip, device)
-            timing_rows.append(["H off strip pool (einsum row+col + token mean)", ms_strip])
+            timing_rows.append([_strip_label, ms_strip])
             h_off_in = _build_h_off_strip()
             for i, block in enumerate(model.off_diag_blocks):
                 h_off_in = _time_transformer_attn_and_mlp(
@@ -770,6 +804,7 @@ def evaluate_estimator_variance(args, runtime):
         use_gcn=True,
         num_gcn_layers=2,
         use_jacobi=use_jacobi,
+        strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
     ).to(device)
 
     if save_path.exists():

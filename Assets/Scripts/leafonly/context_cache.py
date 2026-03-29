@@ -17,7 +17,7 @@ from .config import (
 )
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
-CONTEXT_CACHE_VERSION = 8
+CONTEXT_CACHE_VERSION = 9
 
 
 def _mtime_ns(path: Path) -> int:
@@ -74,7 +74,7 @@ def training_context_cache_path(cache_dir: Path, meta: dict) -> Path:
 
 def _serialize_context(ctx: dict) -> dict:
     lm, lf, om, off = ctx["precomputed_leaf_connectivity"]
-    return {
+    out = {
         "n_pad": int(ctx["n_pad"]),
         "n_orig": int(ctx["n_orig"]),
         "num_leaves": int(ctx["num_leaves"]),
@@ -82,7 +82,6 @@ def _serialize_context(ctx: dict) -> dict:
         "x_input": ctx["x_input"].detach().cpu().contiguous(),
         "edge_index": ctx["edge_index"].detach().cpu().contiguous(),
         "edge_values": ctx["edge_values"].detach().cpu().contiguous(),
-        "A_dense": ctx["A_dense"].detach().cpu().contiguous(),
         "precomputed_leaf_connectivity": (
             lm.detach().cpu().contiguous(),
             lf.detach().cpu().contiguous(),
@@ -92,10 +91,33 @@ def _serialize_context(ctx: dict) -> dict:
         "global_features": ctx["global_features"].detach().cpu().contiguous(),
         "jacobi_inv_diag": ctx["jacobi_inv_diag"].detach().cpu().contiguous(),
     }
+    if ctx.get("use_dense_A"):
+        out["use_dense_A"] = True
+        out["A_dense"] = ctx["A_dense"].detach().cpu().contiguous()
+    else:
+        out["use_dense_A"] = False
+        sp = ctx["A_sp"].detach().cpu().coalesce()
+        out["A_sp_indices"] = sp.indices().contiguous()
+        out["A_sp_values"] = sp.values().contiguous()
+        out["A_sp_size"] = [int(sp.size(0)), int(sp.size(1))]
+    return out
 
 
 def _deserialize_context(entry: dict, device: torch.device) -> dict:
     lm, lf, om, off = entry["precomputed_leaf_connectivity"]
+    use_dense = bool(entry.get("use_dense_A", True))
+    if use_dense:
+        A_dense = entry["A_dense"].to(device)
+        A_sp = None
+    else:
+        A_dense = None
+        A_sp = torch.sparse_coo_tensor(
+            entry["A_sp_indices"],
+            entry["A_sp_values"],
+            tuple(entry["A_sp_size"]),
+            dtype=entry["A_sp_values"].dtype,
+            device=device,
+        ).coalesce()
     return {
         "n_pad": entry["n_pad"],
         "n_orig": entry["n_orig"],
@@ -104,7 +126,9 @@ def _deserialize_context(entry: dict, device: torch.device) -> dict:
         "x_input": entry["x_input"].to(device),
         "edge_index": entry["edge_index"].to(device),
         "edge_values": entry["edge_values"].to(device),
-        "A_dense": entry["A_dense"].to(device),
+        "use_dense_A": use_dense,
+        "A_dense": A_dense,
+        "A_sp": A_sp,
         "precomputed_leaf_connectivity": (
             lm.to(device),
             lf.to(device),

@@ -398,8 +398,12 @@ class LeafOnlyNet(nn.Module):
         use_gcn=True,
         num_gcn_layers=PhysicsAwareEmbedding.DEFAULT_NUM_GCN_LAYERS,
         use_jacobi=True,
+        strip_build_mode: str = "no_einsum",
     ):
         super().__init__()
+        if strip_build_mode not in ("einsum", "no_einsum"):
+            raise ValueError(f"strip_build_mode must be 'einsum' or 'no_einsum', got {strip_build_mode!r}")
+        self.strip_build_mode = strip_build_mode
         self.leaf_size = int(leaf_size)
         # H-matrix stack uses fixed L×(L+1) attention (block node); required for static compile.
         attention_layout = f"{self.leaf_size}x{self.leaf_size + 1}"
@@ -592,18 +596,19 @@ class LeafOnlyNet(nn.Module):
                 om = pool_leaf_attn_mask(om, L, self.off_token_pool)
                 oe = pool_leaf_edge_feats(oe, L, self.off_token_pool)
             if om.dim() == 3:
-                om4 = om.unsqueeze(0).expand(B, M_off, -1, -1).contiguous()
+                # Keep expanded view strided; avoid .contiguous() (would materialize a full B×M copy each forward).
+                om4 = om.unsqueeze(0).expand(B, M_off, -1, -1)
             else:
                 om4 = om.contiguous()
                 if om4.shape[0] == 1 and B > 1:
-                    om4 = om4.expand(B, -1, -1, -1).contiguous()
+                    om4 = om4.expand(B, -1, -1, -1)
             Lq, Kq = om4.shape[-2], om4.shape[-1]
             if oe.dim() == 4:
-                oe5 = oe.unsqueeze(0).expand(B, M_off, -1, -1, -1).contiguous()
+                oe5 = oe.unsqueeze(0).expand(B, M_off, -1, -1, -1)
             else:
                 oe5 = oe.contiguous()
                 if oe5.shape[0] == 1 and B > 1:
-                    oe5 = oe5.expand(B, -1, -1, -1, -1, -1).contiguous()
+                    oe5 = oe5.expand(B, -1, -1, -1, -1, -1)
             off_attn_mask = om4.reshape(B * M_off, 1, Lq, Kq)
             off_edge_feats = oe5.reshape(B * M_off, 1, Lq, Kq, 4)
 
@@ -622,10 +627,21 @@ class LeafOnlyNet(nn.Module):
 
         if M_off > 0:
             h_k = h.view(B, K, L, C_h)
-            Wr = self.hm_pool_w_row.to(device=h.device, dtype=h.dtype)
-            Wc = self.hm_pool_w_col.to(device=h.device, dtype=h.dtype)
-            row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
-            col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+            if self.strip_build_mode == "einsum":
+                Wr = self.hm_pool_w_row.to(device=h.device, dtype=h.dtype)
+                Wc = self.hm_pool_w_col.to(device=h.device, dtype=h.dtype)
+                row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
+                col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+            else:
+                ridx, cidx, gidx = _hm_prolong_scatter_indices(h.device)
+                h_k_t = h_k.transpose(0, 1)
+                row_sum = torch.zeros(M_off, B, L, C_h, device=h.device, dtype=h.dtype)
+                col_sum = torch.zeros(M_off, B, L, C_h, device=h.device, dtype=h.dtype)
+                row_sum.index_add_(0, gidx, h_k_t[ridx])
+                col_sum.index_add_(0, gidx, h_k_t[cidx])
+                S_view = self.h_block_S.view(M_off, 1, 1, 1).to(device=h.device, dtype=h.dtype)
+                row_p = (row_sum / S_view).transpose(0, 1)
+                col_p = (col_sum / S_view).transpose(0, 1)
             h_off = (row_p + col_p).reshape(B * M_off, L, C_h)
             if self.off_token_pool > 1:
                 Ls = self.leaf_apply_off
