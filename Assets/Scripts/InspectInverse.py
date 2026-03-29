@@ -125,6 +125,8 @@ def main():
     
     max_above = np.percentile(impacts_above, 98) + 1e-9
     max_below = np.percentile(impacts_below, 98) + 1e-9
+    median_above = float(np.median(impacts_above))
+    median_below = float(np.median(impacts_below))
 
     # 4. Setup Interactive Matplotlib UI (2x2 Grid)
     fig, ((ax_inv, ax_sens), (ax_eig, ax_cond)) = plt.subplots(2, 2, figsize=(18, 16), constrained_layout=True)
@@ -163,6 +165,17 @@ def main():
     sm_below.set_array([])
     cbar_below = fig.colorbar(sm_below, ax=ax_cond, orientation='horizontal', fraction=0.04, pad=0.08)
     cbar_below.set_label("Impact Below Cluster (fixes large $\\lambda_A$) — Blue scale")
+
+    # Reference: median of all blocks on each impact scale (dashed). Selection adds yellow lines in onclick.
+    for cb, med in ((cbar_above, median_above), (cbar_below, median_below)):
+        cb.ax.axvline(
+            med,
+            color="#555",
+            linestyle="--",
+            linewidth=1.25,
+            zorder=5,
+            clip_on=False,
+        )
 
     rects_inv, rects_eig, rects_cond = [], [], []
     green_cmap = plt.get_cmap("Greens")
@@ -229,7 +242,11 @@ def main():
     fig.colorbar(im2, ax=ax_sens, fraction=0.046, pad=0.04)
 
     # State container for click event
-    state = {'selected_idx': None}
+    state = {
+        'selected_idx': None,
+        'cbar_marker_above': None,
+        'cbar_marker_below': None,
+    }
     energy_label = ax_sens.text(
         0.99, 0.01, "",
         transform=ax_sens.transAxes, ha="right", va="bottom",
@@ -253,6 +270,12 @@ def main():
 
         if clicked_idx is None:
             return
+
+        for key in ("cbar_marker_above", "cbar_marker_below"):
+            m = state.get(key)
+            if m is not None:
+                m.remove()
+                state[key] = None
 
         # Restore previous selection
         if state['selected_idx'] is not None:
@@ -282,6 +305,21 @@ def main():
         state['selected_idx'] = clicked_idx
 
         b = block_info[clicked_idx]
+
+        state["cbar_marker_above"] = cbar_above.ax.axvline(
+            b["impact_above"],
+            color="yellow",
+            linewidth=2.8,
+            zorder=6,
+            clip_on=False,
+        )
+        state["cbar_marker_below"] = cbar_below.ax.axvline(
+            b["impact_below"],
+            color="yellow",
+            linewidth=2.8,
+            zorder=6,
+            clip_on=False,
+        )
         R = slice(b['r0'], b['r1'])
         C = slice(b['c0'], b['c1'])
 
