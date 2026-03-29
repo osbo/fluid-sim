@@ -60,48 +60,48 @@ def _unmerge_batch_blocks(t: torch.Tensor, batch_shape: Optional[Tuple[int, int]
     return t.view(B, nb, *tail_shape)
 
 
-def pool_leaf_attn_mask(attn_mask: torch.Tensor, leaf_size: int, pool: int) -> torch.Tensor:
-    """Or-pool query×key within each leaf; supports (M, L, K) or (B, M, L, K)."""
+def pool_leaf_attn_mask(attn_mask: torch.Tensor, leaf_size: int, pool: int, num_extra: int = 0) -> torch.Tensor:
+    """Or-pool leaf×leaf quadrant; special rows/cols (last ``num_extra``) are not pooled on their axis."""
     if pool <= 1:
         return attn_mask
     L = int(leaf_size)
     assert L % pool == 0, f"leaf_size {L} not divisible by pool {pool}"
     Ls = L // pool
+    nx = int(num_extra)
     m, batch_shape = _merge_batch_blocks(attn_mask, attn_mask.dim() == 4)
-    k_old = m.shape[-1]
-    special = k_old - L
-    if special not in (1, 2):
-        raise ValueError(f"expected L+1 or L+2 key layout, got key_dim={k_old} for L={L}")
+    T = int(m.shape[-1])
+    if T != L + nx or m.shape[-2] != T:
+        raise ValueError(f"expected square (L+nx)x(L+nx) with L={L}, nx={nx}, got {tuple(m.shape)}")
     nb = m.shape[0]
-    sub = m[:, :L, :L].reshape(nb, Ls, pool, Ls, pool).amax(dim=(2, 4))
-    parts = [sub]
-    for j in range(special):
-        c = m[:, :L, L + j].reshape(nb, Ls, pool).amax(dim=2)
-        parts.append(c.unsqueeze(-1))
-    out = torch.cat(parts, dim=-1)
+    out = m.new_zeros(nb, Ls + nx, Ls + nx)
+    out[:, :Ls, :Ls] = m[:, :L, :L].reshape(nb, Ls, pool, Ls, pool).amax(dim=(2, 4))
+    if nx > 0:
+        out[:, :Ls, Ls:] = m[:, :L, L:T].reshape(nb, Ls, pool, nx).amax(dim=2)
+        out[:, Ls:, :Ls] = m[:, L:T, :L].reshape(nb, nx, Ls, pool).amax(dim=3)
+        out[:, Ls:, Ls:] = m[:, L:T, L:T]
     return _unmerge_batch_blocks(out, batch_shape, tuple(out.shape[1:]))
 
 
-def pool_leaf_edge_feats(edge_feats: torch.Tensor, leaf_size: int, pool: int) -> torch.Tensor:
+def pool_leaf_edge_feats(edge_feats: torch.Tensor, leaf_size: int, pool: int, num_extra: int = 0) -> torch.Tensor:
     """Mean-pool edge feat grid to match ``pool_leaf_attn_mask``."""
     if pool <= 1:
         return edge_feats
     L = int(leaf_size)
     assert L % pool == 0
     Ls = L // pool
+    nx = int(num_extra)
     m, batch_shape = _merge_batch_blocks(edge_feats, edge_feats.dim() == 5)
-    k_old = m.shape[-2]
-    special = k_old - L
-    if special not in (1, 2):
-        raise ValueError(f"expected L+1 or L+2 key layout for edge_feats, got key_dim={k_old}")
+    T = int(m.shape[-2])
+    if T != L + nx:
+        raise ValueError(f"expected key dim L+nx={L+nx}, got {T}")
     nb = m.shape[0]
     E = m.shape[-1]
-    sub = m[:, :L, :L, :].reshape(nb, Ls, pool, Ls, pool, E).mean(dim=(2, 4))
-    parts = [sub]
-    for j in range(special):
-        c = m[:, :L, L + j, :].reshape(nb, Ls, pool, E).mean(dim=2)
-        parts.append(c.unsqueeze(2))
-    out = torch.cat(parts, dim=2)
+    out = m.new_zeros(nb, Ls + nx, Ls + nx, E)
+    out[:, :Ls, :Ls, :] = m[:, :L, :L, :].reshape(nb, Ls, pool, Ls, pool, E).mean(dim=(2, 4))
+    if nx > 0:
+        out[:, :Ls, Ls:, :] = m[:, :L, L:T, :].reshape(nb, Ls, pool, nx, E).mean(dim=2)
+        out[:, Ls:, :Ls, :] = m[:, L:T, :L, :].reshape(nb, nx, Ls, pool, E).mean(dim=3)
+        out[:, Ls:, Ls:, :] = m[:, L:T, L:T, :]
     return _unmerge_batch_blocks(out, batch_shape, tuple(out.shape[1:]))
 
 
@@ -109,39 +109,36 @@ def _normalize_attention_layout_string(layout: str) -> str:
     return layout.strip().lower().replace("×", "x")
 
 
-def parse_attention_layout(layout: str, block_size: int) -> tuple[bool, bool]:
+def parse_attention_layout(layout: str, leaf_size: int) -> int:
     """
-    Returns (use_block_node, use_matrix_node) for LeafBlockAttention.
-    Layout must be '{L}x{L}', '{L}x{L+1}', or '{L}x{L+2}' with L == block_size (query rows = leaf nodes).
+    Symmetric TxT attention with T = leaf_size + num_extra, num_extra in {0,1,2}.
+
+    Layout strings: ``LxL``, ``(L+1)x(L+1)``, ``(L+2)x(L+2)`` (e.g. ``33x33`` for L=32).
+    Returns ``num_extra`` (0, 1, or 2). Checkpoint code is the same: 0 / 1 / 2.
     """
     parts = _normalize_attention_layout_string(layout).split("x")
     if len(parts) != 2:
-        raise ValueError(
-            f"attention_layout {layout!r} must look like '{{L}}x{{L}}', '{{L}}x{{L+1}}', or '{{L}}x{{L+2}}'"
-        )
+        raise ValueError(f"attention_layout {layout!r} must look like '{{T}}x{{T}}' with T in {{L,L+1,L+2}}")
     r, c = int(parts[0]), int(parts[1])
-    L = int(block_size)
-    if r != L:
-        raise ValueError(f"attention_layout first dimension ({r}) must equal leaf_size ({L})")
-    if c == L:
-        return False, False
-    if c == L + 1:
-        return True, False
-    if c == L + 2:
-        return True, True
-    raise ValueError(
-        f"attention_layout second dimension ({c}) must be L, L+1, or L+2 for leaf_size={L}; got {layout!r}"
-    )
+    L = int(leaf_size)
+    if r != c:
+        raise ValueError(
+            f"attention_layout must be symmetric TxT (e.g. {L}x{L}, {L+1}x{L+1}); got {layout!r}"
+        )
+    T = r
+    if T < L or T > L + 2:
+        raise ValueError(f"T must be in [L, L+2] for leaf_size={L}; got T={T}")
+    return T - L
 
 
 def attention_layout_choices(leaf_size: int) -> tuple[str, str, str]:
     L = int(leaf_size)
-    return (f"{L}x{L}", f"{L}x{L + 1}", f"{L}x{L + 2}")
+    return (f"{L}x{L}", f"{L + 1}x{L + 1}", f"{L + 2}x{L + 2}")
 
 
 def default_attention_layout(leaf_size: int) -> str:
     L = int(leaf_size)
-    return f"{L}x{L + 1}"
+    return f"{L + 1}x{L + 1}"
 
 
 class SparsePhysicsGCN(nn.Module):
@@ -211,14 +208,17 @@ class PhysicsAwareEmbedding(nn.Module):
 
 
 class LeafBlockAttention(nn.Module):
-    def __init__(self, dim, block_size, num_heads=8, attention_layout=None):
+    def __init__(self, dim, leaf_size, num_heads=8, attention_layout=None):
         super().__init__()
         self.dim = dim
-        self.block_size = int(block_size)
+        self.leaf_size = int(leaf_size)
         if attention_layout is None:
-            attention_layout = default_attention_layout(block_size)
-        self.use_block_node, self.use_matrix_node = parse_attention_layout(attention_layout, block_size)
-        self.attention_layout = attention_layout
+            attention_layout = default_attention_layout(self.leaf_size)
+        self.num_extra = int(parse_attention_layout(attention_layout, self.leaf_size))
+        self.T = self.leaf_size + self.num_extra
+        self.attention_layout = f"{self.T}x{self.T}"
+        self.use_block_node = self.num_extra >= 1
+        self.use_matrix_node = self.num_extra >= 2
         self.num_heads = num_heads if dim % num_heads == 0 else 1
         self.head_dim = dim // self.num_heads
         self.scale = self.head_dim ** -0.5
@@ -234,46 +234,34 @@ class LeafBlockAttention(nn.Module):
         self.last_scores_matrix = None
         self.last_bias_physics_matrix = None
 
-    def forward(self, x, edge_index=None, edge_values=None, positions=None, save_attention=False, attn_mask=None, edge_feats=None):
-        B, N, C = x.shape
-        device = x.device
-        dtype = x.dtype
-        L = self.block_size
+    def _view_x_as_blocks(self, x):
+        """Pad to full blocks and return (x_blk, node_pad, N_orig)."""
+        B, N_orig, C = x.shape
+        T = self.T
         node_pad = 0
-        if N % L != 0:
-            node_pad = L - (N % L)
-            x = F.pad(x, (0, 0, 0, node_pad))
-        N_pad = x.shape[1]
-        num_blocks = N_pad // L
-        x_blk = x.view(B, num_blocks, L, C)
+        x_work = x
+        if N_orig % T != 0:
+            node_pad = T - (N_orig % T)
+            x_work = F.pad(x, (0, 0, 0, node_pad))
+        N_pad = x_work.shape[1]
+        num_blocks = N_pad // T
+        x_blk = x_work.view(B, num_blocks, T, C)
+        return x_blk, node_pad, N_orig
 
-        if attn_mask is None:
-            if edge_feats is not None:
-                raise ValueError("LeafBlockAttention: edge_feats set but attn_mask is None.")
-            return x[:, :N, :] if node_pad > 0 else x
-        if edge_feats is None:
-            raise ValueError("LeafBlockAttention requires edge_feats when attn_mask is provided.")
+    def _combined_weights_heads_from_xblk(self, x_blk, attn_mask, edge_feats):
+        """
+        Same combined weights as forward (softmax scores + edge_gate), shape (B, num_blocks, T, T, num_heads).
+        """
+        B, num_blocks, T, C = x_blk.shape
+        device = x_blk.device
 
-        x_attn = x_blk
-        use_block_node = self.use_block_node
-        use_matrix_node = self.use_matrix_node
-        kv_parts = [x_attn]
-        if use_block_node:
-            block_node = x_attn.mean(dim=2, keepdim=True)
-            kv_parts.append(block_node)
-        if use_matrix_node:
-            matrix_node = x.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, num_blocks, -1, -1)
-            kv_parts.append(matrix_node)
-        kv = torch.cat(kv_parts, dim=2)
-        qkv_q = self.qkv(x_attn)
-        qkv_kv = self.qkv(kv)
-        q = qkv_q[..., :C]
-        k = qkv_kv[..., C:2 * C]
-        v = qkv_kv[..., 2 * C:3 * C]
-        key_count = kv.shape[2]
-        q = q.view(B, num_blocks, L, self.num_heads, self.head_dim)
-        k = k.view(B, num_blocks, key_count, self.num_heads, self.head_dim)
-        v = v.view(B, num_blocks, key_count, self.num_heads, self.head_dim)
+        qkv = self.qkv(x_blk)
+        q = qkv[..., :C]
+        k = qkv[..., C : 2 * C]
+        v = qkv[..., 2 * C : 3 * C]
+        q = q.view(B, num_blocks, T, self.num_heads, self.head_dim)
+        k = k.view(B, num_blocks, T, self.num_heads, self.head_dim)
+        v = v.view(B, num_blocks, T, self.num_heads, self.head_dim)
 
         scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
 
@@ -281,69 +269,104 @@ class LeafBlockAttention(nn.Module):
             bias_physics = edge_feats[..., :4].unsqueeze(0).expand(B, -1, -1, -1, -1).clone()
         else:
             bias_physics = edge_feats[..., :4].clone()
-        if bias_physics.shape[3] != key_count:
-            if bias_physics.shape[3] > key_count:
-                bias_physics = bias_physics[:, :, :, :key_count, :]
-            else:
-                key_pad = key_count - bias_physics.shape[3]
-                pad_tensor = torch.zeros(*bias_physics.shape[:3], key_pad, bias_physics.shape[4], device=bias_physics.device, dtype=bias_physics.dtype)
-                bias_physics = torch.cat([bias_physics, pad_tensor], dim=3)
-        special_start = L
-        if use_block_node:
-            bias_physics[:, :, :, special_start, :] = 0.0
-            bias_physics[:, :, :, special_start, 3] = 1.0
-            special_start += 1
-        if use_matrix_node:
-            bias_physics[:, :, :, special_start, :] = 0.0
-            bias_physics[:, :, :, special_start, 3] = 1.0
-        arange_s = torch.arange(L, device=device)
-        bias_physics[:, :, arange_s, arange_s, :] = 0.0
-        bias_physics[:, :, arange_s, arange_s, 3] = 1.0
+        if bias_physics.shape[3] != T or bias_physics.shape[2] != T:
+            raise ValueError(
+                f"edge_feats expected (..., {T}, {T}, 4), got {tuple(bias_physics.shape)}"
+            )
+        ar_t = torch.arange(T, device=device)
+        bias_physics[:, :, ar_t, ar_t, :] = 0.0
+        bias_physics[:, :, ar_t, ar_t, 3] = 1.0
         scores = scores + bias_physics[..., 3:4]
+
         if attn_mask.dim() == 3:
             mask_base = attn_mask.unsqueeze(0)
         else:
             mask_base = attn_mask
-        if mask_base.shape[3] != key_count:
-            if mask_base.shape[3] > key_count:
-                mask_base = mask_base[:, :, :, :key_count]
-            else:
-                key_pad = key_count - mask_base.shape[3]
-                pad_tensor = torch.ones(*mask_base.shape[:3], key_pad, device=mask_base.device, dtype=mask_base.dtype)
-                mask_base = torch.cat([mask_base, pad_tensor], dim=3)
+        if mask_base.shape[2] != T or mask_base.shape[3] != T:
+            raise ValueError(f"attn_mask expected (..., {T}, {T}), got {tuple(mask_base.shape)}")
         mask_expanded = mask_base.unsqueeze(-1)
         scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
-
-        if save_attention:
-            with torch.no_grad():
-                self.last_scores_matrix = scores.mean(dim=-1)[:, :, :, :L].cpu().float()
-                self.last_bias_physics_matrix = bias_physics[:, :, :L].cpu().float()
 
         attn_probs = F.softmax(scores, dim=3)
         linear_edge_weights = self.edge_gate(bias_physics)
         linear_edge_weights = linear_edge_weights.masked_fill(mask_expanded == 0, 0.0)
         combined_weights = attn_probs + linear_edge_weights
+        return combined_weights, v, bias_physics, scores, mask_expanded
+
+    @torch.no_grad()
+    def row_normalized_mean_weights(self, x, attn_mask, edge_feats):
+        """
+        Mean over heads of (softmax + edge_gate), then row-normalized to sum to 1 (matches a distribution over keys).
+        Returns (W, M) with W, M shape (B, num_blocks, T, T); M is 0/1 attention mask (broadcast-expanded).
+        """
+        x_blk, _, _ = self._view_x_as_blocks(x)
+        cw, _, _, _, _ = self._combined_weights_heads_from_xblk(x_blk, attn_mask, edge_feats)
+        W = cw.mean(dim=-1)
+        W = W / W.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        if attn_mask.dim() == 3:
+            mask_base = attn_mask.unsqueeze(0)
+        else:
+            mask_base = attn_mask
+        M = (mask_base > 0).float()
+        if M.shape[0] == 1 and W.shape[0] != 1:
+            M = M.expand(W.shape[0], -1, -1, -1)
+        return W, M
+
+    def forward(
+        self,
+        x,
+        edge_index=None,
+        edge_values=None,
+        positions=None,
+        save_attention=False,
+        attn_mask=None,
+        edge_feats=None,
+    ):
+        B, N, C = x.shape
+        device = x.device
+        T = self.T
+        x_blk, node_pad, N_orig = self._view_x_as_blocks(x)
+        num_blocks = x_blk.shape[1]
+
+        if attn_mask is None:
+            if edge_feats is not None:
+                raise ValueError("LeafBlockAttention: edge_feats set but attn_mask is None.")
+            return x[:, :N_orig, :] if node_pad > 0 else x
+        if edge_feats is None:
+            raise ValueError("LeafBlockAttention requires edge_feats when attn_mask is provided.")
+
+        combined_weights, v, bias_physics, scores, mask_expanded = self._combined_weights_heads_from_xblk(
+            x_blk, attn_mask, edge_feats
+        )
+        L = self.leaf_size
+
+        if save_attention:
+            with torch.no_grad():
+                self.last_scores_matrix = scores.mean(dim=-1)[:, :, :, :L].cpu().float()
+                self.last_bias_physics_matrix = bias_physics[:, :, :L, :L].cpu().float()
 
         if not self.training and not torch.compiler.is_compiling():
             with torch.no_grad():
                 attn_viz = combined_weights.mean(dim=-1)
                 arange = torch.arange(L, device=attn_viz.device)
                 self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
-                if use_block_node and attn_viz.shape[3] > L:
+                if self.num_extra >= 1 and attn_viz.shape[3] > L:
                     self.last_attn_block = attn_viz[:, :, :, L].mean().item()
                 else:
                     self.last_attn_block = 0.0
-                to_nodes = attn_viz[:, :, :, :L].sum(dim=3)
+                # Physical queries only: T may be L+num_extra; arange is length L.
+                to_nodes = attn_viz[:, :, :L, :L].sum(dim=3)
                 self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
                 if save_attention:
                     self.last_attn_matrix = attn_viz[:, :, :, :L].cpu().float()
 
         x_out = torch.einsum("bnqkh,bnkhd->bnqhd", combined_weights, v)
-        x_out = x_out.reshape(B, num_blocks, L, C)
+        x_out = x_out.reshape(B, num_blocks, T, C)
         x_out = self.proj(x_out)
+        N_pad = num_blocks * T
         x_out = x_out.reshape(B, N_pad, C)
         if node_pad > 0:
-            x_out = x_out[:, :N, :]
+            x_out = x_out[:, :N_orig, :]
         return x_out
 
 
@@ -360,7 +383,16 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_hidden, dim),
         )
 
-    def forward(self, x, edge_index=None, edge_values=None, positions=None, save_attention=False, attn_mask=None, edge_feats=None):
+    def forward(
+        self,
+        x,
+        edge_index=None,
+        edge_values=None,
+        positions=None,
+        save_attention=False,
+        attn_mask=None,
+        edge_feats=None,
+    ):
         x = x + self.attn(
             self.norm1(x),
             edge_index=edge_index,
@@ -405,8 +437,11 @@ class LeafOnlyNet(nn.Module):
             raise ValueError(f"strip_build_mode must be 'einsum' or 'no_einsum', got {strip_build_mode!r}")
         self.strip_build_mode = strip_build_mode
         self.leaf_size = int(leaf_size)
-        # H-matrix stack uses fixed L×(L+1) attention (block node); required for static compile.
-        attention_layout = f"{self.leaf_size}x{self.leaf_size + 1}"
+        if attention_layout is None:
+            attention_layout = default_attention_layout(self.leaf_size)
+        self.attention_layout = str(attention_layout)
+        self.num_extra = int(parse_attention_layout(self.attention_layout, self.leaf_size))
+        self.tokens_per_block = self.leaf_size + self.num_extra
         self.embed = PhysicsAwareEmbedding(
             input_dim,
             d_model,
@@ -422,31 +457,33 @@ class LeafOnlyNet(nn.Module):
         self.off_token_pool = otp
         Ls_off = L // otp
         self.leaf_apply_size = L
-        self.leaf_apply_off = Ls_off
         La_d = L
         La_o = Ls_off
-        off_attn_layout = f"{Ls_off}x{Ls_off + 1}"
+        self.leaf_apply_off = La_o
+        T_off = Ls_off + self.num_extra
+        self.off_tokens_per_block = T_off
+        off_attn_layout = f"{T_off}x{T_off}"
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
                     d_model,
-                    block_size=L,
+                    block_size=self.tokens_per_block,
                     attn_module=LeafBlockAttention(
                         d_model,
                         L,
                         num_heads=num_heads,
-                        attention_layout=attention_layout,
+                        attention_layout=self.attention_layout,
                     ),
                 )
                 for _ in range(num_layers)
             ]
         )
-        # Strip-pooled tokens are mean-pooled to Ls_off before this stack; attention + MLP stay at Ls_off (no upsample).
+        # H row/col strip features start at length L; if off_token_pool>1, mean-pool to Ls_off before this stack.
         self.off_diag_blocks = nn.ModuleList(
             [
                 TransformerBlock(
                     d_model,
-                    block_size=Ls_off,
+                    block_size=T_off,
                     attn_module=LeafBlockAttention(
                         d_model,
                         Ls_off,
@@ -493,25 +530,35 @@ class LeafOnlyNet(nn.Module):
         self.register_buffer("hm_sum_w_col", wc_sum, persistent=False)
 
     def _get_leaf_blocks(self, h, mode="diagonal"):
-        # Diagonal: (B, N, C) with N = K * L. Off: (B, M_off, L, C) one L-token tile per H block — fold to (B*M, L, C).
+        # Diagonal: N = K * T; first L positions are mesh nodes. Off: N = M * T_off; heads use first Ls strip only.
         off_bm = None
+        T_off = int(self.off_tokens_per_block)
+        Ls = int(self.leaf_apply_off)
         if mode == "off-diagonal" and h.dim() == 4:
             B0, M0, Ln, C = h.shape
-            if Ln != self.leaf_apply_off:
-                raise ValueError(f"off-diagonal h expected L={self.leaf_apply_off}, got {Ln}")
+            if Ln != T_off:
+                raise ValueError(f"off-diagonal h expected {T_off} tokens/tile, got {Ln}")
             off_bm = (B0, M0)
-            h = h.reshape(B0 * M0, self.leaf_apply_off, C)
+            h = h.reshape(B0 * M0, T_off, C)
         Bf, N_or_P_len, _ = h.shape
+        Lf = self.leaf_size
         if mode == "diagonal":
-            num_leaves = N_or_P_len // self.leaf_size
-            h_leaves = h.view(Bf, num_leaves, self.leaf_size, -1)
+            T = self.tokens_per_block
+            if N_or_P_len % T != 0:
+                raise ValueError(f"diagonal h length {N_or_P_len} not divisible by tokens_per_block {T}")
+            num_leaves = N_or_P_len // T
+            h_full = h.view(Bf, num_leaves, T, -1)
+            h_leaves = h_full[:, :, :Lf, :]
             u_leaf = self.leaf_head(h_leaves)
             out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2))
         else:
-            num_tiles = N_or_P_len // self.leaf_apply_off
-            h_leaves = h.view(Bf, num_tiles, self.leaf_apply_off, -1)
-            u_leaf = self.off_diag_head_U(h_leaves)
-            v_leaf = self.off_diag_head_V(h_leaves)
+            if N_or_P_len % T_off != 0:
+                raise ValueError(f"off h length {N_or_P_len} not divisible by {T_off}")
+            num_tiles = N_or_P_len // T_off
+            h_full = h.view(Bf, num_tiles, T_off, -1)
+            h_strip = h_full[:, :, :Ls, :]
+            u_leaf = self.off_diag_head_U(h_strip)
+            v_leaf = self.off_diag_head_V(h_strip)
             out = torch.matmul(u_leaf, v_leaf.transpose(-1, -2))
         if off_bm is not None:
             B0, M0 = off_bm
@@ -522,11 +569,64 @@ class LeafOnlyNet(nn.Module):
         if not self.use_jacobi:
             return None
         B, N, C = h.shape
-        num_leaves = N // self.leaf_size
-        h_leaves = h.view(B, num_leaves, self.leaf_size, C)
+        T = self.tokens_per_block
+        Lf = self.leaf_size
+        num_leaves = N // T
+        h_leaves = h.view(B, num_leaves, T, C)[:, :, :Lf, :]
         j_gate = torch.sigmoid(self.jacobi_gate(h_leaves)).squeeze(-1)
         self._last_j_gate = j_gate.detach()
-        return j_gate.view(B, N)
+        return j_gate.view(B, num_leaves * Lf)
+
+    @staticmethod
+    def _append_special_tokens_diagonal(h_flat: torch.Tensor, B: int, K: int, L: int, C: int, num_extra: int) -> torch.Tensor:
+        if num_extra <= 0:
+            return h_flat
+        h_lv = h_flat.view(B, K, L, C)
+        parts = [h_lv, h_lv.mean(dim=2, keepdim=True)]
+        if num_extra >= 2:
+            g = h_flat.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, K, -1, -1)
+            parts.append(g)
+        return torch.cat(parts, dim=2).reshape(B, K * (L + num_extra), C)
+
+    def _append_special_tokens_off_strip(
+        self, strip: torch.Tensor, h_diag: torch.Tensor, B: int, K: int, L: int, C_h: int, M_off: int
+    ) -> torch.Tensor:
+        nx = int(self.num_extra)
+        if nx <= 0:
+            return strip
+        Bm = B * M_off
+        Ls = self.leaf_apply_off
+        s4 = strip.view(Bm, 1, Ls, C_h)
+        parts = [s4, s4.mean(dim=2, keepdim=True)]
+        if nx >= 2:
+            g = h_diag.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, M_off, -1).reshape(Bm, 1, 1, C_h)
+            parts.append(g)
+        return torch.cat(parts, dim=2).reshape(Bm, Ls + nx, C_h)
+
+    def _build_off_strip(self, h_diag: torch.Tensor, B: int, K: int, L: int, C_h: int, M_off: int) -> torch.Tensor:
+        """H row/column strip aggregate for all off-blocks; shape (B*M_off, L or Ls_off, C_h). Uses physical nodes only."""
+        T = self.tokens_per_block
+        h_k = h_diag.view(B, K, T, C_h)[:, :, :L, :].contiguous().view(B, K, L, C_h)
+        if self.strip_build_mode == "einsum":
+            Wr = self.hm_pool_w_row.to(device=h_diag.device, dtype=h_diag.dtype)
+            Wc = self.hm_pool_w_col.to(device=h_diag.device, dtype=h_diag.dtype)
+            row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
+            col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+        else:
+            ridx, cidx, gidx = _hm_prolong_scatter_indices(h_diag.device)
+            h_k_t = h_k.transpose(0, 1)
+            row_sum = torch.zeros(M_off, B, L, C_h, device=h_diag.device, dtype=h_diag.dtype)
+            col_sum = torch.zeros(M_off, B, L, C_h, device=h_diag.device, dtype=h_diag.dtype)
+            row_sum.index_add_(0, gidx, h_k_t[ridx])
+            col_sum.index_add_(0, gidx, h_k_t[cidx])
+            S_view = self.h_block_S.view(M_off, 1, 1, 1).to(device=h_diag.device, dtype=h_diag.dtype)
+            row_p = (row_sum / S_view).transpose(0, 1)
+            col_p = (col_sum / S_view).transpose(0, 1)
+        h_off = (row_p + col_p).reshape(B * M_off, L, C_h)
+        if self.off_token_pool > 1:
+            Ls = self.leaf_apply_off
+            h_off = h_off.view(B * M_off, Ls, self.off_token_pool, C_h).mean(dim=2)
+        return h_off
 
     def forward(self, x, edge_index, edge_values, save_attention=False, precomputed_leaf_connectivity=None, global_features=None):
         B, N, _ = x.shape
@@ -560,6 +660,7 @@ class LeafOnlyNet(nn.Module):
                     device,
                     dtype,
                     num_hops=ATTENTION_HOPS,
+                    num_extra=self.num_extra,
                 )
 
         B, N_h, C_h = h.shape
@@ -570,11 +671,16 @@ class LeafOnlyNet(nn.Module):
                 f"LeafOnlyNet: expected N/leaf_size == MAX_NUM_LEAVES ({MAX_NUM_LEAVES}), got K={K} (N={N_h}). "
                 "Pad/truncate to MAX_MIXED_SIZE nodes for a static H-grid."
             )
+        h = self._append_special_tokens_diagonal(h, B, K, L, C_h, self.num_extra)
+        N_h = h.shape[1]
+        T = self.tokens_per_block
+        if N_h != K * T:
+            raise ValueError(f"internal: expected N={K * T} after special tokens, got {N_h}")
 
         off_attn_mask = off_edge_feats = None
         M_off = self.num_h_off
+        T_off = self.off_tokens_per_block
         if M_off > 0:
-            # After strip sum + optional token mean-pool: (B*M_off, Ls_off, C), num_blocks=1; masks match Ls_off.
             if off_om_pre is None or off_om_pre.numel() == 0:
                 raise ValueError(
                     "LeafOnlyNet: H off-diagonal attention mask missing. "
@@ -593,10 +699,9 @@ class LeafOnlyNet(nn.Module):
             om = off_om_pre.to(device=h.device, dtype=h.dtype)
             oe = off_oe_pre.to(device=h.device, dtype=h.dtype)
             if self.off_token_pool > 1:
-                om = pool_leaf_attn_mask(om, L, self.off_token_pool)
-                oe = pool_leaf_edge_feats(oe, L, self.off_token_pool)
+                om = pool_leaf_attn_mask(om, L, self.off_token_pool, self.num_extra)
+                oe = pool_leaf_edge_feats(oe, L, self.off_token_pool, self.num_extra)
             if om.dim() == 3:
-                # Keep expanded view strided; avoid .contiguous() (would materialize a full B×M copy each forward).
                 om4 = om.unsqueeze(0).expand(B, M_off, -1, -1)
             else:
                 om4 = om.contiguous()
@@ -613,50 +718,51 @@ class LeafOnlyNet(nn.Module):
             off_edge_feats = oe5.reshape(B * M_off, 1, Lq, Kq, 4)
 
         h_diag = h
-        for block in self.blocks:
-            h_diag = block(
-                h_diag,
-                edge_index=edge_index,
-                edge_values=edge_values,
-                positions=positions,
-                save_attention=save_attention,
-                attn_mask=attn_mask,
-                edge_feats=edge_feats,
-            )
-        diag_blocks = self._get_leaf_blocks(h_diag, mode="diagonal")
-
+        off_stream = None
+        n_l = len(self.blocks)
         if M_off > 0:
-            h_k = h.view(B, K, L, C_h)
-            if self.strip_build_mode == "einsum":
-                Wr = self.hm_pool_w_row.to(device=h.device, dtype=h.dtype)
-                Wc = self.hm_pool_w_col.to(device=h.device, dtype=h.dtype)
-                row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
-                col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+            if n_l == 0:
+                strip_b = self._build_off_strip(h_diag, B, K, L, C_h, M_off)
+                off_stream = self._append_special_tokens_off_strip(strip_b, h_diag, B, K, L, C_h, M_off)
             else:
-                ridx, cidx, gidx = _hm_prolong_scatter_indices(h.device)
-                h_k_t = h_k.transpose(0, 1)
-                row_sum = torch.zeros(M_off, B, L, C_h, device=h.device, dtype=h.dtype)
-                col_sum = torch.zeros(M_off, B, L, C_h, device=h.device, dtype=h.dtype)
-                row_sum.index_add_(0, gidx, h_k_t[ridx])
-                col_sum.index_add_(0, gidx, h_k_t[cidx])
-                S_view = self.h_block_S.view(M_off, 1, 1, 1).to(device=h.device, dtype=h.dtype)
-                row_p = (row_sum / S_view).transpose(0, 1)
-                col_p = (col_sum / S_view).transpose(0, 1)
-            h_off = (row_p + col_p).reshape(B * M_off, L, C_h)
-            if self.off_token_pool > 1:
-                Ls = self.leaf_apply_off
-                h_off = h_off.view(B * M_off, Ls, self.off_token_pool, C_h).mean(dim=2)
-            for block in self.off_diag_blocks:
-                h_off = block(
-                    h_off,
+                for i in range(n_l):
+                    h_diag = self.blocks[i](
+                        h_diag,
+                        edge_index=edge_index,
+                        edge_values=edge_values,
+                        positions=positions,
+                        save_attention=save_attention,
+                        attn_mask=attn_mask,
+                        edge_feats=edge_feats,
+                    )
+                    strip = self._build_off_strip(h_diag, B, K, L, C_h, M_off)
+                    strip = self._append_special_tokens_off_strip(strip, h_diag, B, K, L, C_h, M_off)
+                    off_in = strip if off_stream is None else strip + off_stream
+                    off_stream = self.off_diag_blocks[i](
+                        off_in,
+                        edge_index=edge_index,
+                        edge_values=edge_values,
+                        positions=positions,
+                        save_attention=False,
+                        attn_mask=off_attn_mask,
+                        edge_feats=off_edge_feats,
+                    )
+        else:
+            for block in self.blocks:
+                h_diag = block(
+                    h_diag,
                     edge_index=edge_index,
                     edge_values=edge_values,
                     positions=positions,
-                    save_attention=False,
-                    attn_mask=off_attn_mask,
-                    edge_feats=off_edge_feats,
+                    save_attention=save_attention,
+                    attn_mask=attn_mask,
+                    edge_feats=edge_feats,
                 )
-            h_off = h_off.view(B, M_off, self.leaf_apply_off, C_h)
+
+        diag_blocks = self._get_leaf_blocks(h_diag, mode="diagonal")
+
+        if M_off > 0:
+            h_off = off_stream.view(B, M_off, T_off, C_h)
             off_diag_blocks = self._get_leaf_blocks(h_off, mode="off-diagonal")
         else:
             off_diag_blocks = torch.empty(
@@ -665,8 +771,9 @@ class LeafOnlyNet(nn.Module):
 
         jacobi_scale = self._get_jacobi_scale(h_diag)
 
-        node_U = self.node_u(h_diag)
-        node_V = self.node_v(h_diag)
+        h_phys_flat = h_diag.view(B, K, T, C_h)[:, :, :L, :].reshape(B, K * L, C_h)
+        node_U = self.node_u(h_phys_flat)
+        node_V = self.node_v(h_phys_flat)
 
         Bb = diag_blocks.shape[0]
         packed_diag = diag_blocks.reshape(Bb, -1)

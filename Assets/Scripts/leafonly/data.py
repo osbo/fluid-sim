@@ -165,13 +165,15 @@ def _edge_feats_LxL_mean_scatter(
 
 
 def _materialize_block_attn_and_edge_feats(
-    reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
+    reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, num_extra, device, dtype
 ):
-    L = leaf_size
-    attn_mask = torch.zeros(num_blocks, L, L + 1, device=device, dtype=dtype)
-    attn_mask[:, :, :L] = reachable
-    attn_mask[:, :, L] = 1.0
-    edge_feats = torch.zeros(num_blocks, L, L + 1, 4, device=device, dtype=dtype)
+    """Symmetric (L+num_extra)x(L+num_extra) masks; leaf×leaf from reachability; specials fully connected."""
+    L = int(leaf_size)
+    nx = int(num_extra)
+    T = L + nx
+    attn_mask = torch.ones(num_blocks, T, T, device=device, dtype=dtype)
+    attn_mask[:, :L, :L] = reachable
+    edge_feats = torch.zeros(num_blocks, T, T, 4, device=device, dtype=dtype)
     if b_l.numel() > 0:
         for b in range(int(num_blocks)):
             sel = b_l == b
@@ -280,7 +282,7 @@ def _diag_in_block_edge_features(edge_index, edge_values, positions, leaf_size, 
 
 
 def _reachable_and_diag_materialize(
-    edge_index, edge_values, positions, leaf_size, device, dtype, num_hops
+    edge_index, edge_values, positions, leaf_size, device, dtype, num_hops, num_extra: int = 0
 ):
     """One full-graph hop pass; diagonal masks/feats; returns (R, dm, df, num_blocks) or (None, None, None, 0)."""
     N = positions.shape[0]
@@ -293,20 +295,27 @@ def _reachable_and_diag_materialize(
         edge_index, edge_values, positions, leaf_size, num_blocks, device, dtype
     )
     dm, df = _materialize_block_attn_and_edge_feats(
-        diag_reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
+        diag_reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, num_extra, device, dtype
     )
     return R, dm, df, num_blocks
 
 
 def build_diag_leaf_connectivity(
-    edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS
+    edge_index,
+    edge_values,
+    positions,
+    leaf_size,
+    device,
+    dtype=torch.float32,
+    num_hops=ATTENTION_HOPS,
+    num_extra: int = 0,
 ):
     """
     Per-leaf diagonal tiles only: n-hop reachability restricted to same leaf + edge features on
     in-leaf edges. (H off masks come from the same reachability in build_leaf_block_connectivity.)
     """
     _, dm, df, num_blocks = _reachable_and_diag_materialize(
-        edge_index, edge_values, positions, leaf_size, device, dtype, num_hops
+        edge_index, edge_values, positions, leaf_size, device, dtype, num_hops, num_extra=num_extra
     )
     if num_blocks == 0:
         return None, None
@@ -321,6 +330,7 @@ def build_hmatrix_off_attn_masks_from_reachable(
     num_blocks: int,
     leaf_size: int,
     dtype_out: torch.dtype,
+    num_extra: int = 0,
 ) -> torch.Tensor:
     """
     Aggregate global n-hop reachability into H-matrix off-block attention masks.
@@ -328,9 +338,11 @@ def build_hmatrix_off_attn_masks_from_reachable(
     For each admissible tile (r0, c0, S), OR together all L×L leaf-pair slices
     R[rr*L:(rr+1)*L, cc*L:(cc+1)*L] for rr in [r0, r0+S), cc in [c0, c0+S).
 
-    Returns (M_off, L, L+1); last key column is 1 (block node), matching diagonal layout.
+    Returns (M_off, T, T) with T = L + num_extra; specials fully connected (ones outside L×L leaf block).
     """
     L = int(leaf_size)
+    nx = int(num_extra)
+    T = L + nx
     K = int(num_blocks)
     N = K * L
     if reachable.shape != (N, N):
@@ -338,11 +350,11 @@ def build_hmatrix_off_attn_masks_from_reachable(
     device = reachable.device
     M = int(r0.shape[0])
     if M == 0:
-        return torch.zeros(0, L, L + 1, device=device, dtype=dtype_out)
+        return torch.zeros(0, T, T, device=device, dtype=dtype_out)
     r0_l = r0.long().to(device)
     c0_l = c0.long().to(device)
     s_l = s.long().to(device)
-    out = torch.zeros(M, L, L + 1, device=device, dtype=dtype_out)
+    out = torch.ones(M, T, T, device=device, dtype=dtype_out)
     for m in range(M):
         rr0 = int(r0_l[m].item())
         cc0 = int(c0_l[m].item())
@@ -354,8 +366,7 @@ def build_hmatrix_off_attn_masks_from_reachable(
                     subs.append(reachable[rr * L : (rr + 1) * L, cc * L : (cc + 1) * L])
         if subs:
             acc = torch.stack(subs, dim=0).amax(dim=0).to(dtype_out)
-            out[m, :, :L] = acc
-        out[m, :, L] = 1.0
+            out[m, :L, :L] = acc
     return out
 
 
@@ -369,14 +380,17 @@ def build_hmatrix_off_edge_feats_from_edges(
     num_blocks: int,
     leaf_size: int,
     dtype: torch.dtype,
+    num_extra: int = 0,
 ) -> torch.Tensor:
     """
     Per H-tile (r0, c0, S): aggregate direct graph edges whose src lies in the row-strip leaves
     and dst in the col-strip leaves into local (L, L, 4) with [Δx(3), A_ij(1)], mean over duplicates.
 
-    Layout matches diagonal per-leaf cells; last key column (block node) stays zero.
+    Padded to (T, T, 4), T = L + num_extra; non-leaf cells stay zero.
     """
     L = int(leaf_size)
+    nx = int(num_extra)
+    T = L + nx
     K = int(num_blocks)
     N = K * L
     device = edge_index.device
@@ -388,7 +402,7 @@ def build_hmatrix_off_edge_feats_from_edges(
     cols = cols[valid]
     if rows.numel() == 0:
         M = int(r0.shape[0])
-        return torch.zeros(M, L, L + 1, 4, device=device, dtype=dtype)
+        return torch.zeros(M, T, T, 4, device=device, dtype=dtype)
     ev = edge_values[valid].to(dtype=dtype)
     br = rows // L
     bc = cols // L
@@ -401,11 +415,11 @@ def build_hmatrix_off_edge_feats_from_edges(
 
     M = int(r0.shape[0])
     if M == 0:
-        return torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
+        return torch.zeros(0, T, T, 4, device=device, dtype=dtype)
     r0_l = r0.long().to(device)
     c0_l = c0.long().to(device)
     s_l = s.long().to(device)
-    out = torch.zeros(M, L, L + 1, 4, device=device, dtype=dtype)
+    out = torch.zeros(M, T, T, 4, device=device, dtype=dtype)
     for m in range(M):
         rr0 = int(r0_l[m].item())
         cc0 = int(c0_l[m].item())
@@ -420,7 +434,14 @@ def build_hmatrix_off_edge_feats_from_edges(
 
 
 def build_leaf_block_connectivity(
-    edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS
+    edge_index,
+    edge_values,
+    positions,
+    leaf_size,
+    device,
+    dtype=torch.float32,
+    num_hops=ATTENTION_HOPS,
+    num_extra: int = 0,
 ):
     """
     Returns (diag_mask, diag_feats, off_attn_mask, off_edge_feats).
@@ -430,21 +451,34 @@ def build_leaf_block_connectivity(
     direct edges crossing row-strip × col-strip leaves (mean per local L×L cell).
     """
     R, dm, df, num_blocks = _reachable_and_diag_materialize(
-        edge_index, edge_values, positions, leaf_size, device, dtype, num_hops
+        edge_index, edge_values, positions, leaf_size, device, dtype, num_hops, num_extra=num_extra
     )
     HM_R0_CPU, HM_C0_CPU, HM_S_CPU = _hmatrix_static()
     L = int(leaf_size)
+    nx = int(num_extra)
+    T = L + nx
     if num_blocks == 0 or R is None:
-        zm = torch.zeros(0, L, L + 1, device=device, dtype=dtype)
-        zf = torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
+        zm = torch.zeros(0, T, T, device=device, dtype=dtype)
+        zf = torch.zeros(0, T, T, 4, device=device, dtype=dtype)
         return None, None, zm, zf
 
     hm_r0 = HM_R0_CPU.to(device)
     hm_c0 = HM_C0_CPU.to(device)
     hm_s = HM_S_CPU.to(device)
-    om = build_hmatrix_off_attn_masks_from_reachable(R, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype)
+    om = build_hmatrix_off_attn_masks_from_reachable(
+        R, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype, num_extra=nx
+    )
     oe = build_hmatrix_off_edge_feats_from_edges(
-        edge_index, edge_values, positions, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype
+        edge_index,
+        edge_values,
+        positions,
+        hm_r0,
+        hm_c0,
+        hm_s,
+        num_blocks,
+        leaf_size,
+        dtype,
+        num_extra=nx,
     )
     return dm, df, om, oe
 

@@ -10,11 +10,11 @@ Use ``--test_only`` to run the PCG benchmark path and print only that summary (n
 
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
-plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. Off-diagonal neural tiles use
-``leaf_apply_off = LEAF_SIZE // OFF_DIAG_TOKEN_POOL`` (see ``leafonly.config``): the H-strip stream is
-mean-pooled on the leaf axis before the off-diagonal Transformer stack; connectivity masks are pooled
-to match—no upsample before the off heads. If σ_k does not decay by those indices, increase apply rank
-or decrease ``HMATRIX_ETA`` for smaller tiles.
+plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. Off-diagonal path uses
+``leaf_apply_off = LEAF_SIZE // OFF_DIAG_TOKEN_POOL`` (``leafonly.config``): H-matrix row/col strip
+aggregation only when ``OFF_DIAG_TOKEN_POOL`` is 1; larger values add uniform strip mean-pooling
+(masks/features pooled to match). If σ_k does not decay by those indices, increase apply rank or
+decrease ``HMATRIX_ETA`` for smaller tiles.
 """
 import argparse
 import sys
@@ -63,7 +63,6 @@ from leafonly import (
     apply_block_diagonal_m_into,
     block_diagonal_m_apply_workspace,
     build_sparse_bsr_preconditioner,
-    default_attention_layout,
     unpack_precond,
     FluidGraphDataset,
     build_leaf_block_connectivity,
@@ -1108,6 +1107,14 @@ def main():
     jacobi_diag_np[:n_requested] = np.diag(A_small).astype(np.float32, copy=False)
 
     _info("\nLeafOnly (GPU)...")
+    ac_hdr = int(_attention_layout_code)
+    if ac_hdr < 0:
+        ac_hdr = 1
+    _al_pick = (
+        f"{leaf_L}x{leaf_L}",
+        f"{leaf_L + 1}x{leaf_L + 1}",
+        f"{leaf_L + 2}x{leaf_L + 2}",
+    )[min(ac_hdr, 2)]
     model_leaf = LeafOnlyNet(
         input_dim=input_dim_lo,
         d_model=d_model_lo,
@@ -1115,7 +1122,7 @@ def main():
         num_layers=num_layers_lo,
         num_heads=num_heads_lo,
         use_gcn=bool(use_gcn_lo),
-        attention_layout=default_attention_layout(leaf_size_lo),
+        attention_layout=_al_pick,
     ).to(device)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
@@ -1135,10 +1142,18 @@ def main():
     pool_diag_to_full = int(leaf_L) // leaf_apply_diag_L
     pool_off_to_full = int(leaf_L) // leaf_apply_off_L
     if not test_only:
-        _info(
-            f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL={OFF_DIAG_TOKEN_POOL} → leaf_apply_off={leaf_apply_off_L} "
-            f"(H-strip mean-pool then Transformer+MLP at {leaf_apply_off_L} tokens/tile; packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
-        )
+        if int(OFF_DIAG_TOKEN_POOL) > 1:
+            _info(
+                f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL={OFF_DIAG_TOKEN_POOL} → leaf_apply_off={leaf_apply_off_L} "
+                f"(H strip + uniform mean-pool; Transformer+MLP at {leaf_apply_off_L} tokens/tile; "
+                f"packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
+            )
+        else:
+            _info(
+                f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL=1, leaf_apply_off={leaf_apply_off_L} "
+                f"(H-matrix strip aggregation only; Transformer+MLP at {leaf_apply_off_L} tokens/tile; "
+                f"packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
+            )
 
     with torch.inference_mode():
         x_leaf = x[:, :n_requested, :].clone()
@@ -1154,8 +1169,6 @@ def main():
                 global_feat = global_feat.unsqueeze(0)
 
         positions_leaf = x_leaf[0, :, :3]
-        # Full leaf resolution connectivity; LeafOnlyNet.forward pools off-diagonal (om, oe) and strip
-        # features to match OFF_DIAG_TOKEN_POOL before off_diag_blocks (same as training / eval).
         pre_leaf_connectivity = build_leaf_block_connectivity(
             edge_index_leaf,
             edge_values_leaf,
@@ -1163,6 +1176,7 @@ def main():
             leaf_L,
             device,
             x_leaf.dtype,
+            num_extra=int(model_leaf.num_extra),
         )
         pre_leaf_connectivity = tuple(
             t.contiguous() if isinstance(t, torch.Tensor) else t for t in pre_leaf_connectivity

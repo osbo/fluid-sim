@@ -18,6 +18,171 @@ from .config import LEAF_APPLY_SIZE, LEAF_APPLY_SIZE_OFF, LEAF_SIZE, MAX_MIXED_S
 from .data import FluidGraphDataset, build_leaf_block_connectivity, most_recent_run_folder
 
 
+def _diag_off_attention_category_rows(W, M, L_phys: int, num_extra: int):
+    """
+    For query rows 0..L_phys-1 (original mesh / strip tokens), report mean fraction of row mass
+    on self, other same-block leaf indices, and each extra column. Compare to mask-aware uniform
+    (uniform over keys with M[q,k]==1). Returns (table_rows, mean_total_variation).
+    """
+    eps = 1e-12
+    U = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
+    row_leaf_w = W[:, :, :L_phys, :L_phys]
+    diag_w = torch.diagonal(row_leaf_w, dim1=2, dim2=3)
+    other_leaf_w = row_leaf_w.sum(dim=-1) - diag_w
+    self_m = diag_w.mean().item() * 100.0
+    other_m = other_leaf_w.mean().item() * 100.0
+
+    row_leaf_u = U[:, :, :L_phys, :L_phys]
+    diag_u = torch.diagonal(row_leaf_u, dim1=2, dim2=3)
+    other_leaf_u = row_leaf_u.sum(dim=-1) - diag_u
+    self_u = diag_u.mean().item() * 100.0
+    other_u = other_leaf_u.mean().item() * 100.0
+
+    rows = [
+        ["self", f"{self_m:.2f}", f"{self_u:.2f}", f"{self_m - self_u:+.2f}"],
+        [
+            "other_leaf_nodes",
+            f"{other_m:.2f}",
+            f"{other_u:.2f}",
+            f"{other_m - other_u:+.2f}",
+        ],
+    ]
+    for j in range(num_extra):
+        if j == 0:
+            label = "extra_block_token"
+        elif j == 1:
+            label = "extra_matrix_token"
+        else:
+            label = f"extra_{j}"
+        col = L_phys + j
+        wm = W[:, :, :L_phys, col].mean().item() * 100.0
+        um = U[:, :, :L_phys, col].mean().item() * 100.0
+        rows.append([label, f"{wm:.2f}", f"{um:.2f}", f"{wm - um:+.2f}"])
+
+    diff = (W - U).abs()
+    tv = 0.5 * diff[:, :, :L_phys, :].sum(dim=-1).mean().item()
+    return rows, tv
+
+
+def _report_evaluate_gradients_attention_breakdown(
+    model: LeafOnlyNet,
+    x_input: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_values: torch.Tensor,
+    pre_leaf: tuple,
+    global_feat: torch.Tensor,
+    device: torch.device,
+):
+    """
+    One no_grad pass mirroring LeafOnlyNet interleave: per diag/off layer, row-normalized
+    mean(softmax + edge_gate) vs mask-aware uniform baseline on original query rows.
+    """
+    attn_mask, edge_feats, om_prof, oe_prof = pre_leaf
+    positions = x_input[0, :, :3]
+    B_prof, _N_prof, _ = x_input.shape
+    Lf = LEAF_SIZE
+    Mh = model.num_h_off
+    T_off = int(model.off_tokens_per_block)
+    nx = int(model.num_extra)
+    otp = int(model.off_token_pool)
+
+    if Mh > 0:
+        om = om_prof.to(device=device, dtype=x_input.dtype)
+        oe = oe_prof.to(device=device, dtype=x_input.dtype)
+        if otp > 1:
+            om = pool_leaf_attn_mask(om, Lf, otp, nx)
+            oe = pool_leaf_edge_feats(oe, Lf, otp, nx)
+        off_attn_mask = om.unsqueeze(0).expand(B_prof, Mh, T_off, T_off).contiguous().reshape(
+            B_prof * Mh, 1, T_off, T_off
+        )
+        off_edge_feats = (
+            oe.unsqueeze(0)
+            .expand(B_prof, Mh, T_off, T_off, 4)
+            .contiguous()
+            .reshape(B_prof * Mh, 1, T_off, T_off, 4)
+        )
+    else:
+        off_attn_mask = off_edge_feats = None
+
+    K = MAX_NUM_LEAVES
+    n_l = len(model.blocks)
+    Ls = int(model.leaf_apply_off)
+
+    print(
+        "\n=== Attention mass vs mask-aware uniform (--evaluate_gradients) ===\n"
+        "Per layer: rows = mean over batch, blocks, and queries 0..L_phys-1. "
+        "Weights = row-normalized mean over heads of (softmax + edge_gate); "
+        "Uniform = uniform over keys allowed by attn_mask for that query. "
+        "Delta = learned % − uniform % (percentage points). "
+        "TV = mean 0.5·Σ_k|p_k−u_k| over those query rows (full key axis).\n"
+    )
+
+    if n_l == 0:
+        print("No transformer layers; skipping attention breakdown.")
+        return
+
+    leaf_kw = dict(
+        edge_index=edge_index,
+        edge_values=edge_values,
+        positions=positions,
+        save_attention=False,
+        attn_mask=attn_mask,
+        edge_feats=edge_feats,
+    )
+    off_kw = dict(
+        edge_index=edge_index,
+        edge_values=edge_values,
+        positions=positions,
+        save_attention=False,
+        attn_mask=off_attn_mask,
+        edge_feats=off_edge_feats,
+    )
+
+    with torch.no_grad():
+        h_lift = model.embed.lift(
+            torch.cat(
+                [x_input[..., 3:], global_feat.unsqueeze(1).expand(-1, x_input.size(1), -1)],
+                dim=-1,
+            )
+        )
+        h_gcn = h_lift
+        if model.embed.gcn is not None:
+            for gcn_layer in model.embed.gcn:
+                h_gcn = gcn_layer(h_gcn, edge_index, edge_values)
+        h_norm = model.embed.norm(h_gcn)
+        h_proj0 = model.enc_input_proj(h_norm)
+        C_dim = h_proj0.shape[-1]
+        h_diag = model._append_special_tokens_diagonal(h_proj0, B_prof, K, Lf, C_dim, model.num_extra)
+        off_stream = None
+
+        for i in range(n_l):
+            block = model.blocks[i]
+            x_mid = block.norm1(h_diag)
+            W, M = block.attn.row_normalized_mean_weights(x_mid, attn_mask, edge_feats)
+            rows, tv = _diag_off_attention_category_rows(W, M, Lf, nx)
+            _print_table(
+                f"Diagonal layer {i} (L_phys={Lf}, num_extra={nx})",
+                ["Category", "Learned %", "Uniform %", "Δ (pp)"],
+                rows + [["TV (full row)", f"{tv:.4f}", "—", "—"]],
+            )
+            h_diag = block(h_diag, **leaf_kw)
+
+            if Mh > 0:
+                strip = model._build_off_strip(h_diag, B_prof, K, Lf, C_dim, Mh)
+                strip = model._append_special_tokens_off_strip(strip, h_diag, B_prof, K, Lf, C_dim, Mh)
+                off_in = strip if off_stream is None else strip + off_stream
+                ob = model.off_diag_blocks[i]
+                x_off = ob.norm1(off_in)
+                W_off, M_off = ob.attn.row_normalized_mean_weights(x_off, off_attn_mask, off_edge_feats)
+                rows_o, tv_o = _diag_off_attention_category_rows(W_off, M_off, Ls, nx)
+                _print_table(
+                    f"Off-diagonal layer {i} (L_phys={Ls}, num_extra={nx})",
+                    ["Category", "Learned %", "Uniform %", "Δ (pp)"],
+                    rows_o + [["TV (full row)", f"{tv_o:.4f}", "—", "—"]],
+                )
+                off_stream = ob(off_in, **off_kw)
+
+
 def _sync_device(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -359,7 +524,13 @@ def evaluate_gradient_interference(args, runtime):
             A_dense[:n_orig, :n_orig] = A_small
             A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
             dm, df, om, oe = build_leaf_block_connectivity(
-                edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
+                edge_index,
+                edge_values,
+                x_input[0, :n_pad, :3],
+                LEAF_SIZE,
+                device,
+                x_input.dtype,
+                num_extra=int(model.num_extra),
             )
             pre_leaf = (dm, df, om, oe)
             global_feat = batch.get("global_features")
@@ -463,7 +634,13 @@ def evaluate_gradient_interference(args, runtime):
     edge_index = batch["edge_index"][:, mask].to(device)
     edge_values = batch["edge_values"][mask].to(device)
     dm, df, om, oe = build_leaf_block_connectivity(
-        edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
+        edge_index,
+        edge_values,
+        x_input[0, :n_pad, :3],
+        LEAF_SIZE,
+        device,
+        x_input.dtype,
+        num_extra=int(model.num_extra),
     )
     pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")
@@ -472,6 +649,10 @@ def evaluate_gradient_interference(args, runtime):
     global_feat = global_feat.to(device)
     if global_feat.dim() == 1:
         global_feat = global_feat.unsqueeze(0)
+
+    _report_evaluate_gradients_attention_breakdown(
+        model, x_input, edge_index, edge_values, pre_leaf, global_feat, device
+    )
 
     A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
     A_small = A_sparse.to_dense().to(device) if device.type == "mps" else A_sparse.to(device).to_dense()
@@ -489,22 +670,23 @@ def evaluate_gradient_interference(args, runtime):
     assert N_prof == MAX_NUM_LEAVES * LEAF_SIZE, "Profile expects N == MAX_MIXED_SIZE"
     Lf = LEAF_SIZE
     Mh = model.num_h_off
-    Ls_off = int(model.leaf_apply_off)
+    T_off = int(model.off_tokens_per_block)
+    nx = int(model.num_extra)
     otp = int(model.off_token_pool)
     if Mh > 0:
         om = om_prof.to(device=device, dtype=x_input.dtype)
         oe = oe_prof.to(device=device, dtype=x_input.dtype)
         if otp > 1:
-            om = pool_leaf_attn_mask(om, Lf, otp)
-            oe = pool_leaf_edge_feats(oe, Lf, otp)
-        off_attn_mask = om.unsqueeze(0).expand(B_prof, Mh, Ls_off, Ls_off + 1).contiguous().reshape(
-            B_prof * Mh, 1, Ls_off, Ls_off + 1
+            om = pool_leaf_attn_mask(om, Lf, otp, nx)
+            oe = pool_leaf_edge_feats(oe, Lf, otp, nx)
+        off_attn_mask = om.unsqueeze(0).expand(B_prof, Mh, T_off, T_off).contiguous().reshape(
+            B_prof * Mh, 1, T_off, T_off
         )
         off_edge_feats = (
             oe.unsqueeze(0)
-            .expand(B_prof, Mh, Ls_off, Ls_off + 1, 4)
+            .expand(B_prof, Mh, T_off, T_off, 4)
             .contiguous()
-            .reshape(B_prof * Mh, 1, Ls_off, Ls_off + 1, 4)
+            .reshape(B_prof * Mh, 1, T_off, T_off, 4)
         )
     else:
         off_attn_mask = off_edge_feats = None
@@ -518,56 +700,67 @@ def evaluate_gradient_interference(args, runtime):
         h_norm = model.embed.norm(h_gcn)
         h_proj0 = model.enc_input_proj(h_norm)
         C_dim = h_proj0.shape[-1]
-        h_diag = h_proj0
-        for block in model.blocks:
-            h_diag = block(
-                h_diag,
-                edge_index=edge_index,
-                edge_values=edge_values,
-                positions=positions,
-                save_attention=False,
-                attn_mask=attn_mask,
-                edge_feats=edge_feats,
-            )
-        diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
+        K = MAX_NUM_LEAVES
+        h = model._append_special_tokens_diagonal(h_proj0, B_prof, K, Lf, C_dim, model.num_extra)
+        h_diag = h
+        off_stream = None
+        n_l = len(model.blocks)
+        T_off = int(model.off_tokens_per_block)
         if Mh > 0:
-            h_k = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
-            if getattr(model, "strip_build_mode", "einsum") == "einsum":
-                Wr = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
-                Wc = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
-                row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
-                col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
+            if n_l == 0:
+                strip_b = model._build_off_strip(h_diag, B_prof, K, Lf, C_dim, Mh)
+                off_stream = model._append_special_tokens_off_strip(
+                    strip_b, h_diag, B_prof, K, Lf, C_dim, Mh
+                )
             else:
-                ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
-                hk_trans = h_k.transpose(0, 1)
-                r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                r_sum.index_add_(0, gidx, hk_trans[ridx])
-                c_sum.index_add_(0, gidx, hk_trans[cidx])
-                S_view = model.h_block_S.view(Mh, 1, 1, 1).to(device=device, dtype=x_input.dtype)
-                row_p = (r_sum / S_view).transpose(0, 1)
-                col_p = (c_sum / S_view).transpose(0, 1)
-            h_off = (row_p + col_p).reshape(B_prof * Mh, Lf, C_dim)
-            if otp > 1:
-                h_off = h_off.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
-            for block in model.off_diag_blocks:
-                h_off = block(
-                    h_off,
+                for i in range(n_l):
+                    h_diag = model.blocks[i](
+                        h_diag,
+                        edge_index=edge_index,
+                        edge_values=edge_values,
+                        positions=positions,
+                        save_attention=False,
+                        attn_mask=attn_mask,
+                        edge_feats=edge_feats,
+                    )
+                    strip = model._build_off_strip(h_diag, B_prof, K, Lf, C_dim, Mh)
+                    strip = model._append_special_tokens_off_strip(
+                        strip, h_diag, B_prof, K, Lf, C_dim, Mh
+                    )
+                    off_in = strip if off_stream is None else strip + off_stream
+                    off_stream = model.off_diag_blocks[i](
+                        off_in,
+                        edge_index=edge_index,
+                        edge_values=edge_values,
+                        positions=positions,
+                        save_attention=False,
+                        attn_mask=off_attn_mask,
+                        edge_feats=off_edge_feats,
+                    )
+        else:
+            for block in model.blocks:
+                h_diag = block(
+                    h_diag,
                     edge_index=edge_index,
                     edge_values=edge_values,
                     positions=positions,
                     save_attention=False,
-                    attn_mask=off_attn_mask,
-                    edge_feats=off_edge_feats,
+                    attn_mask=attn_mask,
+                    edge_feats=edge_feats,
                 )
-            h_off = h_off.view(B_prof, Mh, Ls_off, C_dim)
+
+        diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
+        if Mh > 0:
+            h_off = off_stream.view(B_prof, Mh, T_off, C_dim)
             off_diag_blocks_profile = model._get_leaf_blocks(h_off, mode="off-diagonal")
         else:
             off_diag_blocks_profile = torch.empty(
                 (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
             )
-        node_U_profile = model.node_u(h_diag)
-        node_V_profile = model.node_v(h_diag)
+        T = int(model.tokens_per_block)
+        h_phys_flat = h_diag.view(B_prof, K, T, C_dim)[:, :, :Lf, :].reshape(B_prof, K * Lf, C_dim)
+        node_U_profile = model.node_u(h_phys_flat)
+        node_V_profile = model.node_v(h_phys_flat)
         jacobi_scale_profile = model._get_jacobi_scale(h_diag)
 
     jacobi_inv_diag_profile = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
@@ -641,7 +834,9 @@ def evaluate_gradient_interference(args, runtime):
             attn_mask=attn_mask,
             edge_feats=edge_feats,
         )
-        h_block_in = h_proj0
+        h_block_in = model._append_special_tokens_diagonal(
+            h_proj0, B_prof, MAX_NUM_LEAVES, Lf, C_dim, model.num_extra
+        )
         for i, block in enumerate(model.blocks):
             h_block_in = _time_transformer_attn_and_mlp(
                 timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
@@ -658,29 +853,11 @@ def evaluate_gradient_interference(args, runtime):
             attn_mask=off_attn_mask,
             edge_feats=off_edge_feats,
         )
+        T_off_t = int(model.off_tokens_per_block)
         if Mh > 0:
 
             def _build_h_off_strip():
-                h_k_t = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
-                if getattr(model, "strip_build_mode", "einsum") == "einsum":
-                    Wr_t = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
-                    Wc_t = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
-                    row_pt = torch.einsum("mk,bklc->bmlc", Wr_t, h_k_t)
-                    col_pt = torch.einsum("mk,bklc->bmlc", Wc_t, h_k_t)
-                else:
-                    ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
-                    hk_trans = h_k_t.transpose(0, 1)
-                    r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                    c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                    r_sum.index_add_(0, gidx, hk_trans[ridx])
-                    c_sum.index_add_(0, gidx, hk_trans[cidx])
-                    S_view = model.h_block_S.view(Mh, 1, 1, 1).to(device=device, dtype=x_input.dtype)
-                    row_pt = (r_sum / S_view).transpose(0, 1)
-                    col_pt = (c_sum / S_view).transpose(0, 1)
-                h_ = (row_pt + col_pt).reshape(B_prof * Mh, Lf, C_dim)
-                if otp > 1:
-                    h_ = h_.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
-                return h_
+                return model._build_off_strip(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh)
 
             _strip_label = (
                 "H off strip pool (einsum row+col + token mean)"
@@ -689,18 +866,25 @@ def evaluate_gradient_interference(args, runtime):
             )
             ms_strip = _timed_ms(_build_h_off_strip, device)
             timing_rows.append([_strip_label, ms_strip])
-            h_off_in = _build_h_off_strip()
+            strip_t = _build_h_off_strip()
+            h_off_in = model._append_special_tokens_off_strip(
+                strip_t, h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh
+            )
             for i, block in enumerate(model.off_diag_blocks):
                 h_off_in = _time_transformer_attn_and_mlp(
                     timing_rows, "H off", i, block, h_off_in, device, **off_attn_kw
                 )
-            h_off_in = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
-            ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_in, mode="off-diagonal"), device)
+            h_off_4 = h_off_in.view(B_prof, Mh, T_off_t, C_dim)
+            ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_4, mode="off-diagonal"), device)
             timing_rows.append(["H off head (U V^T)", ms_off_head])
 
-        ms_node_u = _timed_ms(lambda: model.node_u(h_block_in), device)
+        Ttok = int(model.tokens_per_block)
+        h_phys_timing = h_block_in.view(B_prof, MAX_NUM_LEAVES, Ttok, C_dim)[:, :, :Lf, :].reshape(
+            B_prof, MAX_NUM_LEAVES * Lf, C_dim
+        )
+        ms_node_u = _timed_ms(lambda: model.node_u(h_phys_timing), device)
         timing_rows.append(["Global node U linear", ms_node_u])
-        ms_node_v = _timed_ms(lambda: model.node_v(h_block_in), device)
+        ms_node_v = _timed_ms(lambda: model.node_v(h_phys_timing), device)
         timing_rows.append(["Global node V linear", ms_node_v])
 
         ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_in), device)
@@ -844,7 +1028,13 @@ def evaluate_estimator_variance(args, runtime):
     A_dense[:n_orig, :n_orig] = A_small
     A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
     dm, df, om, oe = build_leaf_block_connectivity(
-        edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
+        edge_index,
+        edge_values,
+        x_input[0, :n_pad, :3],
+        LEAF_SIZE,
+        device,
+        x_input.dtype,
+        num_extra=int(model.num_extra),
     )
     pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")

@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from .architecture import LeafOnlyNet, apply_block_diagonal_M
+from .architecture import LeafOnlyNet, parse_attention_layout, apply_block_diagonal_M
 from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
 from .config import (
     LEAF_APPLY_SIZE,
@@ -251,8 +251,15 @@ def train_leaf_only(args, runtime):
 
             t_c0 = time.perf_counter()
             positions_ctx = x_input[0, :n_pad, :3]
+            _nx_conn = int(parse_attention_layout(str(args.attention_layout), LEAF_SIZE))
             dm, df, om, oe = build_leaf_block_connectivity(
-                edge_index, edge_values, positions_ctx, LEAF_SIZE, device, x_input.dtype
+                edge_index,
+                edge_values,
+                positions_ctx,
+                LEAF_SIZE,
+                device,
+                x_input.dtype,
+                num_extra=_nx_conn,
             )
             precomputed_leaf_connectivity = (dm, df, om, oe)
             ctx_conn_ms += (time.perf_counter() - t_c0) * 1000.0
