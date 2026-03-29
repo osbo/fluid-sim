@@ -61,9 +61,9 @@ from leafonly import (
     LeafOnlyNet,
     load_leaf_only_weights,
     apply_block_diagonal_m_into,
+    attention_layout_from_checkpoint_code,
     block_diagonal_m_apply_workspace,
     build_sparse_bsr_preconditioner,
-    default_attention_layout,
     unpack_precond,
     FluidGraphDataset,
     build_leaf_block_connectivity,
@@ -1115,7 +1115,7 @@ def main():
         num_layers=num_layers_lo,
         num_heads=num_heads_lo,
         use_gcn=bool(use_gcn_lo),
-        attention_layout=default_attention_layout(leaf_size_lo),
+        attention_layout=attention_layout_from_checkpoint_code(leaf_size_lo, _attention_layout_code),
     ).to(device)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
@@ -1588,7 +1588,7 @@ def main():
         num_leaves_viz,
         leaf_apply_diag_L,
         leaf_apply_off_L,
-        max_samples=4,
+        max_samples=3,
         rng=np.random.default_rng(123),
     )
     _print_hmatrix_rank_profiler(hm_rank_bands, HMATRIX_ETA)

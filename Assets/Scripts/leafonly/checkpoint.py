@@ -1,3 +1,4 @@
+import os
 import struct
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import torch
 
 # v1: 32 bytes (8 ints). v2: 36 bytes (9 ints), diag + off apply sizes.
 # v3: 40 bytes (10 ints), adds attention_layout_code + TransformerBlock FFN params in body.
-#   attention_layout_code: 0 = LxL (no special nodes), 1 = Lx(L+1) (+ block node), 2 = Lx(L+2) (+ matrix node).
+#   attention_layout_code: 0 = LxL, 1 = Lx(L+1), 2 = Lx(L+2), 3 = (L+1)x(L+1) (query block + flat-tree GNN path).
 LEAF_ONLY_HEADER_BYTES = 40
 
 
@@ -120,7 +121,14 @@ def save_leaf_only_weights(model, path, input_dim=9):
     num_gcn_layers = len(gcn_layers)
     use_block_node = model.blocks[0].attn.use_block_node if model.blocks else False
     use_matrix_node = model.blocks[0].attn.use_matrix_node if model.blocks else False
-    attention_layout_code = (1 if use_block_node else 0) + (1 if use_matrix_node else 0)
+    attention_layout_code = 0
+    if use_matrix_node:
+        attention_layout_code = 2
+    elif use_block_node:
+        if model.blocks[0].attn.query_has_block:
+            attention_layout_code = 3
+        else:
+            attention_layout_code = 1
     with open(path, "wb") as f:
         f.write(
             struct.pack(
@@ -151,6 +159,13 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_transformer_block(f, block)
         for block in model.off_diag_blocks:
             _write_transformer_block(f, block)
+        for layer in model.tree_gnn_layers:
+            _write_packed_tensor(f, layer[0].weight.detach().cpu().float(), True)
+            _write_packed_tensor(f, layer[0].bias.detach().cpu().float(), False)
+            _write_packed_tensor(f, layer[2].weight.detach().cpu().float(), True)
+            _write_packed_tensor(f, layer[2].bias.detach().cpu().float(), False)
+        _write_packed_tensor(f, model.tree_gnn_norm.weight.detach().cpu().float(), False)
+        _write_packed_tensor(f, model.tree_gnn_norm.bias.detach().cpu().float(), False)
         _write_packed_tensor(f, model.off_diag_head_U.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.off_diag_head_U.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.off_diag_head_V.weight.detach().cpu().float(), transpose=True)
@@ -163,6 +178,44 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.node_v.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.jacobi_gate.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.jacobi_gate.bias.detach().cpu().float(), transpose=False)
+
+
+def _packed_tensor_storage_bytes(param: torch.Tensor, transpose: bool) -> int:
+    n = int(param.numel())
+    read_len = n + (1 if n % 2 else 0)
+    return read_len * 2
+
+
+def _tree_gnn_blob_bytes(model) -> int:
+    b = 0
+    for layer in model.tree_gnn_layers:
+        b += _packed_tensor_storage_bytes(layer[0].weight, True)
+        b += _packed_tensor_storage_bytes(layer[0].bias, False)
+        b += _packed_tensor_storage_bytes(layer[2].weight, True)
+        b += _packed_tensor_storage_bytes(layer[2].bias, False)
+    b += _packed_tensor_storage_bytes(model.tree_gnn_norm.weight, False)
+    b += _packed_tensor_storage_bytes(model.tree_gnn_norm.bias, False)
+    return b
+
+
+def _checkpoint_tail_blob_bytes(model) -> int:
+    b = 0
+    for p, tr in (
+        (model.off_diag_head_U.weight, True),
+        (model.off_diag_head_U.bias, False),
+        (model.off_diag_head_V.weight, True),
+        (model.off_diag_head_V.bias, False),
+        (model.leaf_head.weight, True),
+        (model.leaf_head.bias, False),
+        (model.node_u.weight, True),
+        (model.node_u.bias, False),
+        (model.node_v.weight, True),
+        (model.node_v.bias, False),
+        (model.jacobi_gate.weight, True),
+        (model.jacobi_gate.bias, False),
+    ):
+        b += _packed_tensor_storage_bytes(p, tr)
+    return b
 
 
 def _read_transformer_block_into(f, block, read_tensor):
@@ -214,14 +267,32 @@ def load_leaf_only_weights(model, path):
         raise ValueError(f"Checkpoint num_heads={num_heads_lo} != model {expected_num_heads}")
     if int(use_gcn_file) != 1:
         raise ValueError(f"Checkpoint use_gcn={use_gcn_file} is unsupported; expected 1")
+    def _layout_tuple_from_code(code: int):
+        if code == 0:
+            return False, False, False
+        if code == 1:
+            return True, False, False
+        if code == 2:
+            return True, True, False
+        if code == 3:
+            return True, False, True
+        return None
+
     if model.blocks:
-        ck_ub = attention_layout_code >= 1
-        ck_um = attention_layout_code >= 2
-        if ck_ub != model.blocks[0].attn.use_block_node or ck_um != model.blocks[0].attn.use_matrix_node:
-            layout_names = [f"{leaf_size_lo}x{leaf_size_lo}", f"{leaf_size_lo}x{leaf_size_lo + 1}", f"{leaf_size_lo}x{leaf_size_lo + 2}"]
+        exp = _layout_tuple_from_code(int(attention_layout_code))
+        attn0 = model.blocks[0].attn
+        got = (attn0.use_block_node, attn0.use_matrix_node, attn0.query_has_block)
+        if exp is not None and got != exp:
+            layout_names = [
+                f"{leaf_size_lo}x{leaf_size_lo}",
+                f"{leaf_size_lo}x{leaf_size_lo + 1}",
+                f"{leaf_size_lo}x{leaf_size_lo + 2}",
+                f"{leaf_size_lo + 1}x{leaf_size_lo + 1}",
+            ]
+            idx = int(attention_layout_code) if 0 <= int(attention_layout_code) < len(layout_names) else 0
             raise ValueError(
-                f"Checkpoint attention_layout '{layout_names[min(attention_layout_code, 2)]}' "
-                f"!= model '{model.blocks[0].attn.attention_layout}'"
+                f"Checkpoint attention_layout '{layout_names[idx]}' "
+                f"!= model '{attn0.attention_layout}'"
             )
 
     def read_tensor(f, shape, transpose=False):
@@ -258,6 +329,26 @@ def load_leaf_only_weights(model, path):
             _read_transformer_block_into(f, block, read_tensor)
         for block in model.off_diag_blocks:
             _read_transformer_block_into(f, block, read_tensor)
+        pos_after_off = f.tell()
+        remain = os.path.getsize(path) - pos_after_off
+        gnn_b = _tree_gnn_blob_bytes(model)
+        tail_b = _checkpoint_tail_blob_bytes(model)
+        if remain >= gnn_b + tail_b:
+            for layer in model.tree_gnn_layers:
+                _read_into(f, layer[0].weight, read_tensor, True)
+                _read_into(f, layer[0].bias, read_tensor, False)
+                _read_into(f, layer[2].weight, read_tensor, True)
+                _read_into(f, layer[2].bias, read_tensor, False)
+            _read_into(f, model.tree_gnn_norm.weight, read_tensor, False)
+            _read_into(f, model.tree_gnn_norm.bias, read_tensor, False)
+            model._legacy_no_gnn = False
+        elif remain == tail_b:
+            model._legacy_no_gnn = True
+        else:
+            raise ValueError(
+                f"Checkpoint byte length mismatch after off-diagonal blocks: "
+                f"remaining={remain}, expected either tail-only={tail_b} or tail+gnn={gnn_b + tail_b}"
+            )
         _read_into(f, model.off_diag_head_U.weight, read_tensor, transpose=True)
         _read_into(f, model.off_diag_head_U.bias, read_tensor, transpose=False)
         _read_into(f, model.off_diag_head_V.weight, read_tensor, transpose=True)

@@ -6,6 +6,7 @@ from .architecture import (
     block_diagonal_m_apply_workspace,
     build_sparse_bsr_preconditioner,
     attention_layout_choices,
+    attention_layout_from_checkpoint_code,
     default_attention_layout,
     next_valid_size,
     parse_attention_layout,
