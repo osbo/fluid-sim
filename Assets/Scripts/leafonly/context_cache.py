@@ -17,7 +17,7 @@ from .config import (
 )
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
-CONTEXT_CACHE_VERSION = 9
+CONTEXT_CACHE_VERSION = 10
 
 
 def _mtime_ns(path: Path) -> int:
@@ -49,6 +49,7 @@ def build_training_context_cache_meta(dataset, run_folder: Path, args, frame_ind
         "num_frames": int(getattr(args, "num_frames", 0)),
         "leaf_size": int(LEAF_SIZE),
         "off_diag_token_pool": int(OFF_DIAG_TOKEN_POOL),
+        "attention_layout": str(getattr(args, "attention_layout", "")),
         "attention_hops": int(ATTENTION_HOPS),
         "min_mixed": int(MIN_MIXED_SIZE),
         "max_mixed": int(MAX_MIXED_SIZE),

@@ -6,7 +6,7 @@ import torch
 
 # v1: 32 bytes (8 ints). v2: 36 bytes (9 ints), diag + off apply sizes.
 # v3: 40 bytes (10 ints), adds attention_layout_code + TransformerBlock FFN params in body.
-#   attention_layout_code: 0 = LxL (no special nodes), 1 = Lx(L+1) (+ block node), 2 = Lx(L+2) (+ matrix node).
+#   attention_layout_code: num_extra in {0,1,2} for symmetric (L+nx)x(L+nx) attention.
 LEAF_ONLY_HEADER_BYTES = 40
 
 
@@ -118,9 +118,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
     num_heads = model.blocks[0].attn.num_heads if model.blocks else 4
     gcn_layers = model.embed.gcn if model.embed.gcn is not None else []
     num_gcn_layers = len(gcn_layers)
-    use_block_node = model.blocks[0].attn.use_block_node if model.blocks else False
-    use_matrix_node = model.blocks[0].attn.use_matrix_node if model.blocks else False
-    attention_layout_code = (1 if use_block_node else 0) + (1 if use_matrix_node else 0)
+    attention_layout_code = int(model.blocks[0].attn.num_extra) if model.blocks else 0
     with open(path, "wb") as f:
         f.write(
             struct.pack(
@@ -215,13 +213,12 @@ def load_leaf_only_weights(model, path):
     if int(use_gcn_file) != 1:
         raise ValueError(f"Checkpoint use_gcn={use_gcn_file} is unsupported; expected 1")
     if model.blocks:
-        ck_ub = attention_layout_code >= 1
-        ck_um = attention_layout_code >= 2
-        if ck_ub != model.blocks[0].attn.use_block_node or ck_um != model.blocks[0].attn.use_matrix_node:
-            layout_names = [f"{leaf_size_lo}x{leaf_size_lo}", f"{leaf_size_lo}x{leaf_size_lo + 1}", f"{leaf_size_lo}x{leaf_size_lo + 2}"]
+        if int(attention_layout_code) != int(model.blocks[0].attn.num_extra):
+            Lwl = int(leaf_size_lo)
+            layout_names = [f"{Lwl}x{Lwl}", f"{Lwl + 1}x{Lwl + 1}", f"{Lwl + 2}x{Lwl + 2}"]
             raise ValueError(
-                f"Checkpoint attention_layout '{layout_names[min(attention_layout_code, 2)]}' "
-                f"!= model '{model.blocks[0].attn.attention_layout}'"
+                f"Checkpoint attention num_extra={attention_layout_code} "
+                f"!= model {model.blocks[0].attn.num_extra} ('{model.blocks[0].attn.attention_layout}')"
             )
 
     def read_tensor(f, shape, transpose=False):

@@ -11,7 +11,11 @@ def _validate_leaf_size(L: int) -> int:
 
 
 def _validate_off_diag_token_pool(leaf: int, p: int) -> int:
-    """Power-of-2 pool along each H off-tile's leaf axis; attention + MLP run at LEAF_SIZE // p (no upsample before heads)."""
+    """Optional uniform mean-pool factor along each H off-tile strip (after H row/col aggregation).
+
+    ``p == 1``: full ``LEAF_SIZE`` tokens (no extra downsampling). ``p > 1`` must divide ``LEAF_SIZE``;
+    attention + off heads run at ``LEAF_SIZE // p`` (power of 2).
+    """
     p = int(p)
     if p < 1:
         raise ValueError(f"OFF_DIAG_TOKEN_POOL must be >= 1, got {p}")
@@ -27,8 +31,9 @@ def _validate_off_diag_token_pool(leaf: int, p: int) -> int:
 LEAF_SIZE = _validate_leaf_size(32)
 # Diagonal preconditioner blocks use full leaf tokens.
 LEAF_APPLY_SIZE = LEAF_SIZE
-# H off-diagonal Transformer stack + off_diag heads use this resolution (checkpoint ``leaf_apply_off``).
-OFF_DIAG_TOKEN_POOL = _validate_off_diag_token_pool(LEAF_SIZE, 2)
+# H off-diagonal Transformer + off_diag heads at LEAF_APPLY_SIZE_OFF (checkpoint ``leaf_apply_off``).
+# 1 = only H-matrix strip aggregation; >1 adds uniform mean-pool along the strip before the off stack.
+OFF_DIAG_TOKEN_POOL = _validate_off_diag_token_pool(LEAF_SIZE, 1)
 LEAF_APPLY_SIZE_OFF = LEAF_SIZE // OFF_DIAG_TOKEN_POOL
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
