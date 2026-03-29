@@ -10,8 +10,11 @@ Use ``--test_only`` to run the PCG benchmark path and print only that summary (n
 
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
-plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. If σ_k does not decay by
-those indices, increase apply rank or decrease ``HMATRIX_ETA`` for smaller tiles.
+plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. Off-diagonal neural tiles use
+``leaf_apply_off = LEAF_SIZE // OFF_DIAG_TOKEN_POOL`` (see ``leafonly.config``): the H-strip stream is
+mean-pooled on the leaf axis before the off-diagonal Transformer stack; connectivity masks are pooled
+to match—no upsample before the off heads. If σ_k does not decay by those indices, increase apply rank
+or decrease ``HMATRIX_ETA`` for smaller tiles.
 """
 import argparse
 import sys
@@ -67,7 +70,14 @@ from leafonly import (
 )
 from leafonly.eval import _timed_ms
 from leafonly.checkpoint import read_leaf_only_header
-from leafonly.config import HMATRIX_ETA, LEAF_SIZE, MAX_MIXED_SIZE
+from leafonly.config import (
+    HMATRIX_ETA,
+    LEAF_APPLY_SIZE,
+    LEAF_APPLY_SIZE_OFF,
+    LEAF_SIZE,
+    MAX_MIXED_SIZE,
+    OFF_DIAG_TOKEN_POOL,
+)
 from leafonly.hmatrix import (
     HM_C0_CPU,
     HM_R0_CPU,
@@ -424,6 +434,26 @@ def _print_hmatrix_rank_profiler(bands: list[dict], eta: float, max_plot_bands: 
         print()
 
 
+def _hmatrix_rank_profiler_xlim_right(curves: list, ratio_floor: float = 1e-14) -> float:
+    """
+    Crop x-axis past the numerical tail: last index where σ_k/σ_0 is still above ``ratio_floor``,
+    plus a small margin (avoids long flat line at ~1e-16 in semilogy plots).
+    """
+    if not curves:
+        return 1.0
+    smax = max(len(c) for c in curves)
+    last_sig = 1
+    for srel in curves:
+        s = np.asarray(srel, dtype=np.float64)
+        if s.size == 0:
+            continue
+        ok = np.where(s > ratio_floor)[0]
+        if ok.size:
+            last_sig = max(last_sig, int(ok[-1]) + 1)
+    pad = max(2, int(round(0.04 * last_sig)))
+    return float(min(smax, last_sig + pad))
+
+
 def _plot_hmatrix_rank_profiler_row(axes_row, bands_head: list[dict]) -> None:
     """One subplot per column; up to len(axes_row) bands (on-diag first, then off sizes descending)."""
     for ax in axes_row:
@@ -446,6 +476,8 @@ def _plot_hmatrix_rank_profiler_row(axes_row, bands_head: list[dict]) -> None:
             ax.semilogy(x, np.maximum(srel, 1e-16), alpha=0.75, linewidth=1.2, label=f"sample {k + 1}")
         if rl > 0 and any(len(c) > rl for c in curves):
             ax.axvline(rl, color="crimson", linestyle="--", linewidth=1.5, alpha=0.9, label=f"rank cap ({rl})")
+        x_right = _hmatrix_rank_profiler_xlim_right(curves)
+        ax.set_xlim(0, x_right)
         ax.set_xlabel("Singular value index")
         ax.set_ylabel(r"$\sigma_k / \sigma_0$")
         ax.set_title(f"H-matrix rank profiler\n{b['title']}", fontsize=9)
@@ -1094,8 +1126,19 @@ def main():
         raise RuntimeError(f"header leaf_apply_diag {leaf_apply_diag_ckpt} != model {leaf_apply_diag_L}")
     if leaf_apply_off_L != int(leaf_apply_off_ckpt):
         raise RuntimeError(f"header leaf_apply_off {leaf_apply_off_ckpt} != model {leaf_apply_off_L}")
+    if int(LEAF_APPLY_SIZE) != leaf_apply_diag_L or int(LEAF_APPLY_SIZE_OFF) != leaf_apply_off_L:
+        raise RuntimeError(
+            f"leafonly.config LEAF_APPLY_SIZE={LEAF_APPLY_SIZE}, LEAF_APPLY_SIZE_OFF={LEAF_APPLY_SIZE_OFF} "
+            f"do not match model leaf_apply_size={leaf_apply_diag_L}, leaf_apply_off={leaf_apply_off_L}. "
+            "Sync LEAF_SIZE and OFF_DIAG_TOKEN_POOL in leafonly/config.py with the checkpoint."
+        )
     pool_diag_to_full = int(leaf_L) // leaf_apply_diag_L
     pool_off_to_full = int(leaf_L) // leaf_apply_off_L
+    if not test_only:
+        _info(
+            f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL={OFF_DIAG_TOKEN_POOL} → leaf_apply_off={leaf_apply_off_L} "
+            f"(H-strip mean-pool then Transformer+MLP at {leaf_apply_off_L} tokens/tile; packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
+        )
 
     with torch.inference_mode():
         x_leaf = x[:, :n_requested, :].clone()
@@ -1111,7 +1154,8 @@ def main():
                 global_feat = global_feat.unsqueeze(0)
 
         positions_leaf = x_leaf[0, :, :3]
-        # Diagonal leaf masks/feats; off-diagonal H tiles use static buffers inside LeafOnlyNet.forward.
+        # Full leaf resolution connectivity; LeafOnlyNet.forward pools off-diagonal (om, oe) and strip
+        # features to match OFF_DIAG_TOKEN_POOL before off_diag_blocks (same as training / eval).
         pre_leaf_connectivity = build_leaf_block_connectivity(
             edge_index_leaf,
             edge_values_leaf,

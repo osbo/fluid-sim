@@ -10,7 +10,7 @@ def _build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=2, help="Fixed architecture depth for LeafOnly (kept at 2).")
     parser.add_argument("--num_heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
     parser.add_argument("--frame", type=int, default=600, help="Frame index to use when --use_single_frame is True. Default: 600.")
