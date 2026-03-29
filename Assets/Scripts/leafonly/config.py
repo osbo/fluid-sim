@@ -10,26 +10,32 @@ def _validate_leaf_size(L: int) -> int:
     return L
 
 
+def _validate_off_diag_token_pool(leaf: int, p: int) -> int:
+    """Power-of-2 pool along each H off-tile's leaf axis; attention + MLP run at LEAF_SIZE // p (no upsample before heads)."""
+    p = int(p)
+    if p < 1:
+        raise ValueError(f"OFF_DIAG_TOKEN_POOL must be >= 1, got {p}")
+    if (p & (p - 1)) != 0:
+        raise ValueError(f"OFF_DIAG_TOKEN_POOL must be a power of 2, got {p}")
+    if leaf % p != 0:
+        raise ValueError(f"LEAF_SIZE {leaf} not divisible by OFF_DIAG_TOKEN_POOL {p}")
+    return p
+
+
 # Power of 2; must match ``leaf_size`` in leaf_only_weights header (``read_leaf_only_header``).
 # Padded graph size is MAX_MIXED_SIZE; leaf count is MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE (static H-grid).
-LEAF_SIZE = _validate_leaf_size(32)
-# Diagonal leaf attention + diagonal preconditioner blocks (no downsample when 1).
-ATTN_POOL_FACTOR_DIAG = 1
-# Off-diagonal pair attention + off blocks (2 ⇒ half resolution inside each 32-node chunk).
-ATTN_POOL_FACTOR_OFF = 1
-for _name, _pf in (("ATTN_POOL_FACTOR_DIAG", ATTN_POOL_FACTOR_DIAG), ("ATTN_POOL_FACTOR_OFF", ATTN_POOL_FACTOR_OFF)):
-    if LEAF_SIZE % _pf != 0:
-        raise ValueError(f"LEAF_SIZE {LEAF_SIZE} must be divisible by {_name} {_pf}")
-LEAF_APPLY_SIZE = LEAF_SIZE // ATTN_POOL_FACTOR_DIAG
-LEAF_APPLY_SIZE_OFF = LEAF_SIZE // ATTN_POOL_FACTOR_OFF
-# Back-compat alias (single factor); prefer ATTN_POOL_FACTOR_DIAG / _OFF.
-ATTN_POOL_FACTOR = ATTN_POOL_FACTOR_DIAG
+LEAF_SIZE = _validate_leaf_size(128)
+# Diagonal preconditioner blocks use full leaf tokens.
+LEAF_APPLY_SIZE = LEAF_SIZE
+# H off-diagonal Transformer stack + off_diag heads use this resolution (checkpoint ``leaf_apply_off``).
+OFF_DIAG_TOKEN_POOL = _validate_off_diag_token_pool(LEAF_SIZE, 2)
+LEAF_APPLY_SIZE_OFF = LEAF_SIZE // OFF_DIAG_TOKEN_POOL
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 
 # Padded problem size for LeafOnlyNet / training contexts / InspectModel (single source of truth).
 # MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE must match the checkpoint layout (same as at train time).
-MAX_MIXED_SIZE = 2048
+MAX_MIXED_SIZE = 4096
 # Minimum **aligned** active nodes to keep a frame: n_active = ⌊min(num_nodes, MAX)/LEAF⌋·LEAF.
 # Must be ≤ your smallest frame's aligned count. Do not set this to MAX_MIXED_SIZE unless every frame has ≥ that many nodes.
 MIN_MIXED_SIZE = LEAF_SIZE

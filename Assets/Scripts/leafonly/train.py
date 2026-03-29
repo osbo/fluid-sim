@@ -362,7 +362,7 @@ def train_leaf_only(args, runtime):
             )
             print(f"    x/edges → device + centroid:   {ctx_tf_ms:10.2f}")
             print(f"    A_sparse → A_dense + pad:    {ctx_a_ms:10.2f}")
-            print(f"    n-hop connectivity + pool:   {ctx_conn_ms:10.2f}")
+            print(f"    n-hop connectivity:          {ctx_conn_ms:10.2f}")
             print(f"    jacobi vec + append dict:    {ctx_other_ms:10.2f}")
         print(f"  LeafOnlyNet + .to(device):     {ms_model:10.2f}")
         if device.type == "cuda":
