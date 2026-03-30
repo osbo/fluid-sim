@@ -14,8 +14,17 @@ from .architecture import (
     pool_leaf_edge_feats,
 )
 from .checkpoint import load_leaf_only_weights
-from .config import LEAF_APPLY_SIZE, LEAF_APPLY_SIZE_OFF, LEAF_SIZE, MAX_MIXED_SIZE, MAX_NUM_LEAVES
+from .config import (
+    HUTCHINSON_PROBE_JACOBI_OMEGA,
+    HUTCHINSON_PROBE_JACOBI_STEPS,
+    LEAF_APPLY_SIZE,
+    LEAF_APPLY_SIZE_OFF,
+    LEAF_SIZE,
+    MAX_MIXED_SIZE,
+    MAX_NUM_LEAVES,
+)
 from .data import FluidGraphDataset, build_leaf_block_connectivity, most_recent_run_folder
+from .probe_z import jacobi_smooth_hutchinson_z_inplace
 
 
 def _sync_device(device):
@@ -168,11 +177,15 @@ def print_comprehensive_attention_profiler(
     """
     strip = getattr(model, "strip_build_mode", "einsum")
     _hoff = "dense L×L (all-ones mask)" if bool(getattr(model, "off_diag_dense_attention", True)) else "reachability mask"
+    _edge_gate_note = ""
+    if model.blocks:
+        _h = int(model.blocks[0].attn.edge_gate[0].out_features)
+        _edge_gate_note = f" LeafBlockAttention edge_gate: 2-layer MLP (4→{_h}→heads)."
     print(
         "\n=== Attention profiler (all Transformer stacks) ===\n"
         f"Strip build: {strip!r}; OFF_DIAG_TOKEN_POOL={otp} → off block tokens L={Ls_off}; "
         f"num_h_off={Mh}; Leaf stack layers={len(model.blocks)}; H-off stack layers={len(model.off_diag_blocks)}; "
-        f"H-off softmax: {_hoff}."
+        f"H-off softmax: {_hoff}.{_edge_gate_note}"
     )
 
     inv_headers = [
@@ -575,6 +588,10 @@ def evaluate_gradient_interference(args, runtime):
     use_gcn = effective_gcn_layers > 0
 
     print(f"\n--- Starting Gradient Interference Analysis on {device} ---")
+    print(
+        f"Hutchinson probes: Z is low-passed with {HUTCHINSON_PROBE_JACOBI_STEPS} damped-Jacobi sweeps "
+        f"(ω={HUTCHINSON_PROBE_JACOBI_OMEGA}) before the loss, matching training."
+    )
 
     model = LeafOnlyNet(
         input_dim=9,
@@ -665,13 +682,20 @@ def evaluate_gradient_interference(args, runtime):
                 global_features=global_feat,
             )
             batch_vectors = max(1024, int(round(n_pad ** 0.5)))
-            Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
-            Z[:, n_orig:, :] = 0.0
-            AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
             jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
             diag_A = torch.diagonal(A_dense, 0)
             inv_mask = diag_A.abs() > 1e-6
             jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A[inv_mask]
+            Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
+            Z[:, n_orig:, :] = 0.0
+            jacobi_smooth_hutchinson_z_inplace(
+                Z,
+                jacobi_inv_diag,
+                [n_orig],
+                n_pad,
+                lambda Zt: (A_dense @ Zt.squeeze(0)).unsqueeze(0),
+            )
+            AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
             MAZ = apply_block_diagonal_M(
                 precond_out,
                 AZ,
@@ -773,10 +797,11 @@ def evaluate_gradient_interference(args, runtime):
     A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
     A_dense[:n_orig, :n_orig] = A_small
     A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
+    jacobi_inv_diag_profile = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
+    diag_A_profile = torch.diagonal(A_dense, 0)
+    inv_mask_profile = diag_A_profile.abs() > 1e-6
+    jacobi_inv_diag_profile[0, inv_mask_profile] = 1.0 / diag_A_profile[inv_mask_profile]
     batch_vectors = max(1024, int(round(n_pad ** 0.5)))
-    Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
-    Z[:, n_orig:, :] = 0.0
-    AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
 
     attn_mask, edge_feats, om_prof, oe_prof = pre_leaf
     positions = x_input[0, :, :3]
@@ -848,11 +873,6 @@ def evaluate_gradient_interference(args, runtime):
         node_U_profile = model.node_u(h_diag)
         node_V_profile = model.node_v(h_diag)
         jacobi_scale_profile = model._get_jacobi_scale(h_diag)
-
-    jacobi_inv_diag_profile = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
-    diag_A_profile = torch.diagonal(A_dense, 0)
-    inv_mask_profile = diag_A_profile.abs() > 1e-6
-    jacobi_inv_diag_profile[0, inv_mask_profile] = 1.0 / diag_A_profile[inv_mask_profile]
 
     was_training = model.training
     model.eval()
@@ -982,8 +1002,36 @@ def evaluate_gradient_interference(args, runtime):
         ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_in), device)
         timing_rows.append(["Jacobi gate (node_scalar)", ms_jacobi])
 
+        def _bench_probe_z():
+            z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
+            z[:, n_orig:, :] = 0.0
+            jacobi_smooth_hutchinson_z_inplace(
+                z,
+                jacobi_inv_diag_profile,
+                [n_orig],
+                n_pad,
+                lambda Zt: (A_dense @ Zt.squeeze(0)).unsqueeze(0),
+            )
+
+        ms_probe_z = _timed_ms(_bench_probe_z, device)
+        timing_rows.append(
+            [
+                f"Probe Z (+ Jacobi {HUTCHINSON_PROBE_JACOBI_STEPS}×ω={HUTCHINSON_PROBE_JACOBI_OMEGA})",
+                ms_probe_z,
+            ]
+        )
+
+        Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
+        Z[:, n_orig:, :] = 0.0
+        jacobi_smooth_hutchinson_z_inplace(
+            Z,
+            jacobi_inv_diag_profile,
+            [n_orig],
+            n_pad,
+            lambda Zt: (A_dense @ Zt.squeeze(0)).unsqueeze(0),
+        )
         ms_AZ = _timed_ms(lambda: (A_dense @ Z.squeeze(0)).unsqueeze(0), device)
-        timing_rows.append(["A @ Z", ms_AZ])
+        timing_rows.append(["A @ Z (post-smooth)", ms_AZ])
         B_pack = diag_blocks_profile.shape[0]
         packed_profile = torch.cat(
             [
@@ -1036,7 +1084,8 @@ def evaluate_gradient_interference(args, runtime):
     print(
         "\nTiming coverage: micro-benchmarks use eval() and omit build_leaf_block_connectivity only "
         "(masks are precomputed). Rows cover lift linears, GCN, embed norm, enc_input_proj, per-layer leaf and "
-        "H-off attention vs MLP, strip pool, both low-rank heads, node U/V, Jacobi gate, pack cat, A@Z, and M apply. "
+        "H-off attention vs MLP, strip pool, both low-rank heads, node U/V, Jacobi gate, pack cat, "
+        "probe Z (randn + damped Jacobi, same as training), A@Z on smoothed Z, and M apply. "
         "Earlier in this run, Attention profiler: per-layer inventory, decomposed pre-attn LN vs attention ms, "
         "mean self/neighbor/block mass, and torch.compile full-stack lines for Leaf diag and H-off. "
         "Gradient interference uses leafonly_grad_param_groups() for trainable coverage."
@@ -1055,8 +1104,9 @@ def evaluate_gradient_interference(args, runtime):
 
 def evaluate_estimator_variance(args, runtime):
     """
-    Fix one frame and resample probe matrix Z many times. Measures gradient SNR across Z samples:
-    if Hutchinson noise dominates, low-rank off-diagonal heads see signal-to-noise ratio below ~1.
+    Fix one frame and resample probe matrix Z many times (with the same Jacobi smoothing as training).
+    Measures gradient SNR across Z samples: if Hutchinson noise dominates, low-rank off-diagonal heads
+    see signal-to-noise ratio below ~1.
     """
     data_folder = runtime["data_folder"]
     save_path = runtime["save_path"]
@@ -1141,7 +1191,9 @@ def evaluate_estimator_variance(args, runtime):
 
     print(
         f"Sampling Z {num_samples} times with {batch_vectors} vectors each on FIXED frame index {frame_idx} "
-        f"(probe_vectors arg: {pv if pv > 0 else 'default 256'})."
+        f"(probe_vectors arg: {pv if pv > 0 else 'default 256'}); "
+        f"each Z gets {HUTCHINSON_PROBE_JACOBI_STEPS} damped-Jacobi sweeps (ω={HUTCHINSON_PROBE_JACOBI_OMEGA}), "
+        "matching training."
     )
 
     precond_out = model(
@@ -1164,6 +1216,13 @@ def evaluate_estimator_variance(args, runtime):
         model.zero_grad()
         Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
         Z[:, n_orig:, :] = 0.0
+        jacobi_smooth_hutchinson_z_inplace(
+            Z,
+            jacobi_inv_diag,
+            [n_orig],
+            n_pad,
+            lambda Zt: (A_dense @ Zt.squeeze(0)).unsqueeze(0),
+        )
         AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
         MAZ = apply_block_diagonal_M(
             precond_out,

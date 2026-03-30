@@ -1119,7 +1119,8 @@ def main():
         leaf_apply_diag_ckpt,
         leaf_apply_off_ckpt,
         _attention_layout_code,
-        *_decoupled_route_hdr,
+        _decoupled_route_gates_hdr,
+        _edge_gate_mlp_hdr,
     ) = read_leaf_only_header(leaf_only_weights_path)
     if int(leaf_size_lo) != int(LEAF_SIZE):
         raise ValueError(
@@ -1243,9 +1244,11 @@ def main():
         if device.type == "cuda":
             torch.cuda.synchronize()
 
-        # Time pure forward only (same idea as leafonly.eval ``--evaluate_gradients``). Running
-        # ``build_sparse_bsr_preconditioner`` (when ``--leafonly_pcg bsr``) or other large materialization
-        # first allocates big buffers and can leave the GPU in a different memory state, skewing this line.
+        # Time pure forward only (same idea as leafonly.eval ``--evaluate_gradients`` component table’s
+        # encoder + heads; training/eval Hutchinson loss also builds Jacobi-smoothed Z, which is not here).
+        # Running ``build_sparse_bsr_preconditioner`` (when ``--leafonly_pcg bsr``) or other large
+        # materialization first allocates big buffers and can leave the GPU in a different memory state,
+        # skewing this line.
         inference_ms = _timed_ms(_fwd, device, warmup=0, repeat=10)
         precond_out = _last_out[0]
 

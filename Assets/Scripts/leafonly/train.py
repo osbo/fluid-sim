@@ -31,6 +31,7 @@ from .data import (
     most_recent_run_folder,
 )
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
+from .probe_z import jacobi_smooth_hutchinson_z_inplace
 
 
 def _padded_operator_sparse(edge_index, edge_values, n_phys: int, n_pad: int, dtype, device):
@@ -636,13 +637,26 @@ def train_leaf_only(args, runtime):
             if n_orig_ctx < max_n_pad_step:
                 Z[b_idx, n_orig_ctx:, :] = 0.0
 
+        def _az_probe(Zt: torch.Tensor) -> torch.Tensor:
+            if use_dense_batch:
+                return _probe_bmm(A_batched, Zt)
+            return _batched_A_mul_Z_blockdiag(sp_list, Zt)
+
+        jacobi_smooth_hutchinson_z_inplace(
+            Z,
+            jacobi_inv_diag_batched,
+            n_orig_list,
+            max_n_pad_step,
+            _az_probe,
+        )
+
         if do_detailed:
             _cuda_sync()
             t_z = time.perf_counter() - t_mark
             t_mark = time.perf_counter()
 
         if use_dense_batch:
-            AZ = compiled_probe_bmm(A_batched, Z)
+            AZ = _probe_bmm(A_batched, Z)
         else:
             AZ = _batched_A_mul_Z_blockdiag(sp_list, Z)
 
@@ -737,7 +751,7 @@ def train_leaf_only(args, runtime):
             print(f"  zero_grad:        {t_zero_grad * 1000:8.2f}")
             print(f"  batch assembly:   {t_batch * 1000:8.2f}")
             print(f"  model forward:    {t_forward * 1000:8.2f}")
-            print(f"  sample Z:         {t_z * 1000:8.2f}")
+            print(f"  probe Z+Jacobi:   {t_z * 1000:8.2f}")
             _az_tag = "dense bmm" if use_dense_batch else "sparse block-mm"
             print(f"  A @ Z ({_az_tag}): {t_az * 1000:8.2f}")
             print(f"  apply M (MAZ):    {t_apply * 1000:8.2f}")

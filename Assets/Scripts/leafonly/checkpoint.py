@@ -2,13 +2,19 @@ import struct
 from pathlib import Path
 
 import torch
+import torch.nn as nn
+
+from .architecture import EDGE_GATE_HIDDEN_DIM
 
 
 # v1: 32 bytes (8 ints). v2: 36 bytes (9 ints), diag + off apply sizes.
 # v3: 40 bytes (10 ints), adds attention_layout_code + TransformerBlock FFN params in body.
 #   attention_layout_code: 0 = LxL (no special nodes), 1 = Lx(L+1) (+ block node), 2 = Lx(L+2) (+ matrix node).
 # v4: 44 bytes (11 ints), adds decoupled_route_gates (1 = block_route_gate / matrix_route_gate tensors after edge_gate).
+# v4+edge_mlp: 52-byte header = v4 + 8 bytes (magic + ver) before tensor blob; LeafBlockAttention edge_gate is 2-layer MLP.
 LEAF_ONLY_HEADER_BYTES = 44
+CHECKPOINT_EDGE_GATE_EXT_MAGIC = 0x4544474D  # b"MDGE"
+CHECKPOINT_EDGE_GATE_EXT_VER = 1
 
 
 def read_leaf_only_header(path):
@@ -55,6 +61,18 @@ def read_leaf_only_header(path):
         leaf_apply_diag = leaf_size
     if leaf_apply_off <= 0:
         leaf_apply_off = leaf_apply_diag
+
+    edge_gate_hidden_dim = 0
+    if header_bytes == 44:
+        with open(path, "rb") as f:
+            f.seek(44)
+            ext = f.read(8)
+        if len(ext) == 8:
+            mag, ver = struct.unpack("<ii", ext)
+            if mag == CHECKPOINT_EDGE_GATE_EXT_MAGIC and ver == CHECKPOINT_EDGE_GATE_EXT_VER:
+                header_bytes = 52
+                edge_gate_hidden_dim = int(EDGE_GATE_HIDDEN_DIM)
+
     return (
         d_model,
         leaf_size,
@@ -68,6 +86,7 @@ def read_leaf_only_header(path):
         leaf_apply_off,
         attention_layout_code,
         decoupled_route_gates,
+        edge_gate_hidden_dim,
     )
 
 
@@ -102,6 +121,26 @@ def _write_gcn_layer(f, gcn_layer):
     _write_packed_tensor(f, gcn_layer.update_gate[2].bias.detach().cpu().float(), transpose=False)
 
 
+def _write_edge_gate_mlp(f, attn):
+    _write_packed_tensor(f, attn.edge_gate[0].weight.detach().cpu().float(), transpose=True)
+    _write_packed_tensor(f, attn.edge_gate[0].bias.detach().cpu().float(), transpose=False)
+    _write_packed_tensor(f, attn.edge_gate[2].weight.detach().cpu().float(), transpose=True)
+    _write_packed_tensor(f, attn.edge_gate[2].bias.detach().cpu().float(), transpose=False)
+
+
+def _read_edge_gate_into(f, attn, read_tensor, *, legacy_linear: bool):
+    if legacy_linear:
+        _read_into(f, attn.edge_gate[2].weight, read_tensor, transpose=True)
+        _read_into(f, attn.edge_gate[2].bias, read_tensor, transpose=False)
+        nn.init.normal_(attn.edge_gate[0].weight, std=0.01)
+        nn.init.zeros_(attn.edge_gate[0].bias)
+    else:
+        _read_into(f, attn.edge_gate[0].weight, read_tensor, transpose=True)
+        _read_into(f, attn.edge_gate[0].bias, read_tensor, transpose=False)
+        _read_into(f, attn.edge_gate[2].weight, read_tensor, transpose=True)
+        _read_into(f, attn.edge_gate[2].bias, read_tensor, transpose=False)
+
+
 def _read_gcn_layer_into(f, gcn_layer, read_tensor):
     _read_into(f, gcn_layer.linear_self.weight, read_tensor, transpose=True)
     _read_into(f, gcn_layer.linear_self.bias, read_tensor, transpose=False)
@@ -120,8 +159,7 @@ def _write_transformer_block(f, block, *, write_route_gates: bool = True):
     _write_packed_tensor(f, block.attn.qkv.bias.detach().cpu().float(), False)
     _write_packed_tensor(f, block.attn.proj.weight.detach().cpu().float(), True)
     _write_packed_tensor(f, block.attn.proj.bias.detach().cpu().float(), False)
-    _write_packed_tensor(f, block.attn.edge_gate.weight.detach().cpu().float(), True)
-    _write_packed_tensor(f, block.attn.edge_gate.bias.detach().cpu().float(), False)
+    _write_edge_gate_mlp(f, block.attn)
     if write_route_gates and block.attn.block_route_gate is not None:
         _write_packed_tensor(f, block.attn.block_route_gate.weight.detach().cpu().float(), True)
         _write_packed_tensor(f, block.attn.block_route_gate.bias.detach().cpu().float(), False)
@@ -169,6 +207,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
                 1 if has_route_gates else 0,
             )
         )
+        f.write(struct.pack("<ii", CHECKPOINT_EDGE_GATE_EXT_MAGIC, CHECKPOINT_EDGE_GATE_EXT_VER))
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.embed.lift[0].bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.embed.lift[2].weight.detach().cpu().float(), transpose=True)
@@ -197,15 +236,14 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.jacobi_gate.bias.detach().cpu().float(), transpose=False)
 
 
-def _read_transformer_block_into(f, block, read_tensor, *, load_route_gates: bool = False):
+def _read_transformer_block_into(f, block, read_tensor, *, load_route_gates: bool = False, legacy_edge_gate_linear: bool = False):
     _read_into(f, block.norm1.weight, read_tensor, transpose=False)
     _read_into(f, block.norm1.bias, read_tensor, transpose=False)
     _read_into(f, block.attn.qkv.weight, read_tensor, transpose=True)
     _read_into(f, block.attn.qkv.bias, read_tensor, transpose=False)
     _read_into(f, block.attn.proj.weight, read_tensor, transpose=True)
     _read_into(f, block.attn.proj.bias, read_tensor, transpose=False)
-    _read_into(f, block.attn.edge_gate.weight, read_tensor, transpose=True)
-    _read_into(f, block.attn.edge_gate.bias, read_tensor, transpose=False)
+    _read_edge_gate_into(f, block.attn, read_tensor, legacy_linear=legacy_edge_gate_linear)
     if load_route_gates:
         if block.attn.block_route_gate is not None:
             _read_into(f, block.attn.block_route_gate.weight, read_tensor, transpose=True)
@@ -239,7 +277,9 @@ def load_leaf_only_weights(model, path):
         leaf_apply_off_lo,
         attention_layout_code,
         decoupled_route_gates,
+        edge_gate_hidden_dim,
     ) = result
+    legacy_edge_gate_linear = int(edge_gate_hidden_dim) != int(EDGE_GATE_HIDDEN_DIM)
     if header_bytes < 40:
         raise ValueError(
             f"Checkpoint '{path}' uses old format (header v{'1' if header_bytes < 36 else '2'}); "
@@ -308,9 +348,13 @@ def load_leaf_only_weights(model, path):
         _read_into(f, model.enc_input_proj.bias, read_tensor, transpose=False)
         _load_rg = int(decoupled_route_gates) == 1
         for block in model.blocks:
-            _read_transformer_block_into(f, block, read_tensor, load_route_gates=_load_rg)
+            _read_transformer_block_into(
+                f, block, read_tensor, load_route_gates=_load_rg, legacy_edge_gate_linear=legacy_edge_gate_linear
+            )
         for block in model.off_diag_blocks:
-            _read_transformer_block_into(f, block, read_tensor, load_route_gates=_load_rg)
+            _read_transformer_block_into(
+                f, block, read_tensor, load_route_gates=_load_rg, legacy_edge_gate_linear=legacy_edge_gate_linear
+            )
         _read_into(f, model.off_diag_head_U.weight, read_tensor, transpose=True)
         _read_into(f, model.off_diag_head_U.bias, read_tensor, transpose=False)
         _read_into(f, model.off_diag_head_V.weight, read_tensor, transpose=True)
