@@ -87,6 +87,7 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
         use_gcn=cfg.num_gcn_layers > 0,
         num_gcn_layers=cfg.num_gcn_layers,
         use_jacobi=cfg.use_jacobi,
+        off_diag_dense_attention=bool(getattr(cfg, "off_diag_dense_attention", True)),
     ).to(device)
     load_leaf_only_weights(model, str(save_path))
     model.eval()

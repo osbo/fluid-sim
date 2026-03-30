@@ -359,6 +359,53 @@ def build_hmatrix_off_attn_masks_from_reachable(
     return out
 
 
+def build_hmatrix_off_dense_rpe_from_positions(
+    positions: torch.Tensor,
+    r0: torch.Tensor,
+    c0: torch.Tensor,
+    s: torch.Tensor,
+    num_blocks: int,
+    leaf_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Per H-tile (r0, c0, S): dense relative geometry for the L×L leaf-local attention grid.
+
+    Row-strip nodes with local index i are ``pos[rr*L+i]`` for ``rr ∈ [r0, r0+S)``; column-strip
+    similarly ``cc ∈ [c0, c0+S)``. For each (i, j), store the mean over all S×S pairwise differences
+    ``pos[col] - pos[row]``, which equals ``mean_col(pos at slot j) - mean_row(pos at slot i)``.
+    Features are [Δx, Δy, Δz, 0] on leaf keys; block column (L) is zero.
+    """
+    L = int(leaf_size)
+    K = int(num_blocks)
+    N = K * L
+    device = positions.device
+    pos = positions.to(device=device, dtype=dtype)
+    if pos.shape[0] < N:
+        raise ValueError(f"positions rows {pos.shape[0]} < N={N} (K*L)")
+    pos = pos[:, :3]
+    M = int(r0.shape[0])
+    if M == 0:
+        return torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
+    r0_l = r0.long().to(device)
+    c0_l = c0.long().to(device)
+    s_l = s.long().to(device)
+    li = torch.arange(L, device=device, dtype=torch.long)
+    out = torch.zeros(M, L, L + 1, 4, device=device, dtype=dtype)
+    for m in range(M):
+        rr0 = int(r0_l[m].item())
+        cc0 = int(c0_l[m].item())
+        sv = int(s_l[m].item())
+        rr = torch.arange(rr0, rr0 + sv, device=device, dtype=torch.long)
+        cc = torch.arange(cc0, cc0 + sv, device=device, dtype=torch.long)
+        idx_r = rr[:, None] * L + li[None, :]
+        idx_c = cc[:, None] * L + li[None, :]
+        pr = pos[idx_r].mean(dim=0)
+        pc = pos[idx_c].mean(dim=0)
+        out[m, :L, :L, :3] = pc.unsqueeze(0) - pr.unsqueeze(1)
+    return out
+
+
 def build_hmatrix_off_edge_feats_from_edges(
     edge_index: torch.Tensor,
     edge_values: torch.Tensor,
@@ -369,13 +416,26 @@ def build_hmatrix_off_edge_feats_from_edges(
     num_blocks: int,
     leaf_size: int,
     dtype: torch.dtype,
+    *,
+    dense_position_rpe: bool = False,
 ) -> torch.Tensor:
     """
-    Per H-tile (r0, c0, S): aggregate direct graph edges whose src lies in the row-strip leaves
-    and dst in the col-strip leaves into local (L, L, 4) with [Δx(3), A_ij(1)], mean over duplicates.
+    Per H-tile (r0, c0, S): off-diagonal edge features for LeafBlockAttention ``edge_gate``.
+
+    If ``dense_position_rpe`` is False (default): aggregate direct graph edges whose src lies in the
+    row-strip leaves and dst in the col-strip leaves into local (L, L, 4) with [Δx(3), A_ij(1)],
+    mean over duplicates (sparse edge_index).
+
+    If True: ignore edge_index for this tensor; fill [Δx, Δy, Δz, 0] from dense strip geometry
+    (see ``build_hmatrix_off_dense_rpe_from_positions``).
 
     Layout matches diagonal per-leaf cells; last key column (block node) stays zero.
     """
+    if dense_position_rpe:
+        return build_hmatrix_off_dense_rpe_from_positions(
+            positions, r0, c0, s, num_blocks, leaf_size, dtype
+        )
+
     L = int(leaf_size)
     K = int(num_blocks)
     N = K * L
@@ -420,14 +480,25 @@ def build_hmatrix_off_edge_feats_from_edges(
 
 
 def build_leaf_block_connectivity(
-    edge_index, edge_values, positions, leaf_size, device, dtype=torch.float32, num_hops=ATTENTION_HOPS
+    edge_index,
+    edge_values,
+    positions,
+    leaf_size,
+    device,
+    dtype=torch.float32,
+    num_hops=ATTENTION_HOPS,
+    *,
+    off_diag_dense_attention: bool = False,
 ):
     """
     Returns (diag_mask, diag_feats, off_attn_mask, off_edge_feats).
 
     Diagonal: same-leaf n-hop reachability and in-leaf edge features (mean if multiple edges per cell).
     Off-diagonal: H-tile reachability masks (OR over leaf-pair slices) and edge features from all
-    direct edges crossing row-strip × col-strip leaves (mean per local L×L cell).
+    direct edges crossing row-strip × col-strip leaves (mean per local L×L cell), unless
+    ``off_diag_dense_attention`` is True: then off edge_feats use dense strip-mean RPE from positions
+    (see ``build_hmatrix_off_dense_rpe_from_positions``); masks are unchanged here (model may still
+    override softmax mask when using dense attention).
     """
     R, dm, df, num_blocks = _reachable_and_diag_materialize(
         edge_index, edge_values, positions, leaf_size, device, dtype, num_hops
@@ -444,7 +515,16 @@ def build_leaf_block_connectivity(
     hm_s = HM_S_CPU.to(device)
     om = build_hmatrix_off_attn_masks_from_reachable(R, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype)
     oe = build_hmatrix_off_edge_feats_from_edges(
-        edge_index, edge_values, positions, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype
+        edge_index,
+        edge_values,
+        positions,
+        hm_r0,
+        hm_c0,
+        hm_s,
+        num_blocks,
+        leaf_size,
+        dtype,
+        dense_position_rpe=bool(off_diag_dense_attention),
     )
     return dm, df, om, oe
 

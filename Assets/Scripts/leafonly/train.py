@@ -252,7 +252,13 @@ def train_leaf_only(args, runtime):
             t_c0 = time.perf_counter()
             positions_ctx = x_input[0, :n_pad, :3]
             dm, df, om, oe = build_leaf_block_connectivity(
-                edge_index, edge_values, positions_ctx, LEAF_SIZE, device, x_input.dtype
+                edge_index,
+                edge_values,
+                positions_ctx,
+                LEAF_SIZE,
+                device,
+                x_input.dtype,
+                off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
             )
             precomputed_leaf_connectivity = (dm, df, om, oe)
             ctx_conn_ms += (time.perf_counter() - t_c0) * 1000.0
@@ -328,12 +334,14 @@ def train_leaf_only(args, runtime):
         num_gcn_layers=effective_gcn_layers,
         use_jacobi=True,
         strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
+        off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
     ).to(device)
     ms_model = (time.perf_counter() - t_seg) * 1000.0
+    _oda = bool(getattr(args, "off_diag_dense_attn", True))
     print(
         "  [startup] Ablation config:"
         f" layers={args.num_layers}, gcn_layers={effective_gcn_layers}, jacobi=True (node_scalar),"
-        f" attention_layout={attention_layout}"
+        f" attention_layout={attention_layout}, off_diag_dense_attn={_oda}"
     )
 
     ms_compile = 0.0

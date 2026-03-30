@@ -17,7 +17,7 @@ from .config import (
 )
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
-CONTEXT_CACHE_VERSION = 9
+CONTEXT_CACHE_VERSION = 10
 
 
 def _mtime_ns(path: Path) -> int:
@@ -54,6 +54,7 @@ def build_training_context_cache_meta(dataset, run_folder: Path, args, frame_ind
         "max_mixed": int(MAX_MIXED_SIZE),
         "max_num_leaves": int(MAX_NUM_LEAVES),
         "hmatrix_off_blocks": int(NUM_HMATRIX_OFF_BLOCKS),
+        "off_diag_dense_attn": bool(getattr(args, "off_diag_dense_attn", True)),
         "dataset_len": int(len(dataset)),
         "fingerprints": fingerprints,
     }

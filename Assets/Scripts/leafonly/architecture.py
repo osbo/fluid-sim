@@ -227,9 +227,19 @@ class LeafBlockAttention(nn.Module):
         self.edge_gate = nn.Linear(4, self.num_heads)
         nn.init.normal_(self.edge_gate.weight, std=0.01)
         nn.init.zeros_(self.edge_gate.bias)
+        # Decoupled global routing: block/matrix values bypass spatial softmax; gates can → 0.
+        self.block_route_gate = nn.Linear(dim, self.num_heads) if self.use_block_node else None
+        self.matrix_route_gate = nn.Linear(dim, self.num_heads) if self.use_matrix_node else None
+        if self.block_route_gate is not None:
+            nn.init.normal_(self.block_route_gate.weight, std=0.01)
+            nn.init.zeros_(self.block_route_gate.bias)
+        if self.matrix_route_gate is not None:
+            nn.init.normal_(self.matrix_route_gate.weight, std=0.01)
+            nn.init.zeros_(self.matrix_route_gate.bias)
         self.last_attn_self = 0.0
         self.last_attn_neighbor = 0.0
         self.last_attn_block = 0.0
+        self.last_attn_distribution_stats: Optional[dict] = None
         self.last_attn_matrix = None
         self.last_scores_matrix = None
         self.last_bias_physics_matrix = None
@@ -283,66 +293,47 @@ class LeafBlockAttention(nn.Module):
         x_attn = x_blk
         use_block_node = self.use_block_node
         use_matrix_node = self.use_matrix_node
-        kv_parts = [x_attn]
-        if use_block_node:
-            if prep_block_node is not None:
-                block_node = self._align_prep_blocks(prep_block_node, B, num_blocks, C)
-            else:
-                block_node = x_attn.mean(dim=2, keepdim=True)
-            kv_parts.append(block_node)
-        if use_matrix_node:
-            if prep_matrix_node is not None:
-                matrix_node = self._align_prep_blocks(prep_matrix_node, B, num_blocks, C)
-            else:
-                matrix_node = x.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, num_blocks, -1, -1)
-            kv_parts.append(matrix_node)
-        kv = torch.cat(kv_parts, dim=2)
-        qkv_q = self.qkv(x_attn)
-        qkv_kv = self.qkv(kv)
-        q = qkv_q[..., :C]
-        k = qkv_kv[..., C:2 * C]
-        v = qkv_kv[..., 2 * C:3 * C]
-        key_count = kv.shape[2]
-        q = q.view(B, num_blocks, L, self.num_heads, self.head_dim)
-        k = k.view(B, num_blocks, key_count, self.num_heads, self.head_dim)
-        v = v.view(B, num_blocks, key_count, self.num_heads, self.head_dim)
+
+        # L×L spatial attention only: drop block/matrix key columns from mask and edge grid (global via gates).
+        ef_sp = edge_feats[..., :L, :L, :4]
+        if ef_sp.dim() == 4:
+            bias_physics = ef_sp.unsqueeze(0).expand(B, -1, -1, -1, -1).clone()
+        else:
+            bias_physics = ef_sp.clone()
+            if bias_physics.shape[0] == 1 and B > 1:
+                bias_physics = bias_physics.expand(B, -1, -1, -1, -1)
+
+        am = attn_mask
+        if am.shape[-1] > L:
+            am = am[..., :L]
+        if am.dim() == 3:
+            mask_base = am.unsqueeze(0)
+        else:
+            mask_base = am
+            if mask_base.shape[0] == 1 and B > 1:
+                mask_base = mask_base.expand(B, -1, -1, -1)
+
+        # Coupled layout used to always include a block key (column L) = 1, so no row was all-masked.
+        # Spatial-only softmax rows must have ≥1 allowed key or softmax is all -inf → NaN (H-off tiles
+        # with no reachability, batch-padded empty leaf blocks, etc.).
+        mask_base = mask_base.clone()
+        _need_diag = (mask_base.sum(dim=-1) < 1).to(dtype=mask_base.dtype)
+        _diag_view = mask_base.diagonal(dim1=-2, dim2=-1)
+        _diag_view.copy_(torch.maximum(_diag_view, _need_diag))
+
+        key_count = L
+        qkv_x = self.qkv(x_attn)
+        q = qkv_x[..., :C].view(B, num_blocks, L, self.num_heads, self.head_dim)
+        k = qkv_x[..., C : 2 * C].view(B, num_blocks, L, self.num_heads, self.head_dim)
+        v_spatial = qkv_x[..., 2 * C : 3 * C].view(B, num_blocks, L, self.num_heads, self.head_dim)
 
         scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
 
-        if edge_feats.dim() == 4:
-            bias_physics = edge_feats[..., :4].unsqueeze(0).expand(B, -1, -1, -1, -1).clone()
-        else:
-            bias_physics = edge_feats[..., :4].clone()
-        if bias_physics.shape[3] != key_count:
-            if bias_physics.shape[3] > key_count:
-                bias_physics = bias_physics[:, :, :, :key_count, :]
-            else:
-                key_pad = key_count - bias_physics.shape[3]
-                pad_tensor = torch.zeros(*bias_physics.shape[:3], key_pad, bias_physics.shape[4], device=bias_physics.device, dtype=bias_physics.dtype)
-                bias_physics = torch.cat([bias_physics, pad_tensor], dim=3)
-        special_start = L
-        if use_block_node:
-            bias_physics[:, :, :, special_start, :] = 0.0
-            bias_physics[:, :, :, special_start, 3] = 1.0
-            special_start += 1
-        if use_matrix_node:
-            bias_physics[:, :, :, special_start, :] = 0.0
-            bias_physics[:, :, :, special_start, 3] = 1.0
-        arange_s = torch.arange(L, device=device)
+        arange_s = torch.arange(L, device=device, dtype=torch.long)
         bias_physics[:, :, arange_s, arange_s, :] = 0.0
         bias_physics[:, :, arange_s, arange_s, 3] = 1.0
         scores = scores + bias_physics[..., 3:4]
-        if attn_mask.dim() == 3:
-            mask_base = attn_mask.unsqueeze(0)
-        else:
-            mask_base = attn_mask
-        if mask_base.shape[3] != key_count:
-            if mask_base.shape[3] > key_count:
-                mask_base = mask_base[:, :, :, :key_count]
-            else:
-                key_pad = key_count - mask_base.shape[3]
-                pad_tensor = torch.ones(*mask_base.shape[:3], key_pad, device=mask_base.device, dtype=mask_base.dtype)
-                mask_base = torch.cat([mask_base, pad_tensor], dim=3)
+
         mask_expanded = mask_base.unsqueeze(-1)
         scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
 
@@ -356,21 +347,103 @@ class LeafBlockAttention(nn.Module):
         linear_edge_weights = linear_edge_weights.masked_fill(mask_expanded == 0, 0.0)
         combined_weights = attn_probs + linear_edge_weights
 
+        x_mid = torch.einsum("bnqkh,bnkhd->bnqhd", combined_weights, v_spatial)
+
+        g_block = None
+        g_matrix = None
+        if use_block_node:
+            if prep_block_node is not None:
+                block_node = self._align_prep_blocks(prep_block_node, B, num_blocks, C)
+            else:
+                block_node = x_attn.mean(dim=2, keepdim=True)
+            v_block = self.qkv(block_node)[..., 2 * C : 3 * C].view(
+                B, num_blocks, 1, self.num_heads, self.head_dim
+            )
+            g_block = torch.sigmoid(self.block_route_gate(x_attn))
+            x_mid = x_mid + g_block.unsqueeze(-1) * v_block
+
+        if use_matrix_node:
+            if prep_matrix_node is not None:
+                matrix_node = self._align_prep_blocks(prep_matrix_node, B, num_blocks, C)
+            else:
+                matrix_node = x.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, num_blocks, -1, -1)
+            v_matrix = self.qkv(matrix_node)[..., 2 * C : 3 * C].view(
+                B, num_blocks, 1, self.num_heads, self.head_dim
+            )
+            g_matrix = torch.sigmoid(self.matrix_route_gate(x_attn))
+            x_mid = x_mid + g_matrix.unsqueeze(-1) * v_matrix
+
         if not self.training and not torch.compiler.is_compiling():
             with torch.no_grad():
                 attn_viz = combined_weights.mean(dim=-1)
-                arange = torch.arange(L, device=attn_viz.device)
+                arange = torch.arange(L, device=attn_viz.device, dtype=torch.long)
                 self.last_attn_self = attn_viz[:, :, arange, arange].mean().item()
-                if use_block_node and attn_viz.shape[3] > L:
-                    self.last_attn_block = attn_viz[:, :, :, L].mean().item()
-                else:
-                    self.last_attn_block = 0.0
                 to_nodes = attn_viz[:, :, :, :L].sum(dim=3)
                 self.last_attn_neighbor = (to_nodes - attn_viz[:, :, arange, arange]).mean().item()
+                if use_block_node and g_block is not None:
+                    self.last_attn_block = float(g_block.mean().item())
+                else:
+                    self.last_attn_block = 0.0
+                m_mat_model = float(g_matrix.mean().item()) if use_matrix_node and g_matrix is not None else 0.0
                 if save_attention:
                     self.last_attn_matrix = attn_viz[:, :, :, :L].cpu().float()
 
-        x_out = torch.einsum("bnqkh,bnkhd->bnqhd", combined_weights, v)
+                # Spatial softmax uses K=L only; block/matrix are σ(gate)·V baselines (not in softmax sum).
+                K = int(key_count)
+                mask_b = (mask_base > 0).to(dtype=attn_viz.dtype)
+                n_allowed = mask_b.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                unif = mask_b / n_allowed
+                u_self = float(unif[:, :, arange, arange].mean().item())
+                u_leaf = unif[..., :L]
+                u_sum_leaf = u_leaf.sum(dim=-1)
+                u_diag = unif[:, :, arange, arange]
+                u_nei = float((u_sum_leaf - u_diag).mean().item())
+                inv_k = 1.0 / float(K)
+                b_self = inv_k
+                b_nei = inv_k * float(max(L - 1, 0))
+                if use_block_node and g_block is not None:
+                    model_blk = float(g_block.mean().item())
+                    u_blk = 0.5
+                    b_blk = 0.0
+                else:
+                    model_blk = 0.0
+                    u_blk = 0.0
+                    b_blk = 0.0
+                if use_matrix_node and g_matrix is not None:
+                    model_mat = m_mat_model
+                    u_mat = 0.5
+                    b_mat = 0.0
+                else:
+                    model_mat = 0.0
+                    u_mat = 0.0
+                    b_mat = 0.0
+                self.last_attn_distribution_stats = {
+                    "key_count": K,
+                    "model_self": self.last_attn_self,
+                    "unif_self": u_self,
+                    "blind_self": b_self,
+                    "model_nei": self.last_attn_neighbor,
+                    "unif_nei": u_nei,
+                    "blind_nei": b_nei,
+                    "model_blk": model_blk,
+                    "unif_blk": u_blk,
+                    "blind_blk": b_blk,
+                    "model_mat": model_mat,
+                    "unif_mat": u_mat,
+                    "blind_mat": b_mat,
+                    "excess_self": self.last_attn_self - u_self,
+                    "excess_nei": self.last_attn_neighbor - u_nei,
+                    "excess_blk": model_blk - u_blk,
+                    "excess_mat": model_mat - u_mat,
+                    "excess_self_vs_blind": self.last_attn_self - b_self,
+                    "excess_nei_vs_blind": self.last_attn_neighbor - b_nei,
+                    "excess_blk_vs_blind": model_blk - b_blk,
+                    "excess_mat_vs_blind": model_mat - b_mat,
+                }
+        else:
+            self.last_attn_distribution_stats = None
+
+        x_out = x_mid
         x_out = x_out.reshape(B, num_blocks, L, C)
         x_out = self.proj(x_out)
         x_out = x_out.reshape(B, N_pad, C)
@@ -444,13 +517,15 @@ class LeafOnlyNet(nn.Module):
         num_gcn_layers=PhysicsAwareEmbedding.DEFAULT_NUM_GCN_LAYERS,
         use_jacobi=True,
         strip_build_mode: str = "no_einsum",
+        off_diag_dense_attention: bool = True,
     ):
         super().__init__()
         if strip_build_mode not in ("einsum", "no_einsum"):
             raise ValueError(f"strip_build_mode must be 'einsum' or 'no_einsum', got {strip_build_mode!r}")
         self.strip_build_mode = strip_build_mode
+        self.off_diag_dense_attention = bool(off_diag_dense_attention)
         self.leaf_size = int(leaf_size)
-        # H-matrix stack uses fixed L×(L+1) attention (block node); required for static compile.
+        # L×(L+1) layout: block summary still exists, but LeafBlockAttention uses L×L softmax + gated V_block (not a softmax key).
         attention_layout = f"{self.leaf_size}x{self.leaf_size + 1}"
         self.embed = PhysicsAwareEmbedding(
             input_dim,
@@ -629,6 +704,7 @@ class LeafOnlyNet(nn.Module):
                     device,
                     dtype,
                     num_hops=ATTENTION_HOPS,
+                    off_diag_dense_attention=self.off_diag_dense_attention,
                 )
 
         B, N_h, C_h = h.shape
@@ -680,6 +756,9 @@ class LeafOnlyNet(nn.Module):
                     oe5 = oe5.expand(B, -1, -1, -1, -1, -1)
             off_attn_mask = om4.reshape(B * M_off, 1, Lq, Kq)
             off_edge_feats = oe5.reshape(B * M_off, 1, Lq, Kq, 4)
+            if self.off_diag_dense_attention:
+                # Ignore H reachability for softmax: all L×L keys allowed (still uses edge_feats physics bias + gated block path).
+                off_attn_mask = torch.ones_like(off_attn_mask)
 
         # Frozen KV extras (+1 / +2): means from post-embed h only (not refreshed per TransformerBlock).
         h_lv = h.view(B, K, L, C_h)

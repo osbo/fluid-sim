@@ -485,6 +485,40 @@ def _plot_hmatrix_rank_profiler_row(axes_row, bands_head: list[dict]) -> None:
         ax.legend(loc="upper right", fontsize=7)
 
 
+def _spectral_am_error_vs_A_eigenmodes(
+    A_dense: np.ndarray,
+    AM_dense: np.ndarray,
+    *,
+    eig_A: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    For A φ_i = λ_i φ_i (right eigenvectors), Rayleigh quotient
+    μ_i = (φ_i^H AM φ_i) / (φ_i^H φ_i). Returns (Re(λ_i), |1 - μ_i|) with modes sorted by Re(λ).
+    Ideal preconditioning (AM = I) gives μ_i = 1 and zero error.
+
+    Pass ``eig_A=(λ, V)`` from a single ``np.linalg.eig(A)`` (columns of V are eigenvectors)
+    when comparing several preconditioners so A is not re-factorized each time.
+    """
+    if eig_A is None:
+        lam, V = np.linalg.eig(A_dense)
+        order = np.argsort(np.real(lam))
+        lam = lam[order]
+        V = V[:, order]
+    else:
+        lam, V = eig_A
+    n = int(lam.shape[0])
+    errs = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        v = V[:, i]
+        denom = np.vdot(v, v)
+        if abs(denom) < 1e-30:
+            errs[i] = np.nan
+            continue
+        mu = np.vdot(v, AM_dense @ v) / denom
+        errs[i] = np.abs(1.0 - mu)
+    return np.real(lam), errs
+
+
 def _amg_solver(A_sparse_scipy):
     if not HAS_AMG:
         return None
@@ -1023,6 +1057,14 @@ def main():
             "matrix_free = apply_block_diagonal_m_into with preallocated workspace (scales for large H off-diagonal)."
         ),
     )
+    parser.add_argument(
+        "--off-diag-dense-attn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "LeafOnlyNet H-off: True (default) = dense L×L softmax; False (--no-off-diag-dense-attn) = reachability mask."
+        ),
+    )
     args = parser.parse_args()
     test_only = bool(args.test_only)
 
@@ -1077,6 +1119,7 @@ def main():
         leaf_apply_diag_ckpt,
         leaf_apply_off_ckpt,
         _attention_layout_code,
+        *_decoupled_route_hdr,
     ) = read_leaf_only_header(leaf_only_weights_path)
     if int(leaf_size_lo) != int(LEAF_SIZE):
         raise ValueError(
@@ -1116,6 +1159,7 @@ def main():
         num_heads=num_heads_lo,
         use_gcn=bool(use_gcn_lo),
         attention_layout=default_attention_layout(leaf_size_lo),
+        off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
     ).to(device)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
@@ -1170,6 +1214,7 @@ def main():
             leaf_L,
             device,
             x_leaf.dtype,
+            off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
         )
         pre_leaf_connectivity = tuple(
             t.contiguous() if isinstance(t, torch.Tensor) else t for t in pre_leaf_connectivity
@@ -1605,7 +1650,7 @@ def main():
     if PLOT_MATRICES:
         M_neural_n = M_gpu.detach().cpu().numpy()
         methods = [("LeafOnly", M_neural_n), ("AMG", M_amg_n)]
-        n_cols = 5
+        n_cols = 6
         n_rows = 1 + len(methods) + 1
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows), constrained_layout=True)
 
@@ -1669,6 +1714,52 @@ def main():
         ax_a_t.text(0.1, 0.8, "Unpreconditioned A", fontsize=12, fontfamily='monospace')
         ax_a_t.text(0.1, 0.65, f"Cond(A): {cond_A:.2e}", fontsize=12, fontfamily='monospace')
 
+        ax_spec_hdr = axes[0, 5]
+        ax_spec_hdr.axis("off")
+        ax_spec_hdr.text(
+            0.02,
+            0.92,
+            "Spectral error in A eigenmodes",
+            fontsize=11,
+            fontweight="bold",
+            transform=ax_spec_hdr.transAxes,
+            va="top",
+        )
+        ax_spec_hdr.text(
+            0.02,
+            0.72,
+            r"$A\phi_i=\lambda_i\phi_i$",
+            fontsize=10,
+            transform=ax_spec_hdr.transAxes,
+            va="top",
+        )
+        ax_spec_hdr.text(
+            0.02,
+            0.56,
+            r"$\mu_i=(\phi_i^H AM\phi_i)/(\phi_i^H\phi_i)$",
+            fontsize=9,
+            transform=ax_spec_hdr.transAxes,
+            va="top",
+            fontfamily="monospace",
+        )
+        ax_spec_hdr.text(
+            0.02,
+            0.34,
+            r"Plot: $\mathrm{Re}(\lambda_i)$ vs $|1-\mu_i|$",
+            fontsize=9,
+            transform=ax_spec_hdr.transAxes,
+            va="top",
+        )
+        ax_spec_hdr.text(
+            0.02,
+            0.14,
+            "Spike at small Re(λ): global modes;\nflat spectrum: local/capacity",
+            fontsize=8,
+            transform=ax_spec_hdr.transAxes,
+            va="top",
+            style="italic",
+        )
+
         am_log_min, am_log_max = None, None
         for _name, M in methods:
             AM = A_viz_n @ M
@@ -1678,6 +1769,14 @@ def main():
             am_log_max = hi if am_log_max is None else max(am_log_max, hi)
         if am_log_min is None:
             am_log_min, am_log_max = -8.0, 0.0
+
+        eig_A_cache: tuple[np.ndarray, np.ndarray] | None = None
+        try:
+            _lam_a, _V_a = np.linalg.eig(A_viz_n)
+            _ord = np.argsort(np.real(_lam_a))
+            eig_A_cache = (_lam_a[_ord], _V_a[:, _ord])
+        except Exception:
+            eig_A_cache = None
 
         for idx, (name, M) in enumerate(methods):
             row = 1 + idx
@@ -1727,6 +1826,35 @@ def main():
             color = 'green' if cond_A / cond_AM > 1.0 else 'red'
             for i, line in enumerate(msg):
                 ax_t.text(0.1, 0.8 - i * 0.15, line, fontsize=12, color='black' if i != 2 else color, fontfamily='monospace')
+
+            ax_ray = axes[row, 5]
+            if eig_A_cache is None:
+                ax_ray.text(
+                    0.5,
+                    0.5,
+                    "A eigendecomposition failed;\ncannot plot mode errors.",
+                    transform=ax_ray.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                )
+                ax_ray.set_axis_off()
+            else:
+                lam_re, mode_errs = _spectral_am_error_vs_A_eigenmodes(A_viz_n, AM, eig_A=eig_A_cache)
+                ok = np.isfinite(mode_errs)
+                ax_ray.scatter(
+                    lam_re[ok],
+                    np.maximum(mode_errs[ok], 1e-16),
+                    alpha=0.65,
+                    s=14,
+                    c="C0",
+                    edgecolors="none",
+                )
+                ax_ray.set_yscale("log")
+                ax_ray.set_xlabel(r"$\mathrm{Re}(\lambda_i)$ of $A$")
+                ax_ray.set_ylabel(r"$|1 - \mu_i|$")
+                ax_ray.set_title(f"{name}: error on $A$-eigenmodes")
+                ax_ray.grid(True, which="both", alpha=0.3)
 
         _plot_hmatrix_rank_profiler_row(axes[n_rows - 1, :], hm_rank_bands[:n_cols])
 
