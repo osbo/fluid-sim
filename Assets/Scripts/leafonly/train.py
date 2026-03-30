@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from .architecture import LeafOnlyNet, apply_block_diagonal_M
-from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
+from .checkpoint import apply_leaf_only_arch_from_checkpoint_args, load_leaf_only_weights, save_leaf_only_weights
 from .config import (
     LEAF_APPLY_SIZE,
     LEAF_APPLY_SIZE_OFF,
@@ -312,10 +312,12 @@ def train_leaf_only(args, runtime):
     contexts_per_step = max(1, int(args.contexts_per_step))
     print(f"  [startup] contexts_per_step = {contexts_per_step} (gradient accumulation)")
 
-    args.num_layers = 2
     args.num_gcn_layers = 2
     args.use_jacobi = True
     attention_layout = str(args.attention_layout)
+
+    if getattr(args, "continue_training", False) and save_path.exists():
+        apply_leaf_only_arch_from_checkpoint_args(args, save_path)
 
     torch.manual_seed(args.seed)
     max_n_pad = max(ctx["n_pad"] for ctx in training_contexts)
@@ -426,7 +428,7 @@ def train_leaf_only(args, runtime):
         print(f"  Probe vectors (loss MC columns): fixed K={_pv} (--probe-vectors)")
     else:
         print(
-            "  Probe vectors (loss MC columns): auto max(256, ⌈√n_pad⌉) per step "
+            "  Probe vectors (loss MC columns): auto max(64, ⌈√n_pad⌉) per step "
             "(override with --probe-vectors K)"
         )
     if getattr(args, "profile_backward", False):

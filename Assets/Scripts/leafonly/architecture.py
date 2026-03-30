@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from .config import (
     ATTENTION_HOPS,
+    DIAG_TOKEN_POOL,
     GLOBAL_FEATURES_DIM,
     LEAF_SIZE,
     MAX_NUM_LEAVES,
@@ -587,7 +588,7 @@ class LeafOnlyNet(nn.Module):
         use_gcn=True,
         num_gcn_layers=PhysicsAwareEmbedding.DEFAULT_NUM_GCN_LAYERS,
         use_jacobi=True,
-        strip_build_mode: str = "no_einsum",
+        strip_build_mode: str = "einsum",
         off_diag_dense_attention: bool = True,
         diag_dense_attention: bool = True,
     ):
@@ -599,11 +600,16 @@ class LeafOnlyNet(nn.Module):
         self.diag_dense_attention = bool(diag_dense_attention)
         self.leaf_size = int(leaf_size)
         L = self.leaf_size
+        dtp = int(DIAG_TOKEN_POOL)
+        if L % dtp != 0:
+            raise ValueError(f"leaf_size {L} not divisible by DIAG_TOKEN_POOL {dtp}")
+        Ls_diag = L // dtp
+        self.diag_token_pool = dtp
         otp = int(OFF_DIAG_TOKEN_POOL)
         if L % otp != 0:
             raise ValueError(f"leaf_size {L} not divisible by OFF_DIAG_TOKEN_POOL {otp}")
         Ls_off = L // otp
-        diag_layout = f"{L}x{L}" if self.diag_dense_attention else f"{L}x{L + 1}"
+        diag_layout = f"{Ls_diag}x{Ls_diag}" if self.diag_dense_attention else f"{Ls_diag}x{Ls_diag + 1}"
         off_layout = f"{Ls_off}x{Ls_off}" if self.off_diag_dense_attention else f"{Ls_off}x{Ls_off + 1}"
         self.embed = PhysicsAwareEmbedding(
             input_dim,
@@ -614,18 +620,18 @@ class LeafOnlyNet(nn.Module):
         )
         self.enc_input_proj = nn.Linear(d_model, d_model)
         self.off_token_pool = otp
-        self.leaf_apply_size = L
+        self.leaf_apply_size = Ls_diag
         self.leaf_apply_off = Ls_off
-        La_d = L
+        La_d = Ls_diag
         La_o = Ls_off
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
                     d_model,
-                    block_size=L,
+                    block_size=Ls_diag,
                     attn_module=LeafBlockAttention(
                         d_model,
-                        L,
+                        Ls_diag,
                         num_heads=num_heads,
                         attention_layout=diag_layout,
                     ),
@@ -684,6 +690,26 @@ class LeafOnlyNet(nn.Module):
         self.register_buffer("hm_sum_w_row", wr_sum, persistent=False)
         self.register_buffer("hm_sum_w_col", wc_sum, persistent=False)
 
+    def _pool_full_leaf_to_diag_tokens(self, h: torch.Tensor, B: int, K: int, L_full: int, C_h: int) -> torch.Tensor:
+        """(B, K*L_full, C) → (B, K*Ls_diag, C) via uniform mean-pool over ``diag_token_pool`` consecutive tokens."""
+        h_kv = h.view(B, K, L_full, C_h)
+        p = self.diag_token_pool
+        if p <= 1:
+            return h_kv.reshape(B, K * L_full, C_h)
+        Ls = self.leaf_apply_size
+        hp = h_kv.view(B, K, Ls, p, C_h).mean(dim=3)
+        return hp.reshape(B, K * Ls, C_h)
+
+    def _diag_tokens_to_full_leaf(self, h_diag: torch.Tensor, B: int, K: int, L_full: int, C_h: int) -> torch.Tensor:
+        """(B, K*Ls_diag, C) → (B, K*L_full, C) by repeating each pooled token across its pool group (strip / node heads)."""
+        p = self.diag_token_pool
+        if p <= 1:
+            return h_diag
+        Ls = self.leaf_apply_size
+        h_kv = h_diag.view(B, K, Ls, C_h)
+        h_kv = h_kv.repeat_interleave(p, dim=2)
+        return h_kv.reshape(B, K * L_full, C_h)
+
     def _get_leaf_blocks(self, h, mode="diagonal"):
         # Diagonal: (B, N, C) with N = K * L. Off: (B, M_off, L, C) one L-token tile per H block — fold to (B*M, L, C).
         off_bm = None
@@ -695,8 +721,9 @@ class LeafOnlyNet(nn.Module):
             h = h.reshape(B0 * M0, self.leaf_apply_off, C)
         Bf, N_or_P_len, _ = h.shape
         if mode == "diagonal":
-            num_leaves = N_or_P_len // self.leaf_size
-            h_leaves = h.view(Bf, num_leaves, self.leaf_size, -1)
+            La = self.leaf_apply_size
+            num_leaves = N_or_P_len // La
+            h_leaves = h.view(Bf, num_leaves, La, -1)
             u_leaf = self.leaf_head(h_leaves)
             out = torch.matmul(u_leaf, u_leaf.transpose(-1, -2))
         else:
@@ -743,6 +770,51 @@ class LeafOnlyNet(nn.Module):
             Ls = self.leaf_apply_off
             h_off = h_off.view(B * M_off, Ls, self.off_token_pool, C_h).mean(dim=2)
         return h_off
+
+    def _apply_highway(
+        self,
+        h_diag: torch.Tensor,
+        off_stream: torch.Tensor,
+        B: int,
+        K: int,
+        M_off: int,
+        L_diag: int,
+        Ls_off: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        1D row/column highway: diagonal and off-diagonal streams exchange DC summaries via scatter (write)
+        and mean-pool (read), then residual-add back to token streams. ``L_diag`` is tokens per diagonal leaf
+        (``leaf_apply_size``); ``Ls_off`` is tokens per off tile (``leaf_apply_off``).
+        """
+        C = h_diag.shape[-1]
+        device, dtype = h_diag.device, h_diag.dtype
+
+        h_d = h_diag.view(B, K, L_diag, C)
+        h_o = off_stream.view(B, M_off, Ls_off, C)
+
+        diag_summary = h_d.mean(dim=2)
+        off_summary = h_o.mean(dim=2)
+
+        row_highway = diag_summary.clone()
+        col_highway = diag_summary.clone()
+
+        ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
+        off_gathered = off_summary[:, gidx, :]
+        row_highway.index_add_(1, ridx, off_gathered)
+        col_highway.index_add_(1, cidx, off_gathered)
+
+        diag_row_update = row_highway
+        diag_col_update = col_highway
+
+        Wr = self.hm_pool_w_row.to(device=device, dtype=dtype)
+        Wc = self.hm_pool_w_col.to(device=device, dtype=dtype)
+        off_row_update = torch.einsum("mk,bkc->bmc", Wr, row_highway)
+        off_col_update = torch.einsum("mk,bkc->bmc", Wc, col_highway)
+
+        h_d_out = h_d + (diag_row_update + diag_col_update).unsqueeze(2)
+        h_o_out = h_o + (off_row_update + off_col_update).unsqueeze(2)
+
+        return h_d_out.view(B, K * L_diag, C), h_o_out.view(B * M_off, Ls_off, C)
 
     def forward(
         self,
@@ -797,6 +869,16 @@ class LeafOnlyNet(nn.Module):
                 f"LeafOnlyNet: expected N/leaf_size == MAX_NUM_LEAVES ({MAX_NUM_LEAVES}), got K={K} (N={N_h}). "
                 "Pad/truncate to MAX_MIXED_SIZE nodes for a static H-grid."
             )
+
+        if self.diag_token_pool > 1:
+            if self.diag_dense_attention:
+                if edge_feats is not None:
+                    edge_feats = pool_leaf_edge_feats(edge_feats, L, self.diag_token_pool)
+            else:
+                if attn_mask is not None:
+                    attn_mask = pool_leaf_attn_mask(attn_mask, L, self.diag_token_pool)
+                if edge_feats is not None:
+                    edge_feats = pool_leaf_edge_feats(edge_feats, L, self.diag_token_pool)
 
         off_attn_mask = off_edge_feats = None
         M_off = self.num_h_off
@@ -853,9 +935,11 @@ class LeafOnlyNet(nn.Module):
                 off_attn_mask = om4.reshape(B * M_off, 1, Lq, Kq)
                 off_edge_feats = oe5.reshape(B * M_off, 1, Lq, Kq, 4)
 
-        # Frozen KV extras (+1 / +2): means from post-embed h only (not refreshed per TransformerBlock).
-        h_lv = h.view(B, K, L, C_h)
-        diag_prep_block = None if self.diag_dense_attention else h_lv.mean(dim=2, keepdim=True)
+        # Frozen KV extras (+1 / +2): from post-embed h; diagonal stream may be pooled (Ls_diag).
+        h_diag = self._pool_full_leaf_to_diag_tokens(h, B, K, L, C_h)
+        Ls_d = self.leaf_apply_size
+        h_lv_diag = h_diag.view(B, K, Ls_d, C_h)
+        diag_prep_block = None if self.diag_dense_attention else h_lv_diag.mean(dim=2, keepdim=True)
         diag_prep_matrix = h.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, K, -1, -1)
         off_prep_block = off_prep_matrix = None
         if M_off > 0:
@@ -866,12 +950,13 @@ class LeafOnlyNet(nn.Module):
                 off_prep_block = strip0.view(Bm, 1, Ls, C_h).mean(dim=2, keepdim=True)
             off_prep_matrix = strip0.mean(dim=1, keepdim=True).unsqueeze(1).unsqueeze(1)
 
-        h_diag = h
         off_stream = None
         n_l = len(self.blocks)
         if M_off > 0:
             if n_l == 0:
-                off_stream = self._build_off_strip(h_diag, B, K, L, C_h, M_off)
+                off_stream = self._build_off_strip(
+                    self._diag_tokens_to_full_leaf(h_diag, B, K, L, C_h), B, K, L, C_h, M_off
+                )
             else:
                 for i in range(n_l):
                     h_diag = self.blocks[i](
@@ -886,7 +971,9 @@ class LeafOnlyNet(nn.Module):
                         prep_matrix_node=diag_prep_matrix,
                         eager_attention=eager_attention,
                     )
-                    strip = self._build_off_strip(h_diag, B, K, L, C_h, M_off)
+                    strip = self._build_off_strip(
+                        self._diag_tokens_to_full_leaf(h_diag, B, K, L, C_h), B, K, L, C_h, M_off
+                    )
                     off_in = strip if off_stream is None else strip + off_stream
                     off_stream = self.off_diag_blocks[i](
                         off_in,
@@ -899,6 +986,9 @@ class LeafOnlyNet(nn.Module):
                         prep_block_node=off_prep_block,
                         prep_matrix_node=off_prep_matrix,
                         eager_attention=eager_attention,
+                    )
+                    h_diag, off_stream = self._apply_highway(
+                        h_diag, off_stream, B, K, M_off, Ls_d, self.leaf_apply_off
                     )
         else:
             for block in self.blocks:
@@ -925,10 +1015,11 @@ class LeafOnlyNet(nn.Module):
                 (B, 0, self.leaf_apply_off, self.leaf_apply_off), device=h.device, dtype=h.dtype
             )
 
-        jacobi_scale = self._get_jacobi_scale(h_diag)
+        h_full = self._diag_tokens_to_full_leaf(h_diag, B, K, L, C_h)
+        jacobi_scale = self._get_jacobi_scale(h_full)
 
-        node_U = self.node_u(h_diag)
-        node_V = self.node_v(h_diag)
+        node_U = self.node_u(h_full)
+        node_V = self.node_v(h_full)
 
         Bb = diag_blocks.shape[0]
         packed_diag = diag_blocks.reshape(Bb, -1)
