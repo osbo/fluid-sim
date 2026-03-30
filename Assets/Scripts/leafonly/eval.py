@@ -174,6 +174,10 @@ def print_comprehensive_attention_profiler(
     Inventory, decomposed pre-attn LayerNorm vs attention ms, mean attention mass (self / neighbor / block),
     and optional torch.compile timings for full Leaf and H-off stacks. Expects ``model.eval()`` for correct
     ``last_attn_*`` buffers (caller typically runs this inside the component-timing section).
+
+    Pass ``eager_attention=True`` inside ``leaf_attn_kw`` / ``off_attn_kw`` (via ``--profile_attention`` on
+    the CLI) so the mass table uses materialized softmax weights. With fused SDPA only, mass stats are omitted
+    (table shows '-') because weights are not defined for profiling separately from the forward kernel.
     """
     strip = getattr(model, "strip_build_mode", "einsum")
     _hoff = "dense L×L (all-ones mask)" if bool(getattr(model, "off_diag_dense_attention", True)) else "reachability mask"
@@ -279,6 +283,16 @@ def print_comprehensive_attention_profiler(
         f"H-off Σ={off_sum:.3f} ms (same warmup/repeat as component table)."
     )
 
+    if leaf_attn_kw.get("eager_attention"):
+        print(
+            "Attention mass table: eager materialized attention (softmax weights aligned with this forward path; slower)."
+        )
+    else:
+        print(
+            "Attention mass table: not computed under fused SDPA (rows show '-'). "
+            "Use --profile_attention with --evaluate_gradients for materialized masses."
+        )
+
     mass_headers = [
         "stack",
         "layer",
@@ -332,6 +346,8 @@ def print_comprehensive_attention_profiler(
     )
     print(
         "Columns: K = spatial softmax width (L). "
+        "self_m / nei_m / … are mean combined weight (softmax attention + edge_gate additive term per head), not raw softmax alone — "
+        "edge_gate can be negative so *_m can be < 0. "
         "self_u / nei_u = mask-aware uniform over allowed leaf keys; self_b / nei_b = blind 1/L priors on leaf keys. "
         "blk_*/mat_*: for block/matrix, model = mean σ(gate); unif = 0.5 (sigmoid-neutral); blind = 0 (no additive global). "
         "Δ*_u / Δ*_b = model minus those references."
@@ -932,6 +948,7 @@ def evaluate_gradient_interference(args, runtime):
         ms_enc_proj = _timed_ms(lambda: model.enc_input_proj(h_norm), device)
         timing_rows.append(["Encoder input projection", ms_enc_proj])
 
+        _eager_attn = bool(getattr(args, "profile_attention", False))
         leaf_attn_kw = dict(
             edge_index=edge_index,
             edge_values=edge_values,
@@ -939,6 +956,7 @@ def evaluate_gradient_interference(args, runtime):
             save_attention=False,
             attn_mask=attn_mask,
             edge_feats=edge_feats,
+            eager_attention=_eager_attn,
         )
         h_block_in = h_proj0
         for i, block in enumerate(model.blocks):
@@ -956,6 +974,7 @@ def evaluate_gradient_interference(args, runtime):
             save_attention=False,
             attn_mask=off_attn_mask,
             edge_feats=off_edge_feats,
+            eager_attention=_eager_attn,
         )
         print_comprehensive_attention_profiler(
             model,

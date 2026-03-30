@@ -485,6 +485,78 @@ def _plot_hmatrix_rank_profiler_row(axes_row, bands_head: list[dict]) -> None:
         ax.legend(loc="upper right", fontsize=7)
 
 
+def _is_symmetric_dense(A: np.ndarray, *, rtol: float = 1e-9, atol: float = 1e-9) -> bool:
+    return bool(np.allclose(A, A.T, rtol=rtol, atol=atol))
+
+
+def _dense_linalg_device(device: torch.device) -> torch.device:
+    """Use CUDA for big dense LA when available; MPS/CPU fall back to NumPy paths."""
+    return device if device.type == "cuda" else torch.device("cpu")
+
+
+def _inv_numpy_or_torch(A: np.ndarray, device: torch.device) -> np.ndarray:
+    A = np.asarray(A, dtype=np.float64)
+    dev = _dense_linalg_device(device)
+    if dev.type == "cuda":
+        t = torch.as_tensor(A, dtype=torch.float64, device=dev)
+        out = torch.linalg.inv(t).cpu().numpy()
+        torch.cuda.synchronize()
+        return out
+    return np.linalg.inv(A)
+
+
+def _cond_numpy_or_torch(M: np.ndarray, device: torch.device) -> float:
+    M = np.asarray(M, dtype=np.float64)
+    dev = _dense_linalg_device(device)
+    if dev.type == "cuda":
+        t = torch.as_tensor(M, dtype=torch.float64, device=dev)
+        c = float(torch.linalg.cond(t).item())
+        torch.cuda.synchronize()
+        return c
+    return float(np.linalg.cond(M))
+
+
+def _eig_dense_for_inspect(A: np.ndarray, device: torch.device) -> tuple[np.ndarray, np.ndarray, bool]:
+    """
+    One eigendecomposition of dense A for InspectModel plots.
+    Returns (eigenvalues, eigenvectors as columns, used_symmetric_eigh).
+    """
+    A = np.asarray(A, dtype=np.float64)
+    sym = _is_symmetric_dense(A)
+    dev = _dense_linalg_device(device)
+    if dev.type == "cuda":
+        At = torch.as_tensor(A, dtype=torch.float64, device=dev)
+        if sym:
+            w, V = torch.linalg.eigh(At)
+            lam = w.cpu().numpy().astype(np.complex128)
+            Vc = V.cpu().numpy().astype(np.complex128)
+        else:
+            lam_t, V_t = torch.linalg.eig(At)
+            lam = lam_t.cpu().numpy()
+            Vc = V_t.cpu().numpy()
+            order = np.argsort(np.real(lam))
+            lam, Vc = lam[order], Vc[:, order]
+        torch.cuda.synchronize()
+        return lam, Vc, sym
+    if sym:
+        w, V = np.linalg.eigh(A)
+        return w.astype(np.complex128), V.astype(np.complex128), sym
+    lam, V = np.linalg.eig(A)
+    order = np.argsort(np.real(lam))
+    return lam[order], V[:, order], sym
+
+
+def _eigvals_dense_numpy_or_torch(M: np.ndarray, device: torch.device) -> np.ndarray:
+    M = np.asarray(M, dtype=np.float64)
+    dev = _dense_linalg_device(device)
+    if dev.type == "cuda":
+        t = torch.as_tensor(M, dtype=torch.float64, device=dev)
+        ev = torch.linalg.eigvals(t).cpu().numpy()
+        torch.cuda.synchronize()
+        return ev
+    return np.linalg.eigvals(M)
+
+
 def _spectral_am_error_vs_A_eigenmodes(
     A_dense: np.ndarray,
     AM_dense: np.ndarray,
@@ -496,26 +568,29 @@ def _spectral_am_error_vs_A_eigenmodes(
     μ_i = (φ_i^H AM φ_i) / (φ_i^H φ_i). Returns (Re(λ_i), |1 - μ_i|) with modes sorted by Re(λ).
     Ideal preconditioning (AM = I) gives μ_i = 1 and zero error.
 
-    Pass ``eig_A=(λ, V)`` from a single ``np.linalg.eig(A)`` (columns of V are eigenvectors)
-    when comparing several preconditioners so A is not re-factorized each time.
+    Pass ``eig_A=(λ, V)`` from a single factorization (``eig`` / ``eigh``) when comparing several
+    preconditioners so A is not re-factorized each time.
+
+    Vectorized: one matmul ``AM @ V`` and column-wise quotients (no Python loop over modes).
     """
     if eig_A is None:
-        lam, V = np.linalg.eig(A_dense)
-        order = np.argsort(np.real(lam))
-        lam = lam[order]
-        V = V[:, order]
+        sym = _is_symmetric_dense(A_dense)
+        if sym:
+            w, V = np.linalg.eigh(A_dense)
+            lam, V = w.astype(np.complex128), V.astype(np.complex128)
+        else:
+            lam, V = np.linalg.eig(A_dense)
+            order = np.argsort(np.real(lam))
+            lam, V = lam[order], V[:, order]
     else:
         lam, V = eig_A
-    n = int(lam.shape[0])
-    errs = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        v = V[:, i]
-        denom = np.vdot(v, v)
-        if abs(denom) < 1e-30:
-            errs[i] = np.nan
-            continue
-        mu = np.vdot(v, AM_dense @ v) / denom
-        errs[i] = np.abs(1.0 - mu)
+    W = AM_dense @ V
+    num = np.einsum("ji,ji->i", np.conj(V), W)
+    den = np.einsum("ji,ji->i", np.conj(V), V)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mu = num / den
+    errs = np.abs(1.0 - mu)
+    errs[np.abs(den) < 1e-30] = np.nan
     return np.real(lam), errs
 
 
@@ -934,7 +1009,12 @@ def _run_amgx_pcg_session(
     warn_fn=None,
     session_label: str = "AMGX",
 ) -> tuple[float, float, int]:
-    """One full pyamgx initialize → PCG → finalize cycle. Returns (setup_ms, solve_ms, iterations)."""
+    """One full pyamgx initialize → PCG → finalize cycle. Returns (setup_ms, solve_ms, iterations).
+
+    ``solve_ms`` is GPU time for ``solver.solve`` only: initial ``x`` upload is done before the timer
+    so host→device transfer of ``x_init`` is not included (PCIe cost is usually small but avoids
+    unfair inflation in comparisons).
+    """
     cfg = None
     rsc = None
     A_amgx = None
@@ -1002,8 +1082,9 @@ def _run_amgx_pcg_session(
             solver.solve(b_amgx, x_amgx)
         torch.cuda.synchronize()
 
-        t0 = time.perf_counter()
         x_amgx.upload(x_init)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
         solver.solve(b_amgx, x_amgx)
         torch.cuda.synchronize()
         solve_ms = (time.perf_counter() - t0) * 1000
@@ -1372,25 +1453,63 @@ def main():
             A_gpu = torch.from_numpy(A_viz_n.astype(np.float32)).to(device).contiguous()
         b_gpu = torch.from_numpy(b_np).float().to(device).contiguous()
 
-        x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu(
-            A_gpu,
-            b_gpu,
-            lambda r: r,
-            tol=pcg_tol,
-            max_iter=pcg_max_iter,
-            device=device,
-        )
+        if device.type == "cuda":
 
-        apply_diag_gpu = _gpu_jacobi_apply_fn(A_f64, device)
-        _, iters_diag_gpu, solve_diag_gpu_ms = pcg_gpu(
-            A_gpu,
-            b_gpu,
-            apply_diag_gpu,
-            tol=pcg_tol,
-            max_iter=pcg_max_iter,
-            device=device,
-            check_freq=check_freq,
-        )
+            def _apply_none_into(r: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+                z.copy_(r)
+                return z
+
+            x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu_cudagraph_matrix_free(
+                A_gpu,
+                b_gpu,
+                _apply_none_into,
+                tol=pcg_tol,
+                max_iter=pcg_max_iter,
+                device=device,
+                check_freq=check_freq,
+            )
+            _inv_jac = (
+                1.0 / np.maximum(np.abs(np.diag(A_f64).astype(np.float64)), 1e-30)
+            ).astype(np.float32)
+            _inv_jac_t = torch.from_numpy(_inv_jac).to(device=device).contiguous()
+
+            def _apply_jacobi_into(r: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+                torch.mul(r, _inv_jac_t.view(-1, 1), out=z)
+                return z
+
+            _, iters_diag_gpu, solve_diag_gpu_ms = pcg_gpu_cudagraph_matrix_free(
+                A_gpu,
+                b_gpu,
+                _apply_jacobi_into,
+                tol=pcg_tol,
+                max_iter=pcg_max_iter,
+                device=device,
+                check_freq=check_freq,
+            )
+            _info(
+                "  Unpreconditioned / Jacobi PCG (GPU): CUDAGraph (same capture pattern as LeafOnly; "
+                "avoids per-iter Python kernel-launch overhead from eager pcg_gpu)"
+            )
+        else:
+            x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu(
+                A_gpu,
+                b_gpu,
+                lambda r: r,
+                tol=pcg_tol,
+                max_iter=pcg_max_iter,
+                device=device,
+            )
+
+            apply_diag_gpu = _gpu_jacobi_apply_fn(A_f64, device)
+            _, iters_diag_gpu, solve_diag_gpu_ms = pcg_gpu(
+                A_gpu,
+                b_gpu,
+                apply_diag_gpu,
+                tol=pcg_tol,
+                max_iter=pcg_max_iter,
+                device=device,
+                check_freq=check_freq,
+            )
 
         if test_only:
             print(f"  LeafOnly PCG mode: {args.leafonly_pcg}")
@@ -1628,12 +1747,18 @@ def main():
     if test_only:
         return
 
-    A_inv_viz = np.linalg.inv(A_viz_n)
+    print(f"\nDense LA for viz (n={viz_n}) …")
+    t_la = time.perf_counter()
+    A_inv_viz = _inv_numpy_or_torch(A_viz_n, device)
     diag_ainv = np.diag(A_inv_viz)
-    print(f"\nTrue inverse A^{{-1}} diagonal (viz {viz_n}x{viz_n}): min={diag_ainv.min():.6f}, max={diag_ainv.max():.6f}, mean={diag_ainv.mean():.6f}")
+    print(
+        f"True inverse A^{{-1}} diagonal (viz {viz_n}x{viz_n}): min={diag_ainv.min():.6f}, max={diag_ainv.max():.6f}, mean={diag_ainv.mean():.6f}  "
+        f"[inv {time.perf_counter() - t_la:.1f}s]"
+    )
 
-    cond_A = np.linalg.cond(A_viz_n)
-    print(f"Condition number (block A): {cond_A:.2e}")
+    t_la = time.perf_counter()
+    cond_A = _cond_numpy_or_torch(A_viz_n, device)
+    print(f"Condition number (block A): {cond_A:.2e}  [κ(A) {time.perf_counter() - t_la:.1f}s]")
     print(f"Leaf boundaries: every {leaf_L}")
 
     num_leaves_viz = viz_n // leaf_L
@@ -1656,6 +1781,18 @@ def main():
         n_cols = 6
         n_rows = 1 + len(methods) + 1
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows), constrained_layout=True)
+
+        evals_A: np.ndarray | None = None
+        eig_A_cache: tuple[np.ndarray, np.ndarray] | None = None
+        eig_A_err: str | None = None
+        try:
+            t_eig = time.perf_counter()
+            lam_A, V_A, _sym_A = _eig_dense_for_inspect(A_viz_n, device)
+            evals_A = lam_A
+            eig_A_cache = (lam_A, V_A)
+            print(f"  Eig(A) for spectral plots: {time.perf_counter() - t_eig:.1f}s")
+        except Exception as e:
+            eig_A_err = str(e)
 
         log_ainv = np.log10(np.abs(A_inv_viz) + 1e-9)
         log_m_leaf = np.log10(np.abs(M_neural_n) + 1e-9)
@@ -1696,8 +1833,7 @@ def main():
             framealpha=0.92,
         )
         ax_a = axes[0, 3]
-        try:
-            evals_A = np.linalg.eigvals(A_viz_n)
+        if evals_A is not None:
             ax_a.scatter(evals_A.real, evals_A.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
             ax_a.axhline(0.0, color='k', linestyle='-', alpha=0.3)
             ax_a.set_xlabel('Re(λ)')
@@ -1709,8 +1845,16 @@ def main():
             margin = 0.1 * max(r_max - r_min, 2 * i_max, 1.0) or 0.2
             ax_a.set_xlim(r_min - margin, r_max + margin)
             ax_a.set_ylim(-max(i_max, margin), max(i_max, margin))
-        except Exception as e:
-            ax_a.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_a.transAxes, ha='center', va='center', fontsize=9)
+        else:
+            ax_a.text(
+                0.5,
+                0.5,
+                f"eig failed:\n{eig_A_err or 'unknown'}",
+                transform=ax_a.transAxes,
+                ha='center',
+                va='center',
+                fontsize=9,
+            )
             ax_a.set_title("Eigenvalues of A (failed)")
         ax_a_t = axes[0, 4]
         ax_a_t.axis('off')
@@ -1773,14 +1917,6 @@ def main():
         if am_log_min is None:
             am_log_min, am_log_max = -8.0, 0.0
 
-        eig_A_cache: tuple[np.ndarray, np.ndarray] | None = None
-        try:
-            _lam_a, _V_a = np.linalg.eig(A_viz_n)
-            _ord = np.argsort(np.real(_lam_a))
-            eig_A_cache = (_lam_a[_ord], _V_a[:, _ord])
-        except Exception:
-            eig_A_cache = None
-
         for idx, (name, M) in enumerate(methods):
             row = 1 + idx
             im_m = axes[row, 0].imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto', vmin=vmin_log, vmax=vmax_log)
@@ -1799,7 +1935,7 @@ def main():
 
             ax_d = axes[row, 3]
             try:
-                evals = np.linalg.eigvals(AM)
+                evals = _eigvals_dense_numpy_or_torch(AM, device)
                 ax_d.scatter(evals.real, evals.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
                 ax_d.axvline(1.0, color='r', linestyle='--', alpha=0.8)
                 ax_d.axhline(0.0, color='k', linestyle='-', alpha=0.3)
@@ -1818,7 +1954,7 @@ def main():
 
             ax_t = axes[row, 4]
             ax_t.axis('off')
-            cond_AM = np.linalg.cond(AM)
+            cond_AM = _cond_numpy_or_torch(AM, device)
             err_fro = np.linalg.norm(AM - np.eye(viz_n)) / np.linalg.norm(np.eye(viz_n))
             msg = [
                 f"Method: {name}",

@@ -30,6 +30,15 @@ def _build_parser():
         help="Run gradient interference analysis then exit (includes component timing + attention profiler for all Leaf/H-off layers).",
     )
     parser.add_argument(
+        "--profile_attention",
+        action="store_true",
+        help=(
+            "With --evaluate_gradients: run attention with eager materialized softmax (not fused SDPA) when "
+            "building the attention mass table so masses match the forward path. Omit for faster profiling "
+            "(mass rows show '-'; fused SDPA does not expose weights for that table)."
+        ),
+    )
+    parser.add_argument(
         "--peek_parameters",
         action="store_true",
         help=(
