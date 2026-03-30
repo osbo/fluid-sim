@@ -279,6 +279,7 @@ class LeafBlockAttention(nn.Module):
         edge_feats=None,
         prep_block_node=None,
         prep_matrix_node=None,
+        eager_attention: bool = False,
     ):
         B, N, C = x.shape
         device = x.device
@@ -356,24 +357,41 @@ class LeafBlockAttention(nn.Module):
         )
         mb = mask_base.reshape(bn, 1, L, L).expand(bn, Hh, L, L)
         logit_bias = logit_bias.masked_fill(mb == 0, float("-inf"))
-        x_soft = F.scaled_dot_product_attention(
-            q_f, k_f, v_f, attn_mask=logit_bias, dropout_p=0.0, is_causal=False
-        )
-        x_soft = x_soft.transpose(1, 2).reshape(B, num_blocks, L, Hh, Dd)
 
-        need_scores = save_attention or (not self.training and not torch.compiler.is_compiling())
-        if need_scores:
-            scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
-            scores = scores + bias_physics[..., 3:4]
-            scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
-            attn_probs = F.softmax(scores, dim=3)
+        # Fused SDPA is fast but does not materialize attention weights. Mass / distribution stats must use
+        # either eager_attention (manual softmax @ V, same logits as SDPA) or a separate score pass only
+        # when save_attention needs tensors — never treat ad-hoc score math as authoritative under SDPA alone.
+        use_eager = bool(eager_attention)
+        if use_eager:
+            scores_f = torch.matmul(q_f, k_f.transpose(-2, -1)) * self.scale
+            scores_f = scores_f + logit_bias
+            attn_probs_f = F.softmax(scores_f, dim=-1)
+            x_soft = torch.matmul(attn_probs_f, v_f)
+            x_soft = x_soft.transpose(1, 2).reshape(B, num_blocks, L, Hh, Dd)
+            attn_probs = attn_probs_f.reshape(B, num_blocks, Hh, L, L).permute(0, 1, 3, 4, 2).contiguous()
             combined_weights = attn_probs + linear_edge_weights
             if save_attention:
+                scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
+                scores = scores + bias_physics[..., 3:4]
+                scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
                 with torch.no_grad():
                     self.last_scores_matrix = scores.mean(dim=-1)[:, :, :, :L].cpu().float()
                     self.last_bias_physics_matrix = bias_physics[:, :, :L].cpu().float()
         else:
+            x_soft = F.scaled_dot_product_attention(
+                q_f, k_f, v_f, attn_mask=logit_bias, dropout_p=0.0, is_causal=False
+            )
+            x_soft = x_soft.transpose(1, 2).reshape(B, num_blocks, L, Hh, Dd)
             combined_weights = None
+            if save_attention:
+                scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
+                scores = scores + bias_physics[..., 3:4]
+                scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
+                attn_probs = F.softmax(scores, dim=3)
+                combined_weights = attn_probs + linear_edge_weights
+                with torch.no_grad():
+                    self.last_scores_matrix = scores.mean(dim=-1)[:, :, :, :L].cpu().float()
+                    self.last_bias_physics_matrix = bias_physics[:, :, :L].cpu().float()
 
         x_mid = x_soft + torch.einsum("bnqkh,bnkhd->bnqhd", linear_edge_weights, v_spatial)
 
@@ -401,7 +419,7 @@ class LeafBlockAttention(nn.Module):
             g_matrix = torch.sigmoid(self.matrix_route_gate(x_attn))
             x_mid = x_mid + g_matrix.unsqueeze(-1) * v_matrix
 
-        if not self.training and not torch.compiler.is_compiling():
+        if combined_weights is not None and not self.training and not torch.compiler.is_compiling():
             with torch.no_grad():
                 attn_viz = combined_weights.mean(dim=-1)
                 arange = torch.arange(L, device=attn_viz.device, dtype=torch.long)
@@ -470,6 +488,10 @@ class LeafBlockAttention(nn.Module):
                 }
         else:
             self.last_attn_distribution_stats = None
+            if not self.training and not torch.compiler.is_compiling():
+                self.last_attn_self = 0.0
+                self.last_attn_neighbor = 0.0
+                self.last_attn_block = 0.0
 
         x_out = x_mid
         x_out = x_out.reshape(B, num_blocks, L, C)
@@ -504,6 +526,7 @@ class TransformerBlock(nn.Module):
         edge_feats=None,
         prep_block_node=None,
         prep_matrix_node=None,
+        eager_attention: bool = False,
     ):
         x = x + self.attn(
             self.norm1(x),
@@ -515,6 +538,7 @@ class TransformerBlock(nn.Module):
             edge_feats=edge_feats,
             prep_block_node=prep_block_node,
             prep_matrix_node=prep_matrix_node,
+            eager_attention=eager_attention,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -700,7 +724,16 @@ class LeafOnlyNet(nn.Module):
             h_off = h_off.view(B * M_off, Ls, self.off_token_pool, C_h).mean(dim=2)
         return h_off
 
-    def forward(self, x, edge_index, edge_values, save_attention=False, precomputed_leaf_connectivity=None, global_features=None):
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_values,
+        save_attention=False,
+        precomputed_leaf_connectivity=None,
+        global_features=None,
+        eager_attention: bool = False,
+    ):
         B, N, _ = x.shape
         assert N % self.leaf_size == 0, f"LeafOnly expects N divisible by leaf_size {self.leaf_size}, got {N}"
         if global_features is None:
@@ -818,6 +851,7 @@ class LeafOnlyNet(nn.Module):
                         edge_feats=edge_feats,
                         prep_block_node=diag_prep_block,
                         prep_matrix_node=diag_prep_matrix,
+                        eager_attention=eager_attention,
                     )
                     strip = self._build_off_strip(h_diag, B, K, L, C_h, M_off)
                     off_in = strip if off_stream is None else strip + off_stream
@@ -831,6 +865,7 @@ class LeafOnlyNet(nn.Module):
                         edge_feats=off_edge_feats,
                         prep_block_node=off_prep_block,
                         prep_matrix_node=off_prep_matrix,
+                        eager_attention=eager_attention,
                     )
         else:
             for block in self.blocks:
@@ -844,6 +879,7 @@ class LeafOnlyNet(nn.Module):
                     edge_feats=edge_feats,
                     prep_block_node=diag_prep_block,
                     prep_matrix_node=diag_prep_matrix,
+                    eager_attention=eager_attention,
                 )
 
         diag_blocks = self._get_leaf_blocks(h_diag, mode="diagonal")
