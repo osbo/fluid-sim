@@ -1,3 +1,12 @@
+import warnings
+
+# torch.compile / Inductor: internal FutureWarning on deprecated torch._prims_common.check (PyTorch issue).
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\._prims_common\.check.*",
+    category=FutureWarning,
+)
+
 from .architecture import (
     LeafOnlyNet,
     apply_block_diagonal_m_into,

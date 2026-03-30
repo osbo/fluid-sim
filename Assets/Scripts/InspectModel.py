@@ -24,6 +24,11 @@ import warnings
 from pathlib import Path
 
 warnings.filterwarnings("ignore", message=".*Sparse CSR.*", category=UserWarning)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\._prims_common\.check.*",
+    category=FutureWarning,
+)
 
 _script_dir = Path(__file__).resolve().parent
 if str(_script_dir) not in sys.path:
@@ -1024,24 +1029,33 @@ def _run_amgx_pcg_session(
     initialized = False
 
     def _finalize_amgx_lib() -> None:
+        # AMGX prints version / deprecation lines to stdout or stderr; silence both for clean benchmarks.
+        _stdout_fd = os.dup(1)
         _stderr_fd = os.dup(2)
         _devnull = os.open(os.devnull, os.O_WRONLY)
         try:
+            os.dup2(_devnull, 1)
             os.dup2(_devnull, 2)
             pyamgx.finalize()
         finally:
+            os.dup2(_stdout_fd, 1)
             os.dup2(_stderr_fd, 2)
+            os.close(_stdout_fd)
             os.close(_stderr_fd)
             os.close(_devnull)
 
     try:
+        _stdout_fd = os.dup(1)
         _stderr_fd = os.dup(2)
         _devnull = os.open(os.devnull, os.O_WRONLY)
         try:
+            os.dup2(_devnull, 1)
             os.dup2(_devnull, 2)
             pyamgx.initialize()
         finally:
+            os.dup2(_stdout_fd, 1)
             os.dup2(_stderr_fd, 2)
+            os.close(_stdout_fd)
             os.close(_stderr_fd)
             os.close(_devnull)
         initialized = True
@@ -1146,6 +1160,15 @@ def main():
             "LeafOnlyNet H-off: True (default) = dense L×L softmax; False (--no-off-diag-dense-attn) = reachability mask."
         ),
     )
+    parser.add_argument(
+        "--diag-dense-attn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "LeafOnlyNet diagonal: True (default) = full L×L softmax + dense [Δx,Δy,Δz,A] edge_feats; "
+            "False (--no-diag-dense-attn) = n-hop reachability + sparse in-leaf features."
+        ),
+    )
     args = parser.parse_args()
     test_only = bool(args.test_only)
 
@@ -1242,6 +1265,7 @@ def main():
         use_gcn=bool(use_gcn_lo),
         attention_layout=default_attention_layout(leaf_size_lo),
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
+        diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
     ).to(device)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
@@ -1297,6 +1321,7 @@ def main():
             device,
             x_leaf.dtype,
             off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
+            diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
         )
         pre_leaf_connectivity = tuple(
             t.contiguous() if isinstance(t, torch.Tensor) else t for t in pre_leaf_connectivity

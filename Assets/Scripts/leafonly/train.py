@@ -260,6 +260,7 @@ def train_leaf_only(args, runtime):
                 device,
                 x_input.dtype,
                 off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
+                diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
             )
             precomputed_leaf_connectivity = (dm, df, om, oe)
             ctx_conn_ms += (time.perf_counter() - t_c0) * 1000.0
@@ -336,13 +337,15 @@ def train_leaf_only(args, runtime):
         use_jacobi=True,
         strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
+        diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
     ).to(device)
     ms_model = (time.perf_counter() - t_seg) * 1000.0
     _oda = bool(getattr(args, "off_diag_dense_attn", True))
+    _dda = bool(getattr(args, "diag_dense_attn", True))
     print(
         "  [startup] Ablation config:"
         f" layers={args.num_layers}, gcn_layers={effective_gcn_layers}, jacobi=True (node_scalar),"
-        f" attention_layout={attention_layout}, off_diag_dense_attn={_oda}"
+        f" attention_layout={attention_layout}, off_diag_dense_attn={_oda}, diag_dense_attn={_dda}"
     )
 
     ms_compile = 0.0
@@ -568,20 +571,30 @@ def train_leaf_only(args, runtime):
             pre_leaf = ctx["precomputed_leaf_connectivity"]
             leaf_mask, leaf_feats, off_mask, off_feats = pre_leaf
 
-            pad_blocks = max_num_blocks - leaf_mask.shape[0]
-            if pad_blocks > 0:
-                leaf_mask = F.pad(leaf_mask, (0, 0, 0, 0, 0, pad_blocks), value=0.0)
-                leaf_feats = F.pad(leaf_feats, (0, 0, 0, 0, 0, 0, 0, pad_blocks), value=0.0)
+            if leaf_mask is None:
+                pad_blocks = max_num_blocks - leaf_feats.shape[0]
+                if pad_blocks > 0:
+                    leaf_feats = F.pad(leaf_feats, (0, 0, 0, 0, 0, 0, 0, pad_blocks), value=0.0)
+            else:
+                pad_blocks = max_num_blocks - leaf_mask.shape[0]
+                if pad_blocks > 0:
+                    leaf_mask = F.pad(leaf_mask, (0, 0, 0, 0, 0, pad_blocks), value=0.0)
+                    leaf_feats = F.pad(leaf_feats, (0, 0, 0, 0, 0, 0, 0, pad_blocks), value=0.0)
 
-            pad_M = max_M_off - (off_mask.shape[0] if off_mask is not None else 0)
-            if off_mask is None or off_mask.shape[0] == 0:
-                raise RuntimeError(
-                    "Context missing H off-diagonal masks/feats (expected from build_leaf_block_connectivity). "
-                    "Rebuild training context cache with --rebuild-context-cache."
-                )
-            if pad_M > 0:
-                off_mask = F.pad(off_mask, (0, 0, 0, 0, 0, pad_M), value=0.0)
-                off_feats = F.pad(off_feats, (0, 0, 0, 0, 0, 0, 0, pad_M), value=0.0)
+            if off_mask is None:
+                pad_M = max_M_off - off_feats.shape[0]
+                if pad_M > 0:
+                    off_feats = F.pad(off_feats, (0, 0, 0, 0, 0, 0, 0, pad_M), value=0.0)
+            else:
+                if off_mask.shape[0] == 0:
+                    raise RuntimeError(
+                        "Context missing H off-diagonal masks/feats (expected from build_leaf_block_connectivity). "
+                        "Rebuild training context cache with --rebuild-context-cache."
+                    )
+                pad_M = max_M_off - off_mask.shape[0]
+                if pad_M > 0:
+                    off_mask = F.pad(off_mask, (0, 0, 0, 0, 0, pad_M), value=0.0)
+                    off_feats = F.pad(off_feats, (0, 0, 0, 0, 0, 0, 0, pad_M), value=0.0)
 
             leaf_masks_list.append(leaf_mask)
             leaf_feats_list.append(leaf_feats)
@@ -601,10 +614,16 @@ def train_leaf_only(args, runtime):
         edge_values_batched = torch.cat(edge_val_parts, dim=0)
         global_features_batched = torch.stack(gf_list, dim=0)
         jacobi_inv_diag_batched = torch.stack(inv_diag_list, dim=0)
+        n_lm_none = sum(1 for x in leaf_masks_list if x is None)
+        if 0 < n_lm_none < len(leaf_masks_list):
+            raise RuntimeError("Batched contexts mix diag_dense (no leaf mask tensor) and sparse; use one layout per batch.")
+        n_om_none = sum(1 for x in off_masks_list if x is None)
+        if 0 < n_om_none < len(off_masks_list):
+            raise RuntimeError("Batched contexts mix off_diag_dense (no off mask tensor) and sparse; use one layout per batch.")
         pre_leaf_batched = (
-            torch.stack(leaf_masks_list, dim=0),
+            None if n_lm_none == len(leaf_masks_list) else torch.stack(leaf_masks_list, dim=0),
             torch.stack(leaf_feats_list, dim=0),
-            torch.stack(off_masks_list, dim=0),
+            None if n_om_none == len(off_masks_list) else torch.stack(off_masks_list, dim=0),
             torch.stack(off_feats_list, dim=0),
         )
 

@@ -17,7 +17,7 @@ from .config import (
 )
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
-CONTEXT_CACHE_VERSION = 10
+CONTEXT_CACHE_VERSION = 12
 
 
 def _mtime_ns(path: Path) -> int:
@@ -55,6 +55,7 @@ def build_training_context_cache_meta(dataset, run_folder: Path, args, frame_ind
         "max_num_leaves": int(MAX_NUM_LEAVES),
         "hmatrix_off_blocks": int(NUM_HMATRIX_OFF_BLOCKS),
         "off_diag_dense_attn": bool(getattr(args, "off_diag_dense_attn", True)),
+        "diag_dense_attn": bool(getattr(args, "diag_dense_attn", True)),
         "dataset_len": int(len(dataset)),
         "fingerprints": fingerprints,
     }
@@ -84,9 +85,9 @@ def _serialize_context(ctx: dict) -> dict:
         "edge_index": ctx["edge_index"].detach().cpu().contiguous(),
         "edge_values": ctx["edge_values"].detach().cpu().contiguous(),
         "precomputed_leaf_connectivity": (
-            lm.detach().cpu().contiguous(),
+            None if lm is None else lm.detach().cpu().contiguous(),
             lf.detach().cpu().contiguous(),
-            om.detach().cpu().contiguous(),
+            None if om is None else om.detach().cpu().contiguous(),
             off.detach().cpu().contiguous(),
         ),
         "global_features": ctx["global_features"].detach().cpu().contiguous(),
@@ -131,9 +132,9 @@ def _deserialize_context(entry: dict, device: torch.device) -> dict:
         "A_dense": A_dense,
         "A_sp": A_sp,
         "precomputed_leaf_connectivity": (
-            lm.to(device),
+            None if lm is None else lm.to(device),
             lf.to(device),
-            om.to(device),
+            None if om is None else om.to(device),
             off.to(device),
         ),
         "global_features": entry["global_features"].to(device),

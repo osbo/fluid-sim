@@ -70,15 +70,18 @@ def pool_leaf_attn_mask(attn_mask: torch.Tensor, leaf_size: int, pool: int) -> t
     m, batch_shape = _merge_batch_blocks(attn_mask, attn_mask.dim() == 4)
     k_old = m.shape[-1]
     special = k_old - L
-    if special not in (1, 2):
-        raise ValueError(f"expected L+1 or L+2 key layout, got key_dim={k_old} for L={L}")
+    if special not in (0, 1, 2):
+        raise ValueError(f"expected L, L+1, or L+2 key layout, got key_dim={k_old} for L={L}")
     nb = m.shape[0]
     sub = m[:, :L, :L].reshape(nb, Ls, pool, Ls, pool).amax(dim=(2, 4))
-    parts = [sub]
-    for j in range(special):
-        c = m[:, :L, L + j].reshape(nb, Ls, pool).amax(dim=2)
-        parts.append(c.unsqueeze(-1))
-    out = torch.cat(parts, dim=-1)
+    if special == 0:
+        out = sub
+    else:
+        parts = [sub]
+        for j in range(special):
+            c = m[:, :L, L + j].reshape(nb, Ls, pool).amax(dim=2)
+            parts.append(c.unsqueeze(-1))
+        out = torch.cat(parts, dim=-1)
     return _unmerge_batch_blocks(out, batch_shape, tuple(out.shape[1:]))
 
 
@@ -92,16 +95,19 @@ def pool_leaf_edge_feats(edge_feats: torch.Tensor, leaf_size: int, pool: int) ->
     m, batch_shape = _merge_batch_blocks(edge_feats, edge_feats.dim() == 5)
     k_old = m.shape[-2]
     special = k_old - L
-    if special not in (1, 2):
-        raise ValueError(f"expected L+1 or L+2 key layout for edge_feats, got key_dim={k_old}")
+    if special not in (0, 1, 2):
+        raise ValueError(f"expected L, L+1, or L+2 key layout for edge_feats, got key_dim={k_old}")
     nb = m.shape[0]
     E = m.shape[-1]
     sub = m[:, :L, :L, :].reshape(nb, Ls, pool, Ls, pool, E).mean(dim=(2, 4))
-    parts = [sub]
-    for j in range(special):
-        c = m[:, :L, L + j, :].reshape(nb, Ls, pool, E).mean(dim=2)
-        parts.append(c.unsqueeze(2))
-    out = torch.cat(parts, dim=2)
+    if special == 0:
+        out = sub
+    else:
+        parts = [sub]
+        for j in range(special):
+            c = m[:, :L, L + j, :].reshape(nb, Ls, pool, E).mean(dim=2)
+            parts.append(c.unsqueeze(2))
+        out = torch.cat(parts, dim=2)
     return _unmerge_batch_blocks(out, batch_shape, tuple(out.shape[1:]))
 
 
@@ -294,11 +300,13 @@ class LeafBlockAttention(nn.Module):
         x_blk = x.view(B, num_blocks, L, C)
 
         if attn_mask is None:
-            if edge_feats is not None:
-                raise ValueError("LeafBlockAttention: edge_feats set but attn_mask is None.")
-            return x[:, :N, :] if node_pad > 0 else x
-        if edge_feats is None:
-            raise ValueError("LeafBlockAttention requires edge_feats when attn_mask is provided.")
+            if edge_feats is None:
+                return x[:, :N, :] if node_pad > 0 else x
+            no_binary_mask = True
+        else:
+            no_binary_mask = False
+            if edge_feats is None:
+                raise ValueError("LeafBlockAttention requires edge_feats when attn_mask is provided.")
 
         x_attn = x_blk
         use_block_node = self.use_block_node
@@ -313,23 +321,26 @@ class LeafBlockAttention(nn.Module):
             if bias_physics.shape[0] == 1 and B > 1:
                 bias_physics = bias_physics.expand(B, -1, -1, -1, -1)
 
-        am = attn_mask
-        if am.shape[-1] > L:
-            am = am[..., :L]
-        if am.dim() == 3:
-            mask_base = am.unsqueeze(0)
-        else:
-            mask_base = am
-            if mask_base.shape[0] == 1 and B > 1:
-                mask_base = mask_base.expand(B, -1, -1, -1)
+        if not no_binary_mask:
+            am = attn_mask
+            if am.shape[-1] > L:
+                am = am[..., :L]
+            if am.dim() == 3:
+                mask_base = am.unsqueeze(0)
+            else:
+                mask_base = am
+                if mask_base.shape[0] == 1 and B > 1:
+                    mask_base = mask_base.expand(B, -1, -1, -1)
 
-        # Coupled layout used to always include a block key (column L) = 1, so no row was all-masked.
-        # Spatial-only softmax rows must have ≥1 allowed key or softmax is all -inf → NaN (H-off tiles
-        # with no reachability, batch-padded empty leaf blocks, etc.).
-        mask_base = mask_base.clone()
-        _need_diag = (mask_base.sum(dim=-1) < 1).to(dtype=mask_base.dtype)
-        _diag_view = mask_base.diagonal(dim1=-2, dim2=-1)
-        _diag_view.copy_(torch.maximum(_diag_view, _need_diag))
+            # Coupled layout used to always include a block key (column L) = 1, so no row was all-masked.
+            # Spatial-only softmax rows must have ≥1 allowed key or softmax is all -inf → NaN (H-off tiles
+            # with no reachability, batch-padded empty leaf blocks, etc.).
+            mask_base = mask_base.clone()
+            _need_diag = (mask_base.sum(dim=-1) < 1).to(dtype=mask_base.dtype)
+            _diag_view = mask_base.diagonal(dim1=-2, dim2=-1)
+            _diag_view.copy_(torch.maximum(_diag_view, _need_diag))
+        else:
+            mask_base = None
 
         key_count = L
         qkv_x = self.qkv(x_attn)
@@ -341,11 +352,6 @@ class LeafBlockAttention(nn.Module):
         bias_physics[:, :, arange_s, arange_s, :] = 0.0
         bias_physics[:, :, arange_s, arange_s, 3] = 1.0
 
-        mask_expanded = mask_base.unsqueeze(-1)
-        linear_edge_weights = self.edge_gate(bias_physics)
-        linear_edge_weights = linear_edge_weights.masked_fill(mask_expanded == 0, 0.0)
-
-        # Fused attention for softmax(QK^T/√d + physics_3 + mask) @ V; edge_gate is added *after* softmax (see below).
         bn = B * num_blocks
         Hh, Dd = self.num_heads, self.head_dim
         q_f = q.reshape(bn, L, Hh, Dd).transpose(1, 2).contiguous()
@@ -355,8 +361,16 @@ class LeafBlockAttention(nn.Module):
         logit_bias = (
             bias_w3.reshape(bn, 1, L, L).expand(bn, Hh, L, L).to(dtype=q_f.dtype).clone()
         )
-        mb = mask_base.reshape(bn, 1, L, L).expand(bn, Hh, L, L)
-        logit_bias = logit_bias.masked_fill(mb == 0, float("-inf"))
+
+        if no_binary_mask:
+            linear_edge_weights = self.edge_gate(bias_physics)
+            mask_expanded = None
+        else:
+            mask_expanded = mask_base.unsqueeze(-1)
+            linear_edge_weights = self.edge_gate(bias_physics)
+            linear_edge_weights = linear_edge_weights.masked_fill(mask_expanded == 0, 0.0)
+            mb = mask_base.reshape(bn, 1, L, L).expand(bn, Hh, L, L)
+            logit_bias = logit_bias.masked_fill(mb == 0, float("-inf"))
 
         # Fused SDPA is fast but does not materialize attention weights. Mass / distribution stats must use
         # either eager_attention (manual softmax @ V, same logits as SDPA) or a separate score pass only
@@ -373,7 +387,8 @@ class LeafBlockAttention(nn.Module):
             if save_attention:
                 scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
                 scores = scores + bias_physics[..., 3:4]
-                scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
+                if not no_binary_mask:
+                    scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
                 with torch.no_grad():
                     self.last_scores_matrix = scores.mean(dim=-1)[:, :, :, :L].cpu().float()
                     self.last_bias_physics_matrix = bias_physics[:, :, :L].cpu().float()
@@ -386,7 +401,8 @@ class LeafBlockAttention(nn.Module):
             if save_attention:
                 scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
                 scores = scores + bias_physics[..., 3:4]
-                scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
+                if not no_binary_mask:
+                    scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
                 attn_probs = F.softmax(scores, dim=3)
                 combined_weights = attn_probs + linear_edge_weights
                 with torch.no_grad():
@@ -436,7 +452,10 @@ class LeafBlockAttention(nn.Module):
 
                 # Spatial softmax uses K=L only; block/matrix are σ(gate)·V baselines (not in softmax sum).
                 K = int(key_count)
-                mask_b = (mask_base > 0).to(dtype=attn_viz.dtype)
+                if no_binary_mask:
+                    mask_b = torch.ones_like(attn_viz)
+                else:
+                    mask_b = (mask_base > 0).to(dtype=attn_viz.dtype)
                 n_allowed = mask_b.sum(dim=-1, keepdim=True).clamp(min=1.0)
                 unif = mask_b / n_allowed
                 u_self = float(unif[:, :, arange, arange].mean().item())
@@ -570,15 +589,22 @@ class LeafOnlyNet(nn.Module):
         use_jacobi=True,
         strip_build_mode: str = "no_einsum",
         off_diag_dense_attention: bool = True,
+        diag_dense_attention: bool = True,
     ):
         super().__init__()
         if strip_build_mode not in ("einsum", "no_einsum"):
             raise ValueError(f"strip_build_mode must be 'einsum' or 'no_einsum', got {strip_build_mode!r}")
         self.strip_build_mode = strip_build_mode
         self.off_diag_dense_attention = bool(off_diag_dense_attention)
+        self.diag_dense_attention = bool(diag_dense_attention)
         self.leaf_size = int(leaf_size)
-        # L×(L+1) layout: block summary still exists, but LeafBlockAttention uses L×L softmax + gated V_block (not a softmax key).
-        attention_layout = f"{self.leaf_size}x{self.leaf_size + 1}"
+        L = self.leaf_size
+        otp = int(OFF_DIAG_TOKEN_POOL)
+        if L % otp != 0:
+            raise ValueError(f"leaf_size {L} not divisible by OFF_DIAG_TOKEN_POOL {otp}")
+        Ls_off = L // otp
+        diag_layout = f"{L}x{L}" if self.diag_dense_attention else f"{L}x{L + 1}"
+        off_layout = f"{Ls_off}x{Ls_off}" if self.off_diag_dense_attention else f"{Ls_off}x{Ls_off + 1}"
         self.embed = PhysicsAwareEmbedding(
             input_dim,
             d_model,
@@ -587,17 +613,11 @@ class LeafOnlyNet(nn.Module):
             num_gcn_layers=num_gcn_layers,
         )
         self.enc_input_proj = nn.Linear(d_model, d_model)
-        L = self.leaf_size
-        otp = int(OFF_DIAG_TOKEN_POOL)
-        if L % otp != 0:
-            raise ValueError(f"leaf_size {L} not divisible by OFF_DIAG_TOKEN_POOL {otp}")
         self.off_token_pool = otp
-        Ls_off = L // otp
         self.leaf_apply_size = L
         self.leaf_apply_off = Ls_off
         La_d = L
         La_o = Ls_off
-        off_attn_layout = f"{Ls_off}x{Ls_off + 1}"
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
@@ -607,7 +627,7 @@ class LeafOnlyNet(nn.Module):
                         d_model,
                         L,
                         num_heads=num_heads,
-                        attention_layout=attention_layout,
+                        attention_layout=diag_layout,
                     ),
                 )
                 for _ in range(num_layers)
@@ -623,7 +643,7 @@ class LeafOnlyNet(nn.Module):
                         d_model,
                         Ls_off,
                         num_heads=num_heads,
-                        attention_layout=off_attn_layout,
+                        attention_layout=off_layout,
                     ),
                 )
                 for _ in range(num_layers)
@@ -766,6 +786,7 @@ class LeafOnlyNet(nn.Module):
                     dtype,
                     num_hops=ATTENTION_HOPS,
                     off_diag_dense_attention=self.off_diag_dense_attention,
+                    diag_dense_attention=self.diag_dense_attention,
                 )
 
         B, N_h, C_h = h.shape
@@ -781,56 +802,68 @@ class LeafOnlyNet(nn.Module):
         M_off = self.num_h_off
         if M_off > 0:
             # After strip sum + optional token mean-pool: (B*M_off, Ls_off, C), num_blocks=1; masks match Ls_off.
-            if off_om_pre is None or off_om_pre.numel() == 0:
-                raise ValueError(
-                    "LeafOnlyNet: H off-diagonal attention mask missing. "
-                    "Pass build_leaf_block_connectivity(...) (4-tuple) as precomputed_leaf_connectivity, "
-                    "or provide edge_index/edge_values so it can be built."
-                )
+            if not self.off_diag_dense_attention:
+                if off_om_pre is None or off_om_pre.numel() == 0:
+                    raise ValueError(
+                        "LeafOnlyNet: H off-diagonal attention mask missing. "
+                        "Pass build_leaf_block_connectivity(...) (4-tuple) as precomputed_leaf_connectivity, "
+                        "or provide edge_index/edge_values so it can be built."
+                    )
             if off_oe_pre is None or off_oe_pre.numel() == 0:
                 raise ValueError(
                     "LeafOnlyNet: H off-diagonal edge_feats missing (precomputed[...,3] or build_leaf_block_connectivity)."
                 )
-            om_m = int(off_om_pre.shape[0]) if off_om_pre.dim() == 3 else int(off_om_pre.shape[1])
-            if om_m != M_off:
-                raise ValueError(
-                    f"LeafOnlyNet: off attn_mask has M={om_m}, expected num_h_off={M_off}."
-                )
-            om = off_om_pre.to(device=h.device, dtype=h.dtype)
             oe = off_oe_pre.to(device=h.device, dtype=h.dtype)
-            if self.off_token_pool > 1:
-                om = pool_leaf_attn_mask(om, L, self.off_token_pool)
-                oe = pool_leaf_edge_feats(oe, L, self.off_token_pool)
-            if om.dim() == 3:
-                # Keep expanded view strided; avoid .contiguous() (would materialize a full B×M copy each forward).
-                om4 = om.unsqueeze(0).expand(B, M_off, -1, -1)
-            else:
-                om4 = om.contiguous()
-                if om4.shape[0] == 1 and B > 1:
-                    om4 = om4.expand(B, -1, -1, -1)
-            Lq, Kq = om4.shape[-2], om4.shape[-1]
-            if oe.dim() == 4:
-                oe5 = oe.unsqueeze(0).expand(B, M_off, -1, -1, -1)
-            else:
-                oe5 = oe.contiguous()
-                if oe5.shape[0] == 1 and B > 1:
-                    oe5 = oe5.expand(B, -1, -1, -1, -1, -1)
-            off_attn_mask = om4.reshape(B * M_off, 1, Lq, Kq)
-            off_edge_feats = oe5.reshape(B * M_off, 1, Lq, Kq, 4)
             if self.off_diag_dense_attention:
-                # Ignore H reachability for softmax: all L×L keys allowed (still uses edge_feats physics bias + gated block path).
-                off_attn_mask = torch.ones_like(off_attn_mask)
+                if self.off_token_pool > 1:
+                    oe = pool_leaf_edge_feats(oe, L, self.off_token_pool)
+                Ls = self.leaf_apply_off
+                # Per-context oe is (M,Ls,Ls,4); batched precomputed is (B,M,Ls,Ls,4) — do not unsqueeze again.
+                if oe.dim() == 4:
+                    oe5 = oe.unsqueeze(0).expand(B, M_off, -1, -1, -1)
+                else:
+                    oe5 = oe.contiguous()
+                    if oe5.shape[0] == 1 and B > 1:
+                        oe5 = oe5.expand(B, -1, -1, -1, -1)
+                off_attn_mask = None
+                off_edge_feats = oe5.reshape(B * M_off, 1, Ls, Ls, 4)
+            else:
+                om_m = int(off_om_pre.shape[0]) if off_om_pre.dim() == 3 else int(off_om_pre.shape[1])
+                if om_m != M_off:
+                    raise ValueError(
+                        f"LeafOnlyNet: off attn_mask has M={om_m}, expected num_h_off={M_off}."
+                    )
+                om = off_om_pre.to(device=h.device, dtype=h.dtype)
+                if self.off_token_pool > 1:
+                    om = pool_leaf_attn_mask(om, L, self.off_token_pool)
+                    oe = pool_leaf_edge_feats(oe, L, self.off_token_pool)
+                if om.dim() == 3:
+                    om4 = om.unsqueeze(0).expand(B, M_off, -1, -1)
+                else:
+                    om4 = om.contiguous()
+                    if om4.shape[0] == 1 and B > 1:
+                        om4 = om4.expand(B, -1, -1, -1)
+                Lq, Kq = om4.shape[-2], om4.shape[-1]
+                if oe.dim() == 4:
+                    oe5 = oe.unsqueeze(0).expand(B, M_off, -1, -1, -1)
+                else:
+                    oe5 = oe.contiguous()
+                    if oe5.shape[0] == 1 and B > 1:
+                        oe5 = oe5.expand(B, -1, -1, -1, -1, -1)
+                off_attn_mask = om4.reshape(B * M_off, 1, Lq, Kq)
+                off_edge_feats = oe5.reshape(B * M_off, 1, Lq, Kq, 4)
 
         # Frozen KV extras (+1 / +2): means from post-embed h only (not refreshed per TransformerBlock).
         h_lv = h.view(B, K, L, C_h)
-        diag_prep_block = h_lv.mean(dim=2, keepdim=True)
+        diag_prep_block = None if self.diag_dense_attention else h_lv.mean(dim=2, keepdim=True)
         diag_prep_matrix = h.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, K, -1, -1)
         off_prep_block = off_prep_matrix = None
         if M_off > 0:
             strip0 = self._build_off_strip(h, B, K, L, C_h, M_off)
             Ls = self.leaf_apply_off
             Bm = B * M_off
-            off_prep_block = strip0.view(Bm, 1, Ls, C_h).mean(dim=2, keepdim=True)
+            if not self.off_diag_dense_attention:
+                off_prep_block = strip0.view(Bm, 1, Ls, C_h).mean(dim=2, keepdim=True)
             off_prep_matrix = strip0.mean(dim=1, keepdim=True).unsqueeze(1).unsqueeze(1)
 
         h_diag = h
