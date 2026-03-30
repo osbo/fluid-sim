@@ -7,7 +7,8 @@ import torch
 # v1: 32 bytes (8 ints). v2: 36 bytes (9 ints), diag + off apply sizes.
 # v3: 40 bytes (10 ints), adds attention_layout_code + TransformerBlock FFN params in body.
 #   attention_layout_code: 0 = LxL (no special nodes), 1 = Lx(L+1) (+ block node), 2 = Lx(L+2) (+ matrix node).
-LEAF_ONLY_HEADER_BYTES = 40
+# v4: 44 bytes (11 ints), adds decoupled_route_gates (1 = block_route_gate / matrix_route_gate tensors after edge_gate).
+LEAF_ONLY_HEADER_BYTES = 44
 
 
 def read_leaf_only_header(path):
@@ -16,7 +17,23 @@ def read_leaf_only_header(path):
         header = f.read(LEAF_ONLY_HEADER_BYTES)
     if len(header) < 32:
         raise ValueError("LeafOnly weights file too short")
-    if len(header) >= 40:
+    decoupled_route_gates = 0
+    if len(header) >= 44:
+        (
+            d_model,
+            leaf_size,
+            input_dim,
+            num_layers,
+            num_heads,
+            use_gcn,
+            num_gcn_layers,
+            leaf_apply_diag,
+            leaf_apply_off,
+            attention_layout_code,
+            decoupled_route_gates,
+        ) = struct.unpack("<iiiiiiiiiii", header[:44])
+        header_bytes = 44
+    elif len(header) >= 40:
         d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, leaf_apply_diag, leaf_apply_off, attention_layout_code = (
             struct.unpack("<iiiiiiiiii", header[:40])
         )
@@ -50,6 +67,7 @@ def read_leaf_only_header(path):
         leaf_apply_diag,
         leaf_apply_off,
         attention_layout_code,
+        decoupled_route_gates,
     )
 
 
@@ -95,7 +113,7 @@ def _read_gcn_layer_into(f, gcn_layer, read_tensor):
     _read_into(f, gcn_layer.update_gate[2].bias, read_tensor, transpose=False)
 
 
-def _write_transformer_block(f, block):
+def _write_transformer_block(f, block, *, write_route_gates: bool = True):
     _write_packed_tensor(f, block.norm1.weight.detach().cpu().float(), False)
     _write_packed_tensor(f, block.norm1.bias.detach().cpu().float(), False)
     _write_packed_tensor(f, block.attn.qkv.weight.detach().cpu().float(), True)
@@ -104,6 +122,12 @@ def _write_transformer_block(f, block):
     _write_packed_tensor(f, block.attn.proj.bias.detach().cpu().float(), False)
     _write_packed_tensor(f, block.attn.edge_gate.weight.detach().cpu().float(), True)
     _write_packed_tensor(f, block.attn.edge_gate.bias.detach().cpu().float(), False)
+    if write_route_gates and block.attn.block_route_gate is not None:
+        _write_packed_tensor(f, block.attn.block_route_gate.weight.detach().cpu().float(), True)
+        _write_packed_tensor(f, block.attn.block_route_gate.bias.detach().cpu().float(), False)
+    if write_route_gates and block.attn.matrix_route_gate is not None:
+        _write_packed_tensor(f, block.attn.matrix_route_gate.weight.detach().cpu().float(), True)
+        _write_packed_tensor(f, block.attn.matrix_route_gate.bias.detach().cpu().float(), False)
     _write_packed_tensor(f, block.norm2.weight.detach().cpu().float(), False)
     _write_packed_tensor(f, block.norm2.bias.detach().cpu().float(), False)
     _write_packed_tensor(f, block.mlp[0].weight.detach().cpu().float(), True)
@@ -121,10 +145,17 @@ def save_leaf_only_weights(model, path, input_dim=9):
     use_block_node = model.blocks[0].attn.use_block_node if model.blocks else False
     use_matrix_node = model.blocks[0].attn.use_matrix_node if model.blocks else False
     attention_layout_code = (1 if use_block_node else 0) + (1 if use_matrix_node else 0)
+    has_route_gates = bool(
+        model.blocks
+        and (
+            model.blocks[0].attn.block_route_gate is not None
+            or model.blocks[0].attn.matrix_route_gate is not None
+        )
+    )
     with open(path, "wb") as f:
         f.write(
             struct.pack(
-                "<iiiiiiiiii",
+                "<iiiiiiiiiii",
                 d_model,
                 model.leaf_size,
                 input_dim,
@@ -135,6 +166,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
                 int(model.leaf_apply_size),
                 int(model.leaf_apply_off),
                 attention_layout_code,
+                1 if has_route_gates else 0,
             )
         )
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
@@ -148,9 +180,9 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.enc_input_proj.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.enc_input_proj.bias.detach().cpu().float(), transpose=False)
         for block in model.blocks:
-            _write_transformer_block(f, block)
+            _write_transformer_block(f, block, write_route_gates=has_route_gates)
         for block in model.off_diag_blocks:
-            _write_transformer_block(f, block)
+            _write_transformer_block(f, block, write_route_gates=has_route_gates)
         _write_packed_tensor(f, model.off_diag_head_U.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.off_diag_head_U.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.off_diag_head_V.weight.detach().cpu().float(), transpose=True)
@@ -165,7 +197,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.jacobi_gate.bias.detach().cpu().float(), transpose=False)
 
 
-def _read_transformer_block_into(f, block, read_tensor):
+def _read_transformer_block_into(f, block, read_tensor, *, load_route_gates: bool = False):
     _read_into(f, block.norm1.weight, read_tensor, transpose=False)
     _read_into(f, block.norm1.bias, read_tensor, transpose=False)
     _read_into(f, block.attn.qkv.weight, read_tensor, transpose=True)
@@ -174,6 +206,13 @@ def _read_transformer_block_into(f, block, read_tensor):
     _read_into(f, block.attn.proj.bias, read_tensor, transpose=False)
     _read_into(f, block.attn.edge_gate.weight, read_tensor, transpose=True)
     _read_into(f, block.attn.edge_gate.bias, read_tensor, transpose=False)
+    if load_route_gates:
+        if block.attn.block_route_gate is not None:
+            _read_into(f, block.attn.block_route_gate.weight, read_tensor, transpose=True)
+            _read_into(f, block.attn.block_route_gate.bias, read_tensor, transpose=False)
+        if block.attn.matrix_route_gate is not None:
+            _read_into(f, block.attn.matrix_route_gate.weight, read_tensor, transpose=True)
+            _read_into(f, block.attn.matrix_route_gate.bias, read_tensor, transpose=False)
     _read_into(f, block.norm2.weight, read_tensor, transpose=False)
     _read_into(f, block.norm2.bias, read_tensor, transpose=False)
     _read_into(f, block.mlp[0].weight, read_tensor, transpose=True)
@@ -187,7 +226,20 @@ def load_leaf_only_weights(model, path):
 
     path = Path(path)
     result = read_leaf_only_header(path)
-    d_model_lo, leaf_size_lo, input_dim_lo, num_layers_lo, num_heads_lo, use_gcn_file, num_gcn_layers_file, header_bytes, leaf_apply_diag_lo, leaf_apply_off_lo, attention_layout_code = result
+    (
+        d_model_lo,
+        leaf_size_lo,
+        input_dim_lo,
+        num_layers_lo,
+        num_heads_lo,
+        use_gcn_file,
+        num_gcn_layers_file,
+        header_bytes,
+        leaf_apply_diag_lo,
+        leaf_apply_off_lo,
+        attention_layout_code,
+        decoupled_route_gates,
+    ) = result
     if header_bytes < 40:
         raise ValueError(
             f"Checkpoint '{path}' uses old format (header v{'1' if header_bytes < 36 else '2'}); "
@@ -254,10 +306,11 @@ def load_leaf_only_weights(model, path):
         _read_into(f, model.embed.norm.bias, read_tensor, transpose=False)
         _read_into(f, model.enc_input_proj.weight, read_tensor, transpose=True)
         _read_into(f, model.enc_input_proj.bias, read_tensor, transpose=False)
+        _load_rg = int(decoupled_route_gates) == 1
         for block in model.blocks:
-            _read_transformer_block_into(f, block, read_tensor)
+            _read_transformer_block_into(f, block, read_tensor, load_route_gates=_load_rg)
         for block in model.off_diag_blocks:
-            _read_transformer_block_into(f, block, read_tensor)
+            _read_transformer_block_into(f, block, read_tensor, load_route_gates=_load_rg)
         _read_into(f, model.off_diag_head_U.weight, read_tensor, transpose=True)
         _read_into(f, model.off_diag_head_U.bias, read_tensor, transpose=False)
         _read_into(f, model.off_diag_head_V.weight, read_tensor, transpose=True)

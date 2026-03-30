@@ -78,6 +78,288 @@ def _timed_ms(fn, device, warmup=3, repeat=10):
     return float(total_ms / repeat)
 
 
+def _hm_strip_pool_h_off_tokens(
+    model: LeafOnlyNet,
+    h_proj0: torch.Tensor,
+    B_prof: int,
+    Mh: int,
+    Lf: int,
+    Ls_off: int,
+    otp: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """H-matrix row/col strip aggregate + optional token mean-pool → input to off-diagonal Transformer stack."""
+    C_dim = int(h_proj0.shape[-1])
+    h_k_t = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+    if getattr(model, "strip_build_mode", "einsum") == "einsum":
+        Wr_t = model.hm_pool_w_row.to(device=device, dtype=dtype)
+        Wc_t = model.hm_pool_w_col.to(device=device, dtype=dtype)
+        row_pt = torch.einsum("mk,bklc->bmlc", Wr_t, h_k_t)
+        col_pt = torch.einsum("mk,bklc->bmlc", Wc_t, h_k_t)
+    else:
+        ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
+        hk_trans = h_k_t.transpose(0, 1)
+        r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=dtype)
+        c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=dtype)
+        r_sum.index_add_(0, gidx, hk_trans[ridx])
+        c_sum.index_add_(0, gidx, hk_trans[cidx])
+        S_view = model.h_block_S.view(Mh, 1, 1, 1).to(device=device, dtype=dtype)
+        row_pt = (r_sum / S_view).transpose(0, 1)
+        col_pt = (c_sum / S_view).transpose(0, 1)
+    h_ = (row_pt + col_pt).reshape(B_prof * Mh, Lf, C_dim)
+    if otp > 1:
+        h_ = h_.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
+    return h_
+
+
+def _attention_distribution_stats_row(stack: str, layer: int, st: Optional[dict]) -> list:
+    """One table row: model / mask-aware uniform / blind baselines + excess vs each baseline."""
+    if st is None:
+        dash = "-"
+        return [stack, layer, dash] + [dash] * 20
+    return [
+        stack,
+        layer,
+        st["key_count"],
+        st["model_self"],
+        st["unif_self"],
+        st["blind_self"],
+        st["model_nei"],
+        st["unif_nei"],
+        st["blind_nei"],
+        st["model_blk"],
+        st["unif_blk"],
+        st["blind_blk"],
+        st["model_mat"],
+        st["unif_mat"],
+        st["blind_mat"],
+        st["excess_self"],
+        st["excess_nei"],
+        st["excess_blk"],
+        st["excess_mat"],
+        st["excess_self_vs_blind"],
+        st["excess_nei_vs_blind"],
+        st["excess_blk_vs_blind"],
+        st["excess_mat_vs_blind"],
+    ]
+
+
+def print_comprehensive_attention_profiler(
+    model: LeafOnlyNet,
+    device: torch.device,
+    h_proj0: torch.Tensor,
+    leaf_attn_kw: dict,
+    off_attn_kw: Optional[dict],
+    *,
+    B_prof: int,
+    Mh: int,
+    Lf: int,
+    Ls_off: int,
+    otp: int,
+    x_dtype: torch.dtype,
+    warmup: int = 3,
+    repeat: int = 10,
+) -> None:
+    """
+    Inventory, decomposed pre-attn LayerNorm vs attention ms, mean attention mass (self / neighbor / block),
+    and optional torch.compile timings for full Leaf and H-off stacks. Expects ``model.eval()`` for correct
+    ``last_attn_*`` buffers (caller typically runs this inside the component-timing section).
+    """
+    strip = getattr(model, "strip_build_mode", "einsum")
+    _hoff = "dense L×L (all-ones mask)" if bool(getattr(model, "off_diag_dense_attention", True)) else "reachability mask"
+    print(
+        "\n=== Attention profiler (all Transformer stacks) ===\n"
+        f"Strip build: {strip!r}; OFF_DIAG_TOKEN_POOL={otp} → off block tokens L={Ls_off}; "
+        f"num_h_off={Mh}; Leaf stack layers={len(model.blocks)}; H-off stack layers={len(model.off_diag_blocks)}; "
+        f"H-off softmax: {_hoff}."
+    )
+
+    inv_headers = [
+        "stack",
+        "layer",
+        "layout",
+        "L_blk",
+        "heads",
+        "hdim",
+        "blk_node",
+        "mat_node",
+        "n_param",
+    ]
+    inv_rows: list = []
+    for i, block in enumerate(model.blocks):
+        a = block.attn
+        inv_rows.append(
+            [
+                "Leaf diag",
+                i,
+                a.attention_layout,
+                a.block_size,
+                a.num_heads,
+                a.head_dim,
+                int(a.use_block_node),
+                int(a.use_matrix_node),
+                sum(p.numel() for p in a.parameters()),
+            ]
+        )
+    for i, block in enumerate(model.off_diag_blocks):
+        a = block.attn
+        inv_rows.append(
+            [
+                "H-off",
+                i,
+                a.attention_layout,
+                a.block_size,
+                a.num_heads,
+                a.head_dim,
+                int(a.use_block_node),
+                int(a.use_matrix_node),
+                sum(p.numel() for p in a.parameters()),
+            ]
+        )
+    _print_table("Attention modules (per-layer inventory)", inv_headers, inv_rows)
+    print(
+        "blk_node/mat_node: LeafBlockAttention use_block_node / use_matrix_node from layout "
+        "(Layout codes L×(L+1): softmax is L×L; block/matrix use gated V paths, not softmax keys.)"
+    )
+
+    dec_headers = ["stack", "layer", "pre_attn_LN_ms", "attention_ms", "LN+attn_ms"]
+    dec_rows: list = []
+    h = h_proj0
+    for i, block in enumerate(model.blocks):
+        ms_ln = _timed_ms(lambda b=block, x=h: b.norm1(x), device, warmup=warmup, repeat=repeat)
+        with torch.no_grad():
+            xn = block.norm1(h)
+        ms_at = _timed_ms(
+            lambda b=block, u=xn, kw=leaf_attn_kw: b.attn(u, **kw),
+            device,
+            warmup=warmup,
+            repeat=repeat,
+        )
+        dec_rows.append(["Leaf diag", i, ms_ln, ms_at, ms_ln + ms_at])
+        with torch.no_grad():
+            x_mid = h + block.attn(xn, **leaf_attn_kw)
+            h = x_mid + block.mlp(block.norm2(x_mid))
+
+    if Mh > 0 and off_attn_kw is not None:
+        h_off = _hm_strip_pool_h_off_tokens(model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_dtype)
+        for i, block in enumerate(model.off_diag_blocks):
+            ms_ln = _timed_ms(lambda b=block, x=h_off: b.norm1(x), device, warmup=warmup, repeat=repeat)
+            with torch.no_grad():
+                xn = block.norm1(h_off)
+            ms_at = _timed_ms(
+                lambda b=block, u=xn, kw=off_attn_kw: b.attn(u, **kw),
+                device,
+                warmup=warmup,
+                repeat=repeat,
+            )
+            dec_rows.append(["H-off", i, ms_ln, ms_at, ms_ln + ms_at])
+            with torch.no_grad():
+                x_mid = h_off + block.attn(xn, **off_attn_kw)
+                h_off = x_mid + block.mlp(block.norm2(x_mid))
+
+    _print_table("Attention micro-timing (eager, decomposed)", dec_headers, dec_rows)
+    leaf_sum = sum(r[4] for r in dec_rows if r[0] == "Leaf diag")
+    off_sum = sum(r[4] for r in dec_rows if r[0] == "H-off")
+    print(
+        f"Eager LN+attention subtotal: Leaf diag Σ={leaf_sum:.3f} ms; "
+        f"H-off Σ={off_sum:.3f} ms (same warmup/repeat as component table)."
+    )
+
+    mass_headers = [
+        "stack",
+        "layer",
+        "K",
+        "self_m",
+        "self_u",
+        "self_b",
+        "nei_m",
+        "nei_u",
+        "nei_b",
+        "blk_m",
+        "blk_u",
+        "blk_b",
+        "mat_m",
+        "mat_u",
+        "mat_b",
+        "Δself_u",
+        "Δnei_u",
+        "Δblk_u",
+        "Δmat_u",
+        "Δself_b",
+        "Δnei_b",
+        "Δblk_b",
+        "Δmat_b",
+    ]
+    mass_rows: list = []
+    with torch.inference_mode():
+        h = h_proj0
+        for i, block in enumerate(model.blocks):
+            xn = block.norm1(h)
+            ya = block.attn(xn, **leaf_attn_kw)
+            mass_rows.append(
+                _attention_distribution_stats_row("Leaf diag", i, block.attn.last_attn_distribution_stats)
+            )
+            x_mid = h + ya
+            h = x_mid + block.mlp(block.norm2(x_mid))
+        if Mh > 0 and off_attn_kw is not None:
+            h_off = _hm_strip_pool_h_off_tokens(model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_dtype)
+            for i, block in enumerate(model.off_diag_blocks):
+                xn = block.norm1(h_off)
+                ya = block.attn(xn, **off_attn_kw)
+                mass_rows.append(
+                    _attention_distribution_stats_row("H-off", i, block.attn.last_attn_distribution_stats)
+                )
+                x_mid = h_off + ya
+                h_off = x_mid + block.mlp(block.norm2(x_mid))
+    _print_table(
+        "Attention mass vs baselines (eval; mean combined weight over heads, same mask as softmax)",
+        mass_headers,
+        mass_rows,
+    )
+    print(
+        "Columns: K = spatial softmax width (L). "
+        "self_u / nei_u = mask-aware uniform over allowed leaf keys; self_b / nei_b = blind 1/L priors on leaf keys. "
+        "blk_*/mat_*: for block/matrix, model = mean σ(gate); unif = 0.5 (sigmoid-neutral); blind = 0 (no additive global). "
+        "Δ*_u / Δ*_b = model minus those references."
+    )
+
+    compile_w, compile_r = 4, 4
+
+    def _leaf_stack_forward(h0: torch.Tensor) -> torch.Tensor:
+        h = h0
+        for block in model.blocks:
+            xn = block.norm1(h)
+            h = h + block.attn(xn, **leaf_attn_kw)
+            h = h + block.mlp(block.norm2(h))
+        return h
+
+    try:
+        comp_leaf = torch.compile(_leaf_stack_forward, fullgraph=False)
+        ms_leaf_c = _timed_ms(lambda: comp_leaf(h_proj0), device, warmup=compile_w, repeat=compile_r)
+        print(f"\nLeaf diag stack: torch.compile(full blocks, {compile_w} warmup / {compile_r} repeat) → {ms_leaf_c:.3f} ms/call")
+    except Exception as ex:
+        print(f"\nLeaf diag stack torch.compile timing skipped: {ex}")
+
+    if Mh > 0 and off_attn_kw is not None:
+        h0_off = _hm_strip_pool_h_off_tokens(model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_dtype)
+
+        def _hoff_stack_forward(h0: torch.Tensor) -> torch.Tensor:
+            h = h0
+            for block in model.off_diag_blocks:
+                xn = block.norm1(h)
+                h = h + block.attn(xn, **off_attn_kw)
+                h = h + block.mlp(block.norm2(h))
+            return h
+
+        try:
+            comp_off = torch.compile(_hoff_stack_forward, fullgraph=False)
+            ms_off_c = _timed_ms(lambda: comp_off(h0_off), device, warmup=compile_w, repeat=compile_r)
+            print(f"H-off stack: torch.compile(full blocks, {compile_w} warmup / {compile_r} repeat) → {ms_off_c:.3f} ms/call")
+        except Exception as ex:
+            print(f"H-off stack torch.compile timing skipped: {ex}")
+
+
 def _fmt_cell(value):
     if isinstance(value, float):
         return f"{value:.6g}"
@@ -305,6 +587,7 @@ def evaluate_gradient_interference(args, runtime):
         num_gcn_layers=effective_gcn_layers,
         use_jacobi=use_jacobi,
         strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
+        off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
     ).to(device)
 
     if save_path.exists():
@@ -359,7 +642,13 @@ def evaluate_gradient_interference(args, runtime):
             A_dense[:n_orig, :n_orig] = A_small
             A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
             dm, df, om, oe = build_leaf_block_connectivity(
-                edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
+                edge_index,
+                edge_values,
+                x_input[0, :n_pad, :3],
+                LEAF_SIZE,
+                device,
+                x_input.dtype,
+                off_diag_dense_attention=bool(model.off_diag_dense_attention),
             )
             pre_leaf = (dm, df, om, oe)
             global_feat = batch.get("global_features")
@@ -463,7 +752,13 @@ def evaluate_gradient_interference(args, runtime):
     edge_index = batch["edge_index"][:, mask].to(device)
     edge_values = batch["edge_values"][mask].to(device)
     dm, df, om, oe = build_leaf_block_connectivity(
-        edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
+        edge_index,
+        edge_values,
+        x_input[0, :n_pad, :3],
+        LEAF_SIZE,
+        device,
+        x_input.dtype,
+        off_diag_dense_attention=bool(model.off_diag_dense_attention),
     )
     pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")
@@ -500,6 +795,8 @@ def evaluate_gradient_interference(args, runtime):
         off_attn_mask = om.unsqueeze(0).expand(B_prof, Mh, Ls_off, Ls_off + 1).contiguous().reshape(
             B_prof * Mh, 1, Ls_off, Ls_off + 1
         )
+        if model.off_diag_dense_attention:
+            off_attn_mask = torch.ones_like(off_attn_mask)
         off_edge_feats = (
             oe.unsqueeze(0)
             .expand(B_prof, Mh, Ls_off, Ls_off + 1, 4)
@@ -531,25 +828,7 @@ def evaluate_gradient_interference(args, runtime):
             )
         diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
         if Mh > 0:
-            h_k = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
-            if getattr(model, "strip_build_mode", "einsum") == "einsum":
-                Wr = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
-                Wc = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
-                row_p = torch.einsum("mk,bklc->bmlc", Wr, h_k)
-                col_p = torch.einsum("mk,bklc->bmlc", Wc, h_k)
-            else:
-                ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
-                hk_trans = h_k.transpose(0, 1)
-                r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                r_sum.index_add_(0, gidx, hk_trans[ridx])
-                c_sum.index_add_(0, gidx, hk_trans[cidx])
-                S_view = model.h_block_S.view(Mh, 1, 1, 1).to(device=device, dtype=x_input.dtype)
-                row_p = (r_sum / S_view).transpose(0, 1)
-                col_p = (c_sum / S_view).transpose(0, 1)
-            h_off = (row_p + col_p).reshape(B_prof * Mh, Lf, C_dim)
-            if otp > 1:
-                h_off = h_off.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
+            h_off = _hm_strip_pool_h_off_tokens(model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype)
             for block in model.off_diag_blocks:
                 h_off = block(
                     h_off,
@@ -658,38 +937,35 @@ def evaluate_gradient_interference(args, runtime):
             attn_mask=off_attn_mask,
             edge_feats=off_edge_feats,
         )
+        print_comprehensive_attention_profiler(
+            model,
+            device,
+            h_proj0,
+            leaf_attn_kw,
+            off_attn_kw if Mh > 0 else None,
+            B_prof=B_prof,
+            Mh=Mh,
+            Lf=Lf,
+            Ls_off=Ls_off,
+            otp=otp,
+            x_dtype=x_input.dtype,
+        )
         if Mh > 0:
-
-            def _build_h_off_strip():
-                h_k_t = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
-                if getattr(model, "strip_build_mode", "einsum") == "einsum":
-                    Wr_t = model.hm_pool_w_row.to(device=device, dtype=x_input.dtype)
-                    Wc_t = model.hm_pool_w_col.to(device=device, dtype=x_input.dtype)
-                    row_pt = torch.einsum("mk,bklc->bmlc", Wr_t, h_k_t)
-                    col_pt = torch.einsum("mk,bklc->bmlc", Wc_t, h_k_t)
-                else:
-                    ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
-                    hk_trans = h_k_t.transpose(0, 1)
-                    r_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                    c_sum = torch.zeros(Mh, B_prof, Lf, C_dim, device=device, dtype=x_input.dtype)
-                    r_sum.index_add_(0, gidx, hk_trans[ridx])
-                    c_sum.index_add_(0, gidx, hk_trans[cidx])
-                    S_view = model.h_block_S.view(Mh, 1, 1, 1).to(device=device, dtype=x_input.dtype)
-                    row_pt = (r_sum / S_view).transpose(0, 1)
-                    col_pt = (c_sum / S_view).transpose(0, 1)
-                h_ = (row_pt + col_pt).reshape(B_prof * Mh, Lf, C_dim)
-                if otp > 1:
-                    h_ = h_.view(B_prof * Mh, Ls_off, otp, C_dim).mean(dim=2)
-                return h_
-
             _strip_label = (
                 "H off strip pool (einsum row+col + token mean)"
                 if getattr(model, "strip_build_mode", "einsum") == "einsum"
                 else "H off strip pool (index_add row+col + token mean)"
             )
-            ms_strip = _timed_ms(_build_h_off_strip, device)
+            ms_strip = _timed_ms(
+                lambda: _hm_strip_pool_h_off_tokens(
+                    model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
+                ),
+                device,
+            )
             timing_rows.append([_strip_label, ms_strip])
-            h_off_in = _build_h_off_strip()
+            h_off_in = _hm_strip_pool_h_off_tokens(
+                model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
+            )
             for i, block in enumerate(model.off_diag_blocks):
                 h_off_in = _time_transformer_attn_and_mlp(
                     timing_rows, "H off", i, block, h_off_in, device, **off_attn_kw
@@ -761,6 +1037,8 @@ def evaluate_gradient_interference(args, runtime):
         "\nTiming coverage: micro-benchmarks use eval() and omit build_leaf_block_connectivity only "
         "(masks are precomputed). Rows cover lift linears, GCN, embed norm, enc_input_proj, per-layer leaf and "
         "H-off attention vs MLP, strip pool, both low-rank heads, node U/V, Jacobi gate, pack cat, A@Z, and M apply. "
+        "Earlier in this run, Attention profiler: per-layer inventory, decomposed pre-attn LN vs attention ms, "
+        "mean self/neighbor/block mass, and torch.compile full-stack lines for Leaf diag and H-off. "
         "Gradient interference uses leafonly_grad_param_groups() for trainable coverage."
     )
     if ms_end_to_end is not None:
@@ -805,6 +1083,7 @@ def evaluate_estimator_variance(args, runtime):
         num_gcn_layers=2,
         use_jacobi=use_jacobi,
         strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
+        off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
     ).to(device)
 
     if save_path.exists():
@@ -844,7 +1123,13 @@ def evaluate_estimator_variance(args, runtime):
     A_dense[:n_orig, :n_orig] = A_small
     A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
     dm, df, om, oe = build_leaf_block_connectivity(
-        edge_index, edge_values, x_input[0, :n_pad, :3], LEAF_SIZE, device, x_input.dtype
+        edge_index,
+        edge_values,
+        x_input[0, :n_pad, :3],
+        LEAF_SIZE,
+        device,
+        x_input.dtype,
+        off_diag_dense_attention=bool(model.off_diag_dense_attention),
     )
     pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")

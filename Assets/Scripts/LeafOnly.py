@@ -24,7 +24,11 @@ def _build_parser():
         action="store_true",
         help="Ignore TestData/.leafonly_training_context_cache/ and rebuild contexts from frame files.",
     )
-    parser.add_argument("--evaluate_gradients", action="store_true", help="Run gradient interference analysis then exit.")
+    parser.add_argument(
+        "--evaluate_gradients",
+        action="store_true",
+        help="Run gradient interference analysis then exit (includes component timing + attention profiler for all Leaf/H-off layers).",
+    )
     parser.add_argument(
         "--peek_parameters",
         action="store_true",
@@ -86,6 +90,15 @@ def _build_parser():
         help=(
             "How to build H off-diagonal row/column strip means from per-leaf features: "
             "einsum (default) or no_einsum (gather/scatter index_add_, lower asymptotic work for large K)."
+        ),
+    )
+    parser.add_argument(
+        "--off-diag-dense-attn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "H off-diagonal Transformer: True (default) = all-ones attention mask (full L×L softmax), ignoring "
+            "H-matrix reachability; False (--no-off-diag-dense-attn) = reachability mask. Edge physics features unchanged."
         ),
     )
     return parser
