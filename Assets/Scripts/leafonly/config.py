@@ -28,12 +28,12 @@ def _validate_off_diag_token_pool(leaf: int, p: int) -> int:
 
 # Power of 2; must match ``leaf_size`` in leaf_only_weights header (``read_leaf_only_header``).
 # Padded graph size is MAX_MIXED_SIZE; leaf count is MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE (static H-grid).
-LEAF_SIZE = _validate_leaf_size(32)
+LEAF_SIZE = _validate_leaf_size(128)
 # Diagonal preconditioner blocks use full leaf tokens.
 LEAF_APPLY_SIZE = LEAF_SIZE
 # H off-diagonal Transformer + off_diag heads at LEAF_APPLY_SIZE_OFF (checkpoint ``leaf_apply_off``).
 # 1 = only H-matrix strip aggregation; >1 adds uniform mean-pool along the strip before the off stack.
-OFF_DIAG_TOKEN_POOL = _validate_off_diag_token_pool(LEAF_SIZE, 1)
+OFF_DIAG_TOKEN_POOL = _validate_off_diag_token_pool(LEAF_SIZE, 2)
 LEAF_APPLY_SIZE_OFF = LEAF_SIZE // OFF_DIAG_TOKEN_POOL
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
@@ -44,7 +44,7 @@ HUTCHINSON_PROBE_JACOBI_OMEGA = 0.6
 
 # Padded problem size for LeafOnlyNet / training contexts / InspectModel (single source of truth).
 # MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE must match the checkpoint layout (same as at train time).
-MAX_MIXED_SIZE = 512
+MAX_MIXED_SIZE = 4096
 # Minimum **aligned** active nodes to keep a frame: n_active = ⌊min(num_nodes, MAX)/LEAF⌋·LEAF.
 # Must be ≤ your smallest frame's aligned count. Do not set this to MAX_MIXED_SIZE unless every frame has ≥ that many nodes.
 MIN_MIXED_SIZE = LEAF_SIZE

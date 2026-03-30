@@ -336,27 +336,46 @@ class LeafBlockAttention(nn.Module):
         k = qkv_x[..., C : 2 * C].view(B, num_blocks, L, self.num_heads, self.head_dim)
         v_spatial = qkv_x[..., 2 * C : 3 * C].view(B, num_blocks, L, self.num_heads, self.head_dim)
 
-        scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
-
         arange_s = torch.arange(L, device=device, dtype=torch.long)
         bias_physics[:, :, arange_s, arange_s, :] = 0.0
         bias_physics[:, :, arange_s, arange_s, 3] = 1.0
-        scores = scores + bias_physics[..., 3:4]
 
         mask_expanded = mask_base.unsqueeze(-1)
-        scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
-
-        if save_attention:
-            with torch.no_grad():
-                self.last_scores_matrix = scores.mean(dim=-1)[:, :, :, :L].cpu().float()
-                self.last_bias_physics_matrix = bias_physics[:, :, :L].cpu().float()
-
-        attn_probs = F.softmax(scores, dim=3)
         linear_edge_weights = self.edge_gate(bias_physics)
         linear_edge_weights = linear_edge_weights.masked_fill(mask_expanded == 0, 0.0)
-        combined_weights = attn_probs + linear_edge_weights
 
-        x_mid = torch.einsum("bnqkh,bnkhd->bnqhd", combined_weights, v_spatial)
+        # Fused attention for softmax(QK^T/√d + physics_3 + mask) @ V; edge_gate is added *after* softmax (see below).
+        bn = B * num_blocks
+        Hh, Dd = self.num_heads, self.head_dim
+        q_f = q.reshape(bn, L, Hh, Dd).transpose(1, 2).contiguous()
+        k_f = k.reshape(bn, L, Hh, Dd).transpose(1, 2).contiguous()
+        v_f = v_spatial.reshape(bn, L, Hh, Dd).transpose(1, 2).contiguous()
+        bias_w3 = bias_physics[:, :, :, :, 3]
+        logit_bias = (
+            bias_w3.reshape(bn, 1, L, L).expand(bn, Hh, L, L).to(dtype=q_f.dtype).clone()
+        )
+        mb = mask_base.reshape(bn, 1, L, L).expand(bn, Hh, L, L)
+        logit_bias = logit_bias.masked_fill(mb == 0, float("-inf"))
+        x_soft = F.scaled_dot_product_attention(
+            q_f, k_f, v_f, attn_mask=logit_bias, dropout_p=0.0, is_causal=False
+        )
+        x_soft = x_soft.transpose(1, 2).reshape(B, num_blocks, L, Hh, Dd)
+
+        need_scores = save_attention or (not self.training and not torch.compiler.is_compiling())
+        if need_scores:
+            scores = torch.einsum("bnqhd,bnkhd->bnqkh", q, k) * self.scale
+            scores = scores + bias_physics[..., 3:4]
+            scores = scores.masked_fill(mask_expanded == 0, float("-inf"))
+            attn_probs = F.softmax(scores, dim=3)
+            combined_weights = attn_probs + linear_edge_weights
+            if save_attention:
+                with torch.no_grad():
+                    self.last_scores_matrix = scores.mean(dim=-1)[:, :, :, :L].cpu().float()
+                    self.last_bias_physics_matrix = bias_physics[:, :, :L].cpu().float()
+        else:
+            combined_weights = None
+
+        x_mid = x_soft + torch.einsum("bnqkh,bnkhd->bnqhd", linear_edge_weights, v_spatial)
 
         g_block = None
         g_matrix = None
