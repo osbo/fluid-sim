@@ -180,7 +180,7 @@ def print_comprehensive_attention_profiler(
     (table shows '-') because weights are not defined for profiling separately from the forward kernel.
     """
     strip = getattr(model, "strip_build_mode", "einsum")
-    _hoff = "dense L×L (all-ones mask)" if bool(getattr(model, "off_diag_dense_attention", True)) else "reachability mask"
+    _hoff = "dense L×L (no mask)" if bool(getattr(model, "off_diag_dense_attention", True)) else "reachability mask"
     _edge_gate_note = ""
     if model.blocks:
         _h = int(model.blocks[0].attn.edge_gate[0].out_features)
@@ -621,6 +621,7 @@ def evaluate_gradient_interference(args, runtime):
         use_jacobi=use_jacobi,
         strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
+        diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
     ).to(device)
 
     if save_path.exists():
@@ -682,6 +683,7 @@ def evaluate_gradient_interference(args, runtime):
                 device,
                 x_input.dtype,
                 off_diag_dense_attention=bool(model.off_diag_dense_attention),
+                diag_dense_attention=bool(model.diag_dense_attention),
             )
             pre_leaf = (dm, df, om, oe)
             global_feat = batch.get("global_features")
@@ -799,6 +801,7 @@ def evaluate_gradient_interference(args, runtime):
         device,
         x_input.dtype,
         off_diag_dense_attention=bool(model.off_diag_dense_attention),
+        diag_dense_attention=bool(model.diag_dense_attention),
     )
     pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")
@@ -828,22 +831,31 @@ def evaluate_gradient_interference(args, runtime):
     Ls_off = int(model.leaf_apply_off)
     otp = int(model.off_token_pool)
     if Mh > 0:
-        om = om_prof.to(device=device, dtype=x_input.dtype)
         oe = oe_prof.to(device=device, dtype=x_input.dtype)
-        if otp > 1:
-            om = pool_leaf_attn_mask(om, Lf, otp)
-            oe = pool_leaf_edge_feats(oe, Lf, otp)
-        off_attn_mask = om.unsqueeze(0).expand(B_prof, Mh, Ls_off, Ls_off + 1).contiguous().reshape(
-            B_prof * Mh, 1, Ls_off, Ls_off + 1
-        )
         if model.off_diag_dense_attention:
-            off_attn_mask = torch.ones_like(off_attn_mask)
-        off_edge_feats = (
-            oe.unsqueeze(0)
-            .expand(B_prof, Mh, Ls_off, Ls_off + 1, 4)
-            .contiguous()
-            .reshape(B_prof * Mh, 1, Ls_off, Ls_off + 1, 4)
-        )
+            if otp > 1:
+                oe = pool_leaf_edge_feats(oe, Lf, otp)
+            off_attn_mask = None
+            off_edge_feats = (
+                oe.unsqueeze(0)
+                .expand(B_prof, Mh, Ls_off, Ls_off, 4)
+                .contiguous()
+                .reshape(B_prof * Mh, 1, Ls_off, Ls_off, 4)
+            )
+        else:
+            om = om_prof.to(device=device, dtype=x_input.dtype)
+            if otp > 1:
+                om = pool_leaf_attn_mask(om, Lf, otp)
+                oe = pool_leaf_edge_feats(oe, Lf, otp)
+            off_attn_mask = om.unsqueeze(0).expand(B_prof, Mh, Ls_off, Ls_off + 1).contiguous().reshape(
+                B_prof * Mh, 1, Ls_off, Ls_off + 1
+            )
+            off_edge_feats = (
+                oe.unsqueeze(0)
+                .expand(B_prof, Mh, Ls_off, Ls_off + 1, 4)
+                .contiguous()
+                .reshape(B_prof * Mh, 1, Ls_off, Ls_off + 1, 4)
+            )
     else:
         off_attn_mask = off_edge_feats = None
 
@@ -1153,6 +1165,7 @@ def evaluate_estimator_variance(args, runtime):
         use_jacobi=use_jacobi,
         strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
+        diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
     ).to(device)
 
     if save_path.exists():
@@ -1199,6 +1212,7 @@ def evaluate_estimator_variance(args, runtime):
         device,
         x_input.dtype,
         off_diag_dense_attention=bool(model.off_diag_dense_attention),
+        diag_dense_attention=bool(model.diag_dense_attention),
     )
     pre_leaf = (dm, df, om, oe)
     global_feat = batch.get("global_features")

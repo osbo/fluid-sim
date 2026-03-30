@@ -164,6 +164,29 @@ def _edge_feats_LxL_mean_scatter(
     return (sum_flat / cnt_flat.unsqueeze(-1).clamp(min=1.0)).view(L, L, 4)
 
 
+def _mean_A_ij_per_LxL_cell(
+    r_l: torch.Tensor,
+    c_l: torch.Tensor,
+    edge_vals: torch.Tensor,
+    leaf_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Mean ``A_ij`` per local (i, j) cell; cells with no edge stay 0."""
+    L = int(leaf_size)
+    if r_l.numel() == 0:
+        return torch.zeros(L, L, device=device, dtype=dtype)
+    idx = r_l.long() * L + c_l.long()
+    sum_v = torch.zeros(L * L, device=device, dtype=dtype)
+    cnt = torch.zeros(L * L, device=device, dtype=dtype)
+    v = edge_vals.to(device=device, dtype=dtype)
+    sum_v.index_add_(0, idx, v)
+    cnt.index_add_(0, idx, torch.ones(idx.shape[0], device=device, dtype=dtype))
+    mean_flat = sum_v / cnt.clamp(min=1.0)
+    mean_flat = mean_flat * (cnt > 0).to(dtype)
+    return mean_flat.view(L, L)
+
+
 def _materialize_block_attn_and_edge_feats(
     reachable, b_l, r_l, c_l, edge_feats_flat, num_blocks, leaf_size, device, dtype
 ):
@@ -367,6 +390,10 @@ def build_hmatrix_off_dense_rpe_from_positions(
     num_blocks: int,
     leaf_size: int,
     dtype: torch.dtype,
+    edge_index: torch.Tensor | None = None,
+    edge_values: torch.Tensor | None = None,
+    *,
+    with_block_key_column: bool = True,
 ) -> torch.Tensor:
     """
     Per H-tile (r0, c0, S): dense relative geometry for the L×L leaf-local attention grid.
@@ -374,7 +401,10 @@ def build_hmatrix_off_dense_rpe_from_positions(
     Row-strip nodes with local index i are ``pos[rr*L+i]`` for ``rr ∈ [r0, r0+S)``; column-strip
     similarly ``cc ∈ [c0, c0+S)``. For each (i, j), store the mean over all S×S pairwise differences
     ``pos[col] - pos[row]``, which equals ``mean_col(pos at slot j) - mean_row(pos at slot i)``.
-    Features are [Δx, Δy, Δz, 0] on leaf keys; block column (L) is zero.
+
+    When ``edge_index`` / ``edge_values`` are provided, channel 3 is the mean ``A_ij`` over direct
+    graph edges whose endpoints fall in that tile's row- and column-strips (same filtering as the
+    sparse off-diag path); local (i, j) pairs with no such edge get 0. Block column (L) stays zero.
     """
     L = int(leaf_size)
     K = int(num_blocks)
@@ -386,12 +416,17 @@ def build_hmatrix_off_dense_rpe_from_positions(
     pos = pos[:, :3]
     M = int(r0.shape[0])
     if M == 0:
-        return torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
+        if with_block_key_column:
+            return torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
+        return torch.zeros(0, L, L, 4, device=device, dtype=dtype)
     r0_l = r0.long().to(device)
     c0_l = c0.long().to(device)
     s_l = s.long().to(device)
     li = torch.arange(L, device=device, dtype=torch.long)
-    out = torch.zeros(M, L, L + 1, 4, device=device, dtype=dtype)
+    if with_block_key_column:
+        out = torch.zeros(M, L, L + 1, 4, device=device, dtype=dtype)
+    else:
+        out = torch.zeros(M, L, L, 4, device=device, dtype=dtype)
     for m in range(M):
         rr0 = int(r0_l[m].item())
         cc0 = int(c0_l[m].item())
@@ -403,6 +438,84 @@ def build_hmatrix_off_dense_rpe_from_positions(
         pr = pos[idx_r].mean(dim=0)
         pc = pos[idx_c].mean(dim=0)
         out[m, :L, :L, :3] = pc.unsqueeze(0) - pr.unsqueeze(1)
+
+    if edge_index is not None and edge_values is not None:
+        rows = edge_index[0].long()
+        cols = edge_index[1].long()
+        valid = (rows >= 0) & (cols >= 0) & (rows < N) & (cols < N)
+        rows = rows[valid]
+        cols = cols[valid]
+        ev = edge_values[valid].to(dtype=dtype)
+        if rows.numel() > 0:
+            br = rows // L
+            bc = cols // L
+            rl = rows % L
+            cl = cols % L
+            for m in range(M):
+                rr0 = int(r0_l[m].item())
+                cc0 = int(c0_l[m].item())
+                sv = int(s_l[m].item())
+                strip_r = (br >= rr0) & (br < rr0 + sv)
+                strip_c = (bc >= cc0) & (bc < cc0 + sv)
+                msk = strip_r & strip_c
+                if msk.any():
+                    out[m, :L, :L, 3] = _mean_A_ij_per_LxL_cell(
+                        rl[msk], cl[msk], ev[msk], L, device, dtype
+                    )
+    return out
+
+
+def build_diag_dense_edge_feats_from_positions(
+    edge_index: torch.Tensor,
+    edge_values: torch.Tensor,
+    positions: torch.Tensor,
+    num_blocks: int,
+    leaf_size: int,
+    dtype: torch.dtype,
+    *,
+    with_block_key_column: bool = True,
+) -> torch.Tensor:
+    """
+    Per diagonal leaf block: dense L×L features [Δx, Δy, Δz, A_ij] for full (query i, key j) softmax.
+
+    Geometry is pairwise ``pos[b*L+j] - pos[b*L+i]`` (same semantics as sparse in-leaf edges).
+    Channel 3 is mean ``A_ij`` over direct graph edges in that cell, 0 when no edge (matches dense
+    off-diagonal strip aggregation, but with per-node offsets because row/column strips coincide).
+    """
+    L = int(leaf_size)
+    K = int(num_blocks)
+    N = K * L
+    device = positions.device
+    pos = positions.to(device=device, dtype=dtype)
+    if pos.shape[0] < N:
+        raise ValueError(f"positions rows {pos.shape[0]} < N={N} (K*L)")
+    pos = pos[:, :3]
+    if with_block_key_column:
+        out = torch.zeros(K, L, L + 1, 4, device=device, dtype=dtype)
+    else:
+        out = torch.zeros(K, L, L, 4, device=device, dtype=dtype)
+    li = torch.arange(L, device=device, dtype=torch.long)
+    for b in range(K):
+        idx = b * L + li
+        p = pos[idx]
+        out[b, :L, :L, :3] = p.unsqueeze(0) - p.unsqueeze(1)
+
+    rows = edge_index[0].long()
+    cols = edge_index[1].long()
+    valid = (rows >= 0) & (cols >= 0) & (rows < N) & (cols < N)
+    rows = rows[valid]
+    cols = cols[valid]
+    ev = edge_values[valid].to(dtype=dtype)
+    if rows.numel() == 0:
+        return out
+    br = rows // L
+    bc = cols // L
+    rl = rows % L
+    cl = cols % L
+    for b in range(K):
+        in_b = (br == b) & (bc == b)
+        if in_b.any():
+            out[b, :L, :L, 3] = _mean_A_ij_per_LxL_cell(rl[in_b], cl[in_b], ev[in_b], L, device, dtype)
     return out
 
 
@@ -418,6 +531,7 @@ def build_hmatrix_off_edge_feats_from_edges(
     dtype: torch.dtype,
     *,
     dense_position_rpe: bool = False,
+    with_block_key_column: bool = True,
 ) -> torch.Tensor:
     """
     Per H-tile (r0, c0, S): off-diagonal edge features for LeafBlockAttention ``edge_gate``.
@@ -426,14 +540,24 @@ def build_hmatrix_off_edge_feats_from_edges(
     row-strip leaves and dst in the col-strip leaves into local (L, L, 4) with [Δx(3), A_ij(1)],
     mean over duplicates (sparse edge_index).
 
-    If True: ignore edge_index for this tensor; fill [Δx, Δy, Δz, 0] from dense strip geometry
+    If True: fill [Δx, Δy, Δz] from dense strip geometry and channel 3 from ``edge_values`` (mean per
+    local (i,j) over edges in the tile; 0 where no direct edge), matching the sparse path's strip filter
     (see ``build_hmatrix_off_dense_rpe_from_positions``).
 
-    Layout matches diagonal per-leaf cells; last key column (block node) stays zero.
+    Layout matches diagonal per-leaf cells; if ``with_block_key_column`` is True, last key column (block node) stays zero.
     """
     if dense_position_rpe:
         return build_hmatrix_off_dense_rpe_from_positions(
-            positions, r0, c0, s, num_blocks, leaf_size, dtype
+            positions,
+            r0,
+            c0,
+            s,
+            num_blocks,
+            leaf_size,
+            dtype,
+            edge_index=edge_index,
+            edge_values=edge_values,
+            with_block_key_column=with_block_key_column,
         )
 
     L = int(leaf_size)
@@ -489,43 +613,114 @@ def build_leaf_block_connectivity(
     num_hops=ATTENTION_HOPS,
     *,
     off_diag_dense_attention: bool = False,
+    diag_dense_attention: bool = False,
 ):
     """
     Returns (diag_mask, diag_feats, off_attn_mask, off_edge_feats).
 
-    Diagonal: same-leaf n-hop reachability and in-leaf edge features (mean if multiple edges per cell).
-    Off-diagonal: H-tile reachability masks (OR over leaf-pair slices) and edge features from all
-    direct edges crossing row-strip × col-strip leaves (mean per local L×L cell), unless
-    ``off_diag_dense_attention`` is True: then off edge_feats use dense strip-mean RPE from positions
-    (see ``build_hmatrix_off_dense_rpe_from_positions``); masks are unchanged here (model may still
-    override softmax mask when using dense attention).
+    Diagonal: same-leaf n-hop reachability and in-leaf edge features (mean if multiple edges per cell),
+    unless ``diag_dense_attention`` is True: then ``diag_mask`` is None (no binary mask; full L×L softmax)
+    and ``diag_feats`` are dense [Δx, Δy, Δz, A_ij] per (i, j), shape (K, L, L, 4).
+
+    Off-diagonal: H-tile reachability masks and edge features from direct edges across strips, unless
+    ``off_diag_dense_attention`` is True: then ``off_attn_mask`` is None and ``off_edge_feats`` are dense
+    strip RPE with shape (M, L, L, 4) (no block-key column).
+
+    When both dense flags are True, skips n-hop reachability and H-tile mask construction.
     """
+    N = int(positions.shape[0])
+    L = int(leaf_size)
+    num_blocks = N // leaf_size
+    HM_R0_CPU, HM_C0_CPU, HM_S_CPU = _hmatrix_static()
+    dd = bool(diag_dense_attention)
+    od = bool(off_diag_dense_attention)
+
+    if num_blocks == 0:
+        zm = torch.zeros(0, L, L + 1, device=device, dtype=dtype)
+        zf = torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
+        return None, None, zm, zf
+
+    if dd and od:
+        dm = None
+        df = build_diag_dense_edge_feats_from_positions(
+            edge_index,
+            edge_values,
+            positions,
+            num_blocks,
+            leaf_size,
+            dtype,
+            with_block_key_column=False,
+        )
+        hm_r0 = HM_R0_CPU.to(device)
+        hm_c0 = HM_C0_CPU.to(device)
+        hm_s = HM_S_CPU.to(device)
+        om = None
+        oe = build_hmatrix_off_dense_rpe_from_positions(
+            positions,
+            hm_r0,
+            hm_c0,
+            hm_s,
+            num_blocks,
+            leaf_size,
+            dtype,
+            edge_index=edge_index,
+            edge_values=edge_values,
+            with_block_key_column=False,
+        )
+        return dm, df, om, oe
+
     R, dm, df, num_blocks = _reachable_and_diag_materialize(
         edge_index, edge_values, positions, leaf_size, device, dtype, num_hops
     )
-    HM_R0_CPU, HM_C0_CPU, HM_S_CPU = _hmatrix_static()
-    L = int(leaf_size)
     if num_blocks == 0 or R is None:
         zm = torch.zeros(0, L, L + 1, device=device, dtype=dtype)
         zf = torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
         return None, None, zm, zf
 
+    if dd:
+        dm = None
+        df = build_diag_dense_edge_feats_from_positions(
+            edge_index,
+            edge_values,
+            positions,
+            num_blocks,
+            leaf_size,
+            dtype,
+            with_block_key_column=False,
+        )
+
     hm_r0 = HM_R0_CPU.to(device)
     hm_c0 = HM_C0_CPU.to(device)
     hm_s = HM_S_CPU.to(device)
-    om = build_hmatrix_off_attn_masks_from_reachable(R, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype)
-    oe = build_hmatrix_off_edge_feats_from_edges(
-        edge_index,
-        edge_values,
-        positions,
-        hm_r0,
-        hm_c0,
-        hm_s,
-        num_blocks,
-        leaf_size,
-        dtype,
-        dense_position_rpe=bool(off_diag_dense_attention),
-    )
+    if od:
+        om = None
+        oe = build_hmatrix_off_edge_feats_from_edges(
+            edge_index,
+            edge_values,
+            positions,
+            hm_r0,
+            hm_c0,
+            hm_s,
+            num_blocks,
+            leaf_size,
+            dtype,
+            dense_position_rpe=True,
+            with_block_key_column=False,
+        )
+    else:
+        om = build_hmatrix_off_attn_masks_from_reachable(R, hm_r0, hm_c0, hm_s, num_blocks, leaf_size, dtype)
+        oe = build_hmatrix_off_edge_feats_from_edges(
+            edge_index,
+            edge_values,
+            positions,
+            hm_r0,
+            hm_c0,
+            hm_s,
+            num_blocks,
+            leaf_size,
+            dtype,
+            dense_position_rpe=False,
+        )
     return dm, df, om, oe
 
 

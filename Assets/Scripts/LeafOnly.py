@@ -110,6 +110,16 @@ def _build_parser():
             "H-matrix reachability; False (--no-off-diag-dense-attn) = reachability mask. Edge physics features unchanged."
         ),
     )
+    parser.add_argument(
+        "--diag-dense-attn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Diagonal leaf Transformer: True (default) = full dense L×L softmax (all-ones mask), with edge_feats "
+            "[Δx,Δy,Δz,A] per (i,j) like dense off-diag; False (--no-diag-dense-attn) = n-hop reachability mask "
+            "and sparse in-leaf edge aggregation."
+        ),
+    )
     return parser
 
 
