@@ -771,51 +771,6 @@ class LeafOnlyNet(nn.Module):
             h_off = h_off.view(B * M_off, Ls, self.off_token_pool, C_h).mean(dim=2)
         return h_off
 
-    def _apply_highway(
-        self,
-        h_diag: torch.Tensor,
-        off_stream: torch.Tensor,
-        B: int,
-        K: int,
-        M_off: int,
-        L_diag: int,
-        Ls_off: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        1D row/column highway: diagonal and off-diagonal streams exchange DC summaries via scatter (write)
-        and mean-pool (read), then residual-add back to token streams. ``L_diag`` is tokens per diagonal leaf
-        (``leaf_apply_size``); ``Ls_off`` is tokens per off tile (``leaf_apply_off``).
-        """
-        C = h_diag.shape[-1]
-        device, dtype = h_diag.device, h_diag.dtype
-
-        h_d = h_diag.view(B, K, L_diag, C)
-        h_o = off_stream.view(B, M_off, Ls_off, C)
-
-        diag_summary = h_d.mean(dim=2)
-        off_summary = h_o.mean(dim=2)
-
-        row_highway = diag_summary.clone()
-        col_highway = diag_summary.clone()
-
-        ridx, cidx, gidx = _hm_prolong_scatter_indices(device)
-        off_gathered = off_summary[:, gidx, :]
-        row_highway.index_add_(1, ridx, off_gathered)
-        col_highway.index_add_(1, cidx, off_gathered)
-
-        diag_row_update = row_highway
-        diag_col_update = col_highway
-
-        Wr = self.hm_pool_w_row.to(device=device, dtype=dtype)
-        Wc = self.hm_pool_w_col.to(device=device, dtype=dtype)
-        off_row_update = torch.einsum("mk,bkc->bmc", Wr, row_highway)
-        off_col_update = torch.einsum("mk,bkc->bmc", Wc, col_highway)
-
-        h_d_out = h_d + (diag_row_update + diag_col_update).unsqueeze(2)
-        h_o_out = h_o + (off_row_update + off_col_update).unsqueeze(2)
-
-        return h_d_out.view(B, K * L_diag, C), h_o_out.view(B * M_off, Ls_off, C)
-
     def forward(
         self,
         x,
@@ -986,9 +941,6 @@ class LeafOnlyNet(nn.Module):
                         prep_block_node=off_prep_block,
                         prep_matrix_node=off_prep_matrix,
                         eager_attention=eager_attention,
-                    )
-                    h_diag, off_stream = self._apply_highway(
-                        h_diag, off_stream, B, K, M_off, Ls_d, self.leaf_apply_off
                     )
         else:
             for block in self.blocks:

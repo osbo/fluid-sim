@@ -1003,84 +1003,31 @@ def evaluate_gradient_interference(args, runtime):
             edge_feats=edge_feats,
             eager_attention=_eager_attn,
         )
-        off_attn_kw = (
-            dict(
-                edge_index=edge_index,
-                edge_values=edge_values,
-                positions=positions,
-                save_attention=False,
-                attn_mask=off_attn_mask,
-                edge_feats=off_edge_feats,
-                eager_attention=_eager_attn,
-            )
-            if Mh > 0
-            else None
-        )
-
-        Ls_d = int(model.leaf_apply_size)
         h_block_in = h_leaf_diag
-        if Mh > 0:
-            assert off_attn_kw is not None
-            off_stream_t = None
-            if len(model.blocks) == 0:
-                off_stream_t = model._build_off_strip(
-                    model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim),
-                    B_prof,
-                    MAX_NUM_LEAVES,
-                    Lf,
-                    C_dim,
-                    Mh,
-                )
-            else:
-                for i, block in enumerate(model.blocks):
-                    h_block_in = _time_transformer_attn_and_mlp(
-                        timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
-                    )
-                    strip = model._build_off_strip(
-                        model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim),
-                        B_prof,
-                        MAX_NUM_LEAVES,
-                        Lf,
-                        C_dim,
-                        Mh,
-                    )
-                    off_in = strip if off_stream_t is None else strip + off_stream_t
-                    off_stream_t = _time_transformer_attn_and_mlp(
-                        timing_rows,
-                        "H off",
-                        i,
-                        model.off_diag_blocks[i],
-                        off_in,
-                        device,
-                        **off_attn_kw,
-                    )
-                    ms_hw = _timed_ms(
-                        lambda h=h_block_in, o=off_stream_t: model._apply_highway(
-                            h, o, B_prof, MAX_NUM_LEAVES, Mh, Ls_d, Ls_off
-                        ),
-                        device,
-                    )
-                    timing_rows.append([f"Highway layer {i}", ms_hw])
-                    with torch.no_grad():
-                        h_block_in, off_stream_t = model._apply_highway(
-                            h_block_in, off_stream_t, B_prof, MAX_NUM_LEAVES, Mh, Ls_d, Ls_off
-                        )
-        else:
-            for i, block in enumerate(model.blocks):
-                h_block_in = _time_transformer_attn_and_mlp(
-                    timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
-                )
+        for i, block in enumerate(model.blocks):
+            h_block_in = _time_transformer_attn_and_mlp(
+                timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
+            )
 
         ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_block_in, mode="diagonal"), device)
         timing_rows.append(["Diagonal leaf head (U U^T)", ms_leaf_head])
 
+        off_attn_kw = dict(
+            edge_index=edge_index,
+            edge_values=edge_values,
+            positions=positions,
+            save_attention=False,
+            attn_mask=off_attn_mask,
+            edge_feats=off_edge_feats,
+            eager_attention=_eager_attn,
+        )
         print_comprehensive_attention_profiler(
             model,
             device,
             h_proj0,
             h_leaf_diag,
             leaf_attn_kw,
-            off_attn_kw,
+            off_attn_kw if Mh > 0 else None,
             B_prof=B_prof,
             Mh=Mh,
             Lf=Lf,
@@ -1090,10 +1037,27 @@ def evaluate_gradient_interference(args, runtime):
             x_dtype=x_input.dtype,
         )
         if Mh > 0:
-            h_off_final = off_stream_t.view(B_prof, Mh, Ls_off, C_dim)
-            ms_off_head = _timed_ms(
-                lambda: model._get_leaf_blocks(h_off_final, mode="off-diagonal"), device
+            _strip_label = (
+                "H off strip pool (einsum row+col + token mean)"
+                if getattr(model, "strip_build_mode", "einsum") == "einsum"
+                else "H off strip pool (index_add row+col + token mean)"
             )
+            ms_strip = _timed_ms(
+                lambda: _hm_strip_pool_h_off_tokens(
+                    model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
+                ),
+                device,
+            )
+            timing_rows.append([_strip_label, ms_strip])
+            h_off_in = _hm_strip_pool_h_off_tokens(
+                model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
+            )
+            for i, block in enumerate(model.off_diag_blocks):
+                h_off_in = _time_transformer_attn_and_mlp(
+                    timing_rows, "H off", i, block, h_off_in, device, **off_attn_kw
+                )
+            h_off_in = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
+            ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_in, mode="off-diagonal"), device)
             timing_rows.append(["H off head (U V^T)", ms_off_head])
 
         h_block_full = model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
