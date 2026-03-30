@@ -210,6 +210,9 @@ class PhysicsAwareEmbedding(nn.Module):
         return h
 
 
+EDGE_GATE_HIDDEN_DIM = 16
+
+
 class LeafBlockAttention(nn.Module):
     def __init__(self, dim, block_size, num_heads=8, attention_layout=None):
         super().__init__()
@@ -224,9 +227,15 @@ class LeafBlockAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
-        self.edge_gate = nn.Linear(4, self.num_heads)
-        nn.init.normal_(self.edge_gate.weight, std=0.01)
-        nn.init.zeros_(self.edge_gate.bias)
+        self.edge_gate = nn.Sequential(
+            nn.Linear(4, EDGE_GATE_HIDDEN_DIM),
+            nn.GELU(),
+            nn.Linear(EDGE_GATE_HIDDEN_DIM, self.num_heads),
+        )
+        nn.init.normal_(self.edge_gate[0].weight, std=0.01)
+        nn.init.zeros_(self.edge_gate[0].bias)
+        nn.init.normal_(self.edge_gate[2].weight, std=0.01)
+        nn.init.zeros_(self.edge_gate[2].bias)
         # Decoupled global routing: block/matrix values bypass spatial softmax; gates can → 0.
         self.block_route_gate = nn.Linear(dim, self.num_heads) if self.use_block_node else None
         self.matrix_route_gate = nn.Linear(dim, self.num_heads) if self.use_matrix_node else None

@@ -38,6 +38,10 @@ LEAF_APPLY_SIZE_OFF = LEAF_SIZE // OFF_DIAG_TOKEN_POOL
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
 
+# Hutchinson / probe loss: damped Jacobi on random Z (aligned with train.py and leafonly.eval).
+HUTCHINSON_PROBE_JACOBI_STEPS = 2
+HUTCHINSON_PROBE_JACOBI_OMEGA = 0.6
+
 # Padded problem size for LeafOnlyNet / training contexts / InspectModel (single source of truth).
 # MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE must match the checkpoint layout (same as at train time).
 MAX_MIXED_SIZE = 512
