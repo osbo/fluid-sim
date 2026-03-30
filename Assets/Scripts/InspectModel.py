@@ -10,11 +10,12 @@ Use ``--test_only`` to run the PCG benchmark path and print only that summary (n
 
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
-plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. Off-diagonal path uses
-``leaf_apply_off = LEAF_SIZE // OFF_DIAG_TOKEN_POOL`` (``leafonly.config``): H-matrix row/col strip
-aggregation only when ``OFF_DIAG_TOKEN_POOL`` is 1; larger values add uniform strip mean-pooling
-(masks/features pooled to match). If σ_k does not decay by those indices, increase apply rank or
-decrease ``HMATRIX_ETA`` for smaller tiles.
+plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. On-diagonal packed blocks use
+``leaf_apply_diag = LEAF_SIZE // DIAG_TOKEN_POOL``; ``DIAG_TOKEN_POOL > 1`` mean-pools within each leaf
+before the diagonal Transformer (masks/features pooled inside ``LeafOnlyNet.forward``). Off-diagonal path
+uses ``leaf_apply_off = LEAF_SIZE // OFF_DIAG_TOKEN_POOL``: strip aggregation only when that pool is 1;
+larger values add uniform strip mean-pooling (masks/features pooled to match). If σ_k does not decay by
+those indices, increase apply rank or decrease ``HMATRIX_ETA`` for smaller tiles.
 """
 import argparse
 import sys
@@ -74,8 +75,9 @@ from leafonly import (
     build_leaf_block_connectivity,
 )
 from leafonly.eval import _timed_ms
-from leafonly.checkpoint import read_leaf_only_header
+from leafonly.checkpoint import leaf_only_arch_from_checkpoint
 from leafonly.config import (
+    DIAG_TOKEN_POOL,
     HMATRIX_ETA,
     LEAF_APPLY_SIZE,
     LEAF_APPLY_SIZE_OFF,
@@ -1211,21 +1213,17 @@ def main():
 
     if not leaf_only_weights_path.exists():
         raise SystemExit(f"Leaf-only weights not found: {leaf_only_weights_path}. Run LeafOnly.py first.")
-    (
-        d_model_lo,
-        leaf_size_lo,
-        input_dim_lo,
-        num_layers_lo,
-        num_heads_lo,
-        use_gcn_lo,
-        _num_gcn_hdr,
-        _header_bytes,
-        leaf_apply_diag_ckpt,
-        leaf_apply_off_ckpt,
-        _attention_layout_code,
-        _decoupled_route_gates_hdr,
-        _edge_gate_mlp_hdr,
-    ) = read_leaf_only_header(leaf_only_weights_path)
+    ckpt_arch = leaf_only_arch_from_checkpoint(leaf_only_weights_path)
+    if ckpt_arch is None:
+        raise SystemExit(f"Could not read architecture from {leaf_only_weights_path}")
+    d_model_lo = ckpt_arch["d_model"]
+    leaf_size_lo = ckpt_arch["leaf_size"]
+    input_dim_lo = ckpt_arch["input_dim"]
+    num_layers_lo = ckpt_arch["num_layers"]
+    num_heads_lo = ckpt_arch["num_heads"]
+    use_gcn_lo = ckpt_arch["use_gcn"]
+    leaf_apply_diag_ckpt = ckpt_arch["leaf_apply_diag"]
+    leaf_apply_off_ckpt = ckpt_arch["leaf_apply_off"]
     if int(leaf_size_lo) != int(LEAF_SIZE):
         raise ValueError(
             f"Checkpoint leaf_size={leaf_size_lo} != leafonly.config.LEAF_SIZE={LEAF_SIZE}. "
@@ -1280,11 +1278,22 @@ def main():
         raise RuntimeError(
             f"leafonly.config LEAF_APPLY_SIZE={LEAF_APPLY_SIZE}, LEAF_APPLY_SIZE_OFF={LEAF_APPLY_SIZE_OFF} "
             f"do not match model leaf_apply_size={leaf_apply_diag_L}, leaf_apply_off={leaf_apply_off_L}. "
-            "Sync LEAF_SIZE and OFF_DIAG_TOKEN_POOL in leafonly/config.py with the checkpoint."
+            "Sync LEAF_SIZE, DIAG_TOKEN_POOL, and OFF_DIAG_TOKEN_POOL in leafonly/config.py with the checkpoint."
         )
     pool_diag_to_full = int(leaf_L) // leaf_apply_diag_L
     pool_off_to_full = int(leaf_L) // leaf_apply_off_L
     if not test_only:
+        if int(DIAG_TOKEN_POOL) > 1:
+            _info(
+                f"  On-diagonal path: DIAG_TOKEN_POOL={DIAG_TOKEN_POOL} → leaf_apply_diag={leaf_apply_diag_L} "
+                f"(uniform mean-pool per leaf; Transformer+MLP at {leaf_apply_diag_L} tokens/leaf; "
+                f"packed cores {leaf_apply_diag_L}×{leaf_apply_diag_L})"
+            )
+        else:
+            _info(
+                f"  On-diagonal path: DIAG_TOKEN_POOL=1, leaf_apply_diag={leaf_apply_diag_L} "
+                f"(full leaf tokens; packed cores {leaf_apply_diag_L}×{leaf_apply_diag_L})"
+            )
         if int(OFF_DIAG_TOKEN_POOL) > 1:
             _info(
                 f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL={OFF_DIAG_TOKEN_POOL} → leaf_apply_off={leaf_apply_off_L} "
@@ -1312,7 +1321,8 @@ def main():
                 global_feat = global_feat.unsqueeze(0)
 
         positions_leaf = x_leaf[0, :, :3]
-        # Full leaf resolution connectivity; forward() pools (om, oe) and strip only when OFF_DIAG_TOKEN_POOL>1.
+        # Full leaf resolution connectivity; forward() pools diag (dm, df) when DIAG_TOKEN_POOL>1,
+        # and off (om, oe) / strip when OFF_DIAG_TOKEN_POOL>1.
         pre_leaf_connectivity = build_leaf_block_connectivity(
             edge_index_leaf,
             edge_values_leaf,

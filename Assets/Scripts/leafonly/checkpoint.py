@@ -90,6 +90,73 @@ def read_leaf_only_header(path):
     )
 
 
+def leaf_only_arch_from_checkpoint(path) -> dict | None:
+    """
+    Return architecture fields from ``leaf_only_weights.bytes`` header, or None if ``path`` is missing.
+
+    Used to build ``LeafOnlyNet`` so it matches ``load_leaf_only_weights`` (same as InspectModel).
+    """
+    p = Path(path)
+    if not p.is_file():
+        return None
+    (
+        d_model,
+        leaf_size,
+        input_dim,
+        num_layers,
+        num_heads,
+        use_gcn,
+        num_gcn_layers,
+        header_bytes,
+        leaf_apply_diag,
+        leaf_apply_off,
+        attention_layout_code,
+        decoupled_route_gates,
+        edge_gate_hidden_dim,
+    ) = read_leaf_only_header(p)
+    return {
+        "d_model": int(d_model),
+        "leaf_size": int(leaf_size),
+        "input_dim": int(input_dim),
+        "num_layers": int(num_layers),
+        "num_heads": int(num_heads),
+        "use_gcn": int(use_gcn),
+        "num_gcn_layers": int(num_gcn_layers),
+        "header_bytes": int(header_bytes),
+        "leaf_apply_diag": int(leaf_apply_diag),
+        "leaf_apply_off": int(leaf_apply_off),
+        "attention_layout_code": int(attention_layout_code),
+        "decoupled_route_gates": int(decoupled_route_gates),
+        "edge_gate_hidden_dim": int(edge_gate_hidden_dim),
+    }
+
+
+def apply_leaf_only_arch_from_checkpoint_args(args, save_path) -> None:
+    """
+    If ``save_path`` exists, set ``args.num_layers``, ``args.d_model``, ``args.num_heads`` from the header
+    so the model matches the checkpoint (CLI values are overridden when they differ).
+    """
+    arch = leaf_only_arch_from_checkpoint(save_path)
+    if arch is None:
+        return
+    cli_nl = getattr(args, "num_layers", None)
+    cli_dm = getattr(args, "d_model", None)
+    cli_nh = getattr(args, "num_heads", None)
+    args.num_layers = arch["num_layers"]
+    args.d_model = arch["d_model"]
+    args.num_heads = arch["num_heads"]
+    changed = []
+    if cli_nl is not None and int(cli_nl) != arch["num_layers"]:
+        changed.append(f"num_layers {cli_nl}→{arch['num_layers']}")
+    if cli_dm is not None and int(cli_dm) != arch["d_model"]:
+        changed.append(f"d_model {cli_dm}→{arch['d_model']}")
+    if cli_nh is not None and int(cli_nh) != arch["num_heads"]:
+        changed.append(f"num_heads {cli_nh}→{arch['num_heads']}")
+    if changed:
+        name = Path(save_path).name
+        print(f"  [checkpoint] Using architecture from {name}: " + ", ".join(changed))
+
+
 def _write_packed_tensor(f, param, transpose=False):
     import numpy as np
 

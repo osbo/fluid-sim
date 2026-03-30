@@ -9,6 +9,7 @@ import torch
 
 from .config import (
     ATTENTION_HOPS,
+    DIAG_TOKEN_POOL,
     LEAF_SIZE,
     MAX_MIXED_SIZE,
     MAX_NUM_LEAVES,
@@ -17,7 +18,7 @@ from .config import (
 )
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
-CONTEXT_CACHE_VERSION = 12
+CONTEXT_CACHE_VERSION = 13
 
 
 def _mtime_ns(path: Path) -> int:
@@ -48,6 +49,7 @@ def build_training_context_cache_meta(dataset, run_folder: Path, args, frame_ind
         "seed": int(getattr(args, "seed", 0)),
         "num_frames": int(getattr(args, "num_frames", 0)),
         "leaf_size": int(LEAF_SIZE),
+        "diag_token_pool": int(DIAG_TOKEN_POOL),
         "off_diag_token_pool": int(OFF_DIAG_TOKEN_POOL),
         "attention_hops": int(ATTENTION_HOPS),
         "min_mixed": int(MIN_MIXED_SIZE),

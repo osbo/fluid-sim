@@ -13,7 +13,7 @@ from .architecture import (
     pool_leaf_attn_mask,
     pool_leaf_edge_feats,
 )
-from .checkpoint import load_leaf_only_weights
+from .checkpoint import apply_leaf_only_arch_from_checkpoint_args, load_leaf_only_weights
 from .config import (
     HUTCHINSON_PROBE_JACOBI_OMEGA,
     HUTCHINSON_PROBE_JACOBI_STEPS,
@@ -32,6 +32,24 @@ def _sync_device(device):
         torch.cuda.synchronize()
     elif device.type == "mps":
         torch.mps.synchronize()
+
+
+def _pool_diag_connectivity_for_model(
+    attn_mask, edge_feats, Lf: int, model: LeafOnlyNet
+):
+    """Match ``LeafOnlyNet.forward``: pool diagonal mask/edge grid to ``model.leaf_apply_size`` when needed."""
+    dtp = int(getattr(model, "diag_token_pool", 1))
+    if dtp <= 1:
+        return attn_mask, edge_feats
+    if bool(model.diag_dense_attention):
+        if edge_feats is not None:
+            edge_feats = pool_leaf_edge_feats(edge_feats, Lf, dtp)
+        return attn_mask, edge_feats
+    if attn_mask is not None:
+        attn_mask = pool_leaf_attn_mask(attn_mask, Lf, dtp)
+    if edge_feats is not None:
+        edge_feats = pool_leaf_edge_feats(edge_feats, Lf, dtp)
+    return attn_mask, edge_feats
 
 
 def _time_transformer_attn_and_mlp(
@@ -158,6 +176,7 @@ def print_comprehensive_attention_profiler(
     model: LeafOnlyNet,
     device: torch.device,
     h_proj0: torch.Tensor,
+    h_leaf_diag: torch.Tensor,
     leaf_attn_kw: dict,
     off_attn_kw: Optional[dict],
     *,
@@ -166,6 +185,7 @@ def print_comprehensive_attention_profiler(
     Lf: int,
     Ls_off: int,
     otp: int,
+    dtp: int,
     x_dtype: torch.dtype,
     warmup: int = 3,
     repeat: int = 10,
@@ -174,6 +194,10 @@ def print_comprehensive_attention_profiler(
     Inventory, decomposed pre-attn LayerNorm vs attention ms, mean attention mass (self / neighbor / block),
     and optional torch.compile timings for full Leaf and H-off stacks. Expects ``model.eval()`` for correct
     ``last_attn_*`` buffers (caller typically runs this inside the component-timing section).
+
+    ``h_leaf_diag`` is the diagonal-stack activations (``K * leaf_apply_size`` tokens), matching
+    ``LeafOnlyNet.forward`` after ``_pool_full_leaf_to_diag_tokens``; ``h_proj0`` stays full ``K * LEAF_SIZE``
+    for H-off strip pooling. ``dtp`` is ``model.diag_token_pool`` (same role as ``otp`` for off-diag).
 
     Pass ``eager_attention=True`` inside ``leaf_attn_kw`` / ``off_attn_kw`` (via ``--profile_attention`` on
     the CLI) so the mass table uses materialized softmax weights. With fused SDPA only, mass stats are omitted
@@ -185,9 +209,12 @@ def print_comprehensive_attention_profiler(
     if model.blocks:
         _h = int(model.blocks[0].attn.edge_gate[0].out_features)
         _edge_gate_note = f" LeafBlockAttention edge_gate: 2-layer MLP (4→{_h}→heads)."
+    Ls_diag = int(model.leaf_apply_size) if model.blocks else LEAF_APPLY_SIZE
     print(
         "\n=== Attention profiler (all Transformer stacks) ===\n"
-        f"Strip build: {strip!r}; OFF_DIAG_TOKEN_POOL={otp} → off block tokens L={Ls_off}; "
+        f"Strip build: {strip!r}; DIAG_TOKEN_POOL={dtp} → diag block tokens L={Ls_diag} "
+        f"(LEAF_APPLY_SIZE={LEAF_APPLY_SIZE} from config); "
+        f"OFF_DIAG_TOKEN_POOL={otp} → off block tokens L={Ls_off}; "
         f"num_h_off={Mh}; Leaf stack layers={len(model.blocks)}; H-off stack layers={len(model.off_diag_blocks)}; "
         f"H-off softmax: {_hoff}.{_edge_gate_note}"
     )
@@ -242,7 +269,7 @@ def print_comprehensive_attention_profiler(
 
     dec_headers = ["stack", "layer", "pre_attn_LN_ms", "attention_ms", "LN+attn_ms"]
     dec_rows: list = []
-    h = h_proj0
+    h = h_leaf_diag
     for i, block in enumerate(model.blocks):
         ms_ln = _timed_ms(lambda b=block, x=h: b.norm1(x), device, warmup=warmup, repeat=repeat)
         with torch.no_grad():
@@ -320,7 +347,7 @@ def print_comprehensive_attention_profiler(
     ]
     mass_rows: list = []
     with torch.inference_mode():
-        h = h_proj0
+        h = h_leaf_diag
         for i, block in enumerate(model.blocks):
             xn = block.norm1(h)
             ya = block.attn(xn, **leaf_attn_kw)
@@ -365,7 +392,7 @@ def print_comprehensive_attention_profiler(
 
     try:
         comp_leaf = torch.compile(_leaf_stack_forward, fullgraph=False)
-        ms_leaf_c = _timed_ms(lambda: comp_leaf(h_proj0), device, warmup=compile_w, repeat=compile_r)
+        ms_leaf_c = _timed_ms(lambda: comp_leaf(h_leaf_diag), device, warmup=compile_w, repeat=compile_r)
         print(f"\nLeaf diag stack: torch.compile(full blocks, {compile_w} warmup / {compile_r} repeat) → {ms_leaf_c:.3f} ms/call")
     except Exception as ex:
         print(f"\nLeaf diag stack torch.compile timing skipped: {ex}")
@@ -592,7 +619,6 @@ def evaluate_gradient_interference(args, runtime):
     save_path = runtime["save_path"]
     runtime_use_gcn = runtime["use_gcn"]
     device = runtime["device"]
-    args.num_layers = 2
     args.num_gcn_layers = 2
     args.use_jacobi = True
     use_jacobi = True
@@ -608,6 +634,9 @@ def evaluate_gradient_interference(args, runtime):
         f"Hutchinson probes: Z is low-passed with {HUTCHINSON_PROBE_JACOBI_STEPS} damped-Jacobi sweeps "
         f"(ω={HUTCHINSON_PROBE_JACOBI_OMEGA}) before the loss, matching training."
     )
+
+    if save_path.exists():
+        apply_leaf_only_arch_from_checkpoint_args(args, save_path)
 
     model = LeafOnlyNet(
         input_dim=9,
@@ -830,6 +859,8 @@ def evaluate_gradient_interference(args, runtime):
     Mh = model.num_h_off
     Ls_off = int(model.leaf_apply_off)
     otp = int(model.off_token_pool)
+    dtp = int(model.diag_token_pool)
+    attn_mask, edge_feats = _pool_diag_connectivity_for_model(attn_mask, edge_feats, Lf, model)
     if Mh > 0:
         oe = oe_prof.to(device=device, dtype=x_input.dtype)
         if model.off_diag_dense_attention:
@@ -868,7 +899,8 @@ def evaluate_gradient_interference(args, runtime):
         h_norm = model.embed.norm(h_gcn)
         h_proj0 = model.enc_input_proj(h_norm)
         C_dim = h_proj0.shape[-1]
-        h_diag = h_proj0
+        h_leaf_diag = model._pool_full_leaf_to_diag_tokens(h_proj0, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+        h_diag = h_leaf_diag
         for block in model.blocks:
             h_diag = block(
                 h_diag,
@@ -898,9 +930,10 @@ def evaluate_gradient_interference(args, runtime):
             off_diag_blocks_profile = torch.empty(
                 (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
             )
-        node_U_profile = model.node_u(h_diag)
-        node_V_profile = model.node_v(h_diag)
-        jacobi_scale_profile = model._get_jacobi_scale(h_diag)
+        h_full_diag = model._diag_tokens_to_full_leaf(h_diag, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+        node_U_profile = model.node_u(h_full_diag)
+        node_V_profile = model.node_v(h_full_diag)
+        jacobi_scale_profile = model._get_jacobi_scale(h_full_diag)
 
     was_training = model.training
     model.eval()
@@ -970,67 +1003,106 @@ def evaluate_gradient_interference(args, runtime):
             edge_feats=edge_feats,
             eager_attention=_eager_attn,
         )
-        h_block_in = h_proj0
-        for i, block in enumerate(model.blocks):
-            h_block_in = _time_transformer_attn_and_mlp(
-                timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
+        off_attn_kw = (
+            dict(
+                edge_index=edge_index,
+                edge_values=edge_values,
+                positions=positions,
+                save_attention=False,
+                attn_mask=off_attn_mask,
+                edge_feats=off_edge_feats,
+                eager_attention=_eager_attn,
             )
+            if Mh > 0
+            else None
+        )
+
+        Ls_d = int(model.leaf_apply_size)
+        h_block_in = h_leaf_diag
+        if Mh > 0:
+            assert off_attn_kw is not None
+            off_stream_t = None
+            if len(model.blocks) == 0:
+                off_stream_t = model._build_off_strip(
+                    model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim),
+                    B_prof,
+                    MAX_NUM_LEAVES,
+                    Lf,
+                    C_dim,
+                    Mh,
+                )
+            else:
+                for i, block in enumerate(model.blocks):
+                    h_block_in = _time_transformer_attn_and_mlp(
+                        timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
+                    )
+                    strip = model._build_off_strip(
+                        model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim),
+                        B_prof,
+                        MAX_NUM_LEAVES,
+                        Lf,
+                        C_dim,
+                        Mh,
+                    )
+                    off_in = strip if off_stream_t is None else strip + off_stream_t
+                    off_stream_t = _time_transformer_attn_and_mlp(
+                        timing_rows,
+                        "H off",
+                        i,
+                        model.off_diag_blocks[i],
+                        off_in,
+                        device,
+                        **off_attn_kw,
+                    )
+                    ms_hw = _timed_ms(
+                        lambda h=h_block_in, o=off_stream_t: model._apply_highway(
+                            h, o, B_prof, MAX_NUM_LEAVES, Mh, Ls_d, Ls_off
+                        ),
+                        device,
+                    )
+                    timing_rows.append([f"Highway layer {i}", ms_hw])
+                    with torch.no_grad():
+                        h_block_in, off_stream_t = model._apply_highway(
+                            h_block_in, off_stream_t, B_prof, MAX_NUM_LEAVES, Mh, Ls_d, Ls_off
+                        )
+        else:
+            for i, block in enumerate(model.blocks):
+                h_block_in = _time_transformer_attn_and_mlp(
+                    timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
+                )
 
         ms_leaf_head = _timed_ms(lambda: model._get_leaf_blocks(h_block_in, mode="diagonal"), device)
         timing_rows.append(["Diagonal leaf head (U U^T)", ms_leaf_head])
 
-        off_attn_kw = dict(
-            edge_index=edge_index,
-            edge_values=edge_values,
-            positions=positions,
-            save_attention=False,
-            attn_mask=off_attn_mask,
-            edge_feats=off_edge_feats,
-            eager_attention=_eager_attn,
-        )
         print_comprehensive_attention_profiler(
             model,
             device,
             h_proj0,
+            h_leaf_diag,
             leaf_attn_kw,
-            off_attn_kw if Mh > 0 else None,
+            off_attn_kw,
             B_prof=B_prof,
             Mh=Mh,
             Lf=Lf,
             Ls_off=Ls_off,
             otp=otp,
+            dtp=dtp,
             x_dtype=x_input.dtype,
         )
         if Mh > 0:
-            _strip_label = (
-                "H off strip pool (einsum row+col + token mean)"
-                if getattr(model, "strip_build_mode", "einsum") == "einsum"
-                else "H off strip pool (index_add row+col + token mean)"
+            h_off_final = off_stream_t.view(B_prof, Mh, Ls_off, C_dim)
+            ms_off_head = _timed_ms(
+                lambda: model._get_leaf_blocks(h_off_final, mode="off-diagonal"), device
             )
-            ms_strip = _timed_ms(
-                lambda: _hm_strip_pool_h_off_tokens(
-                    model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
-                ),
-                device,
-            )
-            timing_rows.append([_strip_label, ms_strip])
-            h_off_in = _hm_strip_pool_h_off_tokens(
-                model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
-            )
-            for i, block in enumerate(model.off_diag_blocks):
-                h_off_in = _time_transformer_attn_and_mlp(
-                    timing_rows, "H off", i, block, h_off_in, device, **off_attn_kw
-                )
-            h_off_in = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
-            ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_in, mode="off-diagonal"), device)
             timing_rows.append(["H off head (U V^T)", ms_off_head])
 
-        ms_node_u = _timed_ms(lambda: model.node_u(h_block_in), device)
+        h_block_full = model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+        ms_node_u = _timed_ms(lambda: model.node_u(h_block_full), device)
         timing_rows.append(["Global node U linear", ms_node_u])
-        ms_node_v = _timed_ms(lambda: model.node_v(h_block_in), device)
+        ms_node_v = _timed_ms(lambda: model.node_v(h_block_full), device)
         timing_rows.append(["Global node V linear", ms_node_v])
 
-        ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_in), device)
+        ms_jacobi = _timed_ms(lambda: model._get_jacobi_scale(h_block_full), device)
         timing_rows.append(["Jacobi gate (node_scalar)", ms_jacobi])
 
         def _bench_probe_z():
@@ -1143,7 +1215,6 @@ def evaluate_estimator_variance(args, runtime):
     save_path = runtime["save_path"]
     runtime_use_gcn = runtime["use_gcn"]
     device = runtime["device"]
-    args.num_layers = 2
     args.num_gcn_layers = 2
     args.use_jacobi = True
     use_jacobi = True
@@ -1152,6 +1223,9 @@ def evaluate_estimator_variance(args, runtime):
         raise ValueError("Runtime has use_gcn=False, but the fixed architecture requires 2 GCN layers.")
 
     print("\n--- Isolating Hutchinson Estimator Variance ---")
+
+    if save_path.exists():
+        apply_leaf_only_arch_from_checkpoint_args(args, save_path)
 
     model = LeafOnlyNet(
         input_dim=9,
@@ -1178,7 +1252,7 @@ def evaluate_estimator_variance(args, runtime):
 
     num_samples = 20
     pv = int(getattr(args, "probe_vectors", -1))
-    batch_vectors = pv if pv > 0 else 256
+    batch_vectors = pv if pv > 0 else 64
 
     eval_max_nodes = max(LEAF_SIZE * 2, int(MAX_MIXED_SIZE))
     data_path = Path(data_folder)
@@ -1224,7 +1298,7 @@ def evaluate_estimator_variance(args, runtime):
 
     print(
         f"Sampling Z {num_samples} times with {batch_vectors} vectors each on FIXED frame index {frame_idx} "
-        f"(probe_vectors arg: {pv if pv > 0 else 'default 256'}); "
+        f"(probe_vectors arg: {pv if pv > 0 else 'default 64'}); "
         f"each Z gets {HUTCHINSON_PROBE_JACOBI_STEPS} damped-Jacobi sweeps (ω={HUTCHINSON_PROBE_JACOBI_OMEGA}), "
         "matching training."
     )

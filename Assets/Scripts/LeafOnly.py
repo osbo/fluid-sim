@@ -10,8 +10,13 @@ def _build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--d_model", type=int, default=128)
-    parser.add_argument("--num_layers", type=int, default=2, help="Fixed architecture depth for LeafOnly (kept at 2).")
+    parser.add_argument("--d_model", type=int, default=64)
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        default=1,
+        help="Transformer depth: number of diagonal-leaf blocks and H-off blocks (each stack). Checkpoint must match.",
+    )
     parser.add_argument("--num_heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
     parser.add_argument("--frame", type=int, default=600, help="Frame index to use when --use_single_frame is True. Default: 600.")
     parser.add_argument("--use_single_frame", action="store_true", help="Train on a single frame (--frame) instead of random-frame sampling.")
@@ -67,9 +72,9 @@ def _build_parser():
         metavar="K",
         help=(
             "Monte-Carlo probe count for ||M A Z - Z||^2 loss (columns of Z). "
-            "Default -1: use max(256, ceil(sqrt(n_pad))) as before. "
+            "Default -1: use max(64, ceil(sqrt(n_pad))) as before. "
             "Smaller K (e.g. 64, 128) speeds AZ/MAZ and backward roughly linearly; noisier gradient. "
-            "With --evaluate_gradients, the fixed-frame Hutchinson variance probe uses K=256 when this is -1."
+            "With --evaluate_gradients, the fixed-frame Hutchinson variance probe uses K=64 when this is -1."
         ),
     )
     parser.add_argument(
@@ -95,7 +100,7 @@ def _build_parser():
         "--strip_build_mode",
         type=str,
         choices=("einsum", "no_einsum"),
-        default="no_einsum",
+        default="einsum",
         help=(
             "How to build H off-diagonal row/column strip means from per-leaf features: "
             "einsum (default) or no_einsum (gather/scatter index_add_, lower asymptotic work for large K)."
@@ -125,7 +130,6 @@ def _build_parser():
 
 def train_leaf_only():
     args = _build_parser().parse_args()
-    args.num_layers = 2
     args.num_gcn_layers = 2
     args.use_jacobi = True
     runtime = fixed_runtime_config(__file__)

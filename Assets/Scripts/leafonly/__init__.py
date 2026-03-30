@@ -22,6 +22,7 @@ from .architecture import (
 )
 from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
 from .config import (
+    DIAG_TOKEN_POOL,
     LEAF_APPLY_SIZE,
     LEAF_APPLY_SIZE_OFF,
     LEAF_SIZE,

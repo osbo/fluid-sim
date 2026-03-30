@@ -10,30 +10,28 @@ def _validate_leaf_size(L: int) -> int:
     return L
 
 
-def _validate_off_diag_token_pool(leaf: int, p: int) -> int:
-    """Optional uniform mean-pool factor along each H off-tile strip (after H row/col aggregation).
-
-    ``p == 1``: full ``LEAF_SIZE`` tokens (no extra downsampling). ``p > 1`` must divide ``LEAF_SIZE``;
-    attention + off heads run at ``LEAF_SIZE // p`` (power of 2).
-    """
+def _validate_token_pool(leaf: int, p: int, name: str) -> int:
+    """Uniform mean-pool factor along leaf tokens: ``p == 1`` is full resolution; ``p > 1`` divides ``LEAF_SIZE`` (power of 2)."""
     p = int(p)
     if p < 1:
-        raise ValueError(f"OFF_DIAG_TOKEN_POOL must be >= 1, got {p}")
+        raise ValueError(f"{name} must be >= 1, got {p}")
     if (p & (p - 1)) != 0:
-        raise ValueError(f"OFF_DIAG_TOKEN_POOL must be a power of 2, got {p}")
+        raise ValueError(f"{name} must be a power of 2, got {p}")
     if leaf % p != 0:
-        raise ValueError(f"LEAF_SIZE {leaf} not divisible by OFF_DIAG_TOKEN_POOL {p}")
+        raise ValueError(f"LEAF_SIZE {leaf} not divisible by {name} {p}")
     return p
 
 
 # Power of 2; must match ``leaf_size`` in leaf_only_weights header (``read_leaf_only_header``).
 # Padded graph size is MAX_MIXED_SIZE; leaf count is MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE (static H-grid).
 LEAF_SIZE = _validate_leaf_size(128)
-# Diagonal preconditioner blocks use full leaf tokens.
-LEAF_APPLY_SIZE = LEAF_SIZE
+# Diagonal Transformer + packed diag blocks at LEAF_APPLY_SIZE (checkpoint ``leaf_apply_diag``).
+# 1 = full ``LEAF_SIZE`` tokens per leaf; >1 mean-pools within each leaf before the on-diagonal stack (same idea as off).
+DIAG_TOKEN_POOL = _validate_token_pool(LEAF_SIZE, 1, "DIAG_TOKEN_POOL")
+LEAF_APPLY_SIZE = LEAF_SIZE // DIAG_TOKEN_POOL
 # H off-diagonal Transformer + off_diag heads at LEAF_APPLY_SIZE_OFF (checkpoint ``leaf_apply_off``).
 # 1 = only H-matrix strip aggregation; >1 adds uniform mean-pool along the strip before the off stack.
-OFF_DIAG_TOKEN_POOL = _validate_off_diag_token_pool(LEAF_SIZE, 2)
+OFF_DIAG_TOKEN_POOL = _validate_token_pool(LEAF_SIZE, 4, "OFF_DIAG_TOKEN_POOL")
 LEAF_APPLY_SIZE_OFF = LEAF_SIZE // OFF_DIAG_TOKEN_POOL
 ATTENTION_HOPS = 1
 GLOBAL_FEATURES_DIM = 12
