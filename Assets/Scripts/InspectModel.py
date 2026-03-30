@@ -63,6 +63,7 @@ from leafonly import (
     apply_block_diagonal_m_into,
     block_diagonal_m_apply_workspace,
     build_sparse_bsr_preconditioner,
+    default_attention_layout,
     unpack_precond,
     FluidGraphDataset,
     build_leaf_block_connectivity,
@@ -1107,14 +1108,6 @@ def main():
     jacobi_diag_np[:n_requested] = np.diag(A_small).astype(np.float32, copy=False)
 
     _info("\nLeafOnly (GPU)...")
-    ac_hdr = int(_attention_layout_code)
-    if ac_hdr < 0:
-        ac_hdr = 1
-    _al_pick = (
-        f"{leaf_L}x{leaf_L}",
-        f"{leaf_L + 1}x{leaf_L + 1}",
-        f"{leaf_L + 2}x{leaf_L + 2}",
-    )[min(ac_hdr, 2)]
     model_leaf = LeafOnlyNet(
         input_dim=input_dim_lo,
         d_model=d_model_lo,
@@ -1122,7 +1115,7 @@ def main():
         num_layers=num_layers_lo,
         num_heads=num_heads_lo,
         use_gcn=bool(use_gcn_lo),
-        attention_layout=_al_pick,
+        attention_layout=default_attention_layout(leaf_size_lo),
     ).to(device)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
@@ -1169,6 +1162,7 @@ def main():
                 global_feat = global_feat.unsqueeze(0)
 
         positions_leaf = x_leaf[0, :, :3]
+        # Full leaf resolution connectivity; forward() pools (om, oe) and strip only when OFF_DIAG_TOKEN_POOL>1.
         pre_leaf_connectivity = build_leaf_block_connectivity(
             edge_index_leaf,
             edge_values_leaf,
@@ -1176,7 +1170,6 @@ def main():
             leaf_L,
             device,
             x_leaf.dtype,
-            num_extra=int(model_leaf.num_extra),
         )
         pre_leaf_connectivity = tuple(
             t.contiguous() if isinstance(t, torch.Tensor) else t for t in pre_leaf_connectivity

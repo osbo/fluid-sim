@@ -94,22 +94,20 @@ def hmatrix_off_masks_and_feats(
     leaf_size: int,
     device,
     dtype=torch.float32,
-    num_extra: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Legacy helper: dense all-ones mask and zero edge_feats of shape (M_off, T, T), T = L + num_extra.
+    Legacy helper: dense all-ones mask and zero edge_feats of shape (M_off, L, L+1) / (..., 4).
 
     Training/inference use ``build_leaf_block_connectivity``, which builds masks and edge_feats from
     the graph (reachability + per-cell mean edge features) instead of calling this.
     """
     L = int(leaf_size)
-    T = L + int(num_extra)
     if num_off_blocks <= 0:
-        zm = torch.zeros(0, T, T, device=device, dtype=dtype)
-        zf = torch.zeros(0, T, T, 4, device=device, dtype=dtype)
+        zm = torch.zeros(0, L, L + 1, device=device, dtype=dtype)
+        zf = torch.zeros(0, L, L + 1, 4, device=device, dtype=dtype)
         return zm, zf
-    m = torch.ones(num_off_blocks, T, T, device=device, dtype=dtype)
-    f = torch.zeros(num_off_blocks, T, T, 4, device=device, dtype=dtype)
+    m = torch.ones(num_off_blocks, L, L + 1, device=device, dtype=dtype)
+    f = torch.zeros(num_off_blocks, L, L + 1, 4, device=device, dtype=dtype)
     return m, f
 
 
