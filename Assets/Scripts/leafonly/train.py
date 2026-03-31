@@ -340,6 +340,7 @@ def train_leaf_only(args, runtime):
         strip_build_mode=getattr(args, "strip_build_mode", "einsum"),
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
         diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
+        use_highways=bool(getattr(args, "use_highways", True)),
     ).to(device)
     ms_model = (time.perf_counter() - t_seg) * 1000.0
     _oda = bool(getattr(args, "off_diag_dense_attn", True))
@@ -347,7 +348,8 @@ def train_leaf_only(args, runtime):
     print(
         "  [startup] Ablation config:"
         f" layers={args.num_layers}, gcn_layers={effective_gcn_layers}, jacobi=True (node_scalar),"
-        f" attention_layout={attention_layout}, off_diag_dense_attn={_oda}, diag_dense_attn={_dda}"
+        f" attention_layout={attention_layout}, off_diag_dense_attn={_oda}, diag_dense_attn={_dda},"
+        f" use_highways={bool(getattr(args, 'use_highways', True))}"
     )
 
     ms_compile = 0.0
