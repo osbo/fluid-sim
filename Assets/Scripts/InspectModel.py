@@ -1171,6 +1171,16 @@ def main():
             "False (--no-diag-dense-attn) = n-hop reachability + sparse in-leaf features."
         ),
     )
+    parser.add_argument(
+        "--use-highways",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "LeafOnly output-head highway conditioning toggle. "
+            "True (default): heads use [block,row,col] token inputs. "
+            "False (--no-use-highways): no highway build, heads use block tokens only."
+        ),
+    )
     args = parser.parse_args()
     test_only = bool(args.test_only)
 
@@ -1264,6 +1274,7 @@ def main():
         attention_layout=default_attention_layout(leaf_size_lo),
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
         diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
+        use_highways=bool(getattr(args, "use_highways", True)),
     ).to(device)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)

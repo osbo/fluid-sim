@@ -125,6 +125,16 @@ def _build_parser():
             "and sparse in-leaf edge aggregation."
         ),
     )
+    parser.add_argument(
+        "--use-highways",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use row/column highway conditioning in output heads. "
+            "True (default): heads take [block,row,col] tokens. "
+            "False (--no-use-highways): skip highway construction and heads use block tokens only."
+        ),
+    )
     return parser
 
 

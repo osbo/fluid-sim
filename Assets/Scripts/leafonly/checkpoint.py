@@ -15,6 +15,8 @@ from .architecture import EDGE_GATE_HIDDEN_DIM
 LEAF_ONLY_HEADER_BYTES = 44
 CHECKPOINT_EDGE_GATE_EXT_MAGIC = 0x4544474D  # b"MDGE"
 CHECKPOINT_EDGE_GATE_EXT_VER = 1
+CHECKPOINT_HEAD_EXT_MAGIC = 0x48454144  # b"DAEH" little-endian
+CHECKPOINT_HEAD_EXT_VER = 1
 
 
 def read_leaf_only_header(path):
@@ -63,6 +65,7 @@ def read_leaf_only_header(path):
         leaf_apply_off = leaf_apply_diag
 
     edge_gate_hidden_dim = 0
+    mlp_heads = 0
     if header_bytes == 44:
         with open(path, "rb") as f:
             f.seek(44)
@@ -72,6 +75,14 @@ def read_leaf_only_header(path):
             if mag == CHECKPOINT_EDGE_GATE_EXT_MAGIC and ver == CHECKPOINT_EDGE_GATE_EXT_VER:
                 header_bytes = 52
                 edge_gate_hidden_dim = int(EDGE_GATE_HIDDEN_DIM)
+                with open(path, "rb") as f:
+                    f.seek(52)
+                    ext2 = f.read(8)
+                if len(ext2) == 8:
+                    mag2, ver2 = struct.unpack("<ii", ext2)
+                    if mag2 == CHECKPOINT_HEAD_EXT_MAGIC and ver2 == CHECKPOINT_HEAD_EXT_VER:
+                        header_bytes = 60
+                        mlp_heads = 1
 
     return (
         d_model,
@@ -87,6 +98,7 @@ def read_leaf_only_header(path):
         attention_layout_code,
         decoupled_route_gates,
         edge_gate_hidden_dim,
+        mlp_heads,
     )
 
 
@@ -113,6 +125,7 @@ def leaf_only_arch_from_checkpoint(path) -> dict | None:
         attention_layout_code,
         decoupled_route_gates,
         edge_gate_hidden_dim,
+        mlp_heads,
     ) = read_leaf_only_header(p)
     return {
         "d_model": int(d_model),
@@ -128,6 +141,7 @@ def leaf_only_arch_from_checkpoint(path) -> dict | None:
         "attention_layout_code": int(attention_layout_code),
         "decoupled_route_gates": int(decoupled_route_gates),
         "edge_gate_hidden_dim": int(edge_gate_hidden_dim),
+        "mlp_heads": int(mlp_heads),
     }
 
 
@@ -219,6 +233,37 @@ def _read_gcn_layer_into(f, gcn_layer, read_tensor):
     _read_into(f, gcn_layer.update_gate[2].bias, read_tensor, transpose=False)
 
 
+def _write_head_module(f, head):
+    if isinstance(head, nn.Sequential):
+        _write_packed_tensor(f, head[0].weight.detach().cpu().float(), transpose=True)
+        _write_packed_tensor(f, head[0].bias.detach().cpu().float(), transpose=False)
+        _write_packed_tensor(f, head[2].weight.detach().cpu().float(), transpose=True)
+        _write_packed_tensor(f, head[2].bias.detach().cpu().float(), transpose=False)
+        return
+    _write_packed_tensor(f, head.weight.detach().cpu().float(), transpose=True)
+    _write_packed_tensor(f, head.bias.detach().cpu().float(), transpose=False)
+
+
+def _read_head_module_into(f, head, read_tensor, *, ckpt_is_mlp: bool):
+    if isinstance(head, nn.Sequential):
+        if ckpt_is_mlp:
+            _read_into(f, head[0].weight, read_tensor, transpose=True)
+            _read_into(f, head[0].bias, read_tensor, transpose=False)
+            _read_into(f, head[2].weight, read_tensor, transpose=True)
+            _read_into(f, head[2].bias, read_tensor, transpose=False)
+        else:
+            # Legacy checkpoints had single-linear heads; map into second layer, re-init first.
+            nn.init.normal_(head[0].weight, std=0.001)
+            nn.init.constant_(head[0].bias, 0.0)
+            _read_into(f, head[2].weight, read_tensor, transpose=True)
+            _read_into(f, head[2].bias, read_tensor, transpose=False)
+        return
+    if ckpt_is_mlp:
+        raise ValueError("Checkpoint has MLP heads, but model expects linear heads.")
+    _read_into(f, head.weight, read_tensor, transpose=True)
+    _read_into(f, head.bias, read_tensor, transpose=False)
+
+
 def _write_transformer_block(f, block, *, write_route_gates: bool = True):
     _write_packed_tensor(f, block.norm1.weight.detach().cpu().float(), False)
     _write_packed_tensor(f, block.norm1.bias.detach().cpu().float(), False)
@@ -257,6 +302,7 @@ def save_leaf_only_weights(model, path, input_dim=9):
             or model.blocks[0].attn.matrix_route_gate is not None
         )
     )
+    has_mlp_heads = isinstance(model.off_diag_head_U, nn.Sequential)
     with open(path, "wb") as f:
         f.write(
             struct.pack(
@@ -275,6 +321,13 @@ def save_leaf_only_weights(model, path, input_dim=9):
             )
         )
         f.write(struct.pack("<ii", CHECKPOINT_EDGE_GATE_EXT_MAGIC, CHECKPOINT_EDGE_GATE_EXT_VER))
+        f.write(
+            struct.pack(
+                "<ii",
+                CHECKPOINT_HEAD_EXT_MAGIC if has_mlp_heads else 0,
+                CHECKPOINT_HEAD_EXT_VER if has_mlp_heads else 0,
+            )
+        )
         _write_packed_tensor(f, model.embed.lift[0].weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.embed.lift[0].bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.embed.lift[2].weight.detach().cpu().float(), transpose=True)
@@ -289,12 +342,9 @@ def save_leaf_only_weights(model, path, input_dim=9):
             _write_transformer_block(f, block, write_route_gates=has_route_gates)
         for block in model.off_diag_blocks:
             _write_transformer_block(f, block, write_route_gates=has_route_gates)
-        _write_packed_tensor(f, model.off_diag_head_U.weight.detach().cpu().float(), transpose=True)
-        _write_packed_tensor(f, model.off_diag_head_U.bias.detach().cpu().float(), transpose=False)
-        _write_packed_tensor(f, model.off_diag_head_V.weight.detach().cpu().float(), transpose=True)
-        _write_packed_tensor(f, model.off_diag_head_V.bias.detach().cpu().float(), transpose=False)
-        _write_packed_tensor(f, model.leaf_head.weight.detach().cpu().float(), transpose=True)
-        _write_packed_tensor(f, model.leaf_head.bias.detach().cpu().float(), transpose=False)
+        _write_head_module(f, model.off_diag_head_U)
+        _write_head_module(f, model.off_diag_head_V)
+        _write_head_module(f, model.leaf_head)
         _write_packed_tensor(f, model.node_u.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.node_u.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.node_v.weight.detach().cpu().float(), transpose=True)
@@ -345,6 +395,7 @@ def load_leaf_only_weights(model, path):
         attention_layout_code,
         decoupled_route_gates,
         edge_gate_hidden_dim,
+        mlp_heads,
     ) = result
     legacy_edge_gate_linear = int(edge_gate_hidden_dim) != int(EDGE_GATE_HIDDEN_DIM)
     if header_bytes < 40:
@@ -422,12 +473,9 @@ def load_leaf_only_weights(model, path):
             _read_transformer_block_into(
                 f, block, read_tensor, load_route_gates=_load_rg, legacy_edge_gate_linear=legacy_edge_gate_linear
             )
-        _read_into(f, model.off_diag_head_U.weight, read_tensor, transpose=True)
-        _read_into(f, model.off_diag_head_U.bias, read_tensor, transpose=False)
-        _read_into(f, model.off_diag_head_V.weight, read_tensor, transpose=True)
-        _read_into(f, model.off_diag_head_V.bias, read_tensor, transpose=False)
-        _read_into(f, model.leaf_head.weight, read_tensor, transpose=True)
-        _read_into(f, model.leaf_head.bias, read_tensor, transpose=False)
+        _read_head_module_into(f, model.off_diag_head_U, read_tensor, ckpt_is_mlp=bool(mlp_heads))
+        _read_head_module_into(f, model.off_diag_head_V, read_tensor, ckpt_is_mlp=bool(mlp_heads))
+        _read_head_module_into(f, model.leaf_head, read_tensor, ckpt_is_mlp=bool(mlp_heads))
         _read_into(f, model.node_u.weight, read_tensor, transpose=True)
         _read_into(f, model.node_u.bias, read_tensor, transpose=False)
         _read_into(f, model.node_v.weight, read_tensor, transpose=True)
