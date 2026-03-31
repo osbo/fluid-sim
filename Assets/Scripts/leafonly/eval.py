@@ -1056,11 +1056,27 @@ def evaluate_gradient_interference(args, runtime):
                 h_off_in = _time_transformer_attn_and_mlp(
                     timing_rows, "H off", i, block, h_off_in, device, **off_attn_kw
                 )
-            h_off_in = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
-            ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_in, mode="off-diagonal"), device)
+            h_off_tokens = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
+            ms_off_head = _timed_ms(lambda: model._get_leaf_blocks(h_off_tokens, mode="off-diagonal"), device)
             timing_rows.append(["H off head (U V^T)", ms_off_head])
+        else:
+            h_off_tokens = None
 
         h_block_full = model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+        ms_highway = _timed_ms(
+            lambda: model._build_token_highways(
+                h_ref=h_proj0,
+                h_diag=h_block_in,
+                off_stream=(h_off_tokens.reshape(B_prof * Mh, Ls_off, C_dim) if h_off_tokens is not None else None),
+                B=B_prof,
+                K=MAX_NUM_LEAVES,
+                L=Lf,
+                C_h=C_dim,
+                M_off=Mh,
+            ),
+            device,
+        )
+        timing_rows.append(["Row/col highway gather (diag+H-off)", ms_highway])
         ms_node_u = _timed_ms(lambda: model.node_u(h_block_full), device)
         timing_rows.append(["Global node U linear", ms_node_u])
         ms_node_v = _timed_ms(lambda: model.node_v(h_block_full), device)

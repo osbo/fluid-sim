@@ -689,6 +689,10 @@ class LeafOnlyNet(nn.Module):
         wr_sum, wc_sum = HM_SUM_W_ROW_CPU.clone(), HM_SUM_W_COL_CPU.clone()
         self.register_buffer("hm_sum_w_row", wr_sum, persistent=False)
         self.register_buffer("hm_sum_w_col", wc_sum, persistent=False)
+        self.register_buffer("leaf_idx_full", torch.arange(MAX_NUM_LEAVES, dtype=torch.long), persistent=False)
+        self._last_row_highway = None
+        self._last_col_highway = None
+        self._highway_cache: dict = {}
 
     def _pool_full_leaf_to_diag_tokens(self, h: torch.Tensor, B: int, K: int, L_full: int, C_h: int) -> torch.Tensor:
         """(B, K*L_full, C) → (B, K*Ls_diag, C) via uniform mean-pool over ``diag_token_pool`` consecutive tokens."""
@@ -770,6 +774,106 @@ class LeafOnlyNet(nn.Module):
             Ls = self.leaf_apply_off
             h_off = h_off.view(B * M_off, Ls, self.off_token_pool, C_h).mean(dim=2)
         return h_off
+
+    def _accumulate_highway_from_blocks(
+        self,
+        row_highway: torch.Tensor,
+        col_highway: torch.Tensor,
+        block_tokens: torch.Tensor,
+        row_leaf_idx: torch.Tensor,
+        col_leaf_idx: torch.Tensor,
+        gather_idx: Optional[torch.Tensor],
+        pool: int,
+        leaf_size: int,
+    ) -> None:
+        """
+        Add per-block tokens into row/column highways in leaf-index space.
+        block_tokens: (B, M, Ls, C) with Ls * pool == leaf_size.
+        row_leaf_idx/col_leaf_idx: (T,) destination leaf indices.
+        gather_idx: (T,) mapping from destination slot to source block (or None when T == M).
+        """
+        if block_tokens.numel() == 0:
+            return
+        B, M, Ls, C_h = block_tokens.shape
+        if Ls * int(pool) != int(leaf_size):
+            raise ValueError(
+                f"highway scatter expected tokens_per_block * pool == leaf_size, got {Ls} * {pool} != {leaf_size}"
+            )
+        toks = block_tokens if pool <= 1 else block_tokens.repeat_interleave(int(pool), dim=2)
+        if gather_idx is not None:
+            toks = toks.index_select(1, gather_idx)
+        T = int(row_leaf_idx.numel())
+        if toks.shape[1] != T:
+            raise ValueError(
+                f"highway scatter mismatch: gathered tokens have T={toks.shape[1]}, "
+                f"but destination leaf index length is {T}"
+            )
+        row_highway.index_add_(1, row_leaf_idx, toks)
+        col_highway.index_add_(1, col_leaf_idx, toks)
+
+    def _build_token_highways(
+        self,
+        h_ref: torch.Tensor,
+        h_diag: torch.Tensor,
+        off_stream: Optional[torch.Tensor],
+        B: int,
+        K: int,
+        L: int,
+        C_h: int,
+        M_off: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build full row/column token highways (B, K*L, C) from diagonal and H off-diagonal token streams.
+        """
+        cache_key = (str(h_ref.device), str(h_ref.dtype), int(B), int(K), int(L), int(C_h), int(M_off))
+        cache = self._highway_cache.get(cache_key)
+        if cache is None:
+            row_highway = h_ref.new_zeros(B, K, L, C_h)
+            col_highway = h_ref.new_zeros(B, K, L, C_h)
+            diag_leaf_idx = self.leaf_idx_full[:K].to(device=h_ref.device, dtype=torch.long)
+            if M_off > 0:
+                off_row_idx, off_col_idx, off_gather_idx = _hm_prolong_scatter_indices(h_ref.device)
+            else:
+                off_row_idx = off_col_idx = off_gather_idx = None
+            cache = {
+                "row_highway": row_highway,
+                "col_highway": col_highway,
+                "diag_leaf_idx": diag_leaf_idx,
+                "off_row_idx": off_row_idx,
+                "off_col_idx": off_col_idx,
+                "off_gather_idx": off_gather_idx,
+            }
+            self._highway_cache[cache_key] = cache
+        else:
+            row_highway = cache["row_highway"]
+            col_highway = cache["col_highway"]
+            row_highway.zero_()
+            col_highway.zero_()
+
+        diag_tokens = h_diag.view(B, K, self.leaf_apply_size, C_h)
+        self._accumulate_highway_from_blocks(
+            row_highway=row_highway,
+            col_highway=col_highway,
+            block_tokens=diag_tokens,
+            row_leaf_idx=cache["diag_leaf_idx"],
+            col_leaf_idx=cache["diag_leaf_idx"],
+            gather_idx=None,
+            pool=self.diag_token_pool,
+            leaf_size=L,
+        )
+        if M_off > 0 and off_stream is not None:
+            off_tokens = off_stream.view(B, M_off, self.leaf_apply_off, C_h)
+            self._accumulate_highway_from_blocks(
+                row_highway=row_highway,
+                col_highway=col_highway,
+                block_tokens=off_tokens,
+                row_leaf_idx=cache["off_row_idx"],
+                col_leaf_idx=cache["off_col_idx"],
+                gather_idx=cache["off_gather_idx"],
+                pool=self.off_token_pool,
+                leaf_size=L,
+            )
+        return row_highway.view(B, K * L, C_h), col_highway.view(B, K * L, C_h)
 
     def forward(
         self,
@@ -956,6 +1060,17 @@ class LeafOnlyNet(nn.Module):
                     prep_matrix_node=diag_prep_matrix,
                     eager_attention=eager_attention,
                 )
+
+        self._last_row_highway, self._last_col_highway = self._build_token_highways(
+            h_ref=h,
+            h_diag=h_diag,
+            off_stream=off_stream,
+            B=B,
+            K=K,
+            L=L,
+            C_h=C_h,
+            M_off=M_off,
+        )
 
         diag_blocks = self._get_leaf_blocks(h_diag, mode="diagonal")
 
