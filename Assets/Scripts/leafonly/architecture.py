@@ -47,6 +47,16 @@ def _hm_prolong_scatter_indices(device: torch.device) -> tuple[torch.Tensor, tor
     return got
 
 
+def warmup_hmatrix_prolong_gpu(device: torch.device) -> None:
+    """Materialize cached H-matrix prolongation indices on ``device`` before ``torch.cuda.graph`` capture.
+
+    ``apply_block_diagonal_m_into`` calls ``_hm_prolong_scatter_indices`` lazily; calling this once up front
+    avoids any first-touch ``.to(device)`` during graph recording.
+    """
+    if device.type == "cuda":
+        _hm_prolong_scatter_indices(device)
+
+
 def _merge_batch_blocks(t: torch.Tensor, merge: bool) -> Tuple[torch.Tensor, Optional[Tuple[int, int]]]:
     if not merge or t.dim() < 4:
         return t, None

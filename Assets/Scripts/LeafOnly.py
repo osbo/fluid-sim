@@ -116,7 +116,7 @@ def _build_parser():
         help=(
             "How to apply M in the probe loss (AZ then MAZ): both use batched apply_block_diagonal_M "
             "(same operator as InspectModel’s expanded M; autograd cannot use BSR sparse.mm). "
-            "bsr = default, eager apply; matrix_free = torch.compile on bmm + apply (faster on CUDA)."
+            "matrix_free (default) = torch.compile on bmm + apply (faster on CUDA); bsr = eager apply."
         ),
     )
     parser.add_argument(

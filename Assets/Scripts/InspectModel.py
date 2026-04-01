@@ -9,6 +9,8 @@ Diag (Jacobi), IC-class (``ilupp.IChol0`` or scipy ``spilu`` fallback), PyAMG / 
 Use ``--test_only`` to run the PCG benchmark path and print only that summary (no plots, profiling, or dense AMG build).
 Use ``--fast_plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``eig(A·M)``, ``cond(A·M)``, and A-eigenmode error curves (saves many minutes for n in the thousands).
 
+CUDA Graph (``--pcg_cuda_backend cudagraph``, default) records real GPU kernels and replays them — it is a production optimization for low CPU launch overhead, not a synthetic timing trick. Use ``--pcg_cuda_backend compile`` for ``torch.compile(one PCG iter)`` + a Python loop instead.
+
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
 plots singular-value decay vs. ``leaf_apply_diag`` / ``leaf_apply_off``. On-diagonal packed blocks use
@@ -76,6 +78,7 @@ from leafonly import (
     unpack_precond,
     FluidGraphDataset,
     build_leaf_block_connectivity,
+    warmup_hmatrix_prolong_gpu,
 )
 from leafonly.eval import _timed_ms
 from leafonly.checkpoint import leaf_only_arch_from_checkpoint
@@ -794,7 +797,12 @@ def pcg_gpu_cudagraph_bsr(
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             one_iter()
-    except RuntimeError:
+    except RuntimeError as e:
+        warnings.warn(
+            f"pcg_gpu_cudagraph_bsr: CUDA graph capture failed ({e}); falling back to eager pcg_gpu (per-iter Python + launches).",
+            UserWarning,
+            stacklevel=2,
+        )
         return pcg_gpu(
             A_gpu,
             b_gpu,
@@ -840,10 +848,15 @@ def pcg_gpu_cudagraph_matrix_free(
     check_freq=3,
 ):
     """
-    Matrix-free PCG ``z = M @ r`` with one iteration captured in a CUDA Graph.
-    ``apply_precond_into(r, z_out)`` must write in-place into ``z_out`` without allocations.
-    ``A_gpu`` should be CSR for best performance. After capture, state is reset so replays
-    start from the true initial iterate.
+    Matrix-free PCG ``z = M @ r`` with one iteration captured in a CUDA Graph (``torch.cuda.CUDAGraph``).
+
+    ``apply_precond_into(r, z_out)`` must write in-place into ``z_out`` without allocations — e.g.
+    ``apply_block_diagonal_m_into(..., ws=block_diagonal_m_apply_workspace(...))``. Equivalent to
+    ``torch.cuda.make_graphed_callables``-style replay of a fixed kernel sequence; manual capture is used
+    so the whole PCG iteration (SpMV + precond + vector ops) lives in one graph.
+
+    ``A_gpu`` should be CSR for best performance. After capture, state is reset so replays start from the
+    true initial iterate.
     """
     if device is None:
         device = b_gpu.device
@@ -887,7 +900,13 @@ def pcg_gpu_cudagraph_matrix_free(
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             one_iter()
-    except RuntimeError:
+    except RuntimeError as e:
+        warnings.warn(
+            f"pcg_gpu_cudagraph_matrix_free: CUDA graph capture failed ({e}); falling back to eager pcg_gpu (per-iter Python + launches).",
+            UserWarning,
+            stacklevel=2,
+        )
+
         def _apply_precond_fallback(r: torch.Tensor) -> torch.Tensor:
             z = torch.empty_like(r)
             return apply_precond_into(r, z)
@@ -925,6 +944,343 @@ def pcg_gpu_cudagraph_matrix_free(
     torch.cuda.synchronize()
     wall_ms = start_ev.elapsed_time(end_ev)
     return x_static.clone(), iters, wall_ms
+
+
+def pcg_gpu_compiled_bsr(
+    A_gpu,
+    b_gpu,
+    M_sparse_bsr,
+    tol=1e-8,
+    max_iter=500,
+    device=None,
+    check_freq=3,
+    *,
+    compile_mode: str = "reduce-overhead",
+):
+    """
+    Same numerics as ``pcg_gpu_cudagraph_bsr``, but one iteration is ``torch.compile(one_iter)`` and the
+    solve loop calls the compiled callable each time (Inductor may fuse; still pays Python + dispatcher
+    per iteration, unlike CUDA Graph replay).
+    """
+    if device is None:
+        device = b_gpu.device
+    if device.type != "cuda":
+        raise ValueError("pcg_gpu_compiled_bsr requires CUDA")
+
+    dtype = b_gpu.dtype
+    x_static = torch.zeros_like(b_gpu)
+    r_static = b_gpu.clone()
+    z_static = torch.zeros_like(b_gpu)
+    z_static.copy_(M_sparse_bsr @ r_static)
+    p_static = z_static.clone()
+    rho_static = torch.zeros(1, device=device, dtype=dtype)
+    rho_static.fill_((r_static * z_static).sum())
+
+    tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
+
+    def one_iter():
+        Ap = A_gpu @ p_static
+        pAp = (p_static * Ap).sum()
+        alpha = rho_static / pAp
+        x_static.add_(p_static * alpha)
+        r_static.sub_(Ap * alpha)
+        z_static.copy_(M_sparse_bsr @ r_static)
+        rho_new = (r_static * z_static).sum()
+        beta = rho_new / rho_static
+        rho_static.fill_(rho_new)
+        p_static.mul_(beta).add_(z_static)
+
+    n = int(b_gpu.shape[0])
+    torch.cuda.synchronize()
+    z_static.copy_(M_sparse_bsr @ r_static)
+    if getattr(A_gpu, "layout", None) == torch.sparse_csr:
+        _ = torch.sparse.mm(A_gpu, p_static.view(n, 1))
+    else:
+        _ = A_gpu @ p_static
+    torch.cuda.synchronize()
+
+    try:
+        one_iter_compiled = torch.compile(one_iter, mode=compile_mode, fullgraph=False)
+    except Exception as e:
+        warnings.warn(
+            f"pcg_gpu_compiled_bsr: torch.compile failed ({e}); falling back to eager pcg_gpu.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return pcg_gpu(
+            A_gpu,
+            b_gpu,
+            lambda r: M_sparse_bsr @ r,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+
+    try:
+        for _ in range(3):
+            x_static.zero_()
+            r_static.copy_(b_gpu)
+            z_static.copy_(M_sparse_bsr @ r_static)
+            p_static.copy_(z_static)
+            rho_static.fill_((r_static * z_static).sum())
+            one_iter_compiled()
+    except Exception as e:
+        warnings.warn(
+            f"pcg_gpu_compiled_bsr: compiled iteration failed during warmup ({e}); falling back to eager pcg_gpu.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return pcg_gpu(
+            A_gpu,
+            b_gpu,
+            lambda r: M_sparse_bsr @ r,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+
+    x_static.zero_()
+    r_static.copy_(b_gpu)
+    z_static.copy_(M_sparse_bsr @ r_static)
+    p_static.copy_(z_static)
+    rho_static.fill_((r_static * z_static).sum())
+
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start_ev.record()
+    iters = 0
+    for k in range(max_iter):
+        one_iter_compiled()
+        iters = k + 1
+        if (k + 1) % check_freq == 0 or k == max_iter - 1:
+            r_sq = (r_static * r_static).sum()
+            if r_sq.item() <= tol_sq_val:
+                break
+    end_ev.record()
+    torch.cuda.synchronize()
+    wall_ms = start_ev.elapsed_time(end_ev)
+    return x_static.clone(), iters, wall_ms
+
+
+def pcg_gpu_compiled_matrix_free(
+    A_gpu,
+    b_gpu,
+    apply_precond_into,
+    tol=1e-8,
+    max_iter=500,
+    device=None,
+    check_freq=3,
+    *,
+    compile_mode: str = "reduce-overhead",
+):
+    """
+    Same numerics as ``pcg_gpu_cudagraph_matrix_free``, but uses ``torch.compile(one_iter)`` instead of
+    ``torch.cuda.CUDAGraph``. Useful when graph capture is unsupported or you prefer Inductor over replay.
+    """
+    if device is None:
+        device = b_gpu.device
+    if device.type != "cuda":
+        raise ValueError("pcg_gpu_compiled_matrix_free requires CUDA")
+
+    dtype = b_gpu.dtype
+    x_static = torch.zeros_like(b_gpu)
+    r_static = b_gpu.clone()
+    z_static = torch.zeros_like(b_gpu)
+    apply_precond_into(r_static, z_static)
+    p_static = z_static.clone()
+    rho_static = torch.zeros(1, device=device, dtype=dtype)
+    rho_static.fill_((r_static * z_static).sum())
+
+    tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
+
+    def one_iter():
+        Ap = A_gpu @ p_static
+        pAp = (p_static * Ap).sum()
+        alpha = rho_static / pAp
+        x_static.add_(p_static * alpha)
+        r_static.sub_(Ap * alpha)
+        apply_precond_into(r_static, z_static)
+        rho_new = (r_static * z_static).sum()
+        beta = rho_new / rho_static
+        rho_static.fill_(rho_new)
+        p_static.mul_(beta).add_(z_static)
+
+    n = int(b_gpu.shape[0])
+    torch.cuda.synchronize()
+    apply_precond_into(r_static, z_static)
+    if getattr(A_gpu, "layout", None) == torch.sparse_csr:
+        _ = torch.sparse.mm(A_gpu, p_static.view(n, 1))
+    else:
+        _ = A_gpu @ p_static
+    torch.cuda.synchronize()
+
+    try:
+        one_iter_compiled = torch.compile(one_iter, mode=compile_mode, fullgraph=False)
+    except Exception as e:
+        warnings.warn(
+            f"pcg_gpu_compiled_matrix_free: torch.compile failed ({e}); falling back to eager pcg_gpu.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+        def _apply_precond_fallback(r: torch.Tensor) -> torch.Tensor:
+            z = torch.empty_like(r)
+            return apply_precond_into(r, z)
+
+        return pcg_gpu(
+            A_gpu,
+            b_gpu,
+            _apply_precond_fallback,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+
+    try:
+        for _ in range(3):
+            x_static.zero_()
+            r_static.copy_(b_gpu)
+            apply_precond_into(r_static, z_static)
+            p_static.copy_(z_static)
+            rho_static.fill_((r_static * z_static).sum())
+            one_iter_compiled()
+    except Exception as e:
+        warnings.warn(
+            f"pcg_gpu_compiled_matrix_free: compiled iteration failed during warmup ({e}); falling back to eager pcg_gpu.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+        def _apply_precond_fallback(r: torch.Tensor) -> torch.Tensor:
+            z = torch.empty_like(r)
+            return apply_precond_into(r, z)
+
+        return pcg_gpu(
+            A_gpu,
+            b_gpu,
+            _apply_precond_fallback,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+
+    x_static.zero_()
+    r_static.copy_(b_gpu)
+    apply_precond_into(r_static, z_static)
+    p_static.copy_(z_static)
+    rho_static.fill_((r_static * z_static).sum())
+
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start_ev.record()
+    iters = 0
+    for k in range(max_iter):
+        one_iter_compiled()
+        iters = k + 1
+        if (k + 1) % check_freq == 0 or k == max_iter - 1:
+            r_sq = (r_static * r_static).sum()
+            if r_sq.item() <= tol_sq_val:
+                break
+    end_ev.record()
+    torch.cuda.synchronize()
+    wall_ms = start_ev.elapsed_time(end_ev)
+    return x_static.clone(), iters, wall_ms
+
+
+def _dispatch_pcg_matrix_free_cuda(
+    A_gpu,
+    b_gpu,
+    apply_precond_into,
+    *,
+    backend: str,
+    tol: float,
+    max_iter: int,
+    device: torch.device,
+    check_freq: int,
+):
+    """``backend``: ``cudagraph`` | ``compile`` | ``eager``."""
+    if backend == "cudagraph":
+        return pcg_gpu_cudagraph_matrix_free(
+            A_gpu,
+            b_gpu,
+            apply_precond_into,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+    if backend == "compile":
+        return pcg_gpu_compiled_matrix_free(
+            A_gpu,
+            b_gpu,
+            apply_precond_into,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+
+    def _apply_alloc(r: torch.Tensor) -> torch.Tensor:
+        z = torch.empty_like(r)
+        return apply_precond_into(r, z)
+
+    return pcg_gpu(
+        A_gpu,
+        b_gpu,
+        _apply_alloc,
+        tol=tol,
+        max_iter=max_iter,
+        device=device,
+        check_freq=check_freq,
+    )
+
+
+def _dispatch_pcg_bsr_cuda(
+    A_gpu,
+    b_gpu,
+    M_sparse_bsr,
+    *,
+    backend: str,
+    tol: float,
+    max_iter: int,
+    device: torch.device,
+    check_freq: int,
+):
+    if backend == "cudagraph":
+        return pcg_gpu_cudagraph_bsr(
+            A_gpu,
+            b_gpu,
+            M_sparse_bsr,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+    if backend == "compile":
+        return pcg_gpu_compiled_bsr(
+            A_gpu,
+            b_gpu,
+            M_sparse_bsr,
+            tol=tol,
+            max_iter=max_iter,
+            device=device,
+            check_freq=check_freq,
+        )
+    return pcg_gpu(
+        A_gpu,
+        b_gpu,
+        lambda r: M_sparse_bsr @ r,
+        tol=tol,
+        max_iter=max_iter,
+        device=device,
+        check_freq=check_freq,
+    )
 
 
 def pcg_cpu(A, b, apply_precond, tol=1e-8, max_iter=500, debug=False):
@@ -1189,8 +1545,20 @@ def main():
         choices=("bsr", "matrix_free"),
         default="matrix_free",
         help=(
-            "LeafOnly PCG preconditioner apply: bsr = materialized BSR + SpMV (default); "
-            "matrix_free = apply_block_diagonal_m_into with preallocated workspace (scales for large H off-diagonal)."
+            "LeafOnly PCG preconditioner representation: matrix_free (default) = allocation-free "
+            "apply_block_diagonal_m_into + block_diagonal_m_apply_workspace; bsr = materialized BSR SpMV. "
+            "On CUDA, how that apply is driven in the solve loop is set by --pcg_cuda_backend "
+            "(cudagraph | compile | eager)."
+        ),
+    )
+    parser.add_argument(
+        "--pcg_cuda_backend",
+        choices=("cudagraph", "compile", "eager"),
+        default="cudagraph",
+        help=(
+            "How to run GPU PCG in this script (none / Jacobi / LeafOnly on CUDA): cudagraph (default) replays "
+            "one iteration via torch.cuda.CUDAGraph; compile uses torch.compile(one_iter) each step; "
+            "eager uses pcg_gpu (most Python overhead per iteration)."
         ),
     )
     parser.add_argument(
@@ -1227,6 +1595,7 @@ def main():
     args = parser.parse_args()
     test_only = bool(args.test_only)
     fast_plot = bool(getattr(args, "fast_plot", False))
+    pcg_cuda_backend = str(getattr(args, "pcg_cuda_backend", "cudagraph"))
 
     def _info(*a, **k):
         if not test_only:
@@ -1568,10 +1937,11 @@ def main():
                 z.copy_(r)
                 return z
 
-            x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu_cudagraph_matrix_free(
+            x_gpu_none, iters_none_gpu, solve_none_gpu_ms = _dispatch_pcg_matrix_free_cuda(
                 A_gpu,
                 b_gpu,
                 _apply_none_into,
+                backend=pcg_cuda_backend,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
@@ -1586,19 +1956,22 @@ def main():
                 torch.mul(r, _inv_jac_t.view(-1, 1), out=z)
                 return z
 
-            _, iters_diag_gpu, solve_diag_gpu_ms = pcg_gpu_cudagraph_matrix_free(
+            _, iters_diag_gpu, solve_diag_gpu_ms = _dispatch_pcg_matrix_free_cuda(
                 A_gpu,
                 b_gpu,
                 _apply_jacobi_into,
+                backend=pcg_cuda_backend,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=check_freq,
             )
-            _info(
-                "  Unpreconditioned / Jacobi PCG (GPU): CUDAGraph (same capture pattern as LeafOnly; "
-                "avoids per-iter Python kernel-launch overhead from eager pcg_gpu)"
-            )
+            _gpu_pcg_desc = {
+                "cudagraph": "CUDAGraph replay of one iter (low CPU launch overhead)",
+                "compile": "torch.compile(one_iter) + Python loop (Inductor)",
+                "eager": "pcg_gpu eager (highest per-iter Python overhead)",
+            }.get(pcg_cuda_backend, pcg_cuda_backend)
+            _info(f"  Unpreconditioned / Jacobi PCG (GPU): {_gpu_pcg_desc}")
         else:
             x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu(
                 A_gpu,
@@ -1621,9 +1994,9 @@ def main():
             )
 
         if test_only:
-            print(f"  LeafOnly PCG mode: {args.leafonly_pcg}")
+            print(f"  LeafOnly PCG mode: {args.leafonly_pcg}; GPU PCG driver: {pcg_cuda_backend}")
         else:
-            _info(f"  LeafOnly PCG mode: {args.leafonly_pcg}")
+            _info(f"  LeafOnly PCG mode: {args.leafonly_pcg}; GPU PCG driver: {pcg_cuda_backend}")
 
         if args.leafonly_pcg == "bsr":
             M_sparse_bsr = build_sparse_bsr_preconditioner(
@@ -1638,17 +2011,21 @@ def main():
             verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
 
             if device.type == "cuda":
-                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph_bsr(
+                x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_bsr_cuda(
                     A_gpu,
                     b_gpu,
                     M_sparse_bsr,
+                    backend=pcg_cuda_backend,
                     tol=pcg_tol,
                     max_iter=pcg_max_iter,
                     device=device,
                     check_freq=check_freq,
                 )
+                _bsr_be = {"cudagraph": "CUDAGraph", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
+                    pcg_cuda_backend, pcg_cuda_backend
+                )
                 _info(
-                    "  LeafOnly PCG: CUDAGraph + BSR preconditioner (z.copy_(M @ r))"
+                    f"  LeafOnly PCG: BSR + {_bsr_be} (z = M @ r)"
                     + (f"; n={viz_n}" if viz_n != n_pad else "")
                 )
             else:
@@ -1676,9 +2053,11 @@ def main():
                 device=device,
                 dtype=b_gpu.dtype,
             )
+            warmup_hmatrix_prolong_gpu(device)
 
             def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-                return apply_block_diagonal_m_into(
+                # Views only; apply_block_diagonal_m_into writes out in-place (no alloc) — safe inside CUDAGraph.
+                apply_block_diagonal_m_into(
                     precond_s,
                     r.reshape(1, viz_n, 1),
                     out.reshape(1, viz_n, 1),
@@ -1687,20 +2066,26 @@ def main():
                     leaf_size=leaf_L,
                     leaf_apply_size=leaf_apply_diag_L,
                     leaf_apply_off=leaf_apply_off_L,
-                ).reshape(viz_n, 1)
+                )
+                return out
 
             if device.type == "cuda":
-                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu_cudagraph_matrix_free(
+                x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_matrix_free_cuda(
                     A_gpu,
                     b_gpu,
                     apply_pcg_fast_into,
+                    backend=pcg_cuda_backend,
                     tol=pcg_tol,
                     max_iter=pcg_max_iter,
                     device=device,
                     check_freq=check_freq,
                 )
+                _mf_be = {"cudagraph": "CUDAGraph replay", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
+                    pcg_cuda_backend, pcg_cuda_backend
+                )
                 _info(
-                    "  LeafOnly PCG: CUDAGraph + matrix-free apply_block_diagonal_m_into preconditioner"
+                    f"  LeafOnly PCG: {_mf_be} — CSR SpMV + block_diagonal_m_apply_workspace + "
+                    f"apply_block_diagonal_m_into (no apply_block_diagonal_M)"
                     + (f"; n={viz_n}" if viz_n != n_pad else "")
                 )
             else:
