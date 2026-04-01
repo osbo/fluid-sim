@@ -431,8 +431,13 @@ def build_hmatrix_off_dense_rpe_from_positions(
         rr0 = int(r0_l[m].item())
         cc0 = int(c0_l[m].item())
         sv = int(s_l[m].item())
-        rr = torch.arange(rr0, rr0 + sv, device=device, dtype=torch.long)
-        cc = torch.arange(cc0, cc0 + sv, device=device, dtype=torch.long)
+        rr_all = torch.arange(rr0, rr0 + sv, device=device, dtype=torch.long)
+        cc_all = torch.arange(cc0, cc0 + sv, device=device, dtype=torch.long)
+        # Static H-tiles are built for MAX_NUM_LEAVES; intersect strips with active leaves [0, K).
+        rr = rr_all[(rr_all >= 0) & (rr_all < K)]
+        cc = cc_all[(cc_all >= 0) & (cc_all < K)]
+        if rr.numel() == 0 or cc.numel() == 0:
+            continue
         idx_r = rr[:, None] * L + li[None, :]
         idx_c = cc[:, None] * L + li[None, :]
         pr = pos[idx_r].mean(dim=0)

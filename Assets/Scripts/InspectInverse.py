@@ -15,7 +15,7 @@ from matplotlib.patches import Rectangle
 import torch
 
 from leafonly.data import FluidGraphDataset
-from leafonly.config import HMATRIX_ETA, LEAF_SIZE, MAX_MIXED_SIZE
+from leafonly.config import HMATRIX_ETA, LEAF_SIZE, problem_padded_num_nodes
 from leafonly.hmatrix import standard_admissible_unique_blocks
 from leafonly.checkpoint import read_leaf_only_header
 
@@ -39,7 +39,7 @@ def main():
     batch = dataset[frame_idx]
 
     num_nodes_real = int(batch['num_nodes'])
-    viz_n = (min(MAX_MIXED_SIZE, num_nodes_real) // leaf_L) * leaf_L
+    viz_n = problem_padded_num_nodes(num_nodes_real)
     print(f"Physical system {viz_n}x{viz_n} (leaf_size={leaf_L})")
 
     ei, ev = batch["edge_index"], batch["edge_values"]

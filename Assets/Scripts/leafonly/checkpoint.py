@@ -12,7 +12,9 @@ from .architecture import EDGE_GATE_HIDDEN_DIM
 #   attention_layout_code: 0 = LxL (no special nodes), 1 = Lx(L+1) (+ block node), 2 = Lx(L+2) (+ matrix node).
 # v4: 44 bytes (11 ints), adds decoupled_route_gates (1 = block_route_gate / matrix_route_gate tensors after edge_gate).
 # v4+edge_mlp: 52-byte header = v4 + 8 bytes (magic + ver) before tensor blob; LeafBlockAttention edge_gate is 2-layer MLP.
-LEAF_ONLY_HEADER_BYTES = 44
+# v5: 12 ints / 48 bytes: + highway_ffn_mlp (0/1). Edge extension at 48; FFN was 3*d when highway (legacy).
+# v6: 13 ints / 52 bytes: + ffn_concat_width (3 = legacy highway only, 4 = + global DC broadcast). Edge at 52.
+LEAF_ONLY_HEADER_BYTES = 52
 CHECKPOINT_EDGE_GATE_EXT_MAGIC = 0x4544474D  # b"MDGE"
 CHECKPOINT_EDGE_GATE_EXT_VER = 1
 CHECKPOINT_HEAD_EXT_MAGIC = 0x48454144  # b"DAEH" little-endian
@@ -22,11 +24,13 @@ CHECKPOINT_HEAD_EXT_VER = 1
 def read_leaf_only_header(path):
     path = Path(path)
     with open(path, "rb") as f:
-        header = f.read(LEAF_ONLY_HEADER_BYTES)
-    if len(header) < 32:
+        prefix = f.read(52)
+    if len(prefix) < 32:
         raise ValueError("LeafOnly weights file too short")
     decoupled_route_gates = 0
-    if len(header) >= 44:
+    highway_ffn_mlp = 0
+    ffn_concat_width = 1
+    if len(prefix) >= 44:
         (
             d_model,
             leaf_size,
@@ -39,24 +43,55 @@ def read_leaf_only_header(path):
             leaf_apply_off,
             attention_layout_code,
             decoupled_route_gates,
-        ) = struct.unpack("<iiiiiiiiiii", header[:44])
-        header_bytes = 44
-    elif len(header) >= 40:
+        ) = struct.unpack("<iiiiiiiiiii", prefix[:44])
+        if len(prefix) >= 48:
+            peek = struct.unpack("<i", prefix[44:48])[0]
+            if int(peek) == int(CHECKPOINT_EDGE_GATE_EXT_MAGIC):
+                base_header_end = 44
+                highway_ffn_mlp = 0
+                ffn_concat_width = 1
+            else:
+                highway_ffn_mlp = 1 if int(peek) != 0 else 0
+                base_header_end = 48
+                if len(prefix) >= 52:
+                    peek2 = struct.unpack("<i", prefix[48:52])[0]
+                    if int(peek2) == int(CHECKPOINT_EDGE_GATE_EXT_MAGIC):
+                        ffn_concat_width = 3 if highway_ffn_mlp else 1
+                    else:
+                        base_header_end = 52
+                        fw = int(peek2)
+                        if fw == 4:
+                            ffn_concat_width = 4
+                        elif fw == 3:
+                            ffn_concat_width = 3
+                        else:
+                            ffn_concat_width = 4 if highway_ffn_mlp else 1
+                else:
+                    ffn_concat_width = 3 if highway_ffn_mlp else 1
+        else:
+            base_header_end = 44
+            highway_ffn_mlp = 0
+            ffn_concat_width = 1
+        header_bytes = base_header_end
+    elif len(prefix) >= 40:
         d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, leaf_apply_diag, leaf_apply_off, attention_layout_code = (
-            struct.unpack("<iiiiiiiiii", header[:40])
+            struct.unpack("<iiiiiiiiii", prefix[:40])
         )
+        decoupled_route_gates = 0
         header_bytes = 40
-    elif len(header) >= 36:
+    elif len(prefix) >= 36:
         d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, leaf_apply_diag, leaf_apply_off = (
-            struct.unpack("<iiiiiiiii", header[:36])
+            struct.unpack("<iiiiiiiii", prefix[:36])
         )
+        decoupled_route_gates = 0
         header_bytes = 36
         attention_layout_code = -1
     else:
         d_model, leaf_size, input_dim, num_layers, num_heads, use_gcn, num_gcn_layers, leaf_apply_diag = struct.unpack(
-            "<iiiiiiii", header[:32]
+            "<iiiiiiii", prefix[:32]
         )
         leaf_apply_off = leaf_apply_diag
+        decoupled_route_gates = 0
         header_bytes = 32
         attention_layout_code = -1
     if leaf_apply_diag <= 0:
@@ -66,23 +101,25 @@ def read_leaf_only_header(path):
 
     edge_gate_hidden_dim = 0
     mlp_heads = 0
-    if header_bytes == 44:
+    pos = int(header_bytes)
+    if pos in (44, 48, 52):
         with open(path, "rb") as f:
-            f.seek(44)
+            f.seek(pos)
             ext = f.read(8)
         if len(ext) == 8:
             mag, ver = struct.unpack("<ii", ext)
             if mag == CHECKPOINT_EDGE_GATE_EXT_MAGIC and ver == CHECKPOINT_EDGE_GATE_EXT_VER:
-                header_bytes = 52
+                pos += 8
                 edge_gate_hidden_dim = int(EDGE_GATE_HIDDEN_DIM)
                 with open(path, "rb") as f:
-                    f.seek(52)
+                    f.seek(pos)
                     ext2 = f.read(8)
                 if len(ext2) == 8:
                     mag2, ver2 = struct.unpack("<ii", ext2)
                     if mag2 == CHECKPOINT_HEAD_EXT_MAGIC and ver2 == CHECKPOINT_HEAD_EXT_VER:
-                        header_bytes = 60
+                        pos += 8
                         mlp_heads = 1
+    header_bytes = pos
 
     return (
         d_model,
@@ -99,6 +136,8 @@ def read_leaf_only_header(path):
         decoupled_route_gates,
         edge_gate_hidden_dim,
         mlp_heads,
+        highway_ffn_mlp,
+        ffn_concat_width,
     )
 
 
@@ -126,6 +165,8 @@ def leaf_only_arch_from_checkpoint(path) -> dict | None:
         decoupled_route_gates,
         edge_gate_hidden_dim,
         mlp_heads,
+        highway_ffn_mlp,
+        ffn_concat_width,
     ) = read_leaf_only_header(p)
     return {
         "d_model": int(d_model),
@@ -142,6 +183,8 @@ def leaf_only_arch_from_checkpoint(path) -> dict | None:
         "decoupled_route_gates": int(decoupled_route_gates),
         "edge_gate_hidden_dim": int(edge_gate_hidden_dim),
         "mlp_heads": int(mlp_heads),
+        "highway_ffn_mlp": int(highway_ffn_mlp),
+        "ffn_concat_width": int(ffn_concat_width),
     }
 
 
@@ -166,6 +209,15 @@ def apply_leaf_only_arch_from_checkpoint_args(args, save_path) -> None:
         changed.append(f"d_model {cli_dm}→{arch['d_model']}")
     if cli_nh is not None and int(cli_nh) != arch["num_heads"]:
         changed.append(f"num_heads {cli_nh}→{arch['num_heads']}")
+    prev_uh = bool(getattr(args, "use_highways", True))
+    expect_uh = bool(int(arch.get("highway_ffn_mlp", 0)) == 1)
+    if prev_uh != expect_uh:
+        changed.append(f"use_highways {prev_uh}→{expect_uh} (checkpoint highway_ffn_mlp={arch.get('highway_ffn_mlp', 0)})")
+    args.use_highways = expect_uh
+    if expect_uh:
+        args.ffn_concat_width = int(arch.get("ffn_concat_width", 4))
+    else:
+        args.ffn_concat_width = 1
     if changed:
         name = Path(save_path).name
         print(f"  [checkpoint] Using architecture from {name}: " + ", ".join(changed))
@@ -303,23 +355,46 @@ def save_leaf_only_weights(model, path, input_dim=9):
         )
     )
     has_mlp_heads = isinstance(model.off_diag_head_U, nn.Sequential)
+    has_highway_ffn = bool(getattr(model, "highway_ffn", False))
+    fcw = int(getattr(model, "ffn_concat_width", 1))
     with open(path, "wb") as f:
-        f.write(
-            struct.pack(
-                "<iiiiiiiiiii",
-                d_model,
-                model.leaf_size,
-                input_dim,
-                len(model.blocks),
-                num_heads,
-                1,
-                num_gcn_layers,
-                int(model.leaf_apply_size),
-                int(model.leaf_apply_off),
-                attention_layout_code,
-                1 if has_route_gates else 0,
+        if has_highway_ffn:
+            f.write(
+                struct.pack(
+                    "<iiiiiiiiiiiii",
+                    d_model,
+                    model.leaf_size,
+                    input_dim,
+                    len(model.blocks),
+                    num_heads,
+                    1,
+                    num_gcn_layers,
+                    int(model.leaf_apply_size),
+                    int(model.leaf_apply_off),
+                    attention_layout_code,
+                    1 if has_route_gates else 0,
+                    1,
+                    fcw,
+                )
             )
-        )
+        else:
+            f.write(
+                struct.pack(
+                    "<iiiiiiiiiiii",
+                    d_model,
+                    model.leaf_size,
+                    input_dim,
+                    len(model.blocks),
+                    num_heads,
+                    1,
+                    num_gcn_layers,
+                    int(model.leaf_apply_size),
+                    int(model.leaf_apply_off),
+                    attention_layout_code,
+                    1 if has_route_gates else 0,
+                    0,
+                )
+            )
         f.write(struct.pack("<ii", CHECKPOINT_EDGE_GATE_EXT_MAGIC, CHECKPOINT_EDGE_GATE_EXT_VER))
         f.write(
             struct.pack(
@@ -396,8 +471,23 @@ def load_leaf_only_weights(model, path):
         decoupled_route_gates,
         edge_gate_hidden_dim,
         mlp_heads,
+        highway_ffn_mlp_file,
+        ffn_concat_width_file,
     ) = result
     legacy_edge_gate_linear = int(edge_gate_hidden_dim) != int(EDGE_GATE_HIDDEN_DIM)
+    highway_ffn_model = 1 if bool(getattr(model, "highway_ffn", False)) else 0
+    if int(highway_ffn_mlp_file) != int(highway_ffn_model):
+        raise ValueError(
+            f"Checkpoint highway_ffn_mlp={int(highway_ffn_mlp_file)} does not match model "
+            f"(highway_ffn={'True' if highway_ffn_model else 'False'}). "
+            "Use --no-use-highways only with weights saved without highway FFN, or retrain with the current layout."
+        )
+    ffn_model = int(getattr(model, "ffn_concat_width", 1))
+    if int(ffn_concat_width_file) != ffn_model:
+        raise ValueError(
+            f"Checkpoint ffn_concat_width={int(ffn_concat_width_file)} does not match model ffn_concat_width={ffn_model}. "
+            "Retrain or load a checkpoint saved with the same FFN layout (3 = highway only, 4 = highway + global DC)."
+        )
     if header_bytes < 40:
         raise ValueError(
             f"Checkpoint '{path}' uses old format (header v{'1' if header_bytes < 36 else '2'}); "

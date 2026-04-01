@@ -5,6 +5,29 @@ from leafonly.config import LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps
 from leafonly.eval import evaluate_estimator_variance, evaluate_gradient_interference
 from leafonly.train import train_leaf_only as _train_leaf_only_impl
 
+# Single source of truth for InspectModel.py and training CLI (default, help, checkpoint errors).
+DEFAULT_USE_HIGHWAYS = False
+
+USE_HIGHWAYS_HELP = (
+    "Use highway + global DC features in each Transformer FFN: concat 4×d_model "
+    "(block token, row highway, col highway, mean-pooled stream broadcast) into the MLP; "
+    "legacy checkpoints use 3× (no global). "
+    "True (--use-highways): after attention every layer; output heads use block tokens only (d_model). "
+    "False (default): 1×d_model FFN, no highway gather. "
+    "Checkpoint highway_ffn_mlp and ffn_concat_width must match when loading weights."
+)
+
+CHECKPOINT_ERR_HIGHWAY_IN_FILE_NEED_CLI_ON = (
+    "Checkpoint was saved with highway-in-FFN (header highway_ffn_mlp=1). "
+    "Do not pass --no-use-highways when loading this file."
+)
+
+CHECKPOINT_ERR_NO_HIGHWAY_IN_FILE_NEED_CLI_OFF = (
+    "Checkpoint has no highway-in-FFN flag (legacy or trained with --no-use-highways). "
+    "Use LeafOnly.py default (omit --use-highways), or pass --no-use-highways explicitly; "
+    "retrain with --use-highways for weights that include highway FFN."
+)
+
 
 def _build_parser():
     parser = argparse.ArgumentParser()
@@ -89,7 +112,7 @@ def _build_parser():
         "--leafonly-pcg",
         type=str,
         choices=("bsr", "matrix_free"),
-        default="bsr",
+        default="matrix_free",
         help=(
             "How to apply M in the probe loss (AZ then MAZ): both use batched apply_block_diagonal_M "
             "(same operator as InspectModel’s expanded M; autograd cannot use BSR sparse.mm). "
@@ -128,12 +151,8 @@ def _build_parser():
     parser.add_argument(
         "--use-highways",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Use row/column highway conditioning in output heads. "
-            "True (default): heads take [block,row,col] tokens. "
-            "False (--no-use-highways): skip highway construction and heads use block tokens only."
-        ),
+        default=DEFAULT_USE_HIGHWAYS,
+        help=USE_HIGHWAYS_HELP,
     )
     return parser
 

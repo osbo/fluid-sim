@@ -7,6 +7,7 @@ Preconditioners for Conjugate Gradient Solvers on GPUs* (NeurIPS 2025;
 Diag (Jacobi), IC-class (``ilupp.IChol0`` or scipy ``spilu`` fallback), PyAMG / AMGX. On CUDA, the benchmark always runs a second AMGX session: PCG with ``MULTICOLOR_DILU`` (scalar CSR; AMGX ``MULTICOLOR_ILU`` GPU path is 4×4-only).
 
 Use ``--test_only`` to run the PCG benchmark path and print only that summary (no plots, profiling, or dense AMG build).
+Use ``--fast_plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``eig(A·M)``, ``cond(A·M)``, and A-eigenmode error curves (saves many minutes for n in the thousands).
 
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
@@ -34,6 +35,8 @@ warnings.filterwarnings(
 _script_dir = Path(__file__).resolve().parent
 if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
+
+import LeafOnly as _leaf_only_script  # noqa: E402 — DEFAULT_USE_HIGHWAYS, highway help, checkpoint errors
 
 # Used before main() so optional-dependency import warnings stay quiet in test-only runs.
 _TEST_ONLY_CLI = "--test_only" in sys.argv
@@ -84,6 +87,7 @@ from leafonly.config import (
     LEAF_SIZE,
     MAX_MIXED_SIZE,
     OFF_DIAG_TOKEN_POOL,
+    problem_padded_num_nodes,
 )
 from leafonly.hmatrix import (
     HM_C0_CPU,
@@ -138,6 +142,41 @@ def _torch_bsr_to_scipy_csr_cpu(M: torch.Tensor) -> csr_matrix:
     data = np.concatenate(dat_parts)
     return csr_matrix((data, (rows, cols)), shape=(nrows, ncols))
 
+
+def _offdiag_strip_from_packed_leaves(
+    nodes: torch.Tensor,
+    r0i: int,
+    si: int,
+    num_leaves: int,
+    leaf_L: int,
+    La_o: int,
+) -> torch.Tensor:
+    """One axis of an H off-block: (si*leaf_L, La_o). ``nodes`` is (num_leaves, leaf_L, La_o) tight-packed;
+    leaf indices ``r0i .. r0i+si-1`` outside ``[0, num_leaves)`` are zero (matches padded forward)."""
+    device, dtype = nodes.device, nodes.dtype
+    out = torch.zeros((si * leaf_L, La_o), device=device, dtype=dtype)
+    for j in range(si):
+        gi = r0i + j
+        if 0 <= gi < num_leaves:
+            out[j * leaf_L : (j + 1) * leaf_L, :] = nodes[gi]
+    return out
+
+
+def _assign_dense_block_clamped(
+    M: torch.Tensor,
+    oblk: torch.Tensor,
+    br0: int,
+    br1: int,
+    bc0: int,
+    bc1: int,
+    dim_max: int,
+) -> None:
+    """Write ``oblk`` (indexed as global rows ``br0:br1``, cols ``bc0:bc1``) into ``M[:dim_max, :dim_max]``."""
+    r0c, r1c = max(br0, 0), min(br1, dim_max)
+    c0c, c1c = max(bc0, 0), min(bc1, dim_max)
+    if r0c >= r1c or c0c >= c1c:
+        return
+    M[r0c:r1c, c0c:c1c] = oblk[(r0c - br0) : (r1c - br0), (c0c - bc0) : (c1c - bc0)]
 
 def _torch_sparse_precond_to_scipy_csr(M: torch.Tensor) -> csr_matrix:
     """Convert CPU ``torch.sparse_csr`` or ``torch.sparse_bsr`` to SciPy ``csr_matrix`` for analysis."""
@@ -1148,7 +1187,7 @@ def main():
     parser.add_argument(
         "--leafonly_pcg",
         choices=("bsr", "matrix_free"),
-        default="bsr",
+        default="matrix_free",
         help=(
             "LeafOnly PCG preconditioner apply: bsr = materialized BSR + SpMV (default); "
             "matrix_free = apply_block_diagonal_m_into with preallocated workspace (scales for large H off-diagonal)."
@@ -1174,15 +1213,20 @@ def main():
     parser.add_argument(
         "--use-highways",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=_leaf_only_script.DEFAULT_USE_HIGHWAYS,
+        help=_leaf_only_script.USE_HIGHWAYS_HELP,
+    )
+    parser.add_argument(
+        "--fast_plot",
+        action="store_true",
         help=(
-            "LeafOnly output-head highway conditioning toggle. "
-            "True (default): heads use [block,row,col] token inputs. "
-            "False (--no-use-highways): no highway build, heads use block tokens only."
+            "Skip expensive dense panels: full eig(A), eig(AM), cond(AM), and A-eigenmode error curves. "
+            "Keeps heatmaps and H-matrix rank row; saves many minutes when viz_n is a few thousand."
         ),
     )
     args = parser.parse_args()
     test_only = bool(args.test_only)
+    fast_plot = bool(getattr(args, "fast_plot", False))
 
     def _info(*a, **k):
         if not test_only:
@@ -1239,27 +1283,39 @@ def main():
             f"Checkpoint leaf_size={leaf_size_lo} != leafonly.config.LEAF_SIZE={LEAF_SIZE}. "
             "Set LEAF_SIZE in leafonly/config.py to match the weights header so MAX_MIXED_SIZE and MAX_NUM_LEAVES stay consistent."
         )
+    ck_hw = int(ckpt_arch.get("highway_ffn_mlp", 0))
+    cli_hw = bool(getattr(args, "use_highways", _leaf_only_script.DEFAULT_USE_HIGHWAYS))
+    if ck_hw == 1 and not cli_hw:
+        raise SystemExit(_leaf_only_script.CHECKPOINT_ERR_HIGHWAY_IN_FILE_NEED_CLI_ON)
+    if ck_hw == 0 and cli_hw:
+        raise SystemExit(_leaf_only_script.CHECKPOINT_ERR_NO_HIGHWAY_IN_FILE_NEED_CLI_OFF)
+    ck_ffn = int(ckpt_arch.get("ffn_concat_width", 3 if ck_hw else 1))
+    if cli_hw and ck_ffn not in (3, 4):
+        raise SystemExit(f"Checkpoint ffn_concat_width={ck_ffn} invalid (expected 3 or 4 with highways).")
     leaf_L = int(LEAF_SIZE)
-    n_pad = int(MAX_MIXED_SIZE)
-    n_requested = (min(MAX_MIXED_SIZE, num_nodes_real) // leaf_L) * leaf_L
+    n_requested = problem_padded_num_nodes(num_nodes_real)
+    n_pad = int(n_requested)
     # Physical linear system for PCG / baselines / plots (no identity tail): leaf-aligned, ≤ MAX_MIXED_SIZE.
     viz_n = n_requested
     if n_requested < num_nodes_real:
         _info(
             f"  Leaf-aligned subgraph: {n_requested} nodes (frame has {num_nodes_real}; "
-            f"truncated to full {leaf_L}-node leaves); LeafOnly forward padded to {n_pad} (MAX_MIXED_SIZE)"
+            f"truncated to full {leaf_L}-node leaves); LeafOnly forward uses n_pad={n_pad} (no MAX_MIXED_SIZE tail)"
         )
-    elif n_pad > n_requested:
+    elif num_nodes_real >= MAX_MIXED_SIZE and n_pad == MAX_MIXED_SIZE:
         _info(
-            f"  Physical system {n_requested}×{n_requested}; LeafOnly forward padded to {n_pad} (MAX_MIXED_SIZE)"
+            f"  Physical system {n_requested}×{n_requested} (capped at MAX_MIXED_SIZE={MAX_MIXED_SIZE}); "
+            f"LeafOnly forward n_pad={n_pad}"
         )
+    else:
+        _info(f"  Physical system {n_requested}×{n_requested}; LeafOnly forward n_pad={n_pad} (< MAX_MIXED_SIZE)")
 
     ei, ev = batch["edge_index"], batch["edge_values"]
     # Single mask for the n_requested subgraph — reused for A, GPU edges, and connectivity.
     em = (ei[0] < n_requested) & (ei[1] < n_requested)
     A_small = torch.sparse_coo_tensor(ei[:, em], ev[em], (n_requested, n_requested)).coalesce().to_dense().numpy()
     A_phys_f64 = A_small.astype(np.float64, copy=False)
-    # Diagonal of expanded training-style A (identity on padded tail) for Jacobi inside full n_pad apply.
+    # Diagonal of A on active nodes (n_pad == n_requested: no padded identity tail).
     jacobi_diag_np = np.ones(n_pad, dtype=np.float32)
     jacobi_diag_np[:n_requested] = np.diag(A_small).astype(np.float32, copy=False)
 
@@ -1274,7 +1330,8 @@ def main():
         attention_layout=default_attention_layout(leaf_size_lo),
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
         diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
-        use_highways=bool(getattr(args, "use_highways", True)),
+        use_highways=bool(getattr(args, "use_highways", _leaf_only_script.DEFAULT_USE_HIGHWAYS)),
+        ffn_concat_width=int(ck_ffn) if cli_hw else None,
     ).to(device)
     model_leaf = torch.compile(model_leaf)
     load_leaf_only_weights(model_leaf, leaf_only_weights_path)
@@ -1417,12 +1474,18 @@ def main():
                 br0, br1 = r0i * leaf_L, (r0i + si) * leaf_L
                 bc0, bc1 = c0i * leaf_L, (c0i + si) * leaf_L
                 C_m = off_diag_blocks[0, i]
-                U_strip = node_U[0, r0i : r0i + si].reshape(si * leaf_L, leaf_apply_off_L)
-                V_strip = node_V[0, c0i : c0i + si].reshape(si * leaf_L, leaf_apply_off_L)
+                U_strip = _offdiag_strip_from_packed_leaves(
+                    node_U[0], r0i, si, num_leaves, leaf_L, leaf_apply_off_L
+                )
+                V_strip = _offdiag_strip_from_packed_leaves(
+                    node_V[0], c0i, si, num_leaves, leaf_L, leaf_apply_off_L
+                )
                 U_C = torch.matmul(U_strip, C_m)
                 oblk_dense = torch.matmul(U_C, V_strip.transpose(0, 1))
-                M_neural_gpu[br0:br1, bc0:bc1] = oblk_dense
-                M_neural_gpu[bc0:bc1, br0:br1] = oblk_dense.transpose(-1, -2)
+                _assign_dense_block_clamped(M_neural_gpu, oblk_dense, br0, br1, bc0, bc1, n_pad)
+                _assign_dense_block_clamped(
+                    M_neural_gpu, oblk_dense.transpose(-1, -2), bc0, bc1, br0, br1, n_pad
+                )
 
         if jacobi_scale is not None:
             M_neural_gpu += torch.diag((jacobi_scale[0] * jacobi_inv_diag[0]).to(M_neural_gpu.dtype))
@@ -1831,14 +1894,17 @@ def main():
         evals_A: np.ndarray | None = None
         eig_A_cache: tuple[np.ndarray, np.ndarray] | None = None
         eig_A_err: str | None = None
-        try:
-            t_eig = time.perf_counter()
-            lam_A, V_A, _sym_A = _eig_dense_for_inspect(A_viz_n, device)
-            evals_A = lam_A
-            eig_A_cache = (lam_A, V_A)
-            print(f"  Eig(A) for spectral plots: {time.perf_counter() - t_eig:.1f}s")
-        except Exception as e:
-            eig_A_err = str(e)
+        if fast_plot:
+            _info("  Skipped eig(A) and AM spectrum panels (--fast_plot).")
+        else:
+            try:
+                t_eig = time.perf_counter()
+                lam_A, V_A, _sym_A = _eig_dense_for_inspect(A_viz_n, device)
+                evals_A = lam_A
+                eig_A_cache = (lam_A, V_A)
+                print(f"  Eig(A) for spectral plots: {time.perf_counter() - t_eig:.1f}s")
+            except Exception as e:
+                eig_A_err = str(e)
 
         log_ainv = np.log10(np.abs(A_inv_viz) + 1e-9)
         log_m_leaf = np.log10(np.abs(M_neural_n) + 1e-9)
@@ -1891,6 +1957,17 @@ def main():
             margin = 0.1 * max(r_max - r_min, 2 * i_max, 1.0) or 0.2
             ax_a.set_xlim(r_min - margin, r_max + margin)
             ax_a.set_ylim(-max(i_max, margin), max(i_max, margin))
+        elif fast_plot:
+            ax_a.text(
+                0.5,
+                0.5,
+                "Skipped (--fast_plot)",
+                transform=ax_a.transAxes,
+                ha="center",
+                va="center",
+                fontsize=10,
+            )
+            ax_a.set_title(f"Eigenvalues of A (n={viz_n})")
         else:
             ax_a.text(
                 0.5,
@@ -1954,14 +2031,18 @@ def main():
         )
 
         am_log_min, am_log_max = None, None
-        for _name, M in methods:
+        am_by_method: dict[str, np.ndarray] = {}
+        t_am_build = time.perf_counter()
+        for name, M in methods:
             AM = A_viz_n @ M
+            am_by_method[name] = AM
             am_abs_log = np.log10(np.abs(AM) + 1e-9)
             lo, hi = am_abs_log.min(), am_abs_log.max()
             am_log_min = lo if am_log_min is None else min(am_log_min, lo)
             am_log_max = hi if am_log_max is None else max(am_log_max, hi)
         if am_log_min is None:
             am_log_min, am_log_max = -8.0, 0.0
+        _info(f"  Dense A·M for plot color scale ({len(methods)}× matmul): {time.perf_counter() - t_am_build:.1f}s")
 
         for idx, (name, M) in enumerate(methods):
             row = 1 + idx
@@ -1973,47 +2054,79 @@ def main():
             im_diff = axes[row, 1].imshow(log_err, cmap='magma', aspect='auto')
             axes[row, 1].set_title(f"{name} |M − A^{{-1}}| (log10)")
             plt.colorbar(im_diff, ax=axes[row, 1])
-            AM = A_viz_n @ M
+            AM = am_by_method[name]
             am_abs_log = np.log10(np.abs(AM) + 1e-9)
             im_am = axes[row, 2].imshow(am_abs_log, cmap='magma', aspect='auto', vmin=am_log_min, vmax=am_log_max)
             axes[row, 2].set_title(f"{name} A·M (log10 |·|)")
             plt.colorbar(im_am, ax=axes[row, 2])
 
             ax_d = axes[row, 3]
-            try:
-                evals = _eigvals_dense_numpy_or_torch(AM, device)
-                ax_d.scatter(evals.real, evals.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
-                ax_d.axvline(1.0, color='r', linestyle='--', alpha=0.8)
-                ax_d.axhline(0.0, color='k', linestyle='-', alpha=0.3)
-                ax_d.set_xlabel('Re(λ)')
-                ax_d.set_ylabel('Im(λ)')
-                ax_d.set_title(f"{name} Eigenvalues of A·M (n={viz_n})")
-                ax_d.set_aspect('equal', adjustable='box')
-                r_min, r_max = evals.real.min(), evals.real.max()
-                i_max = np.abs(evals.imag).max()
-                margin = 0.1 * max(r_max - r_min, 2 * i_max, 1.0) or 0.2
-                ax_d.set_xlim(min(r_min, 1.0) - margin, max(r_max, 1.0) + margin)
-                ax_d.set_ylim(-max(i_max, margin), max(i_max, margin))
-            except Exception as e:
-                ax_d.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_d.transAxes, ha='center', va='center', fontsize=9)
-                ax_d.set_title(f"{name} Eigenvalues (failed)")
+            if fast_plot:
+                ax_d.text(
+                    0.5,
+                    0.5,
+                    "Skipped (--fast_plot)\n(full eig(AM) is slow for large n)",
+                    transform=ax_d.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                )
+                ax_d.set_title(f"{name} Eigenvalues of A·M (skipped)")
+            else:
+                try:
+                    evals = _eigvals_dense_numpy_or_torch(AM, device)
+                    ax_d.scatter(evals.real, evals.imag, alpha=0.7, s=12, c='C0', edgecolors='none')
+                    ax_d.axvline(1.0, color='r', linestyle='--', alpha=0.8)
+                    ax_d.axhline(0.0, color='k', linestyle='-', alpha=0.3)
+                    ax_d.set_xlabel('Re(λ)')
+                    ax_d.set_ylabel('Im(λ)')
+                    ax_d.set_title(f"{name} Eigenvalues of A·M (n={viz_n})")
+                    ax_d.set_aspect('equal', adjustable='box')
+                    r_min, r_max = evals.real.min(), evals.real.max()
+                    i_max = np.abs(evals.imag).max()
+                    margin = 0.1 * max(r_max - r_min, 2 * i_max, 1.0) or 0.2
+                    ax_d.set_xlim(min(r_min, 1.0) - margin, max(r_max, 1.0) + margin)
+                    ax_d.set_ylim(-max(i_max, margin), max(i_max, margin))
+                except Exception as e:
+                    ax_d.text(0.5, 0.5, f"eig failed:\n{e}", transform=ax_d.transAxes, ha='center', va='center', fontsize=9)
+                    ax_d.set_title(f"{name} Eigenvalues (failed)")
 
             ax_t = axes[row, 4]
             ax_t.axis('off')
-            cond_AM = _cond_numpy_or_torch(AM, device)
             err_fro = np.linalg.norm(AM - np.eye(viz_n)) / np.linalg.norm(np.eye(viz_n))
-            msg = [
-                f"Method: {name}",
-                f"Cond(AM): {cond_AM:.2e}",
-                f"Improvement: {cond_A/cond_AM:.2f}x",
-                f"Frobenius Err: {err_fro:.4f}",
-            ]
-            color = 'green' if cond_A / cond_AM > 1.0 else 'red'
+            if fast_plot:
+                msg = [
+                    f"Method: {name}",
+                    "Cond(AM): skipped (--fast_plot)",
+                    "Improvement: —",
+                    f"Frobenius Err: {err_fro:.4f}",
+                ]
+                colors = ["black", "black", "black", "black"]
+            else:
+                cond_AM = _cond_numpy_or_torch(AM, device)
+                msg = [
+                    f"Method: {name}",
+                    f"Cond(AM): {cond_AM:.2e}",
+                    f"Improvement: {cond_A/cond_AM:.2f}x",
+                    f"Frobenius Err: {err_fro:.4f}",
+                ]
+                colors = ["black", "black", "green" if cond_A / cond_AM > 1.0 else "red", "black"]
             for i, line in enumerate(msg):
-                ax_t.text(0.1, 0.8 - i * 0.15, line, fontsize=12, color='black' if i != 2 else color, fontfamily='monospace')
+                ax_t.text(0.1, 0.8 - i * 0.15, line, fontsize=12, color=colors[i], fontfamily='monospace')
 
             ax_ray = axes[row, 5]
-            if eig_A_cache is None:
+            if fast_plot:
+                ax_ray.text(
+                    0.5,
+                    0.5,
+                    "Skipped (--fast_plot)",
+                    transform=ax_ray.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                )
+                ax_ray.set_axis_off()
+            elif eig_A_cache is None:
                 ax_ray.text(
                     0.5,
                     0.5,

@@ -20,8 +20,8 @@ from .config import (
     LEAF_APPLY_SIZE,
     LEAF_APPLY_SIZE_OFF,
     LEAF_SIZE,
-    MAX_MIXED_SIZE,
     MAX_NUM_LEAVES,
+    problem_padded_num_nodes,
 )
 from .data import FluidGraphDataset, build_leaf_block_connectivity, most_recent_run_folder
 from .probe_z import jacobi_smooth_hutchinson_z_inplace
@@ -59,20 +59,44 @@ def _time_transformer_attn_and_mlp(
     block,
     x_in: torch.Tensor,
     device,
+    highway_pair_fn=None,
+    *,
+    ffn_concat_width: int = 1,
     **attn_kw,
 ) -> torch.Tensor:
     """
     Times LeafBlockAttention (with its pre-norm) and MLP (with its pre-norm) separately; returns post-block x.
-    Matches TransformerBlock residual layout: x_mid = x + attn(norm1(x)), x_out = x_mid + mlp(norm2(x_mid)).
+    Matches TransformerBlock residual layout: x_mid = attn path, x_out = x_mid + mlp(norm2(x_mid) [+ hw + global]).
     """
     ms_attn = _timed_ms(lambda: block.attn(block.norm1(x_in), **attn_kw), device)
     timing_rows.append([f"{label_prefix} {block_idx} attention (+ pre-norm)", ms_attn])
     with torch.no_grad():
         x_mid = x_in + block.attn(block.norm1(x_in), **attn_kw)
-    ms_mlp = _timed_ms(lambda: block.mlp(block.norm2(x_mid)), device)
-    timing_rows.append([f"{label_prefix} {block_idx} MLP (+ pre-norm)", ms_mlp])
-    with torch.no_grad():
-        x_out = x_mid + block.mlp(block.norm2(x_mid))
+    if highway_pair_fn is None:
+        ms_mlp = _timed_ms(lambda: block.mlp(block.norm2(x_mid)), device)
+        timing_rows.append([f"{label_prefix} {block_idx} MLP (+ pre-norm)", ms_mlp])
+        with torch.no_grad():
+            x_out = x_mid + block.mlp(block.norm2(x_mid))
+    else:
+        rr, cc = highway_pair_fn(x_mid)
+        if int(ffn_concat_width) == 4:
+            gg = LeafOnlyNet._mlp_global_broadcast(x_mid)
+
+            def _mlp_in():
+                return torch.cat([block.norm2(x_mid), rr, cc, gg], dim=-1)
+
+            ms_mlp = _timed_ms(lambda: block.mlp(_mlp_in()), device)
+            timing_rows.append([f"{label_prefix} {block_idx} MLP (+ pre-norm, 4× hw+global)", ms_mlp])
+            with torch.no_grad():
+                x_out = block.forward_mlp(x_mid, rr, cc, gg)
+        else:
+            ms_mlp = _timed_ms(
+                lambda: block.mlp(torch.cat([block.norm2(x_mid), rr, cc], dim=-1)),
+                device,
+            )
+            timing_rows.append([f"{label_prefix} {block_idx} MLP (+ pre-norm, 3× highway)", ms_mlp])
+            with torch.no_grad():
+                x_out = block.forward_mlp(x_mid, rr, cc)
     return x_out
 
 
@@ -270,6 +294,9 @@ def print_comprehensive_attention_profiler(
     dec_headers = ["stack", "layer", "pre_attn_LN_ms", "attention_ms", "LN+attn_ms"]
     dec_rows: list = []
     h = h_leaf_diag
+    C_prof = int(h.shape[-1])
+    hw_ff = bool(getattr(model, "highway_ffn", False))
+    ffcw = int(getattr(model, "ffn_concat_width", 1))
     for i, block in enumerate(model.blocks):
         ms_ln = _timed_ms(lambda b=block, x=h: b.norm1(x), device, warmup=warmup, repeat=repeat)
         with torch.no_grad():
@@ -283,9 +310,17 @@ def print_comprehensive_attention_profiler(
         dec_rows.append(["Leaf diag", i, ms_ln, ms_at, ms_ln + ms_at])
         with torch.no_grad():
             x_mid = h + block.attn(xn, **leaf_attn_kw)
-            h = x_mid + block.mlp(block.norm2(x_mid))
+            if hw_ff:
+                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, MAX_NUM_LEAVES, Lf, C_prof)
+                if ffcw == 4:
+                    h = block.forward_mlp(x_mid, rr, cc, LeafOnlyNet._mlp_global_broadcast(x_mid))
+                else:
+                    h = block.forward_mlp(x_mid, rr, cc)
+            else:
+                h = x_mid + block.mlp(block.norm2(x_mid))
 
     if Mh > 0 and off_attn_kw is not None:
+        h_diag_ref = h
         h_off = _hm_strip_pool_h_off_tokens(model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_dtype)
         for i, block in enumerate(model.off_diag_blocks):
             ms_ln = _timed_ms(lambda b=block, x=h_off: b.norm1(x), device, warmup=warmup, repeat=repeat)
@@ -300,7 +335,16 @@ def print_comprehensive_attention_profiler(
             dec_rows.append(["H-off", i, ms_ln, ms_at, ms_ln + ms_at])
             with torch.no_grad():
                 x_mid = h_off + block.attn(xn, **off_attn_kw)
-                h_off = x_mid + block.mlp(block.norm2(x_mid))
+                if hw_ff:
+                    orr, occ = model._build_off_mlp_hw(h_diag_ref, x_mid, B_prof, MAX_NUM_LEAVES, Lf, C_prof, Mh)
+                    if ffcw == 4:
+                        h_off = block.forward_mlp(
+                            x_mid, orr, occ, LeafOnlyNet._mlp_global_broadcast(x_mid)
+                        )
+                    else:
+                        h_off = block.forward_mlp(x_mid, orr, occ)
+                else:
+                    h_off = x_mid + block.mlp(block.norm2(x_mid))
 
     _print_table("Attention micro-timing (eager, decomposed)", dec_headers, dec_rows)
     leaf_sum = sum(r[4] for r in dec_rows if r[0] == "Leaf diag")
@@ -348,6 +392,7 @@ def print_comprehensive_attention_profiler(
     mass_rows: list = []
     with torch.inference_mode():
         h = h_leaf_diag
+        C_mass = int(h.shape[-1])
         for i, block in enumerate(model.blocks):
             xn = block.norm1(h)
             ya = block.attn(xn, **leaf_attn_kw)
@@ -355,8 +400,16 @@ def print_comprehensive_attention_profiler(
                 _attention_distribution_stats_row("Leaf diag", i, block.attn.last_attn_distribution_stats)
             )
             x_mid = h + ya
-            h = x_mid + block.mlp(block.norm2(x_mid))
+            if hw_ff:
+                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, MAX_NUM_LEAVES, Lf, C_mass)
+                if ffcw == 4:
+                    h = block.forward_mlp(x_mid, rr, cc, LeafOnlyNet._mlp_global_broadcast(x_mid))
+                else:
+                    h = block.forward_mlp(x_mid, rr, cc)
+            else:
+                h = x_mid + block.mlp(block.norm2(x_mid))
         if Mh > 0 and off_attn_kw is not None:
+            h_diag_mass = h
             h_off = _hm_strip_pool_h_off_tokens(model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_dtype)
             for i, block in enumerate(model.off_diag_blocks):
                 xn = block.norm1(h_off)
@@ -365,7 +418,16 @@ def print_comprehensive_attention_profiler(
                     _attention_distribution_stats_row("H-off", i, block.attn.last_attn_distribution_stats)
                 )
                 x_mid = h_off + ya
-                h_off = x_mid + block.mlp(block.norm2(x_mid))
+                if hw_ff:
+                    orr, occ = model._build_off_mlp_hw(h_diag_mass, x_mid, B_prof, MAX_NUM_LEAVES, Lf, C_mass, Mh)
+                    if ffcw == 4:
+                        h_off = block.forward_mlp(
+                            x_mid, orr, occ, LeafOnlyNet._mlp_global_broadcast(x_mid)
+                        )
+                    else:
+                        h_off = block.forward_mlp(x_mid, orr, occ)
+                else:
+                    h_off = x_mid + block.mlp(block.norm2(x_mid))
     _print_table(
         "Attention mass vs baselines (eval; mean combined weight over heads, same mask as softmax)",
         mass_headers,
@@ -384,10 +446,18 @@ def print_comprehensive_attention_profiler(
 
     def _leaf_stack_forward(h0: torch.Tensor) -> torch.Tensor:
         h = h0
+        C = int(h.shape[-1])
         for block in model.blocks:
             xn = block.norm1(h)
-            h = h + block.attn(xn, **leaf_attn_kw)
-            h = h + block.mlp(block.norm2(h))
+            x_mid = h + block.attn(xn, **leaf_attn_kw)
+            if hw_ff:
+                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, MAX_NUM_LEAVES, Lf, C)
+                if ffcw == 4:
+                    h = block.forward_mlp(x_mid, rr, cc, LeafOnlyNet._mlp_global_broadcast(x_mid))
+                else:
+                    h = block.forward_mlp(x_mid, rr, cc)
+            else:
+                h = x_mid + block.mlp(block.norm2(x_mid))
         return h
 
     try:
@@ -399,14 +469,26 @@ def print_comprehensive_attention_profiler(
 
     if Mh > 0 and off_attn_kw is not None:
         h0_off = _hm_strip_pool_h_off_tokens(model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_dtype)
+        with torch.inference_mode():
+            h_leaf_frozen = _leaf_stack_forward(h_leaf_diag)
 
         def _hoff_stack_forward(h0: torch.Tensor) -> torch.Tensor:
-            h = h0
+            h_off = h0
+            C = int(h_leaf_frozen.shape[-1])
             for block in model.off_diag_blocks:
-                xn = block.norm1(h)
-                h = h + block.attn(xn, **off_attn_kw)
-                h = h + block.mlp(block.norm2(h))
-            return h
+                xn = block.norm1(h_off)
+                x_mid = h_off + block.attn(xn, **off_attn_kw)
+                if hw_ff:
+                    orr, occ = model._build_off_mlp_hw(h_leaf_frozen, x_mid, B_prof, MAX_NUM_LEAVES, Lf, C, Mh)
+                    if ffcw == 4:
+                        h_off = block.forward_mlp(
+                            x_mid, orr, occ, LeafOnlyNet._mlp_global_broadcast(x_mid)
+                        )
+                    else:
+                        h_off = block.forward_mlp(x_mid, orr, occ)
+                else:
+                    h_off = x_mid + block.mlp(block.norm2(x_mid))
+            return h_off
 
         try:
             comp_off = torch.compile(_hoff_stack_forward, fullgraph=False)
@@ -616,25 +698,51 @@ def print_leafonly_parameter_and_buffer_report(model: LeafOnlyNet) -> None:
 
 def print_highway_head_usage_report(model: LeafOnlyNet) -> None:
     """
-    Report how output heads split first-layer weight magnitude across
-    [block token | row-highway token | col-highway token] inputs.
+    With highway_ffn: report how each Transformer FFN's first linear splits
+    [token | row hw | col hw] or [token | row | col | global DC] when ffn_concat_width==4.
     """
-    print("\n=== Highway usage in output heads ===")
+    print("\n=== Highway usage (FFN vs heads) ===")
     if not bool(getattr(model, "use_highways", True)):
-        print("Highways are disabled (use_highways=False): heads consume block tokens only.")
+        print("Highways are disabled (use_highways=False): FFN and heads use block tokens only.")
         return
     d_model = int(model.embed.lift[0].out_features)
 
-    def _row_for_head(name: str, head: torch.nn.Module):
-        if not isinstance(head, torch.nn.Sequential):
-            return [name, "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a"]
-        W = head[0].weight.detach().float().cpu()
-        if W.shape[1] < 3 * d_model:
-            return [name, "n/a", "n/a", "n/a", "n/a", "n/a", "n/a", "n/a"]
+    def _row_for_ffn(name: str, block: torch.nn.Module):
+        m0 = block.mlp[0]
+        if not hasattr(m0, "weight"):
+            return [name] + ["n/a"] * 10
+        W = m0.weight.detach().float().cpu()
+        cin = int(W.shape[1])
+        if cin < 3 * d_model:
+            return [name, "n/a (1× d_model FFN)"] + ["n/a"] * 9
         wb = W[:, :d_model]
         wr = W[:, d_model : 2 * d_model]
         wc = W[:, 2 * d_model : 3 * d_model]
         nb, nr, nc = float(wb.norm()), float(wr.norm()), float(wc.norm())
+        if cin >= 4 * d_model:
+            wg = W[:, 3 * d_model : 4 * d_model]
+            ng = float(wg.norm())
+            nt = float(W.norm()) + 1e-30
+            eb = float((wb * wb).sum())
+            er = float((wr * wr).sum())
+            ec = float((wc * wc).sum())
+            eg = float((wg * wg).sum())
+            et = eb + er + ec + eg + 1e-30
+            nhw = nr + nc + ng
+            ehw = er + ec + eg
+            return [
+                name,
+                nb / nt,
+                nr / nt,
+                nc / nt,
+                ng / nt,
+                nhw / nt,
+                eb / et,
+                er / et,
+                ec / et,
+                eg / et,
+                ehw / et,
+            ]
         nt = float(W.norm()) + 1e-30
         eb = float((wb * wb).sum())
         er = float((wr * wr).sum())
@@ -645,34 +753,50 @@ def print_highway_head_usage_report(model: LeafOnlyNet) -> None:
             nb / nt,
             nr / nt,
             nc / nt,
+            "n/a",
             (nr + nc) / nt,
             eb / et,
             er / et,
             ec / et,
+            "n/a",
+            (er + ec) / et,
         ]
 
-    rows = [
+    ffn_rows = []
+    for i, block in enumerate(model.blocks):
+        ffn_rows.append(_row_for_ffn(f"Diag Transformer FFN layer {i}", block))
+    for i, block in enumerate(model.off_diag_blocks):
+        ffn_rows.append(_row_for_ffn(f"H-off Transformer FFN layer {i}", block))
+    hdr = [
+        "module",
+        "norm(tok)",
+        "norm(row)",
+        "norm(col)",
+        "norm(glob)",
+        "norm(row+col+glob)",
+        "E(tok)",
+        "E(row)",
+        "E(col)",
+        "E(glob)",
+        "E(row+col+glob)",
+    ]
+    _print_table("FFN first-layer input split", hdr, ffn_rows)
+
+    def _row_for_head(name: str, head: torch.nn.Module):
+        if not isinstance(head, torch.nn.Sequential):
+            return [name, "n/a"]
+        W = head[0].weight.detach().float().cpu()
+        return [name, f"in_features={W.shape[1]} (expect {d_model} for block-only head)"]
+
+    hrows = [
         _row_for_head("Diagonal leaf head", model.leaf_head),
         _row_for_head("Off-diag head U", model.off_diag_head_U),
         _row_for_head("Off-diag head V", model.off_diag_head_V),
     ]
-    _print_table(
-        "First-layer input split by head",
-        [
-            "head",
-            "norm(block)",
-            "norm(row)",
-            "norm(col)",
-            "norm(row+col)",
-            "energy(block)",
-            "energy(row)",
-            "energy(col)",
-        ],
-        rows,
-    )
+    _print_table("Output heads (first linear width)", ["head", "note"], hrows)
     print(
-        "Interpretation: norm(*) is ||W_chunk||/||W||; energy(*) is ||W_chunk||^2 / sum_chunks. "
-        "Higher row/col means more parameterized highway usage."
+        "Interpretation: norm(*) is ||W_chunk||/||W|| on the FFN first layer; E(*) is squared-mass share. "
+        "global = DC (mean-pooled token stream, broadcast). Higher row/col/global means more use of that path."
     )
 
 
@@ -714,6 +838,7 @@ def evaluate_gradient_interference(args, runtime):
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
         diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
         use_highways=bool(getattr(args, "use_highways", True)),
+        ffn_concat_width=getattr(args, "ffn_concat_width", None),
     ).to(device)
 
     if save_path.exists():
@@ -729,7 +854,6 @@ def evaluate_gradient_interference(args, runtime):
 
     num_eval = 10
     contexts_per_step = max(1, int(args.contexts_per_step))
-    eval_max_nodes = max(LEAF_SIZE * 2, int(MAX_MIXED_SIZE))
     data_path = Path(data_folder)
     run_folder = most_recent_run_folder(data_path)
     dataset = FluidGraphDataset([run_folder])
@@ -753,10 +877,9 @@ def evaluate_gradient_interference(args, runtime):
         for micro in range(contexts_per_step):
             frame_idx = frame_indices_per_pass[step][micro]
             batch = dataset[frame_idx]
-            n_pad = MAX_MIXED_SIZE
-            n_orig = min(int(batch["num_nodes"]), eval_max_nodes, n_pad)
+            n_pad = problem_padded_num_nodes(int(batch["num_nodes"]))
+            n_orig = n_pad
             x_input = batch["x"][:n_orig].unsqueeze(0).to(device)
-            x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
             active_pos = x_input[0, :n_orig, :3]
             x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
             rows, cols = batch["edge_index"][0], batch["edge_index"][1]
@@ -876,10 +999,9 @@ def evaluate_gradient_interference(args, runtime):
     # Component-level timing on one representative context.
     profile_frame_idx = frame_indices_per_pass[0][0]
     batch = dataset[profile_frame_idx]
-    n_pad = MAX_MIXED_SIZE
-    n_orig = min(int(batch["num_nodes"]), eval_max_nodes, n_pad)
+    n_pad = problem_padded_num_nodes(int(batch["num_nodes"]))
+    n_orig = n_pad
     x_input = batch["x"][:n_orig].unsqueeze(0).to(device)
-    x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
     active_pos = x_input[0, :n_orig, :3]
     x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
     rows, cols = batch["edge_index"][0], batch["edge_index"][1]
@@ -918,7 +1040,9 @@ def evaluate_gradient_interference(args, runtime):
     attn_mask, edge_feats, om_prof, oe_prof = pre_leaf
     positions = x_input[0, :, :3]
     B_prof, N_prof = x_input.shape[0], x_input.shape[1]
-    assert N_prof == MAX_NUM_LEAVES * LEAF_SIZE, "Profile expects N == MAX_MIXED_SIZE"
+    assert N_prof % LEAF_SIZE == 0 and N_prof // LEAF_SIZE <= MAX_NUM_LEAVES, (
+        f"Profile expects N divisible by LEAF_SIZE and K=N/L≤MAX_NUM_LEAVES; got N={N_prof}"
+    )
     Lf = LEAF_SIZE
     Mh = model.num_h_off
     Ls_off = int(model.leaf_apply_off)
@@ -964,65 +1088,31 @@ def evaluate_gradient_interference(args, runtime):
         h_proj0 = model.enc_input_proj(h_norm)
         C_dim = h_proj0.shape[-1]
         h_leaf_diag = model._pool_full_leaf_to_diag_tokens(h_proj0, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
-        h_diag = h_leaf_diag
-        for block in model.blocks:
-            h_diag = block(
-                h_diag,
-                edge_index=edge_index,
-                edge_values=edge_values,
-                positions=positions,
-                save_attention=False,
-                attn_mask=attn_mask,
-                edge_feats=edge_feats,
-            )
+        h_diag, off_stream_profile = model._apply_transformer_stacks(
+            h_proj0,
+            h_leaf_diag,
+            B_prof,
+            MAX_NUM_LEAVES,
+            Lf,
+            C_dim,
+            edge_index,
+            edge_values,
+            positions,
+            attn_mask,
+            edge_feats,
+            off_attn_mask,
+            off_edge_feats,
+            False,
+            False,
+        )
+        diag_blocks_profile = model._get_leaf_blocks(h_diag, mode="diagonal")
         if Mh > 0:
-            h_off = _hm_strip_pool_h_off_tokens(model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype)
-            for block in model.off_diag_blocks:
-                h_off = block(
-                    h_off,
-                    edge_index=edge_index,
-                    edge_values=edge_values,
-                    positions=positions,
-                    save_attention=False,
-                    attn_mask=off_attn_mask,
-                    edge_feats=off_edge_feats,
-                )
-            h_off = h_off.view(B_prof, Mh, Ls_off, C_dim)
-            off_stream_profile = h_off.reshape(B_prof * Mh, Ls_off, C_dim)
+            h_off = off_stream_profile.view(B_prof, Mh, Ls_off, C_dim)
+            off_diag_blocks_profile = model._get_leaf_blocks(h_off, mode="off-diagonal")
         else:
-            off_stream_profile = None
             off_diag_blocks_profile = torch.empty(
                 (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
             )
-        if model.use_highways:
-            row_highway_prof, col_highway_prof = model._build_token_highways(
-                h_ref=h_proj0,
-                h_diag=h_diag,
-                off_stream=off_stream_profile,
-                B=B_prof,
-                K=MAX_NUM_LEAVES,
-                L=Lf,
-                C_h=C_dim,
-                M_off=Mh,
-            )
-            diag_row_tok_prof, diag_col_tok_prof = model._diag_head_tokens_from_highways(
-                row_highway_prof, col_highway_prof, B_prof, MAX_NUM_LEAVES, Lf, C_dim
-            )
-        else:
-            row_highway_prof = col_highway_prof = None
-            diag_row_tok_prof = diag_col_tok_prof = None
-        diag_blocks_profile = model._get_leaf_blocks(
-            h_diag, mode="diagonal", row_tokens=diag_row_tok_prof, col_tokens=diag_col_tok_prof
-        )
-        if Mh > 0 and model.use_highways:
-            off_row_tok_prof, off_col_tok_prof = model._off_head_tokens_from_highways(
-                row_highway_prof, col_highway_prof, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh
-            )
-            off_diag_blocks_profile = model._get_leaf_blocks(
-                h_off, mode="off-diagonal", row_tokens=off_row_tok_prof, col_tokens=off_col_tok_prof
-            )
-        elif Mh > 0:
-            off_diag_blocks_profile = model._get_leaf_blocks(h_off, mode="off-diagonal")
         h_full_diag = model._diag_tokens_to_full_leaf(h_diag, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
         node_U_profile = model.node_u(h_full_diag)
         node_V_profile = model.node_v(h_full_diag)
@@ -1096,12 +1186,6 @@ def evaluate_gradient_interference(args, runtime):
             edge_feats=edge_feats,
             eager_attention=_eager_attn,
         )
-        h_block_in = h_leaf_diag
-        for i, block in enumerate(model.blocks):
-            h_block_in = _time_transformer_attn_and_mlp(
-                timing_rows, "Leaf", i, block, h_block_in, device, **leaf_attn_kw
-            )
-
         off_attn_kw = dict(
             edge_index=edge_index,
             edge_values=edge_values,
@@ -1126,29 +1210,155 @@ def evaluate_gradient_interference(args, runtime):
             dtp=dtp,
             x_dtype=x_input.dtype,
         )
-        if Mh > 0:
-            _strip_label = (
-                "H off strip pool (einsum row+col + token mean)"
-                if getattr(model, "strip_build_mode", "einsum") == "einsum"
-                else "H off strip pool (index_add row+col + token mean)"
-            )
-            ms_strip = _timed_ms(
-                lambda: _hm_strip_pool_h_off_tokens(
-                    model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
-                ),
-                device,
-            )
-            timing_rows.append([_strip_label, ms_strip])
-            h_off_in = _hm_strip_pool_h_off_tokens(
-                model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
-            )
-            for i, block in enumerate(model.off_diag_blocks):
-                h_off_in = _time_transformer_attn_and_mlp(
-                    timing_rows, "H off", i, block, h_off_in, device, **off_attn_kw
+        _strip_label = (
+            "H off strip pool (einsum row+col + token mean)"
+            if getattr(model, "strip_build_mode", "einsum") == "einsum"
+            else "H off strip pool (index_add row+col + token mean)"
+        )
+        n_l = len(model.blocks)
+        if Mh > 0 and n_l > 0:
+            off_stream_t = None
+            h_block_in = h_leaf_diag
+            for i in range(n_l):
+                blk_d = model.blocks[i]
+                h_in_d = h_block_in
+                ms_da = _timed_ms(
+                    lambda b=blk_d, h_in=h_in_d: b.attn(b.norm1(h_in), **leaf_attn_kw),
+                    device,
                 )
-            h_off_tokens = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
+                timing_rows.append([f"Leaf {i} attention (+ pre-norm)", ms_da])
+                with torch.no_grad():
+                    x_mid_d = blk_d.forward_attn(h_in_d, **leaf_attn_kw)
+                if getattr(model, "highway_ffn", False):
+                    rr, cc = model._build_diag_mlp_hw(x_mid_d, off_stream_t, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+                    if int(getattr(model, "ffn_concat_width", 1)) == 4:
+                        gg_d = LeafOnlyNet._mlp_global_broadcast(x_mid_d)
+                        ms_dm = _timed_ms(
+                            lambda b=blk_d, xm=x_mid_d, r=rr, c=cc, g=gg_d: b.mlp(
+                                torch.cat([b.norm2(xm), r, c, g], dim=-1)
+                            ),
+                            device,
+                        )
+                        timing_rows.append([f"Leaf {i} MLP (+ pre-norm, 4× hw+global)", ms_dm])
+                        with torch.no_grad():
+                            h_block_in = blk_d.forward_mlp(x_mid_d, rr, cc, gg_d)
+                    else:
+                        ms_dm = _timed_ms(
+                            lambda b=blk_d, xm=x_mid_d, r=rr, c=cc: b.mlp(torch.cat([b.norm2(xm), r, c], dim=-1)),
+                            device,
+                        )
+                        timing_rows.append([f"Leaf {i} MLP (+ pre-norm, 3× highway)", ms_dm])
+                        with torch.no_grad():
+                            h_block_in = blk_d.forward_mlp(x_mid_d, rr, cc)
+                else:
+                    ms_dm = _timed_ms(lambda b=blk_d, xm=x_mid_d: b.mlp(b.norm2(xm)), device)
+                    timing_rows.append([f"Leaf {i} MLP (+ pre-norm)", ms_dm])
+                    with torch.no_grad():
+                        h_block_in = x_mid_d + blk_d.mlp(blk_d.norm2(x_mid_d))
+                h_full_d = model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+                ms_st = _timed_ms(
+                    lambda hf=h_full_d: model._build_off_strip(hf, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh),
+                    device,
+                )
+                timing_rows.append([f"{_strip_label} (after Leaf {i})", ms_st])
+                with torch.no_grad():
+                    strip = model._build_off_strip(h_full_d, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh)
+                off_in = strip if off_stream_t is None else strip + off_stream_t
+                blk_o = model.off_diag_blocks[i]
+                h_in_o = off_in
+                ms_oa = _timed_ms(
+                    lambda b=blk_o, h_in=h_in_o: b.attn(b.norm1(h_in), **off_attn_kw),
+                    device,
+                )
+                timing_rows.append([f"H off {i} attention (+ pre-norm)", ms_oa])
+                with torch.no_grad():
+                    x_mid_o = blk_o.forward_attn(h_in_o, **off_attn_kw)
+                if getattr(model, "highway_ffn", False):
+                    orr, occ = model._build_off_mlp_hw(h_block_in, x_mid_o, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh)
+                    if int(getattr(model, "ffn_concat_width", 1)) == 4:
+                        og = LeafOnlyNet._mlp_global_broadcast(x_mid_o)
+                        ms_om = _timed_ms(
+                            lambda b=blk_o, xm=x_mid_o, r=orr, c=occ, g=og: b.mlp(
+                                torch.cat([b.norm2(xm), r, c, g], dim=-1)
+                            ),
+                            device,
+                        )
+                        timing_rows.append([f"H off {i} MLP (+ pre-norm, 4× hw+global)", ms_om])
+                        with torch.no_grad():
+                            off_stream_t = blk_o.forward_mlp(x_mid_o, orr, occ, og)
+                    else:
+                        ms_om = _timed_ms(
+                            lambda b=blk_o, xm=x_mid_o, r=orr, c=occ: b.mlp(torch.cat([b.norm2(xm), r, c], dim=-1)),
+                            device,
+                        )
+                        timing_rows.append([f"H off {i} MLP (+ pre-norm, 3× highway)", ms_om])
+                        with torch.no_grad():
+                            off_stream_t = blk_o.forward_mlp(x_mid_o, orr, occ)
+                else:
+                    ms_om = _timed_ms(lambda b=blk_o, xm=x_mid_o: b.mlp(b.norm2(xm)), device)
+                    timing_rows.append([f"H off {i} MLP (+ pre-norm)", ms_om])
+                    with torch.no_grad():
+                        off_stream_t = x_mid_o + blk_o.mlp(blk_o.norm2(x_mid_o))
+            h_off_tokens = off_stream_t.view(B_prof, Mh, Ls_off, C_dim)
         else:
-            h_off_tokens = None
+            h_block_in = h_leaf_diag
+            for i, block in enumerate(model.blocks):
+                hwfn = None
+                if getattr(model, "highway_ffn", False):
+
+                    def _make_diag_hwfn(os_ref):
+                        def _fn(xm):
+                            return model._build_diag_mlp_hw(xm, os_ref, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+
+                        return _fn
+
+                    hwfn = _make_diag_hwfn(None)
+                h_block_in = _time_transformer_attn_and_mlp(
+                    timing_rows,
+                    "Leaf",
+                    i,
+                    block,
+                    h_block_in,
+                    device,
+                    highway_pair_fn=hwfn,
+                    ffn_concat_width=int(getattr(model, "ffn_concat_width", 1)),
+                    **leaf_attn_kw,
+                )
+            if Mh > 0:
+                ms_strip = _timed_ms(
+                    lambda: _hm_strip_pool_h_off_tokens(
+                        model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
+                    ),
+                    device,
+                )
+                timing_rows.append([_strip_label, ms_strip])
+                h_off_in = _hm_strip_pool_h_off_tokens(
+                    model, h_proj0, B_prof, Mh, Lf, Ls_off, otp, device, x_input.dtype
+                )
+                h_diag_ref_off = h_block_in
+                for i, block in enumerate(model.off_diag_blocks):
+
+                    def _make_off_hwfn(hd_cap):
+                        def _fn(xm):
+                            return model._build_off_mlp_hw(hd_cap, xm, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh)
+
+                        return _fn
+
+                    off_hwfn = _make_off_hwfn(h_diag_ref_off) if getattr(model, "highway_ffn", False) else None
+                    h_off_in = _time_transformer_attn_and_mlp(
+                        timing_rows,
+                        "H off",
+                        i,
+                        block,
+                        h_off_in,
+                        device,
+                        highway_pair_fn=off_hwfn,
+                        ffn_concat_width=int(getattr(model, "ffn_concat_width", 1)),
+                        **off_attn_kw,
+                    )
+                h_off_tokens = h_off_in.view(B_prof, Mh, Ls_off, C_dim)
+            else:
+                h_off_tokens = None
 
         h_block_full = model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
         if model.use_highways:
@@ -1165,39 +1375,15 @@ def evaluate_gradient_interference(args, runtime):
                 ),
                 device,
             )
-            timing_rows.append(["Row/col highway gather (diag+H-off)", ms_highway])
-            row_highway, col_highway = model._build_token_highways(
-                h_ref=h_proj0,
-                h_diag=h_block_in,
-                off_stream=(h_off_tokens.reshape(B_prof * Mh, Ls_off, C_dim) if h_off_tokens is not None else None),
-                B=B_prof,
-                K=MAX_NUM_LEAVES,
-                L=Lf,
-                C_h=C_dim,
-                M_off=Mh,
-            )
-            diag_row_tok, diag_col_tok = model._diag_head_tokens_from_highways(
-                row_highway, col_highway, B_prof, MAX_NUM_LEAVES, Lf, C_dim
-            )
-        else:
-            row_highway = col_highway = None
-            diag_row_tok = diag_col_tok = None
+            timing_rows.append(["Row/col highway gather (diag+H-off, final)", ms_highway])
         ms_leaf_head = _timed_ms(
-            lambda: model._get_leaf_blocks(h_block_in, mode="diagonal", row_tokens=diag_row_tok, col_tokens=diag_col_tok),
+            lambda: model._get_leaf_blocks(h_block_in, mode="diagonal"),
             device,
         )
         timing_rows.append(["Diagonal leaf head (MLP, U U^T)", ms_leaf_head])
         if h_off_tokens is not None:
-            if model.use_highways:
-                off_row_tok, off_col_tok = model._off_head_tokens_from_highways(
-                    row_highway, col_highway, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh
-                )
-            else:
-                off_row_tok = off_col_tok = None
             ms_off_head = _timed_ms(
-                lambda: model._get_leaf_blocks(
-                    h_off_tokens, mode="off-diagonal", row_tokens=off_row_tok, col_tokens=off_col_tok
-                ),
+                lambda: model._get_leaf_blocks(h_off_tokens, mode="off-diagonal"),
                 device,
             )
             timing_rows.append(["H off head (MLP, U V^T)", ms_off_head])
@@ -1345,6 +1531,7 @@ def evaluate_estimator_variance(args, runtime):
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
         diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
         use_highways=bool(getattr(args, "use_highways", True)),
+        ffn_concat_width=getattr(args, "ffn_concat_width", None),
     ).to(device)
 
     if save_path.exists():
@@ -1359,7 +1546,6 @@ def evaluate_estimator_variance(args, runtime):
     pv = int(getattr(args, "probe_vectors", -1))
     batch_vectors = pv if pv > 0 else 64
 
-    eval_max_nodes = max(LEAF_SIZE * 2, int(MAX_MIXED_SIZE))
     data_path = Path(data_folder)
     run_folder = most_recent_run_folder(data_path)
     dataset = FluidGraphDataset([run_folder])
@@ -1368,10 +1554,9 @@ def evaluate_estimator_variance(args, runtime):
 
     frame_idx = 0
     batch = dataset[frame_idx]
-    n_pad = MAX_MIXED_SIZE
-    n_orig = min(int(batch["num_nodes"]), eval_max_nodes, n_pad)
+    n_pad = problem_padded_num_nodes(int(batch["num_nodes"]))
+    n_orig = n_pad
     x_input = batch["x"][:n_orig].unsqueeze(0).to(device)
-    x_input = F.pad(x_input, (0, 0, 0, n_pad - n_orig), value=0.0)
     active_pos = x_input[0, :n_orig, :3]
     x_input[0, :n_orig, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
     rows, cols = batch["edge_index"][0], batch["edge_index"][1]
