@@ -40,9 +40,9 @@ GLOBAL_FEATURES_DIM = 12
 HUTCHINSON_PROBE_JACOBI_STEPS = 2
 HUTCHINSON_PROBE_JACOBI_OMEGA = 0.6
 
-# Padded problem size for LeafOnlyNet / training contexts / InspectModel (single source of truth).
-# MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE must match the checkpoint layout (same as at train time).
-MAX_MIXED_SIZE = 4096
+# Upper cap on nodes; leaf grid in checkpoints is still sized for this maximum (MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE).
+# Per-frame padded size is ``problem_padded_num_nodes(num_nodes)`` (aligned, min(frame, MAX_MIXED_SIZE)) — no identity tail when smaller.
+MAX_MIXED_SIZE = 8192
 # Minimum **aligned** active nodes to keep a frame: n_active = ⌊min(num_nodes, MAX)/LEAF⌋·LEAF.
 # Must be ≤ your smallest frame's aligned count. Do not set this to MAX_MIXED_SIZE unless every frame has ≥ that many nodes.
 MIN_MIXED_SIZE = LEAF_SIZE
@@ -55,6 +55,14 @@ def effective_aligned_num_nodes(num_nodes_real: int) -> int:
     n = int(num_nodes_real)
     cap = min(n, int(MAX_MIXED_SIZE))
     return (cap // int(LEAF_SIZE)) * int(LEAF_SIZE)
+
+
+def problem_padded_num_nodes(num_nodes_real: int) -> int:
+    """
+    Padded graph size N for LeafOnly forward, A, and Jacobi: same as the aligned active count
+    (no identity tail past the frame). At most MAX_MIXED_SIZE; smaller frames use fewer nodes.
+    """
+    return int(effective_aligned_num_nodes(num_nodes_real))
 # Weak admissibility parameter (same as analytical reference).
 HMATRIX_ETA = 1.0
 

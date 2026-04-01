@@ -208,11 +208,10 @@ def train_leaf_only(args, runtime):
             n = effective_aligned_num_nodes(num_nodes_real)
             if n < MIN_MIXED_SIZE:
                 continue
-            n_pad = MAX_MIXED_SIZE
+            n_pad = n
             t_o0 = time.perf_counter()
             x_full = batch["x"]
             x_input = x_full[:n].unsqueeze(0).to(device)
-            x_input = F.pad(x_input, (0, 0, 0, n_pad - n), value=0.0)
             active_pos = x_input[0, :n, :3]
             centroid = active_pos.mean(dim=0, keepdim=True)
             x_input[0, :n, :3] = active_pos - centroid
@@ -341,6 +340,7 @@ def train_leaf_only(args, runtime):
         off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
         diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
         use_highways=bool(getattr(args, "use_highways", True)),
+        ffn_concat_width=getattr(args, "ffn_concat_width", None),
     ).to(device)
     ms_model = (time.perf_counter() - t_seg) * 1000.0
     _oda = bool(getattr(args, "off_diag_dense_attn", True))

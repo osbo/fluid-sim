@@ -16,8 +16,8 @@ from leafonly.config import (
     LEAF_APPLY_SIZE,
     LEAF_APPLY_SIZE_OFF,
     LEAF_SIZE,
-    MAX_MIXED_SIZE,
     fixed_runtime_config,
+    problem_padded_num_nodes,
     require_cuda_or_mps_device,
 )
 from leafonly.data import FluidGraphDataset, most_recent_run_folder
@@ -56,12 +56,11 @@ def _measure_inference_ms(save_path, cfg, runtime, frame_idx=600):
     frame_idx = min(int(frame_idx), len(dataset) - 1)
     batch = dataset[frame_idx]
     num_nodes_real = int(batch["num_nodes"])
-    n_requested = min(MAX_MIXED_SIZE, num_nodes_real)
-    n_pad = MAX_MIXED_SIZE
+    n_requested = problem_padded_num_nodes(num_nodes_real)
+    n_pad = n_requested
 
     x = batch["x"].unsqueeze(0).to(device)
     x_input = x[:, :n_requested, :].clone()
-    x_input = F.pad(x_input, (0, 0, 0, n_pad - n_requested), value=0.0)
     active_pos = x_input[0, :n_requested, :3]
     x_input[0, :n_requested, :3] = active_pos - active_pos.mean(dim=0, keepdim=True)
 
