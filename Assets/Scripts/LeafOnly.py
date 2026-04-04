@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 from leafonly.architecture import attention_layout_choices, default_attention_layout
 from leafonly.config import LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps_device
@@ -31,6 +32,18 @@ CHECKPOINT_ERR_NO_HIGHWAY_IN_FILE_NEED_CLI_OFF = (
 
 def _build_parser():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data-folder",
+        "--dataset_folders",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Directory to scan for frames (rglob nodes.bin under it). "
+            "Default: StreamingAssets/TestData from fixed_runtime_config. "
+            "Repo train.py maps --dataset_folders to this flag."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--d_model", type=int, default=64)
@@ -162,6 +175,8 @@ def train_leaf_only():
     args.num_gcn_layers = 2
     args.use_jacobi = True
     runtime = fixed_runtime_config(__file__)
+    if args.data_folder is not None:
+        runtime["data_folder"] = str(Path(args.data_folder).expanduser().resolve())
     runtime["device"] = require_cuda_or_mps_device()
     if args.evaluate_gradients:
         evaluate_gradient_interference(args, runtime)

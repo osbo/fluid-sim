@@ -57,14 +57,32 @@ except ImportError:
     if not _TEST_ONLY_CLI:
         print("Warning: 'pyamg' not installed. AMG baseline will be skipped.")
 
+AMGX_IMPORT_ERROR = None  # str if pyamgx failed to import (shown in PCG summary when CUDA + --test_only)
 try:
     import pyamgx
     HAS_AMGX = True
 except (ImportError, OSError) as e:
     HAS_AMGX = False
+    AMGX_IMPORT_ERROR = f"{type(e).__name__}: {e}"
     if not _TEST_ONLY_CLI:
         print("Warning: 'pyamgx' not available. AMGX (GPU) comparison will be skipped.", e)
 import torch
+
+
+def _amgx_skip_followup_lines(import_err: str):
+    """Short lines for the PCG table (avoids one huge wrapped line in narrow terminals)."""
+    err = import_err or ""
+    lines = []
+    if "libcusolver.so.11" in err or "libcusolver.so.12" in err:
+        lines.append(
+            "  → CUDA cuSOLVER mismatch: pyamgx/AMGX was built expecting a different libcusolver.so.N than "
+            "your runtime. Add a matching CUDA toolkit to LD_LIBRARY_PATH, or install pyamgx built for "
+            "the same CUDA major as PyTorch (e.g. cu11 wheel vs cu12)."
+        )
+    lines.append(
+        "  → With --test_only, the pyamgx import warning at startup is suppressed; run without it once to see it."
+    )
+    return lines
 
 import torch.nn.functional as F
 
@@ -1592,6 +1610,14 @@ def main():
             "Keeps heatmaps and H-matrix rank row; saves many minutes when viz_n is a few thousand."
         ),
     )
+    parser.add_argument(
+        "--data-folder",
+        "--dataset_folders",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Frame root (rglob nodes.bin). Default: StreamingAssets/TestData next to Assets.",
+    )
     args = parser.parse_args()
     test_only = bool(args.test_only)
     fast_plot = bool(getattr(args, "fast_plot", False))
@@ -1610,7 +1636,11 @@ def main():
     _triton_cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("TRITON_CACHE_DIR", str(_triton_cache.resolve()))
 
-    data_folder = script_dir.parent / "StreamingAssets" / "TestData"
+    _df_arg = getattr(args, "data_folder", None)
+    if _df_arg:
+        data_folder = Path(_df_arg).expanduser().resolve()
+    else:
+        data_folder = script_dir.parent / "StreamingAssets" / "TestData"
     leaf_only_weights_path = script_dir / "leaf_only_weights.bytes"
     out_path = script_dir / "inspect_model_plot.png"
     frame_idx = 600
@@ -2208,7 +2238,7 @@ def main():
     print("Diag (Jacobi; paper Table 7: Eigen CPU / custom GPU):")
     print(f"  Setup: {setup_diag_cpu_ms:.2f} ms, solve (CPU): {solve_diag_cpu_ms:.2f} ms, {iters_diag_cpu} iterations, total: {total_diag_cpu_ms:.2f} ms")
     print(f"  Setup: {setup_diag_gpu_ms:.2f} ms, solve (GPU): {solve_diag_gpu_ms:.2f} ms, {iters_diag_gpu} iterations, total: {total_diag_gpu_ms:.2f} ms")
-    print("IC (paper: Eigen CPU / cuSPARSE GPU; here ilupp or scipy CPU; GPU line uses AMGX MULTICOLOR_DILU for scalar CSR):")
+    print("IC (CPU: ilupp/scipy; GPU IC-class: AMGX MULTICOLOR_DILU if pyamgx loads):")
     if ic_apply is not None:
         print(
             f"  Setup: {ic_setup_ms:.2f} ms, solve (CPU): {solve_ic_cpu_ms:.2f} ms, {iters_ic_cpu} iterations, "
@@ -2237,6 +2267,11 @@ def main():
             f"  Setup: {amgx_amg_setup_ms:.2f} ms, solve: {amgx_amg_solve_ms:.2f} ms, {amgx_amg_iters} iterations, "
             f"total: {total_amgx_amg_ms:.2f} ms"
         )
+    elif device.type == "cuda":
+        _why = AMGX_IMPORT_ERROR or "pyamgx not importable"
+        print(f"AMGX (GPU): skipped — {_why}")
+        for _ln in _amgx_skip_followup_lines(_why):
+            print(_ln)
 
     if test_only:
         return
