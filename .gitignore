@@ -42,3 +42,6 @@ __pycache__/
 
 # Optional: uncomment to avoid committing large training runs
 # Assets/StreamingAssets/TestData/Run_*/
+
+# Local datasets and training caches under Scripts (often >100MB; regenerate locally)
+Assets/Scripts/data/
