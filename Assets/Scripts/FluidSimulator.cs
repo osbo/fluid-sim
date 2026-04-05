@@ -41,7 +41,6 @@ public partial class FluidSimulator : MonoBehaviour
     private int markActiveNodesKernel;
     private int scatterUniquesKernel;
     private int scatterActivesKernel;
-    private int copyNodesKernel;
     private int writeUniqueCountKernel;
     private int writeNodeCountKernel;
     private int radixPrefixSumKernelId;
@@ -69,19 +68,22 @@ public partial class FluidSimulator : MonoBehaviour
     private int precomputeIndicesKernelId;
     private int applySparseGTKernelId;
     private int applySparseGAndDotKernelId;
-    private int clearBufferFloatKernelId;
     private int applyJacobiKernelId;
     private int globalReduceSumKernelId;
     private int copyFloatKernelId;
     private int scaleKernelId;
+    private int computeAlphaKernelId;
+    private int computeBetaKernelId;
+    private int storeRhoFromDotKernelId;
+    private int axpyAlphaKernelId;
+    private int axpyNegAlphaKernelId;
+    private int scaleAddBetaKernelId;
     // Cached CSR builder kernel IDs
     private int csrCountNnzKernelId;
     private int csrFinalizeRowPtrKernelId;
     private int csrFillKernelId;
     // Cached octree/prefix-sum kernel IDs
     private int writeDispatchArgsKernelId;
-    private int clearUniqueBuffersKernelId;
-    private int clearActiveBuffersKernelId;
     private int writeUniqueCountKernelId2;  // alias for writeUniqueCountKernel (already a field above)
     private int writeNodeCountKernelId;
     private int scatterActivesKernelId;
@@ -119,6 +121,9 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer matrixGBuffer; // Output buffer for preconditioner matrix G
     private ComputeBuffer zBuffer; // Intermediate buffer for PCG preconditioner application (used as 'u' in shader)
     private ComputeBuffer zVectorBuffer; // Preconditioned residual vector 'z' for PCG
+    private ComputeBuffer cgAlphaBuffer;
+    private ComputeBuffer cgBetaBuffer;
+    private ComputeBuffer cgRhoBuffer;
     private ComputeBuffer scatterIndicesBuffer; // NEW: Pre-computed scatter indices for optimization
     private ComputeBuffer bufferQ; // Q buffer for attention
     private ComputeBuffer bufferK; // K buffer for attention
@@ -732,6 +737,9 @@ public partial class FluidSimulator : MonoBehaviour
         dispatchArgsBuffer?.Release();
         divergenceBuffer?.Release();
         residualBuffer?.Release();
+        cgAlphaBuffer?.Release();
+        cgBetaBuffer?.Release();
+        cgRhoBuffer?.Release();
         pBuffer?.Release();
         ApBuffer?.Release();
         pressureBuffer?.Release();
