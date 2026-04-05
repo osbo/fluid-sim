@@ -13,6 +13,12 @@
 #pragma kernel GlobalReduceSum
 #pragma kernel SpMV_CSR
 #pragma kernel CopyFloat
+#pragma kernel ComputeAlpha
+#pragma kernel ComputeBeta
+#pragma kernel StoreRhoFromDot
+#pragma kernel AxpyAlpha
+#pragma kernel AxpyNegAlpha
+#pragma kernel ScaleAddBeta
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
@@ -47,6 +53,11 @@ RWStructuredBuffer<uint> scatterIndicesBuffer;
 // Slot 0 = Diagonal, Slots 1-24 = Neighbors 0-23
 // Ensure this matches the C# name
 RWStructuredBuffer<float> matrixABuffer; 
+
+// PCG scalars (1-element buffers; no per-iteration CPU readback)
+RWStructuredBuffer<float> alphaBuffer;
+RWStructuredBuffer<float> betaBuffer;
+RWStructuredBuffer<float> rhoBuffer;
 
 // --- CSR representation of A ---
 StructuredBuffer<uint> csrRowPtr;         // [numNodes + 1]
@@ -479,6 +490,55 @@ void GlobalReduceSum(uint3 id : SV_DispatchThreadID) {
     float total = 0.0;
     for(uint i = 0; i < count; i++) total += divergenceBuffer[i];
     divergenceBuffer[0] = total;
+}
+
+// After SpMV + GlobalReduceSum: divergenceBuffer[0] = p·Ap
+[numthreads(1, 1, 1)]
+void ComputeAlpha(uint3 id : SV_DispatchThreadID)
+{
+    float p_dot_Ap = divergenceBuffer[0];
+    alphaBuffer[0] = (p_dot_Ap > 1e-12f) ? (rhoBuffer[0] / p_dot_Ap) : 0.0f;
+}
+
+// After preconditioner fused dot + GlobalReduceSum: divergenceBuffer[0] = rho_new
+[numthreads(1, 1, 1)]
+void ComputeBeta(uint3 id : SV_DispatchThreadID)
+{
+    float rho_new = divergenceBuffer[0];
+    float rho_old = rhoBuffer[0];
+    betaBuffer[0] = (rho_old > 1e-30f) ? (rho_new / rho_old) : 0.0f;
+    rhoBuffer[0] = rho_new;
+}
+
+[numthreads(1, 1, 1)]
+void StoreRhoFromDot(uint3 id : SV_DispatchThreadID)
+{
+    rhoBuffer[0] = divergenceBuffer[0];
+}
+
+[numthreads(512, 1, 1)]
+void AxpyAlpha(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+    yBuffer[i] += alphaBuffer[0] * xBuffer[i];
+}
+
+[numthreads(512, 1, 1)]
+void AxpyNegAlpha(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+    yBuffer[i] -= alphaBuffer[0] * xBuffer[i];
+}
+
+// p = beta * p + z  (z bound as yBuffer, e.g. zVectorBuffer)
+[numthreads(512, 1, 1)]
+void ScaleAddBeta(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numNodes) return;
+    pBuffer[i] = betaBuffer[0] * pBuffer[i] + yBuffer[i];
 }
 
 // GPU buffer copy: yBuffer[i] = xBuffer[i] for i < numNodes

@@ -19,9 +19,6 @@ public partial class FluidSimulator : MonoBehaviour
         writeNodeCountKernelId     = nodesPrefixSumsShader.FindKernel("writeNodeCount");
         markActiveNodesKernelId    = nodesPrefixSumsShader.FindKernel("markActiveNodes");
         scatterActivesKernelId     = nodesPrefixSumsShader.FindKernel("scatterActives");
-        copyNodesKernel            = nodesPrefixSumsShader.FindKernel("copyNodes");
-        clearUniqueBuffersKernelId = nodesPrefixSumsShader.FindKernel("clearUniqueBuffers");
-        clearActiveBuffersKernelId = nodesPrefixSumsShader.FindKernel("clearActiveBuffers");
         writeDispatchArgsKernelId  = nodesPrefixSumsShader.FindKernel("WriteDispatchArgs");
 
         createLeavesKernel         = nodesShader.FindKernel("CreateLeaves");
@@ -134,8 +131,6 @@ public partial class FluidSimulator : MonoBehaviour
         }
         if (numNodes == 0) return;
 
-        ClearUniqueBuffers();
-
         int prefixBits = layer * 3;
         int groupsLinear = (numNodes + 511) / 512;
 
@@ -197,8 +192,6 @@ public partial class FluidSimulator : MonoBehaviour
         }
         if (nodeCount == null) nodeCount = new ComputeBuffer(1, sizeof(uint));
 
-        ClearActiveBuffers();
-
         int groupsLinear = Mathf.Max(1, (numNodes + 511) / 512);
 
         nodesPrefixSumsShader.SetBuffer(markActiveNodesKernelId, "nodesBuffer", nodesBuffer);
@@ -232,11 +225,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodeCount.GetData(nodeCountCpu);
         numNodes = (int)nodeCountCpu[0];
 
-        nodesPrefixSumsShader.SetBuffer(copyNodesKernel, "nodesBuffer", nodesBuffer);
-        nodesPrefixSumsShader.SetBuffer(copyNodesKernel, "tempNodesBuffer", tempNodesBuffer);
-        nodesPrefixSumsShader.SetInt("len", numNodes);
-        int copyGroups = Mathf.Max(1, (numNodes + 511) / 512);
-        nodesPrefixSumsShader.Dispatch(copyNodesKernel, copyGroups, 1, 1);
+        (nodesBuffer, tempNodesBuffer) = (tempNodesBuffer, nodesBuffer);
     }
 
     private void findNeighbors()
@@ -330,29 +319,6 @@ public partial class FluidSimulator : MonoBehaviour
 
         if (writeBuffer == phiBuffer_Read)
             GpuCopyBuffer(phiBuffer_Read, phiBuffer);
-    }
-
-    private void ClearUniqueBuffers()
-    {
-        if (nodesPrefixSumsShader == null) return;
-        if (numParticles == 0) return;
-
-        nodesPrefixSumsShader.SetBuffer(clearUniqueBuffersKernelId, "indicators", indicators);
-        nodesPrefixSumsShader.SetBuffer(clearUniqueBuffersKernelId, "uniqueIndices", uniqueIndices);
-        nodesPrefixSumsShader.SetInt("len", numParticles);
-        int groupsLinear = (numParticles + 511) / 512;
-        nodesPrefixSumsShader.Dispatch(clearUniqueBuffersKernelId, groupsLinear, 1, 1);
-    }
-
-    private void ClearActiveBuffers()
-    {
-        if (nodesPrefixSumsShader == null) return;
-        if (numParticles == 0) return;
-
-        nodesPrefixSumsShader.SetBuffer(clearActiveBuffersKernelId, "indicators", indicators);
-        nodesPrefixSumsShader.SetInt("len", numParticles);
-        int groupsLinear = (numParticles + 511) / 512;
-        nodesPrefixSumsShader.Dispatch(clearActiveBuffersKernelId, groupsLinear, 1, 1);
     }
 
     // Shared helper: runs a two-level exclusive prefix scan (same logic used in three places).

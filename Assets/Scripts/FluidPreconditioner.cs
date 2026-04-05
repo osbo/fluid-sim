@@ -239,7 +239,7 @@ public partial class FluidSimulator : MonoBehaviour
         ValidateWeightBuffer(weightBuffers.ContainsKey("head.bias") ? weightBuffers["head.bias"] : null, "head.bias");
     }
 
-    private void ApplyPreconditioner(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kClear, int kJacobi)
+    private void ApplyPreconditioner(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kJacobi)
     {
         if (preconditioner == PreconditionerType.None)
         {
@@ -269,12 +269,7 @@ public partial class FluidSimulator : MonoBehaviour
                 zBuffer = new ComputeBuffer(requiredSize, 4);
             }
 
-            // 1. Clear Intermediate
-            cgSolverShader.SetBuffer(kClear, "zBuffer", zBuffer); 
-            cgSolverShader.SetInt("numNodes", numNodes);
-            Dispatch(kClear, numNodes);
-
-            // 2. u = G^T * r
+            // u = G^T * r (ApplySparseGT overwrites every zBuffer[i]; clear is unnecessary)
             cgSolverShader.SetBuffer(kGT, "xBuffer", r);
             cgSolverShader.SetBuffer(kGT, "zBuffer", zBuffer);
             cgSolverShader.SetBuffer(kGT, "matrixGBuffer", matrixGBuffer);
@@ -284,7 +279,7 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetInt("numNodes", numNodes);
             Dispatch(kGT, numNodes);
 
-            // 3. z = G * u + eps * r
+            // z = G * u + eps * r
             cgSolverShader.SetBuffer(kG, "zBuffer", zBuffer);
             cgSolverShader.SetBuffer(kG, "xBuffer", r);
             cgSolverShader.SetBuffer(kG, "yBuffer", z_out);
@@ -296,18 +291,18 @@ public partial class FluidSimulator : MonoBehaviour
         else CopyBuffer(r, z_out);
     }
 
-    private float ApplyPreconditionerAndDot(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kG_Dot, int kClear, int kJacobi)
+    /// <summary>Neural: fused z + partial r·z; else Jacobi/none + dot. Finishes with GlobalReduceSum (no CPU readback).</summary>
+    private void ApplyPreconditionerPcgIterationGpu(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kG_Dot, int kJacobi)
     {
-        float dotResult = 0.0f;
-
         if (preconditioner == PreconditionerType.Neural && matrixGBuffer != null && reverseNeighborsBuffer != null)
         {
-            // 1. Clear
-            cgSolverShader.SetBuffer(kClear, "zBuffer", zBuffer);
-            cgSolverShader.SetInt("numNodes", numNodes);
-            Dispatch(kClear, numNodes);
+            int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
+            if (zBuffer == null || zBuffer.count < requiredSize)
+            {
+                zBuffer?.Release();
+                zBuffer = new ComputeBuffer(requiredSize, 4);
+            }
 
-            // 2. u = G^T * r
             cgSolverShader.SetBuffer(kGT, "xBuffer", r);
             cgSolverShader.SetBuffer(kGT, "zBuffer", zBuffer);
             cgSolverShader.SetBuffer(kGT, "matrixGBuffer", matrixGBuffer);
@@ -317,7 +312,6 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetInt("numNodes", numNodes);
             Dispatch(kGT, numNodes);
 
-            // 3. z = G * u + eps * r AND dot
             cgSolverShader.SetBuffer(kG_Dot, "zBuffer", zBuffer);
             cgSolverShader.SetBuffer(kG_Dot, "xBuffer", r);
             cgSolverShader.SetBuffer(kG_Dot, "yBuffer", z_out);
@@ -325,19 +319,23 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(kG_Dot, "neighborsBuffer", neighborsBuffer);
             cgSolverShader.SetBuffer(kG_Dot, "divergenceBuffer", divergenceBuffer);
             cgSolverShader.SetInt("numNodes", numNodes);
-            
+
             int groups = Mathf.CeilToInt(numNodes / 256.0f);
             cgSolverShader.Dispatch(kG_Dot, groups, 1, 1);
-
-            // 4. GPU final reduction — avoids per-iteration array alloc and full GetData
-            dotResult = GpuReduceSum(groups);
+            GpuFinalizeReduction(groups);
         }
         else
         {
-            ApplyPreconditioner(r, z_out, kGT, kG, kClear, kJacobi);
-            dotResult = GpuDotProduct(r, z_out);
+            ApplyPreconditioner(r, z_out, kGT, kG, kJacobi);
+            GpuDotProductReduceNoReadback(r, z_out);
         }
-        return dotResult;
+    }
+
+    /// <summary>Same as iteration path, then rhoBuffer[0] = divergenceBuffer[0] for initial PCG state.</summary>
+    private void ApplyPreconditionerInitStoreRhoGpu(ComputeBuffer r, ComputeBuffer z_out, int kGT, int kG, int kG_Dot, int kJacobi)
+    {
+        ApplyPreconditionerPcgIterationGpu(r, z_out, kGT, kG, kG_Dot, kJacobi);
+        DispatchStoreRhoFromDot();
     }
 
     private void RunNeuralPreconditioner()
