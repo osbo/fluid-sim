@@ -12,6 +12,7 @@
 #pragma kernel ApplyJacobi // Keep this
 #pragma kernel GlobalReduceSum
 #pragma kernel SpMV_CSR
+#pragma kernel CopyFloat
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
@@ -474,8 +475,16 @@ void ApplyJacobi(uint3 id : SV_DispatchThreadID) {
 [numthreads(64, 1, 1)]
 void GlobalReduceSum(uint3 id : SV_DispatchThreadID) {
     if (id.x != 0) return;
-    uint count = min(reductionCount, 2048); 
+    uint count = min(reductionCount, 2048);
     float total = 0.0;
     for(uint i = 0; i < count; i++) total += divergenceBuffer[i];
     divergenceBuffer[0] = total;
+}
+
+// GPU buffer copy: yBuffer[i] = xBuffer[i] for i < numNodes
+[numthreads(512, 1, 1)]
+void CopyFloat(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (i >= numNodes) return;
+    yBuffer[i] = xBuffer[i];
 }

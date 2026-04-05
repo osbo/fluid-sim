@@ -77,15 +77,17 @@ def main():
             EA = B @ A_sub
         else:
             B = A_inv[r0:r1, c0:c1]
-            Lr, Lc = r1 - r0, c1 - c0
+            # Slices clip at matrix bounds; row/col spans can differ for off-diagonal tiles near edges.
+            Lr, Lc = int(B.shape[0]), int(B.shape[1])
+            r1e, c1e = r0 + Lr, c0 + Lc
             E_UU = np.zeros((Lr + Lc, Lr + Lc), dtype=np.float64)
             E_UU[0:Lr, Lr:Lr+Lc] = B
             E_UU[Lr:Lr+Lc, 0:Lr] = B.T
             A_UU = np.zeros((Lr + Lc, Lr + Lc), dtype=np.float64)
-            A_UU[0:Lr, 0:Lr] = A_phys_f64[r0:r1, r0:r1]
-            A_UU[0:Lr, Lr:Lr+Lc] = A_phys_f64[r0:r1, c0:c1]
-            A_UU[Lr:Lr+Lc, 0:Lr] = A_phys_f64[c0:c1, r0:r1]
-            A_UU[Lr:Lr+Lc, Lr:Lr+Lc] = A_phys_f64[c0:c1, c0:c1]
+            A_UU[0:Lr, 0:Lr] = A_phys_f64[r0:r1e, r0:r1e]
+            A_UU[0:Lr, Lr:Lr+Lc] = A_phys_f64[r0:r1e, c0:c1e]
+            A_UU[Lr:Lr+Lc, 0:Lr] = A_phys_f64[c0:c1e, r0:r1e]
+            A_UU[Lr:Lr+Lc, Lr:Lr+Lc] = A_phys_f64[c0:c1e, c0:c1e]
             EA = E_UU @ A_UU
             
         evs = np.linalg.eigvals(EA)

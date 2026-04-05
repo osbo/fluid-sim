@@ -62,6 +62,30 @@ public partial class FluidSimulator : MonoBehaviour
     private int propagatePhiKernel;
     private int extractMortonCodesKernel;
     private int calculateDensityGradientKernel;
+    // Cached solver kernel IDs (set once in InitSolverKernels)
+    private int buildMatrixAKernelId;
+    private int applyMatrixAndDotKernelId;
+    private int spmvCsrKernelId;
+    private int precomputeIndicesKernelId;
+    private int applySparseGTKernelId;
+    private int applySparseGAndDotKernelId;
+    private int clearBufferFloatKernelId;
+    private int applyJacobiKernelId;
+    private int globalReduceSumKernelId;
+    private int copyFloatKernelId;
+    private int scaleKernelId;
+    // Cached CSR builder kernel IDs
+    private int csrCountNnzKernelId;
+    private int csrFinalizeRowPtrKernelId;
+    private int csrFillKernelId;
+    // Cached octree/prefix-sum kernel IDs
+    private int writeDispatchArgsKernelId;
+    private int clearUniqueBuffersKernelId;
+    private int clearActiveBuffersKernelId;
+    private int writeUniqueCountKernelId2;  // alias for writeUniqueCountKernel (already a field above)
+    private int writeNodeCountKernelId;
+    private int scatterActivesKernelId;
+    private int markActiveNodesKernelId;
     
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
@@ -101,6 +125,7 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer bufferV; // V buffer for attention
     private ComputeBuffer bufferAttn; // Attention output buffer
     private ComputeBuffer diffusionGradientBuffer; // Precomputed normalized density gradient per node
+    private ComputeBuffer dispatchArgsBuffer;       // 3-uint indirect dispatch args for DispatchIndirect
     // CSR matrix representation of A
     private ComputeBuffer nnzPerNode;   // Per-row nnz counts
     private ComputeBuffer csrRowPtr;    // Row pointer (size numNodes + 1)
@@ -290,7 +315,11 @@ public partial class FluidSimulator : MonoBehaviour
     {
         InitializeParticleSystem();
         // InitializeInitialParticles();
-        
+
+        // Cache all kernel IDs once so hot paths never call FindKernel
+        InitSolverKernels();
+        InitOctreeKernels();
+
         // Load neural preconditioner model metadata
         LoadModelMetadata();
         
@@ -482,7 +511,6 @@ public partial class FluidSimulator : MonoBehaviour
             return;
         }
 
-        calculateDensityGradientKernel = nodesShader.FindKernel("CalculateDensityGradient");
         nodesShader.SetBuffer(calculateDensityGradientKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
@@ -701,6 +729,7 @@ public partial class FluidSimulator : MonoBehaviour
         neighborsBuffer?.Release();
         reverseNeighborsBuffer?.Release();
         diffusionGradientBuffer?.Release();
+        dispatchArgsBuffer?.Release();
         divergenceBuffer?.Release();
         residualBuffer?.Release();
         pBuffer?.Release();
