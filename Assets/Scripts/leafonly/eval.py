@@ -25,6 +25,7 @@ from .config import (
 )
 from .data import FluidGraphDataset, build_leaf_block_connectivity, most_recent_run_folder
 from .probe_z import jacobi_smooth_hutchinson_z_inplace
+from .sparse_operator import diag_from_sparse_coo, make_sparse_az_fn, padded_operator_sparse
 
 
 def _sync_device(device):
@@ -142,7 +143,14 @@ def _hm_strip_pool_h_off_tokens(
 ) -> torch.Tensor:
     """H-matrix row/col strip aggregate + optional token mean-pool → input to off-diagonal Transformer stack."""
     C_dim = int(h_proj0.shape[-1])
-    h_k_t = h_proj0.view(B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+    N_seq = int(h_proj0.shape[1])
+    K_actual = N_seq // Lf
+    if N_seq != K_actual * Lf:
+        raise ValueError(f"_hm_strip_pool_h_off_tokens: N={N_seq} not divisible by Lf={Lf}")
+    h_k_t = h_proj0.view(B_prof, K_actual, Lf, C_dim)
+    if K_actual < MAX_NUM_LEAVES:
+        # Weights are (M_off, MAX_NUM_LEAVES); pad inactive leaves with zeros (matches forward semantics).
+        h_k_t = F.pad(h_k_t, (0, 0, 0, 0, 0, MAX_NUM_LEAVES - K_actual))
     if getattr(model, "strip_build_mode", "einsum") == "einsum":
         Wr_t = model.hm_pool_w_row.to(device=device, dtype=dtype)
         Wc_t = model.hm_pool_w_col.to(device=device, dtype=dtype)
@@ -234,6 +242,7 @@ def print_comprehensive_attention_profiler(
         _h = int(model.blocks[0].attn.edge_gate[0].out_features)
         _edge_gate_note = f" LeafBlockAttention edge_gate: 2-layer MLP (4→{_h}→heads)."
     Ls_diag = int(model.leaf_apply_size) if model.blocks else LEAF_APPLY_SIZE
+    K_leaves = int(h_proj0.shape[1]) // int(Lf)
     print(
         "\n=== Attention profiler (all Transformer stacks) ===\n"
         f"Strip build: {strip!r}; DIAG_TOKEN_POOL={dtp} → diag block tokens L={Ls_diag} "
@@ -311,7 +320,7 @@ def print_comprehensive_attention_profiler(
         with torch.no_grad():
             x_mid = h + block.attn(xn, **leaf_attn_kw)
             if hw_ff:
-                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, MAX_NUM_LEAVES, Lf, C_prof)
+                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, K_leaves, Lf, C_prof)
                 if ffcw == 4:
                     h = block.forward_mlp(x_mid, rr, cc, LeafOnlyNet._mlp_global_broadcast(x_mid))
                 else:
@@ -336,7 +345,7 @@ def print_comprehensive_attention_profiler(
             with torch.no_grad():
                 x_mid = h_off + block.attn(xn, **off_attn_kw)
                 if hw_ff:
-                    orr, occ = model._build_off_mlp_hw(h_diag_ref, x_mid, B_prof, MAX_NUM_LEAVES, Lf, C_prof, Mh)
+                    orr, occ = model._build_off_mlp_hw(h_diag_ref, x_mid, B_prof, K_leaves, Lf, C_prof, Mh)
                     if ffcw == 4:
                         h_off = block.forward_mlp(
                             x_mid, orr, occ, LeafOnlyNet._mlp_global_broadcast(x_mid)
@@ -401,7 +410,7 @@ def print_comprehensive_attention_profiler(
             )
             x_mid = h + ya
             if hw_ff:
-                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, MAX_NUM_LEAVES, Lf, C_mass)
+                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, K_leaves, Lf, C_mass)
                 if ffcw == 4:
                     h = block.forward_mlp(x_mid, rr, cc, LeafOnlyNet._mlp_global_broadcast(x_mid))
                 else:
@@ -419,7 +428,7 @@ def print_comprehensive_attention_profiler(
                 )
                 x_mid = h_off + ya
                 if hw_ff:
-                    orr, occ = model._build_off_mlp_hw(h_diag_mass, x_mid, B_prof, MAX_NUM_LEAVES, Lf, C_mass, Mh)
+                    orr, occ = model._build_off_mlp_hw(h_diag_mass, x_mid, B_prof, K_leaves, Lf, C_mass, Mh)
                     if ffcw == 4:
                         h_off = block.forward_mlp(
                             x_mid, orr, occ, LeafOnlyNet._mlp_global_broadcast(x_mid)
@@ -451,7 +460,7 @@ def print_comprehensive_attention_profiler(
             xn = block.norm1(h)
             x_mid = h + block.attn(xn, **leaf_attn_kw)
             if hw_ff:
-                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, MAX_NUM_LEAVES, Lf, C)
+                rr, cc = model._build_diag_mlp_hw(x_mid, None, B_prof, K_leaves, Lf, C)
                 if ffcw == 4:
                     h = block.forward_mlp(x_mid, rr, cc, LeafOnlyNet._mlp_global_broadcast(x_mid))
                 else:
@@ -479,7 +488,7 @@ def print_comprehensive_attention_profiler(
                 xn = block.norm1(h_off)
                 x_mid = h_off + block.attn(xn, **off_attn_kw)
                 if hw_ff:
-                    orr, occ = model._build_off_mlp_hw(h_leaf_frozen, x_mid, B_prof, MAX_NUM_LEAVES, Lf, C, Mh)
+                    orr, occ = model._build_off_mlp_hw(h_leaf_frozen, x_mid, B_prof, K_leaves, Lf, C, Mh)
                     if ffcw == 4:
                         h_off = block.forward_mlp(
                             x_mid, orr, occ, LeafOnlyNet._mlp_global_broadcast(x_mid)
@@ -886,11 +895,11 @@ def evaluate_gradient_interference(args, runtime):
             mask = (rows < n_orig) & (cols < n_orig)
             edge_index = batch["edge_index"][:, mask].to(device)
             edge_values = batch["edge_values"][mask].to(device)
-            A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
-            A_small = A_sparse.to_dense().to(device) if device.type == "mps" else A_sparse.to(device).to_dense()
-            A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
-            A_dense[:n_orig, :n_orig] = A_small
-            A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
+            A_dtype = edge_values.dtype
+            A_sp = padded_operator_sparse(edge_index, edge_values, n_orig, n_pad, A_dtype, device)
+            az_mul = make_sparse_az_fn(A_sp)
+            sp_i, sp_v = A_sp.indices(), A_sp.values()
+            diag_A = diag_from_sparse_coo(sp_i, sp_v, n_pad, A_dtype, device)
             dm, df, om, oe = build_leaf_block_connectivity(
                 edge_index,
                 edge_values,
@@ -916,8 +925,7 @@ def evaluate_gradient_interference(args, runtime):
                 global_features=global_feat,
             )
             batch_vectors = max(1024, int(round(n_pad ** 0.5)))
-            jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
-            diag_A = torch.diagonal(A_dense, 0)
+            jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=A_dtype)
             inv_mask = diag_A.abs() > 1e-6
             jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A[inv_mask]
             Z = torch.randn(1, n_pad, batch_vectors, device=device, dtype=x_input.dtype)
@@ -927,9 +935,9 @@ def evaluate_gradient_interference(args, runtime):
                 jacobi_inv_diag,
                 [n_orig],
                 n_pad,
-                lambda Zt: (A_dense @ Zt.squeeze(0)).unsqueeze(0),
+                az_mul,
             )
-            AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
+            AZ = az_mul(Z)
             MAZ = apply_block_diagonal_M(
                 precond_out,
                 AZ,
@@ -1026,13 +1034,12 @@ def evaluate_gradient_interference(args, runtime):
     if global_feat.dim() == 1:
         global_feat = global_feat.unsqueeze(0)
 
-    A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
-    A_small = A_sparse.to_dense().to(device) if device.type == "mps" else A_sparse.to(device).to_dense()
-    A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
-    A_dense[:n_orig, :n_orig] = A_small
-    A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
-    jacobi_inv_diag_profile = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
-    diag_A_profile = torch.diagonal(A_dense, 0)
+    A_dtype_prof = edge_values.dtype
+    A_sp = padded_operator_sparse(edge_index, edge_values, n_orig, n_pad, A_dtype_prof, device)
+    az_prof = make_sparse_az_fn(A_sp)
+    sp_ip, sp_vp = A_sp.indices(), A_sp.values()
+    diag_A_profile = diag_from_sparse_coo(sp_ip, sp_vp, n_pad, A_dtype_prof, device)
+    jacobi_inv_diag_profile = torch.ones(1, n_pad, device=device, dtype=A_dtype_prof)
     inv_mask_profile = diag_A_profile.abs() > 1e-6
     jacobi_inv_diag_profile[0, inv_mask_profile] = 1.0 / diag_A_profile[inv_mask_profile]
     batch_vectors = max(1024, int(round(n_pad ** 0.5)))
@@ -1044,6 +1051,7 @@ def evaluate_gradient_interference(args, runtime):
         f"Profile expects N divisible by LEAF_SIZE and K=N/L≤MAX_NUM_LEAVES; got N={N_prof}"
     )
     Lf = LEAF_SIZE
+    K_prof = N_prof // Lf
     Mh = model.num_h_off
     Ls_off = int(model.leaf_apply_off)
     otp = int(model.off_token_pool)
@@ -1087,12 +1095,12 @@ def evaluate_gradient_interference(args, runtime):
         h_norm = model.embed.norm(h_gcn)
         h_proj0 = model.enc_input_proj(h_norm)
         C_dim = h_proj0.shape[-1]
-        h_leaf_diag = model._pool_full_leaf_to_diag_tokens(h_proj0, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+        h_leaf_diag = model._pool_full_leaf_to_diag_tokens(h_proj0, B_prof, K_prof, Lf, C_dim)
         h_diag, off_stream_profile = model._apply_transformer_stacks(
             h_proj0,
             h_leaf_diag,
             B_prof,
-            MAX_NUM_LEAVES,
+            K_prof,
             Lf,
             C_dim,
             edge_index,
@@ -1113,7 +1121,7 @@ def evaluate_gradient_interference(args, runtime):
             off_diag_blocks_profile = torch.empty(
                 (B_prof, 0, LEAF_APPLY_SIZE_OFF, LEAF_APPLY_SIZE_OFF), device=device, dtype=h_proj0.dtype
             )
-        h_full_diag = model._diag_tokens_to_full_leaf(h_diag, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+        h_full_diag = model._diag_tokens_to_full_leaf(h_diag, B_prof, K_prof, Lf, C_dim)
         node_U_profile = model.node_u(h_full_diag)
         node_V_profile = model.node_v(h_full_diag)
         jacobi_scale_profile = model._get_jacobi_scale(h_full_diag)
@@ -1230,7 +1238,7 @@ def evaluate_gradient_interference(args, runtime):
                 with torch.no_grad():
                     x_mid_d = blk_d.forward_attn(h_in_d, **leaf_attn_kw)
                 if getattr(model, "highway_ffn", False):
-                    rr, cc = model._build_diag_mlp_hw(x_mid_d, off_stream_t, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+                    rr, cc = model._build_diag_mlp_hw(x_mid_d, off_stream_t, B_prof, K_prof, Lf, C_dim)
                     if int(getattr(model, "ffn_concat_width", 1)) == 4:
                         gg_d = LeafOnlyNet._mlp_global_broadcast(x_mid_d)
                         ms_dm = _timed_ms(
@@ -1255,14 +1263,14 @@ def evaluate_gradient_interference(args, runtime):
                     timing_rows.append([f"Leaf {i} MLP (+ pre-norm)", ms_dm])
                     with torch.no_grad():
                         h_block_in = x_mid_d + blk_d.mlp(blk_d.norm2(x_mid_d))
-                h_full_d = model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+                h_full_d = model._diag_tokens_to_full_leaf(h_block_in, B_prof, K_prof, Lf, C_dim)
                 ms_st = _timed_ms(
-                    lambda hf=h_full_d: model._build_off_strip(hf, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh),
+                    lambda hf=h_full_d: model._build_off_strip(hf, B_prof, K_prof, Lf, C_dim, Mh),
                     device,
                 )
                 timing_rows.append([f"{_strip_label} (after Leaf {i})", ms_st])
                 with torch.no_grad():
-                    strip = model._build_off_strip(h_full_d, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh)
+                    strip = model._build_off_strip(h_full_d, B_prof, K_prof, Lf, C_dim, Mh)
                 off_in = strip if off_stream_t is None else strip + off_stream_t
                 blk_o = model.off_diag_blocks[i]
                 h_in_o = off_in
@@ -1274,7 +1282,7 @@ def evaluate_gradient_interference(args, runtime):
                 with torch.no_grad():
                     x_mid_o = blk_o.forward_attn(h_in_o, **off_attn_kw)
                 if getattr(model, "highway_ffn", False):
-                    orr, occ = model._build_off_mlp_hw(h_block_in, x_mid_o, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh)
+                    orr, occ = model._build_off_mlp_hw(h_block_in, x_mid_o, B_prof, K_prof, Lf, C_dim, Mh)
                     if int(getattr(model, "ffn_concat_width", 1)) == 4:
                         og = LeafOnlyNet._mlp_global_broadcast(x_mid_o)
                         ms_om = _timed_ms(
@@ -1308,7 +1316,7 @@ def evaluate_gradient_interference(args, runtime):
 
                     def _make_diag_hwfn(os_ref):
                         def _fn(xm):
-                            return model._build_diag_mlp_hw(xm, os_ref, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+                            return model._build_diag_mlp_hw(xm, os_ref, B_prof, K_prof, Lf, C_dim)
 
                         return _fn
 
@@ -1340,7 +1348,7 @@ def evaluate_gradient_interference(args, runtime):
 
                     def _make_off_hwfn(hd_cap):
                         def _fn(xm):
-                            return model._build_off_mlp_hw(hd_cap, xm, B_prof, MAX_NUM_LEAVES, Lf, C_dim, Mh)
+                            return model._build_off_mlp_hw(hd_cap, xm, B_prof, K_prof, Lf, C_dim, Mh)
 
                         return _fn
 
@@ -1360,7 +1368,7 @@ def evaluate_gradient_interference(args, runtime):
             else:
                 h_off_tokens = None
 
-        h_block_full = model._diag_tokens_to_full_leaf(h_block_in, B_prof, MAX_NUM_LEAVES, Lf, C_dim)
+        h_block_full = model._diag_tokens_to_full_leaf(h_block_in, B_prof, K_prof, Lf, C_dim)
         if model.use_highways:
             ms_highway = _timed_ms(
                 lambda: model._build_token_highways(
@@ -1368,7 +1376,7 @@ def evaluate_gradient_interference(args, runtime):
                     h_diag=h_block_in,
                     off_stream=(h_off_tokens.reshape(B_prof * Mh, Ls_off, C_dim) if h_off_tokens is not None else None),
                     B=B_prof,
-                    K=MAX_NUM_LEAVES,
+                    K=K_prof,
                     L=Lf,
                     C_h=C_dim,
                     M_off=Mh,
@@ -1403,7 +1411,7 @@ def evaluate_gradient_interference(args, runtime):
                 jacobi_inv_diag_profile,
                 [n_orig],
                 n_pad,
-                lambda Zt: (A_dense @ Zt.squeeze(0)).unsqueeze(0),
+                az_prof,
             )
 
         ms_probe_z = _timed_ms(_bench_probe_z, device)
@@ -1421,10 +1429,11 @@ def evaluate_gradient_interference(args, runtime):
             jacobi_inv_diag_profile,
             [n_orig],
             n_pad,
-            lambda Zt: (A_dense @ Zt.squeeze(0)).unsqueeze(0),
+            az_prof,
         )
-        ms_AZ = _timed_ms(lambda: (A_dense @ Z.squeeze(0)).unsqueeze(0), device)
+        ms_AZ = _timed_ms(lambda: az_prof(Z), device)
         timing_rows.append(["A @ Z (post-smooth)", ms_AZ])
+        AZ = az_prof(Z)
         B_pack = diag_blocks_profile.shape[0]
         packed_profile = torch.cat(
             [
@@ -1563,11 +1572,11 @@ def evaluate_estimator_variance(args, runtime):
     mask = (rows < n_orig) & (cols < n_orig)
     edge_index = batch["edge_index"][:, mask].to(device)
     edge_values = batch["edge_values"][mask].to(device)
-    A_sparse = torch.sparse_coo_tensor(edge_index, edge_values, (n_orig, n_orig)).coalesce()
-    A_small = A_sparse.to_dense().to(device) if device.type == "mps" else A_sparse.to(device).to_dense()
-    A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
-    A_dense[:n_orig, :n_orig] = A_small
-    A_dense[n_orig:, n_orig:] = torch.eye(n_pad - n_orig, device=device, dtype=A_small.dtype)
+    A_dtype_ev = edge_values.dtype
+    A_sp = padded_operator_sparse(edge_index, edge_values, n_orig, n_pad, A_dtype_ev, device)
+    az_ev = make_sparse_az_fn(A_sp)
+    sp_ie, sp_ve = A_sp.indices(), A_sp.values()
+    diag_A_ev = diag_from_sparse_coo(sp_ie, sp_ve, n_pad, A_dtype_ev, device)
     dm, df, om, oe = build_leaf_block_connectivity(
         edge_index,
         edge_values,
@@ -1601,10 +1610,9 @@ def evaluate_estimator_variance(args, runtime):
         global_features=global_feat,
     )
 
-    jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=A_dense.dtype)
-    diag_A = torch.diagonal(A_dense, 0)
-    inv_mask = diag_A.abs() > 1e-6
-    jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A[inv_mask]
+    jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=A_dtype_ev)
+    inv_mask = diag_A_ev.abs() > 1e-6
+    jacobi_inv_diag[0, inv_mask] = 1.0 / diag_A_ev[inv_mask]
 
     param_groups = leafonly_grad_param_groups(model)
     group_gradients = {name: [] for name in param_groups.keys()}
@@ -1618,9 +1626,9 @@ def evaluate_estimator_variance(args, runtime):
             jacobi_inv_diag,
             [n_orig],
             n_pad,
-            lambda Zt: (A_dense @ Zt.squeeze(0)).unsqueeze(0),
+            az_ev,
         )
-        AZ = (A_dense @ Z.squeeze(0)).unsqueeze(0)
+        AZ = az_ev(Z)
         MAZ = apply_block_diagonal_M(
             precond_out,
             AZ,

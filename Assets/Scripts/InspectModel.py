@@ -558,8 +558,10 @@ def _is_symmetric_dense(A: np.ndarray, *, rtol: float = 1e-9, atol: float = 1e-9
 
 
 def _dense_linalg_device(device: torch.device) -> torch.device:
-    """Use CUDA for big dense LA when available; MPS/CPU fall back to NumPy paths."""
-    return device if device.type == "cuda" else torch.device("cpu")
+    """CUDA: fp64 torch.linalg; MPS: fp32 torch.linalg; otherwise CPU NumPy."""
+    if device.type in ("cuda", "mps"):
+        return device
+    return torch.device("cpu")
 
 
 def _inv_numpy_or_torch(A: np.ndarray, device: torch.device) -> np.ndarray:
@@ -569,6 +571,11 @@ def _inv_numpy_or_torch(A: np.ndarray, device: torch.device) -> np.ndarray:
         t = torch.as_tensor(A, dtype=torch.float64, device=dev)
         out = torch.linalg.inv(t).cpu().numpy()
         torch.cuda.synchronize()
+        return out
+    if dev.type == "mps":
+        t = torch.as_tensor(A, dtype=torch.float32, device=dev)
+        out = torch.linalg.inv(t).cpu().numpy().astype(np.float64)
+        torch.mps.synchronize()
         return out
     return np.linalg.inv(A)
 
@@ -580,6 +587,11 @@ def _cond_numpy_or_torch(M: np.ndarray, device: torch.device) -> float:
         t = torch.as_tensor(M, dtype=torch.float64, device=dev)
         c = float(torch.linalg.cond(t).item())
         torch.cuda.synchronize()
+        return c
+    if dev.type == "mps":
+        t = torch.as_tensor(M, dtype=torch.float32, device=dev)
+        c = float(torch.linalg.cond(t).item())
+        torch.mps.synchronize()
         return c
     return float(np.linalg.cond(M))
 
@@ -606,6 +618,20 @@ def _eig_dense_for_inspect(A: np.ndarray, device: torch.device) -> tuple[np.ndar
             lam, Vc = lam[order], Vc[:, order]
         torch.cuda.synchronize()
         return lam, Vc, sym
+    if dev.type == "mps":
+        At = torch.as_tensor(A, dtype=torch.float32, device=dev)
+        if sym:
+            w, V = torch.linalg.eigh(At)
+            lam = w.cpu().numpy().astype(np.complex128)
+            Vc = V.cpu().numpy().astype(np.complex128)
+        else:
+            lam_t, V_t = torch.linalg.eig(At)
+            lam = lam_t.cpu().numpy()
+            Vc = V_t.cpu().numpy()
+            order = np.argsort(np.real(lam))
+            lam, Vc = lam[order], Vc[:, order]
+        torch.mps.synchronize()
+        return lam, Vc, sym
     if sym:
         w, V = np.linalg.eigh(A)
         return w.astype(np.complex128), V.astype(np.complex128), sym
@@ -621,6 +647,11 @@ def _eigvals_dense_numpy_or_torch(M: np.ndarray, device: torch.device) -> np.nda
         t = torch.as_tensor(M, dtype=torch.float64, device=dev)
         ev = torch.linalg.eigvals(t).cpu().numpy()
         torch.cuda.synchronize()
+        return ev
+    if dev.type == "mps":
+        t = torch.as_tensor(M, dtype=torch.float32, device=dev)
+        ev = torch.linalg.eigvals(t).cpu().numpy()
+        torch.mps.synchronize()
         return ev
     return np.linalg.eigvals(M)
 
@@ -1694,7 +1725,8 @@ def main():
         metavar="K",
         help=(
             "GPU PCG: evaluate stopping residual every K iterations. Larger K cuts host sync overhead "
-            "(faster) but may overshoot tolerance by up to K-1 iterations."
+            "(faster) but may overshoot tolerance by up to K-1 iterations. "
+            "On MPS, K is raised to at least 10 unless you pass a larger value."
         ),
     )
     parser.add_argument(
@@ -1768,8 +1800,16 @@ def main():
         device = torch.device('mps')
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
+    elif device.type == 'mps':
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
     _info(f"Using device: {device}")
     check_freq = max(1, int(getattr(args, "pcg_check_freq", 3)))
+    if device.type == "mps":
+        # Fewer .item() / host syncs per solve than K=3; major win vs CUDA Graph + CUDA events.
+        check_freq = max(check_freq, 10)
 
     _info(f"Loading data from {data_folder}")
     dataset = FluidGraphDataset([Path(data_folder)])
@@ -2132,9 +2172,14 @@ def main():
             )
         )
         if test_only:
-            print(f"  LeafOnly PCG mode: {_pcg_driver_line}")
+            print(
+                f"  LeafOnly PCG mode: {_pcg_driver_line}; "
+                f"pcg_check_freq={check_freq} (stopping residual every K iters)"
+            )
         else:
-            _info(f"  LeafOnly PCG mode: {_pcg_driver_line}")
+            _info(
+                f"  LeafOnly PCG mode: {_pcg_driver_line}; pcg_check_freq={check_freq}"
+            )
 
         if args.leafonly_pcg == "bsr":
             M_sparse_bsr = build_sparse_bsr_preconditioner(
