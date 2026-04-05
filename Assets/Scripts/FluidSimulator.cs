@@ -316,8 +316,25 @@ public partial class FluidSimulator : MonoBehaviour
     private RenderTexture fluidThicknessTexture; // Smoothed thickness
     private RenderTexture nodesTexture; // Stores wireframe nodes rendering
     
+    private void ValidateOctreeLayers()
+    {
+        // ProcessNodes first pass uses layer == minLayer + 1 and requires node.layer >= layer.
+        // The layer loop runs for layer in (minLayer + 1) .. maxLayer inclusive.
+        if (maxLayer <= minLayer)
+        {
+            Debug.LogWarning($"FluidSimulator: maxLayer ({maxLayer}) must be > minLayer ({minLayer}). Clamping maxLayer to {minLayer + 1}.");
+            maxLayer = minLayer + 1;
+        }
+    }
+
+    private void OnValidate()
+    {
+        ValidateOctreeLayers();
+    }
+
     void Start()
     {
+        ValidateOctreeLayers();
         InitializeParticleSystem();
         // InitializeInitialParticles();
 

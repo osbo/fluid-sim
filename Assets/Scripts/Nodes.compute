@@ -70,6 +70,7 @@ uint layer;                                             // current hierarchical 
 float deltaTime;                                        // time step for pressure gradient application
 uint minLayer;                                      // initial layer
 uint maxLayer;                                          // maximum layer
+static const uint kMortonAxisBits = 10u;                // 10 bits per axis in EncodeMorton3D; gridDim = 2^(this - layer)
 float3 simulationBoundsMin;                             // minimum simulation bounds
 float3 simulationBoundsMax;                             // maximum simulation bounds
 
@@ -368,7 +369,7 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         uint prefix = baseCode >> shift; // 3b-bit prefix
         uint3 coord = deinterleave(prefix);
 
-        uint gridDim = 1u << (10 - layer);
+        uint gridDim = 1u << (kMortonAxisBits - layer);
 
         uint numNeighbors = 0;
 
@@ -612,7 +613,8 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         aggregatedNode.position = weightedPosition;
         aggregatedNode.velocity = weightedVelocity;
         aggregatedNode.velocities = aggregatedVelocities;
-        aggregatedNode.layer = minSubLayer;
+        // Parent cell is one level coarser than children (larger exp2(layer) in this codebase).
+        aggregatedNode.layer = min(minSubLayer + 1u, kMortonAxisBits);
         aggregatedNode.mass = totalMass;
         aggregatedNode.mortonCode = nodesBuffer[uniqueStart].mortonCode;
         aggregatedNode.active = 1u; // Set last bit to 1
@@ -666,7 +668,7 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
         int nz = (int)coord.z + deltas[d].z;
         
         // Skip if neighbor is outside the grid bounds for this layer
-        uint gridDim = 1u << (10 - node.layer);
+        uint gridDim = 1u << (kMortonAxisBits - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
             // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
@@ -1131,7 +1133,7 @@ void ApplyExternalForces(uint3 id : SV_DispatchThreadID)
     uint shift = node.layer * 3;
     uint prefix = node.mortonCode >> shift;
     uint3 coord = deinterleave(prefix);
-    uint gridDim = 1u << (10 - node.layer);
+    uint gridDim = 1u << (kMortonAxisBits - node.layer);
 
     if (coord.x == 0) node.velocities.left = 0;
     if (coord.x == gridDim - 1) node.velocities.right = 0;

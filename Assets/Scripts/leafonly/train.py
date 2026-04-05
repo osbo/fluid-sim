@@ -32,70 +32,12 @@ from .data import (
 )
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 from .probe_z import jacobi_smooth_hutchinson_z_inplace
-
-
-def _padded_operator_sparse(edge_index, edge_values, n_phys: int, n_pad: int, dtype, device):
-    """Physical Laplacian on [:n_phys,:n_phys] plus identity on the padded tail (matches dense training A)."""
-    rows, cols = edge_index[0].long(), edge_index[1].long()
-    v = edge_values.to(dtype=dtype)
-    tail = torch.arange(n_phys, n_pad, device=device, dtype=torch.long)
-    tail_ones = torch.ones(n_pad - n_phys, device=device, dtype=dtype)
-    ri = torch.cat([rows, tail])
-    ci = torch.cat([cols, tail])
-    vv = torch.cat([v, tail_ones])
-    return torch.sparse_coo_tensor(torch.stack([ri, ci]), vv, (n_pad, n_pad), device=device, dtype=dtype).coalesce()
-
-
-def _diag_from_sparse_coo(indices: torch.Tensor, values: torch.Tensor, n_pad: int, dtype, device) -> torch.Tensor:
-    diag = torch.zeros(n_pad, dtype=dtype, device=device)
-    r, c = indices[0], indices[1]
-    m = r == c
-    if m.any():
-        diag.index_add_(0, r[m], values[m].to(dtype=dtype))
-    return diag
-
-
-def _extend_sparse_identity_tail(sp: torch.Tensor, n_src: int, n_dst: int) -> torch.Tensor:
-    """Grow a padded operator from n_src×n_src to n_dst×n_dst with identity on new diagonal tail."""
-    sp = sp.coalesce()
-    if n_dst == n_src:
-        return sp
-    idx, val = sp.indices(), sp.values()
-    tail = torch.arange(n_src, n_dst, device=sp.device, dtype=idx.dtype)
-    extra = torch.stack([tail, tail])
-    ones = torch.ones(n_dst - n_src, device=sp.device, dtype=val.dtype)
-    new_i = torch.cat([idx, extra], dim=1)
-    new_v = torch.cat([val, ones])
-    return torch.sparse_coo_tensor(new_i, new_v, (n_dst, n_dst), dtype=val.dtype, device=sp.device).coalesce()
-
-
-def _batched_A_mul_Z_blockdiag(sp_list: list, Z: torch.Tensor) -> torch.Tensor:
-    """Apply diag(A_1,…,A_B) to Z via one sparse.mm (avoids dense N² batched bmm)."""
-    B, N, K = Z.shape
-    device, dtype = Z.device, Z.dtype
-    rows_c, cols_c, vals_c = [], [], []
-    for b in range(B):
-        sp = sp_list[b]
-        if sp.device != device:
-            sp = sp.to(device=device)
-        if sp.dtype != dtype:
-            sp = torch.sparse_coo_tensor(
-                sp.indices(), sp.values().to(dtype=dtype), sp.shape, device=device, dtype=dtype
-            ).coalesce()
-        else:
-            sp = sp.coalesce()
-        idx = sp.indices()
-        rows_c.append(idx[0] + b * N)
-        cols_c.append(idx[1] + b * N)
-        vals_c.append(sp.values())
-    rows = torch.cat(rows_c)
-    cols = torch.cat(cols_c)
-    vals = torch.cat(vals_c)
-    a_big = torch.sparse_coo_tensor(
-        torch.stack([rows, cols]), vals, (B * N, B * N), device=device, dtype=dtype
-    ).coalesce()
-    out = torch.sparse.mm(a_big, Z.reshape(B * N, K))
-    return out.view(B, N, K)
+from .sparse_operator import (
+    diag_from_sparse_coo,
+    extend_sparse_identity_tail,
+    make_batched_sparse_az_fn,
+    padded_operator_sparse,
+)
 
 
 def _bucket_cuda_profiler_key(key: str) -> str:
@@ -226,27 +168,15 @@ def train_leaf_only(args, runtime):
             A_indices = batch["edge_index"][:, mask]
             A_vals = batch["edge_values"][mask]
             A_dtype = A_vals.dtype
-            if device.type == "mps":
-                A_sparse_nn = torch.sparse_coo_tensor(A_indices, A_vals, (n, n)).coalesce()
-                A_small = A_sparse_nn.to_dense().to(device)
-                A_dense = torch.zeros(n_pad, n_pad, device=device, dtype=A_small.dtype)
-                A_dense[:n, :n] = A_small
-                A_dense[n:, n:] = torch.eye(n_pad - n, device=device, dtype=A_small.dtype)
-                diag_A = torch.diagonal(A_dense, 0)
-                inv_diag = torch.ones(n_pad, device=device, dtype=A_dense.dtype)
-                inv_mask = diag_A.abs() > 1e-6
-                inv_diag[inv_mask] = 1.0 / diag_A[inv_mask]
-                A_sp, use_dense_A = None, True
-            else:
-                ei_n = A_indices.to(device)
-                ev_n = A_vals.to(device)
-                A_sp = _padded_operator_sparse(ei_n, ev_n, n, n_pad, A_dtype, device)
-                sp_i, sp_v = A_sp.indices(), A_sp.values()
-                diag_A = _diag_from_sparse_coo(sp_i, sp_v, n_pad, A_dtype, device)
-                inv_diag = torch.ones(n_pad, device=device, dtype=A_dtype)
-                inv_mask = diag_A.abs() > 1e-6
-                inv_diag[inv_mask] = 1.0 / diag_A[inv_mask]
-                A_dense, use_dense_A = None, False
+            ei_n = A_indices.to(device)
+            ev_n = A_vals.to(device)
+            A_sp = padded_operator_sparse(ei_n, ev_n, n, n_pad, A_dtype, device)
+            sp_i, sp_v = A_sp.indices(), A_sp.values()
+            diag_A = diag_from_sparse_coo(sp_i, sp_v, n_pad, A_dtype, device)
+            inv_diag = torch.ones(n_pad, device=device, dtype=A_dtype)
+            inv_mask = diag_A.abs() > 1e-6
+            inv_diag[inv_mask] = 1.0 / diag_A[inv_mask]
+            A_dense, use_dense_A = None, False
             ctx_a_ms += (time.perf_counter() - t_a0) * 1000.0
 
             t_c0 = time.perf_counter()
@@ -353,11 +283,23 @@ def train_leaf_only(args, runtime):
     )
 
     ms_compile = 0.0
+    compile_model_ok = False
     if device.type == "cuda":
         t_seg = time.perf_counter()
         model = torch.compile(model)
         ms_compile = (time.perf_counter() - t_seg) * 1000.0
-        print("  [startup] torch.compile: enabled")
+        compile_model_ok = True
+        print("  [startup] torch.compile(model): enabled (CUDA)")
+    elif device.type == "mps":
+        t_seg = time.perf_counter()
+        try:
+            model = torch.compile(model)
+            ms_compile = (time.perf_counter() - t_seg) * 1000.0
+            compile_model_ok = True
+            print("  [startup] torch.compile(model): enabled (MPS)")
+        except Exception as ex:
+            ms_compile = (time.perf_counter() - t_seg) * 1000.0
+            print(f"  [startup] torch.compile(model): skipped on MPS ({ex})")
 
     leafonly_pcg = str(getattr(args, "leafonly_pcg", "bsr"))
 
@@ -381,14 +323,21 @@ def train_leaf_only(args, runtime):
             jacobi_inv_diag=jacobi_inv_diag_batched,
         )
 
-    # MAZ: always batched apply_block_diagonal_M (autograd-safe). A@Z: dense bmm on MPS only;
-    # CUDA/CPU use sparse block-diagonal mm (no N×N dense A in memory).
+    # MAZ: batched apply_block_diagonal_M (autograd-safe). A@Z: sparse block-diagonal mm (all devices);
+    # legacy disk cache may still load dense A — then _probe_bmm is used for that step only.
     if device.type == "cuda":
         compiled_probe_bmm = None
         compiled_probe_apply_m = torch.compile(_probe_apply_m) if leafonly_pcg == "matrix_free" else None
     elif device.type == "mps":
-        compiled_probe_bmm = _probe_bmm
-        compiled_probe_apply_m = _probe_apply_m if leafonly_pcg == "matrix_free" else None
+        compiled_probe_bmm = None
+        if leafonly_pcg == "matrix_free":
+            try:
+                compiled_probe_apply_m = torch.compile(_probe_apply_m)
+            except Exception as ex:
+                print(f"  [startup] torch.compile(apply_block_diagonal_M): skipped ({ex}); using eager MAZ")
+                compiled_probe_apply_m = _probe_apply_m
+        else:
+            compiled_probe_apply_m = None
     else:
         compiled_probe_bmm = _probe_bmm
         compiled_probe_apply_m = _probe_apply_m if leafonly_pcg == "matrix_free" else None
@@ -445,7 +394,7 @@ def train_leaf_only(args, runtime):
         if leafonly_pcg == "matrix_free"
         else "apply_block_diagonal_M eager (bsr; matches expanded M, autograd-safe)"
     )
-    _az_desc = "dense batched bmm (MPS)" if device.type == "mps" else "sparse block-diagonal A@Z (CUDA/CPU)"
+    _az_desc = "sparse block-diagonal A@Z (all devices; dense bmm only if context cache has use_dense_A)"
     print(f"  Probe MAZ path: --leafonly-pcg={leafonly_pcg} (A@Z: {_az_desc}; {_pcg_tail})")
     ms_startup_to_loop = (time.perf_counter() - t_wall0) * 1000.0
     if print_timing:
@@ -462,10 +411,14 @@ def train_leaf_only(args, runtime):
             print(f"    n-hop connectivity:          {ctx_conn_ms:10.2f}")
             print(f"    jacobi vec + append dict:    {ctx_other_ms:10.2f}")
         print(f"  LeafOnlyNet + .to(device):     {ms_model:10.2f}")
-        if device.type == "cuda":
-            print(f"  torch.compile(model) call:     {ms_compile:10.2f}  (Inductor runs on 1st forward/backward)")
+        if compile_model_ok:
+            _tag = "CUDA" if device.type == "cuda" else "MPS"
+            print(
+                f"  torch.compile(model) call:     {ms_compile:10.2f}  "
+                f"({_tag}; Inductor runs on 1st forward/backward)"
+            )
         else:
-            print(f"  torch.compile:                  skipped (not CUDA)")
+            print(f"  torch.compile(model):           skipped or failed")
         if ms_load > 0:
             print(f"  load_leaf_only_weights:        {ms_load:10.2f}")
         else:
@@ -554,7 +507,7 @@ def train_leaf_only(args, runtime):
                     A_ctx[n_pad_ctx:, n_pad_ctx:] = torch.eye(pad_nodes, device=device, dtype=ad.dtype)
                     A_list.append(A_ctx)
                 else:
-                    sp_ctx = _extend_sparse_identity_tail(ctx["A_sp"], n_pad_ctx, max_n_pad_step)
+                    sp_ctx = extend_sparse_identity_tail(ctx["A_sp"], n_pad_ctx, max_n_pad_step)
                     sp_list.append(sp_ctx)
             else:
                 if use_dense_batch:
@@ -660,10 +613,19 @@ def train_leaf_only(args, runtime):
             if n_orig_ctx < max_n_pad_step:
                 Z[b_idx, n_orig_ctx:, :] = 0.0
 
+        if use_dense_batch:
+            _az_call = lambda Zt: _probe_bmm(A_batched, Zt)
+        else:
+            _az_call = make_batched_sparse_az_fn(
+                sp_list,
+                B=B_step,
+                N=max_n_pad_step,
+                dtype=x_batched.dtype,
+                device=device,
+            )
+
         def _az_probe(Zt: torch.Tensor) -> torch.Tensor:
-            if use_dense_batch:
-                return _probe_bmm(A_batched, Zt)
-            return _batched_A_mul_Z_blockdiag(sp_list, Zt)
+            return _az_call(Zt)
 
         jacobi_smooth_hutchinson_z_inplace(
             Z,
@@ -678,10 +640,7 @@ def train_leaf_only(args, runtime):
             t_z = time.perf_counter() - t_mark
             t_mark = time.perf_counter()
 
-        if use_dense_batch:
-            AZ = _probe_bmm(A_batched, Z)
-        else:
-            AZ = _batched_A_mul_Z_blockdiag(sp_list, Z)
+        AZ = _az_call(Z)
 
         if do_detailed:
             _cuda_sync()
@@ -730,7 +689,7 @@ def train_leaf_only(args, runtime):
             _cuda_sync()
         else:
             # Backward: loss → MAZ → apply_block_diagonal_M(precond, AZ) → precond_out, then compiled LeafOnlyNet.
-            # AZ has no grad; on MPS the A@Z bmm has no backward into A; sparse A@Z path is forward-only into Z (no grad).
+            # AZ has no grad through A (sparse.mm / bmm on detached operator); gradients flow through precond_out and model.
             loss.backward()
             if do_detailed:
                 _cuda_sync()
