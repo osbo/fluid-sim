@@ -9,6 +9,42 @@ public partial class FluidSimulator : MonoBehaviour
     private System.Diagnostics.Stopwatch dotProductSw = new System.Diagnostics.Stopwatch();
     private System.Diagnostics.Stopwatch updateVectorSw = new System.Diagnostics.Stopwatch();
 
+    // Cache all solver kernel IDs once in Start() so SolvePressure never calls FindKernel.
+    private void InitSolverKernels()
+    {
+        if (cgSolverShader == null || csrBuilderShader == null || radixSortShader == null)
+        {
+            Debug.LogError("One or more solver shaders not assigned. Cannot cache kernel IDs.");
+            return;
+        }
+
+        calculateDivergenceKernel   = cgSolverShader.FindKernel("CalculateDivergence");
+        buildMatrixAKernelId        = cgSolverShader.FindKernel("BuildMatrixA");
+        applyMatrixAndDotKernelId   = cgSolverShader.FindKernel("ApplyMatrixAndDot");
+        spmvCsrKernelId             = cgSolverShader.FindKernel("SpMV_CSR");
+        axpyKernel                  = cgSolverShader.FindKernel("Axpy");
+        scaleKernelId               = cgSolverShader.FindKernel("Scale");
+        dotProductKernel            = cgSolverShader.FindKernel("DotProduct");
+        precomputeIndicesKernelId   = cgSolverShader.FindKernel("PrecomputeIndices");
+        applySparseGTKernelId       = cgSolverShader.FindKernel("ApplySparseGT");
+        applySparseGAndDotKernelId  = cgSolverShader.FindKernel("ApplySparseGAndDot");
+        clearBufferFloatKernelId    = cgSolverShader.FindKernel("ClearBufferFloat");
+        applyJacobiKernelId         = cgSolverShader.FindKernel("ApplyJacobi");
+        globalReduceSumKernelId     = cgSolverShader.FindKernel("GlobalReduceSum");
+        copyFloatKernelId           = cgSolverShader.FindKernel("CopyFloat");
+
+        csrCountNnzKernelId         = csrBuilderShader.FindKernel("CountNNZ");
+        csrFinalizeRowPtrKernelId   = csrBuilderShader.FindKernel("FinalizeRowPtr");
+        csrFillKernelId             = csrBuilderShader.FindKernel("FillCSR");
+
+        radixPrefixSumKernelId      = radixSortShader.FindKernel("prefixSum");
+        radixPrefixFixupKernelId    = radixSortShader.FindKernel("prefixFixup");
+
+        applyPressureGradientKernel = nodesShader.FindKernel("ApplyPressureGradient");
+        applyExternalForcesKernel   = nodesShader.FindKernel("ApplyExternalForces");
+        calculateDensityGradientKernel = nodesShader.FindKernel("CalculateDensityGradient");
+    }
+
     private void SolvePressure()
     {
         if (cgSolverShader == null)
@@ -17,32 +53,9 @@ public partial class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // --- Kernel Lookups ---
-        int calculateDivergenceKernel = cgSolverShader.FindKernel("CalculateDivergence");
-        // CHANGED: Use new matrix kernel
-        int buildMatrixAKernel = cgSolverShader.FindKernel("BuildMatrixA");
-        int applyMatrixAndDotKernel = cgSolverShader.FindKernel("ApplyMatrixAndDot");
-        int spmvCsrKernel = cgSolverShader.FindKernel("SpMV_CSR");
-        
-        int axpyKernel = cgSolverShader.FindKernel("Axpy");
-        int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
-        
-        // Preconditioner Kernels
-        int precomputeIndicesKernel = cgSolverShader.FindKernel("PrecomputeIndices");
-        int applySparseGTKernel = cgSolverShader.FindKernel("ApplySparseGT"); 
-        int applySparseGAndDotKernel = cgSolverShader.FindKernel("ApplySparseGAndDot");
-        int clearBufferFloatKernel = cgSolverShader.FindKernel("ClearBufferFloat");
-        int applyJacobiKernel = cgSolverShader.FindKernel("ApplyJacobi");
-        
-        if (calculateDivergenceKernel < 0 || buildMatrixAKernel < 0 || spmvCsrKernel < 0)
-        {
-            Debug.LogError("CG solver kernels (BuildMatrixA/SpMV_CSR) not found.");
-            return;
-        }
-
         // --- Buffer Init (Grow-only) ---
         int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
-        
+
         if (divergenceBuffer == null || divergenceBuffer.count < requiredSize) {
             divergenceBuffer?.Release(); divergenceBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
@@ -61,186 +74,148 @@ public partial class FluidSimulator : MonoBehaviour
         if (zVectorBuffer == null || zVectorBuffer.count < requiredSize) {
             zVectorBuffer?.Release(); zVectorBuffer = new ComputeBuffer(requiredSize, sizeof(float));
         }
-        
-        // --- NEW: Alloc Matrix A ---
         if (matrixABuffer == null || matrixABuffer.count < requiredSize * 25) {
             matrixABuffer?.Release();
             matrixABuffer = new ComputeBuffer(requiredSize * 25, sizeof(float));
         }
 
-        // CSR helper buffers
+        // CSR helper buffers — pre-allocated to max stencil width (25 entries per node).
+        // This avoids the per-frame GPU→CPU readback of totalNNZ.
+        int maxNnz = requiredSize * 25;
         if (nnzPerNode == null || nnzPerNode.count < requiredSize) {
             nnzPerNode?.Release();
             nnzPerNode = new ComputeBuffer(requiredSize, sizeof(uint));
         }
-        // RowPtr requires N+1 entries; allocate conservatively with +1 headroom
         if (csrRowPtr == null || csrRowPtr.count < requiredSize + 1) {
             csrRowPtr?.Release();
             csrRowPtr = new ComputeBuffer(requiredSize + 1, sizeof(uint));
         }
-
-        // Keep existing buffers for preconditioners
+        if (csrColIndices == null || csrColIndices.count < maxNnz) {
+            csrColIndices?.Release();
+            csrColIndices = new ComputeBuffer(maxNnz, sizeof(uint));
+        }
+        if (csrRowIndices == null || csrRowIndices.count < maxNnz) {
+            csrRowIndices?.Release();
+            csrRowIndices = new ComputeBuffer(maxNnz, sizeof(uint));
+        }
+        if (csrValues == null || csrValues.count < maxNnz) {
+            csrValues?.Release();
+            csrValues = new ComputeBuffer(maxNnz, sizeof(float));
+        }
         if (scatterIndicesBuffer == null || scatterIndicesBuffer.count < requiredSize * 24) {
             scatterIndicesBuffer?.Release(); scatterIndicesBuffer = new ComputeBuffer(requiredSize * 24, 4);
         }
 
-        // --- Step 1: Init (r = b) ---
-        // 1a. Calculate Divergence (RHS 'b')
+        // --- Step 1: Calculate Divergence (RHS 'b') ---
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(calculateDivergenceKernel, numNodes);
 
-        // 1b. Build Matrix A (LHS 'A')
-        // This bakes geometry and deltaTime into matrixABuffer
+        // --- Step 1b: Build Matrix A ---
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
-        cgSolverShader.SetBuffer(buildMatrixAKernel, "nodesBuffer", nodesBuffer);
-        cgSolverShader.SetBuffer(buildMatrixAKernel, "neighborsBuffer", neighborsBuffer);
-        cgSolverShader.SetBuffer(buildMatrixAKernel, "matrixABuffer", matrixABuffer);
+        cgSolverShader.SetBuffer(buildMatrixAKernelId, "nodesBuffer", nodesBuffer);
+        cgSolverShader.SetBuffer(buildMatrixAKernelId, "neighborsBuffer", neighborsBuffer);
+        cgSolverShader.SetBuffer(buildMatrixAKernelId, "matrixABuffer", matrixABuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
-        cgSolverShader.SetFloat("deltaTime", deltaTime); // Passed here, so we don't need it in the loop
-        
+        cgSolverShader.SetFloat("deltaTime", deltaTime);
         int groupsA = Mathf.CeilToInt(numNodes / 256.0f);
-        cgSolverShader.Dispatch(buildMatrixAKernel, groupsA, 1, 1);
+        cgSolverShader.Dispatch(buildMatrixAKernelId, groupsA, 1, 1);
 
-        // --- NEW: Build CSR representation of A -----------------------------
+        // --- Step 1c: Build CSR representation ---
         if (csrBuilderShader == null)
         {
             Debug.LogError("CSRBuilder compute shader is not assigned.");
             return;
         }
 
-        int countNnzKernel = csrBuilderShader.FindKernel("CountNNZ");
-        int finalizeRowPtrKernel = csrBuilderShader.FindKernel("FinalizeRowPtr");
-        int fillCsrKernel = csrBuilderShader.FindKernel("FillCSR");
+        int csrGroups = Mathf.CeilToInt(numNodes / 256.0f);
 
         // A. Count nnz per row
-        csrBuilderShader.SetBuffer(countNnzKernel, "neighborsBuffer", neighborsBuffer);
-        csrBuilderShader.SetBuffer(countNnzKernel, "nnzPerNode", nnzPerNode);
+        csrBuilderShader.SetBuffer(csrCountNnzKernelId, "neighborsBuffer", neighborsBuffer);
+        csrBuilderShader.SetBuffer(csrCountNnzKernelId, "nnzPerNode", nnzPerNode);
         csrBuilderShader.SetInt("numNodes", numNodes);
+        csrBuilderShader.Dispatch(csrCountNnzKernelId, csrGroups, 1, 1);
 
-        int csrGroups = Mathf.CeilToInt(numNodes / 256.0f);
-        csrBuilderShader.Dispatch(countNnzKernel, csrGroups, 1, 1);
-
-        // B. Exclusive prefix sum nnzPerNode -> csrRowPtr[0..N-1] using RadixSort prefix scan
+        // B. Exclusive prefix sum nnzPerNode -> csrRowPtr
         uint tgSize = 512u;
         uint numThreadgroups = (uint)((numNodes + (tgSize * 2) - 1) / (tgSize * 2));
         uint auxSize = (uint)Mathf.Max(1, (int)numThreadgroups);
 
-        // Ensure aux buffers exist and are large enough
-        if (aux == null || aux.count < auxSize)
-        {
-            aux?.Release();
-            aux = new ComputeBuffer((int)auxSize, sizeof(uint));
+        if (aux == null || aux.count < auxSize) {
+            aux?.Release(); aux = new ComputeBuffer((int)auxSize, sizeof(uint));
         }
-        if (aux2 == null || aux2.count < auxSize)
-        {
-            aux2?.Release();
-            aux2 = new ComputeBuffer((int)auxSize, sizeof(uint));
+        if (aux2 == null || aux2.count < auxSize) {
+            aux2?.Release(); aux2 = new ComputeBuffer((int)auxSize, sizeof(uint));
         }
-        if (auxSmall == null)
-        {
-            auxSmall = new ComputeBuffer(1, sizeof(uint));
-        }
+        if (auxSmall == null) auxSmall = new ComputeBuffer(1, sizeof(uint));
 
-        radixPrefixSumKernelId = radixSortShader.FindKernel("prefixSum");
-        radixPrefixFixupKernelId = radixSortShader.FindKernel("prefixFixup");
-
-        // First-level scan: nnzPerNode -> csrRowPtr
         radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", nnzPerNode);
         radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", csrRowPtr);
         radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", aux);
         radixSortShader.SetInt("len", numNodes);
-        radixSortShader.SetInt("zeroff", 1); // exclusive scan, rowPtr[0] = 0
+        radixSortShader.SetInt("zeroff", 1);
         radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
 
         if (numThreadgroups > 1)
         {
-            // Scan aux -> aux2
-            uint auxThreadgroups = 1; // aux length is small
             radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", aux);
             radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", aux2);
             radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
             radixSortShader.SetInt("len", (int)auxSize);
             radixSortShader.SetInt("zeroff", 1);
-            radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
+            radixSortShader.Dispatch(radixPrefixSumKernelId, 1, 1, 1);
 
-            // Fixup: add scanned aux into csrRowPtr
             radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", csrRowPtr);
             radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", aux2);
             radixSortShader.SetInt("len", numNodes);
             radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
         }
 
-        // C. Finalize rowPtrBuffer[N] on GPU
-        csrBuilderShader.SetBuffer(finalizeRowPtrKernel, "nnzPerNode", nnzPerNode);
-        csrBuilderShader.SetBuffer(finalizeRowPtrKernel, "rowPtrBuffer", csrRowPtr);
+        // C. Finalize csrRowPtr[numNodes] on GPU
+        csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "nnzPerNode", nnzPerNode);
+        csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "rowPtrBuffer", csrRowPtr);
         csrBuilderShader.SetInt("numNodes", numNodes);
-        csrBuilderShader.Dispatch(finalizeRowPtrKernel, 1, 1, 1);
+        csrBuilderShader.Dispatch(csrFinalizeRowPtrKernelId, 1, 1, 1);
 
-        // D. Read total NNZ (csrRowPtr[numNodes]) to size CSR value/index buffers
-        uint[] totalNnzArr = new uint[1];
-        csrRowPtr.GetData(totalNnzArr, 0, numNodes, 1);
-        int totalNNZ = (int)totalNnzArr[0];
-
-        if (totalNNZ <= 0)
-        {
-            Debug.LogError("CSR totalNNZ is zero or negative. Aborting CG solve.");
-            return;
-        }
-
-        if (csrColIndices == null || csrColIndices.count < totalNNZ)
-        {
-            csrColIndices?.Release();
-            csrColIndices = new ComputeBuffer(totalNNZ, sizeof(uint));
-        }
-        if (csrRowIndices == null || csrRowIndices.count < totalNNZ)
-        {
-            csrRowIndices?.Release();
-            csrRowIndices = new ComputeBuffer(totalNNZ, sizeof(uint));
-        }
-        if (csrValues == null || csrValues.count < totalNNZ)
-        {
-            csrValues?.Release();
-            csrValues = new ComputeBuffer(totalNNZ, sizeof(float));
-        }
-
-        // E. Fill CSR colIndices / values
-        csrBuilderShader.SetBuffer(fillCsrKernel, "neighborsBuffer", neighborsBuffer);
-        csrBuilderShader.SetBuffer(fillCsrKernel, "matrixABuffer", matrixABuffer);
-        csrBuilderShader.SetBuffer(fillCsrKernel, "rowPtrBuffer", csrRowPtr);
-        csrBuilderShader.SetBuffer(fillCsrKernel, "colIndicesBuffer", csrColIndices);
-        csrBuilderShader.SetBuffer(fillCsrKernel, "rowIndicesBuffer", csrRowIndices);
-        csrBuilderShader.SetBuffer(fillCsrKernel, "valuesBuffer", csrValues);
+        // D. Fill CSR colIndices / values (buffers pre-allocated — no readback needed)
+        csrBuilderShader.SetBuffer(csrFillKernelId, "neighborsBuffer", neighborsBuffer);
+        csrBuilderShader.SetBuffer(csrFillKernelId, "matrixABuffer", matrixABuffer);
+        csrBuilderShader.SetBuffer(csrFillKernelId, "rowPtrBuffer", csrRowPtr);
+        csrBuilderShader.SetBuffer(csrFillKernelId, "colIndicesBuffer", csrColIndices);
+        csrBuilderShader.SetBuffer(csrFillKernelId, "rowIndicesBuffer", csrRowIndices);
+        csrBuilderShader.SetBuffer(csrFillKernelId, "valuesBuffer", csrValues);
         csrBuilderShader.SetInt("numNodes", numNodes);
-        csrBuilderShader.Dispatch(fillCsrKernel, csrGroups, 1, 1);
+        csrBuilderShader.Dispatch(csrFillKernelId, csrGroups, 1, 1);
 
         // Preconditioner setup (Neural)
         if (preconditioner == PreconditionerType.Neural && preconditionerShader != null) {
-            RunNeuralPreconditioner(); 
-            cgSolverShader.SetBuffer(precomputeIndicesKernel, "neighborsBuffer", neighborsBuffer);
-            cgSolverShader.SetBuffer(precomputeIndicesKernel, "scatterIndicesBuffer", scatterIndicesBuffer);
+            RunNeuralPreconditioner();
+            cgSolverShader.SetBuffer(precomputeIndicesKernelId, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(precomputeIndicesKernelId, "scatterIndicesBuffer", scatterIndicesBuffer);
             cgSolverShader.SetInt("numNodes", numNodes);
-            Dispatch(precomputeIndicesKernel, numNodes);
+            Dispatch(precomputeIndicesKernelId, numNodes);
         }
 
-        // Init Pressure x=0
-        float[] zeros = new float[numNodes];
-        pressureBuffer.SetData(zeros);
+        // Init Pressure x=0 via GPU Scale(0) — no CPU allocation
+        cgSolverShader.SetBuffer(scaleKernelId, "yBuffer", pressureBuffer);
+        cgSolverShader.SetFloat("a", 0.0f);
+        cgSolverShader.SetInt("numNodes", numNodes);
+        Dispatch(scaleKernelId, numNodes);
 
-        // r = b
-        CopyBuffer(divergenceBuffer, residualBuffer);
+        // r = b (GPU copy, no CPU round-trip)
+        GpuCopyBuffer(divergenceBuffer, residualBuffer);
 
         // --- Step 2: Preconditioned Initialization ---
-        // z = M^-1 * r AND rho = r . z (Fused)
         float rho = ApplyPreconditionerAndDot(
-            residualBuffer, zVectorBuffer, 
-            applySparseGTKernel, applySparseGAndDotKernel, applySparseGAndDotKernel, 
-            clearBufferFloatKernel, applyJacobiKernel
+            residualBuffer, zVectorBuffer,
+            applySparseGTKernelId, applySparseGAndDotKernelId, applySparseGAndDotKernelId,
+            clearBufferFloatKernelId, applyJacobiKernelId
         );
 
-        CopyBuffer(zVectorBuffer, pBuffer);
+        // p = z (GPU copy)
+        GpuCopyBuffer(zVectorBuffer, pBuffer);
 
         float initialResidual = GpuDotProduct(residualBuffer, residualBuffer);
         if (initialResidual < convergenceThreshold) return;
@@ -251,34 +226,30 @@ public partial class FluidSimulator : MonoBehaviour
 
         // --- Step 3: PCG Loop ---
         int totalIterations = 0;
-        
+
         for (int k = 0; k < maxCgIterations; k++)
         {
-            // 1. FUSED: Ap = A * p AND p · Ap (CSR SpMV)
+            // 1. FUSED: Ap = A*p AND partial sums of p·Ap into divergenceBuffer
             laplacianSw.Start();
-            cgSolverShader.SetBuffer(spmvCsrKernel, "pBuffer", pBuffer);
-            cgSolverShader.SetBuffer(spmvCsrKernel, "ApBuffer", ApBuffer);
-            cgSolverShader.SetBuffer(spmvCsrKernel, "csrRowPtr", csrRowPtr);
-            cgSolverShader.SetBuffer(spmvCsrKernel, "csrColIndices", csrColIndices);
-            cgSolverShader.SetBuffer(spmvCsrKernel, "csrValues", csrValues);
-            cgSolverShader.SetBuffer(spmvCsrKernel, "divergenceBuffer", divergenceBuffer); // Output for reduction
+            cgSolverShader.SetBuffer(spmvCsrKernelId, "pBuffer", pBuffer);
+            cgSolverShader.SetBuffer(spmvCsrKernelId, "ApBuffer", ApBuffer);
+            cgSolverShader.SetBuffer(spmvCsrKernelId, "csrRowPtr", csrRowPtr);
+            cgSolverShader.SetBuffer(spmvCsrKernelId, "csrColIndices", csrColIndices);
+            cgSolverShader.SetBuffer(spmvCsrKernelId, "csrValues", csrValues);
+            cgSolverShader.SetBuffer(spmvCsrKernelId, "divergenceBuffer", divergenceBuffer);
             cgSolverShader.SetInt("numNodes", numNodes);
-
-            cgSolverShader.Dispatch(spmvCsrKernel, groupsA, 1, 1);
+            cgSolverShader.Dispatch(spmvCsrKernelId, groupsA, 1, 1);
             laplacianSw.Stop();
 
-            // 2. CPU Side Reduction
+            // 2. GPU final reduction → read back 1 float (no per-iteration array alloc)
             dotProductSw.Start();
-            float[] result = new float[groupsA];
-            divergenceBuffer.GetData(result); 
-            float p_dot_Ap = 0.0f;
-            for (int i = 0; i < groupsA; i++) p_dot_Ap += result[i];
+            float p_dot_Ap = GpuReduceSum(groupsA);
             dotProductSw.Stop();
-            
-            if (p_dot_Ap <= 1e-12f) break; // Singular or non-positive-definite
-            
+
+            if (p_dot_Ap <= 1e-12f) break;
+
             float alpha = rho / p_dot_Ap;
-            
+
             // 3. x = x + alpha * p
             updateVectorSw.Start();
             UpdateVector(pressureBuffer, pBuffer, alpha);
@@ -289,7 +260,7 @@ public partial class FluidSimulator : MonoBehaviour
             UpdateVector(residualBuffer, ApBuffer, -alpha);
             updateVectorSw.Stop();
 
-            // Check Convergence
+            // Check Convergence every 5 iterations
             if (k % 5 == 0)
             {
                 dotProductSw.Start();
@@ -301,20 +272,18 @@ public partial class FluidSimulator : MonoBehaviour
                 }
             }
 
-            // --- PRECONDITIONER STEP ---
-            // 5. z_new = M^-1 * r_new
+            // 5. z_new = M^-1 * r_new  AND  rho_new = r · z_new
             dotProductSw.Start();
             float rho_new = ApplyPreconditionerAndDot(
-                residualBuffer, zVectorBuffer, 
-                applySparseGTKernel, applySparseGAndDotKernel, applySparseGAndDotKernel, 
-                clearBufferFloatKernel, applyJacobiKernel
+                residualBuffer, zVectorBuffer,
+                applySparseGTKernelId, applySparseGAndDotKernelId, applySparseGAndDotKernelId,
+                clearBufferFloatKernelId, applyJacobiKernelId
             );
             dotProductSw.Stop();
 
-            // 7. beta
             float beta = rho_new / rho;
 
-            // 8. p = z_new + beta * p
+            // 6. p = z_new + beta * p
             updateVectorSw.Start();
             UpdateVector(pBuffer, zVectorBuffer, 1.0f, beta);
             updateVectorSw.Stop();
@@ -322,20 +291,25 @@ public partial class FluidSimulator : MonoBehaviour
             rho = rho_new;
             totalIterations = k + 1;
         }
-        
+
         cgSolveFrameCount++;
         cumulativeCgIterations += totalIterations;
         averageCgIterations = (float)(cumulativeCgIterations / Math.Max(1, cgSolveFrameCount));
         lastCgIterations = totalIterations;
-        
-        // Save training data
+
+        // Save training data (totalNNZ read back only when recording)
         if (recorder != null && recorder.isRecording)
         {
+            int totalNNZ = csrColIndices.count; // pre-allocated upper bound
+            uint[] totalNnzArr = new uint[1];
+            csrRowPtr.GetData(totalNnzArr, 0, numNodes, 1);
+            totalNNZ = (int)totalNnzArr[0];
+
             Vector3 simBoundsMin = simulationBounds != null ? simulationBounds.bounds.min : Vector3.zero;
             Vector3 simBoundsMax = simulationBounds != null ? simulationBounds.bounds.max : Vector3.zero;
             Vector3 fluidBoundsMin = fluidInitialBounds != null ? fluidInitialBounds.bounds.min : Vector3.zero;
             Vector3 fluidBoundsMax = fluidInitialBounds != null ? fluidInitialBounds.bounds.max : Vector3.zero;
-            
+
             recorder.SaveFrame(
                 nodesBuffer,
                 neighborsBuffer,
@@ -364,6 +338,7 @@ public partial class FluidSimulator : MonoBehaviour
         // --- Step 4: Apply pressure to velocities ---
         ApplyPressureGradient();
     }
+
     private void ApplyPressureGradient()
     {
         if (nodesShader == null)
@@ -372,115 +347,100 @@ public partial class FluidSimulator : MonoBehaviour
             return;
         }
 
-        applyPressureGradientKernel = nodesShader.FindKernel("ApplyPressureGradient");
-        
-        // Set the necessary buffers and parameters
         nodesShader.SetBuffer(applyPressureGradientKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(applyPressureGradientKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetBuffer(applyPressureGradientKernel, "neighborsBuffer", neighborsBuffer);
-        nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer); // The result from the CG solve!
-        
+        nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer);
+
         nodesShader.SetInt("numNodes", numNodes);
-        float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate); // Use the same deltaTime as in advection
+        float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);
         nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         nodesShader.SetInt("minLayer", minLayer);
 
-        // Dispatch the kernel to update velocities
         int threadGroups = Mathf.CeilToInt(numNodes / 256.0f);
         nodesShader.Dispatch(applyPressureGradientKernel, threadGroups, 1, 1);
 
-        // SWAP the C# references
         ComputeBuffer swap = nodesBuffer;
         nodesBuffer = tempNodesBuffer;
         tempNodesBuffer = swap;
     }
-    private void Dispatch(int kernel, int count) 
+
+    private void Dispatch(int kernel, int count)
     {
         int threadGroups = Mathf.CeilToInt(count / 512.0f);
         cgSolverShader.Dispatch(kernel, threadGroups, 1, 1);
     }
-    private void CopyBuffer(ComputeBuffer source, ComputeBuffer destination)
+
+    // Legacy name kept for FluidPreconditioner.cs callers.
+    private void CopyBuffer(ComputeBuffer source, ComputeBuffer destination) => GpuCopyBuffer(source, destination);
+
+    // GPU-only buffer copy: no CPU round-trip.
+    private void GpuCopyBuffer(ComputeBuffer source, ComputeBuffer destination)
     {
-        if (source.count != destination.count) return;
-        
-        float[] data = new float[source.count];
-        source.GetData(data);
-        destination.SetData(data);
+        cgSolverShader.SetBuffer(copyFloatKernelId, "xBuffer", source);
+        cgSolverShader.SetBuffer(copyFloatKernelId, "yBuffer", destination);
+        cgSolverShader.SetInt("numNodes", numNodes);
+        Dispatch(copyFloatKernelId, numNodes);
     }
+
+    // Finishes the reduction already started by SpMV (partial sums in divergenceBuffer[0..groupCount-1]).
+    private float GpuReduceSum(int groupCount)
+    {
+        cgSolverShader.SetBuffer(globalReduceSumKernelId, "divergenceBuffer", divergenceBuffer);
+        cgSolverShader.SetInt("reductionCount", groupCount);
+        cgSolverShader.Dispatch(globalReduceSumKernelId, 1, 1, 1);
+        divergenceBuffer.GetData(reductionResult, 0, 0, 1);
+        return reductionResult[0];
+    }
+
     private float GpuDotProduct(ComputeBuffer bufferA, ComputeBuffer bufferB)
     {
         if (cgSolverShader == null) return 0.0f;
 
-        int dotProductKernel = cgSolverShader.FindKernel("DotProduct");
-        int reduceKernel = cgSolverShader.FindKernel("GlobalReduceSum");
-        
-        // 1. Run Standard Dot Product (Partial Sums)
         cgSolverShader.SetBuffer(dotProductKernel, "xBuffer", bufferA);
         cgSolverShader.SetBuffer(dotProductKernel, "yBuffer", bufferB);
         cgSolverShader.SetBuffer(dotProductKernel, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetInt("numNodes", numNodes);
-        
+
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         cgSolverShader.Dispatch(dotProductKernel, threadGroups, 1, 1);
-        
-        // 2. Run Final Reduction on GPU (Sum partials to index 0)
-        cgSolverShader.SetBuffer(reduceKernel, "divergenceBuffer", divergenceBuffer);
-        cgSolverShader.SetInt("reductionCount", threadGroups);
-        cgSolverShader.Dispatch(reduceKernel, 1, 1, 1);
 
-        // 3. Read back ONLY the single float result
-        // This is still blocking, but minimal data transfer
-        divergenceBuffer.GetData(reductionResult, 0, 0, 1);
-        
-        return reductionResult[0];
+        return GpuReduceSum(threadGroups);
     }
+
     private void UpdateVector(ComputeBuffer yBuffer, ComputeBuffer xBuffer, float a)
     {
         if (cgSolverShader == null) return;
 
-        int axpyKernel = cgSolverShader.FindKernel("Axpy");
-        
         cgSolverShader.SetBuffer(axpyKernel, "xBuffer", xBuffer);
         cgSolverShader.SetBuffer(axpyKernel, "yBuffer", yBuffer);
         cgSolverShader.SetFloat("a", a);
         cgSolverShader.SetInt("numNodes", numNodes);
-        
         Dispatch(axpyKernel, numNodes);
     }
-    private void UpdateVector(ComputeBuffer pBuffer, ComputeBuffer rBuffer, float rCoeff, float pCoeff)
+
+    private void UpdateVector(ComputeBuffer pBuf, ComputeBuffer rBuffer, float rCoeff, float pCoeff)
     {
         if (cgSolverShader == null) return;
 
-        // Find the new Scale kernel (and the existing Axpy kernel)
-        int scaleKernel = cgSolverShader.FindKernel("Scale");
-        int axpyKernel = cgSolverShader.FindKernel("Axpy");
-        
-        // --- CORRECTED LOGIC ---
-
-        // First, scale p by beta: p_new = beta * p_old
-        cgSolverShader.SetBuffer(scaleKernel, "yBuffer", pBuffer);
-        cgSolverShader.SetFloat("a", pCoeff); // pCoeff is beta
+        // p = beta * p
+        cgSolverShader.SetBuffer(scaleKernelId, "yBuffer", pBuf);
+        cgSolverShader.SetFloat("a", pCoeff);
         cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(scaleKernel, numNodes);
-        
-        // Then, add r: p_new = r_new + p_new (which is now beta * p_old)
+        Dispatch(scaleKernelId, numNodes);
+
+        // p = r + p  (rCoeff is always 1.0)
         cgSolverShader.SetBuffer(axpyKernel, "xBuffer", rBuffer);
-        cgSolverShader.SetBuffer(axpyKernel, "yBuffer", pBuffer);
-        cgSolverShader.SetFloat("a", rCoeff); // rCoeff is 1.0
+        cgSolverShader.SetBuffer(axpyKernel, "yBuffer", pBuf);
+        cgSolverShader.SetFloat("a", rCoeff);
         cgSolverShader.SetInt("numNodes", numNodes);
         Dispatch(axpyKernel, numNodes);
     }
+
     private void ApplyExternalForces()
     {
         if (nodesShader == null) return;
-
-        applyExternalForcesKernel = nodesShader.FindKernel("ApplyExternalForces");
-        if (applyExternalForcesKernel < 0)
-        {
-            Debug.LogError("ApplyExternalForces kernel not found in Nodes.compute shader.");
-            return;
-        }
 
         nodesShader.SetBuffer(applyExternalForcesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);

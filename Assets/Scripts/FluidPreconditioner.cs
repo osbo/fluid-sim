@@ -329,10 +329,8 @@ public partial class FluidSimulator : MonoBehaviour
             int groups = Mathf.CeilToInt(numNodes / 256.0f);
             cgSolverShader.Dispatch(kG_Dot, groups, 1, 1);
 
-            // 4. Reduction
-            float[] partials = new float[groups];
-            divergenceBuffer.GetData(partials);
-            for(int i=0; i<groups; i++) dotResult += partials[i];
+            // 4. GPU final reduction — avoids per-iteration array alloc and full GetData
+            dotResult = GpuReduceSum(groups);
         }
         else
         {

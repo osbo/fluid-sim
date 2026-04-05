@@ -10,6 +10,7 @@
 #pragma kernel clearUniqueBuffers
 #pragma kernel clearActiveBuffers
 #pragma kernel copyNodes
+#pragma kernel WriteDispatchArgs
 
 #define SCAN_BLOCKSIZE 512
 
@@ -53,7 +54,8 @@ RWStructuredBuffer<uint> aux2;                   // temp: scanned per-block sums
 
 RWStructuredBuffer<uint> uniqueIndices;          // output: indices of first occurrence of indicators
 RWStructuredBuffer<uint> uniqueCount;            // output: [0] = number of indicators
-RWStructuredBuffer<uint> nodeCount;            // output: [0] = number of indicators
+RWStructuredBuffer<uint> nodeCount;              // output: [0] = number of active nodes
+RWStructuredBuffer<uint> dispatchArgsBuffer;     // output: [threadGroupsX, 1, 1] for DispatchIndirect
 
 uint len;                                        // total number of items
 uint prefixBits;                                 // number of bits to shift right for prefix comparison
@@ -263,4 +265,15 @@ void clearActiveBuffers(uint3 id : SV_DispatchThreadID)
     if (i >= len) return;
 
     indicators[i] = 0;
+}
+
+// Reads uniqueCount[0] and writes dispatch args = {ceil(count/512), 1, 1}
+// Call this after writeUniqueCount, then use dispatchArgsBuffer with DispatchIndirect.
+[numthreads(1, 1, 1)]
+void WriteDispatchArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint count = uniqueCount[0];
+    dispatchArgsBuffer[0] = max(1u, (count + 511u) / 512u);
+    dispatchArgsBuffer[1] = 1u;
+    dispatchArgsBuffer[2] = 1u;
 }

@@ -61,8 +61,9 @@ RWStructuredBuffer<float> phiBuffer;                    // level set distance fi
 StructuredBuffer<float> phiBuffer_Read;                 // level set distance field (read-only copy for propagation)
 RWStructuredBuffer<float3> diffusionGradientBuffer;     // output: precomputed normalized density gradient per node
 RWStructuredBuffer<uint> dirtyFlagBuffer;               // single-element buffer for convergence flag
+RWStructuredBuffer<uint> uniqueCount;                   // [0] = numUniqueNodes, written by writeUniqueCount
 
-uint numUniqueNodes;                              // number of unique morton codes
+uint numUniqueNodes;                              // number of unique morton codes (kept for non-DispatchIndirect callers)
 uint numNodes;                                          // number of nodes
 uint numParticles;                                      // total number of particles
 uint layer;                                             // current hierarchical layer
@@ -340,10 +341,11 @@ void CreateLeaves(uint3 id : SV_DispatchThreadID)
 void ProcessNodes(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
-    if (threadIndex >= numUniqueNodes) return;
+    uint numUnique = uniqueCount[0];
+    if (threadIndex >= numUnique) return;
 
     uint uniqueStart = uniqueIndices[threadIndex];
-    uint uniqueEnd = threadIndex + 1 < numUniqueNodes ? uniqueIndices[threadIndex + 1] : numNodes;
+    uint uniqueEnd = threadIndex + 1 < numUnique ? uniqueIndices[threadIndex + 1] : numNodes;
     uint numNodesInGroup = uniqueEnd - uniqueStart;
 
     // Safety check: prevent infinite loops

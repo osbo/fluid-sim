@@ -9,7 +9,7 @@ Diag (Jacobi), IC-class (``ilupp.IChol0`` or scipy ``spilu`` fallback), PyAMG / 
 Use ``--test_only`` to run the PCG benchmark path and print only that summary (no plots, profiling, or dense AMG build).
 Use ``--fast_plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``eig(A·M)``, ``cond(A·M)``, and A-eigenmode error curves (saves many minutes for n in the thousands).
 
-CUDA Graph (``--pcg_cuda_backend cudagraph``, default) records real GPU kernels and replays them — it is a production optimization for low CPU launch overhead, not a synthetic timing trick. Use ``--pcg_cuda_backend compile`` for ``torch.compile(one PCG iter)`` + a Python loop instead.
+CUDA Graph (``--pcg_cuda_backend cudagraph``, default on CUDA) records real GPU kernels and replays them — low CPU launch overhead. On Apple MPS there is no CUDAGraph; the same flag selects ``torch.compile(one PCG iter)`` + a Python loop. Use ``--pcg_cuda_backend compile`` explicitly for Inductor on both; ``eager`` keeps per-iter Python dispatch.
 
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
@@ -26,6 +26,7 @@ import time
 import os
 import warnings
 from pathlib import Path
+from typing import Optional
 
 warnings.filterwarnings("ignore", message=".*Sparse CSR.*", category=UserWarning)
 warnings.filterwarnings(
@@ -691,7 +692,113 @@ def get_dense_amg(A_sparse_scipy, viz_limit=200, maxiter=1, tol=1e-6, progress_i
         M_dense[:, i] = ml.solve(e_i, x0=x0, maxiter=maxiter, cycle='V', tol=tol)[:limit]
         if progress_interval and (i + 1) % progress_interval == 0:
             print(f"  AMG column {i + 1}/{limit}")
-    return M_dense
+        return M_dense
+
+
+def _torch_gpu_sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+def _build_A_gpu_laplacian(
+    A_scipy_csr,
+    A_dense_f64: np.ndarray,
+    viz_n: int,
+    device: torch.device,
+    *,
+    dtype=torch.float32,
+) -> torch.Tensor:
+    """
+    Match the simulation: SpMV on sparse ``A``. CUDA uses CSR; MPS uses CSR when supported
+    (else dense fallback — O(n²) per matvec).
+    """
+    np_f = A_dense_f64.astype(np.float32)
+    if device.type == "cuda":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            csr_indptr = torch.tensor(
+                np.ascontiguousarray(A_scipy_csr.indptr.astype(np.int32)),
+                dtype=torch.int32,
+                device=device,
+            ).contiguous()
+            csr_indices = torch.tensor(
+                np.ascontiguousarray(A_scipy_csr.indices.astype(np.int32)),
+                dtype=torch.int32,
+                device=device,
+            ).contiguous()
+            csr_data = torch.tensor(
+                np.ascontiguousarray(A_scipy_csr.data.astype(np.float32)),
+                dtype=torch.float32,
+                device=device,
+            ).contiguous()
+        return torch.sparse_csr_tensor(
+            csr_indptr, csr_indices, csr_data, size=(viz_n, viz_n)
+        )
+
+    if device.type == "mps":
+        csr_indptr = torch.tensor(
+            np.ascontiguousarray(A_scipy_csr.indptr.astype(np.int32)),
+            dtype=torch.int32,
+            device=device,
+        ).contiguous()
+        csr_indices = torch.tensor(
+            np.ascontiguousarray(A_scipy_csr.indices.astype(np.int32)),
+            dtype=torch.int32,
+            device=device,
+        ).contiguous()
+        csr_data = torch.tensor(
+            np.ascontiguousarray(A_scipy_csr.data.astype(np.float32)),
+            dtype=torch.float32,
+            device=device,
+        ).contiguous()
+        try:
+            A_csr = torch.sparse_csr_tensor(
+                csr_indptr, csr_indices, csr_data, size=(viz_n, viz_n)
+            )
+            _torch_gpu_sync(device)
+            probe = torch.zeros(viz_n, 1, device=device, dtype=dtype)
+            _ = torch.sparse.mm(A_csr, probe)
+            _torch_gpu_sync(device)
+            return A_csr
+        except Exception as e:
+            warnings.warn(
+                f"MPS sparse CSR Laplacian failed ({type(e).__name__}: {e}); using dense A (O(n²) per PCG iter).",
+                UserWarning,
+                stacklevel=2,
+            )
+            return torch.from_numpy(np_f).to(device=device).contiguous()
+
+    return torch.from_numpy(np_f).to(device=device).contiguous()
+
+
+class _GpuElapsedTimer:
+    """CUDA events when ``device`` is CUDA; otherwise ``perf_counter`` + optional MPS sync."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self._t0: Optional[float] = None
+        self._start_ev = self._end_ev = None
+        if device.type == "cuda":
+            self._start_ev = torch.cuda.Event(enable_timing=True)
+            self._end_ev = torch.cuda.Event(enable_timing=True)
+
+    def start(self) -> None:
+        _torch_gpu_sync(self.device)
+        if self._start_ev is not None:
+            self._start_ev.record()
+        else:
+            self._t0 = time.perf_counter()
+
+    def elapsed_ms(self) -> float:
+        if self._start_ev is not None:
+            self._end_ev.record()
+            torch.cuda.synchronize()
+            return float(self._start_ev.elapsed_time(self._end_ev))
+        _torch_gpu_sync(self.device)
+        assert self._t0 is not None
+        return (time.perf_counter() - self._t0) * 1000.0
 
 
 def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=False, check_freq=3):
@@ -982,8 +1089,8 @@ def pcg_gpu_compiled_bsr(
     """
     if device is None:
         device = b_gpu.device
-    if device.type != "cuda":
-        raise ValueError("pcg_gpu_compiled_bsr requires CUDA")
+    if device.type not in ("cuda", "mps"):
+        raise ValueError("pcg_gpu_compiled_bsr requires CUDA or MPS")
 
     dtype = b_gpu.dtype
     x_static = torch.zeros_like(b_gpu)
@@ -1009,13 +1116,13 @@ def pcg_gpu_compiled_bsr(
         p_static.mul_(beta).add_(z_static)
 
     n = int(b_gpu.shape[0])
-    torch.cuda.synchronize()
+    _torch_gpu_sync(device)
     z_static.copy_(M_sparse_bsr @ r_static)
     if getattr(A_gpu, "layout", None) == torch.sparse_csr:
         _ = torch.sparse.mm(A_gpu, p_static.view(n, 1))
     else:
         _ = A_gpu @ p_static
-    torch.cuda.synchronize()
+    _torch_gpu_sync(device)
 
     try:
         one_iter_compiled = torch.compile(one_iter, mode=compile_mode, fullgraph=False)
@@ -1065,10 +1172,8 @@ def pcg_gpu_compiled_bsr(
     p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
 
-    start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start_ev.record()
+    _timer = _GpuElapsedTimer(device)
+    _timer.start()
     iters = 0
     for k in range(max_iter):
         one_iter_compiled()
@@ -1077,9 +1182,7 @@ def pcg_gpu_compiled_bsr(
             r_sq = (r_static * r_static).sum()
             if r_sq.item() <= tol_sq_val:
                 break
-    end_ev.record()
-    torch.cuda.synchronize()
-    wall_ms = start_ev.elapsed_time(end_ev)
+    wall_ms = _timer.elapsed_ms()
     return x_static.clone(), iters, wall_ms
 
 
@@ -1100,8 +1203,8 @@ def pcg_gpu_compiled_matrix_free(
     """
     if device is None:
         device = b_gpu.device
-    if device.type != "cuda":
-        raise ValueError("pcg_gpu_compiled_matrix_free requires CUDA")
+    if device.type not in ("cuda", "mps"):
+        raise ValueError("pcg_gpu_compiled_matrix_free requires CUDA or MPS")
 
     dtype = b_gpu.dtype
     x_static = torch.zeros_like(b_gpu)
@@ -1127,13 +1230,13 @@ def pcg_gpu_compiled_matrix_free(
         p_static.mul_(beta).add_(z_static)
 
     n = int(b_gpu.shape[0])
-    torch.cuda.synchronize()
+    _torch_gpu_sync(device)
     apply_precond_into(r_static, z_static)
     if getattr(A_gpu, "layout", None) == torch.sparse_csr:
         _ = torch.sparse.mm(A_gpu, p_static.view(n, 1))
     else:
         _ = A_gpu @ p_static
-    torch.cuda.synchronize()
+    _torch_gpu_sync(device)
 
     try:
         one_iter_compiled = torch.compile(one_iter, mode=compile_mode, fullgraph=False)
@@ -1193,10 +1296,8 @@ def pcg_gpu_compiled_matrix_free(
     p_static.copy_(z_static)
     rho_static.fill_((r_static * z_static).sum())
 
-    start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start_ev.record()
+    _timer = _GpuElapsedTimer(device)
+    _timer.start()
     iters = 0
     for k in range(max_iter):
         one_iter_compiled()
@@ -1205,13 +1306,18 @@ def pcg_gpu_compiled_matrix_free(
             r_sq = (r_static * r_static).sum()
             if r_sq.item() <= tol_sq_val:
                 break
-    end_ev.record()
-    torch.cuda.synchronize()
-    wall_ms = start_ev.elapsed_time(end_ev)
+    wall_ms = _timer.elapsed_ms()
     return x_static.clone(), iters, wall_ms
 
 
-def _dispatch_pcg_matrix_free_cuda(
+def _effective_pcg_gpu_backend(device: torch.device, backend: str) -> str:
+    """MPS has no ``torch.cuda.CUDAGraph``; ``cudagraph`` maps to ``torch.compile``."""
+    if device.type == "mps" and backend == "cudagraph":
+        return "compile"
+    return backend
+
+
+def _dispatch_pcg_matrix_free_gpu(
     A_gpu,
     b_gpu,
     apply_precond_into,
@@ -1222,8 +1328,9 @@ def _dispatch_pcg_matrix_free_cuda(
     device: torch.device,
     check_freq: int,
 ):
-    """``backend``: ``cudagraph`` | ``compile`` | ``eager``."""
-    if backend == "cudagraph":
+    """CUDA: ``cudagraph`` | ``compile`` | ``eager``. MPS: ``cudagraph``/``compile`` → compiled iter; ``eager`` → ``pcg_gpu``."""
+    eff = _effective_pcg_gpu_backend(device, backend)
+    if device.type == "cuda" and eff == "cudagraph":
         return pcg_gpu_cudagraph_matrix_free(
             A_gpu,
             b_gpu,
@@ -1233,7 +1340,7 @@ def _dispatch_pcg_matrix_free_cuda(
             device=device,
             check_freq=check_freq,
         )
-    if backend == "compile":
+    if eff == "compile":
         return pcg_gpu_compiled_matrix_free(
             A_gpu,
             b_gpu,
@@ -1259,7 +1366,7 @@ def _dispatch_pcg_matrix_free_cuda(
     )
 
 
-def _dispatch_pcg_bsr_cuda(
+def _dispatch_pcg_bsr_gpu(
     A_gpu,
     b_gpu,
     M_sparse_bsr,
@@ -1270,7 +1377,8 @@ def _dispatch_pcg_bsr_cuda(
     device: torch.device,
     check_freq: int,
 ):
-    if backend == "cudagraph":
+    eff = _effective_pcg_gpu_backend(device, backend)
+    if device.type == "cuda" and eff == "cudagraph":
         return pcg_gpu_cudagraph_bsr(
             A_gpu,
             b_gpu,
@@ -1280,7 +1388,7 @@ def _dispatch_pcg_bsr_cuda(
             device=device,
             check_freq=check_freq,
         )
-    if backend == "compile":
+    if eff == "compile":
         return pcg_gpu_compiled_bsr(
             A_gpu,
             b_gpu,
@@ -1565,8 +1673,8 @@ def main():
         help=(
             "LeafOnly PCG preconditioner representation: matrix_free (default) = allocation-free "
             "apply_block_diagonal_m_into + block_diagonal_m_apply_workspace; bsr = materialized BSR SpMV. "
-            "On CUDA, how that apply is driven in the solve loop is set by --pcg_cuda_backend "
-            "(cudagraph | compile | eager)."
+            "On CUDA/MPS, the solve loop driver is --pcg_cuda_backend (cudagraph | compile | eager; "
+            "on MPS, cudagraph maps to compile)."
         ),
     )
     parser.add_argument(
@@ -1574,9 +1682,19 @@ def main():
         choices=("cudagraph", "compile", "eager"),
         default="cudagraph",
         help=(
-            "How to run GPU PCG in this script (none / Jacobi / LeafOnly on CUDA): cudagraph (default) replays "
-            "one iteration via torch.cuda.CUDAGraph; compile uses torch.compile(one_iter) each step; "
-            "eager uses pcg_gpu (most Python overhead per iteration)."
+            "GPU PCG driver for CUDA and MPS (none / Jacobi / LeafOnly): on CUDA, cudagraph (default) replays "
+            "one iteration via torch.cuda.CUDAGraph; compile uses torch.compile(one_iter) per step. "
+            "On MPS there is no CUDAGraph — cudagraph is mapped to compile. eager uses pcg_gpu (most Python overhead)."
+        ),
+    )
+    parser.add_argument(
+        "--pcg_check_freq",
+        type=int,
+        default=3,
+        metavar="K",
+        help=(
+            "GPU PCG: evaluate stopping residual every K iterations. Larger K cuts host sync overhead "
+            "(faster) but may overshoot tolerance by up to K-1 iterations."
         ),
     )
     parser.add_argument(
@@ -1651,7 +1769,7 @@ def main():
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
     _info(f"Using device: {device}")
-    check_freq = 3
+    check_freq = max(1, int(getattr(args, "pcg_check_freq", 3)))
 
     _info(f"Loading data from {data_folder}")
     dataset = FluidGraphDataset([Path(data_folder)])
@@ -1936,38 +2054,16 @@ def main():
     A_f64 = A_viz_n.astype(np.float64)
     leaf_rel_res = float("nan")
     with torch.inference_mode():
-        if device.type == "cuda":
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                csr_indptr = torch.tensor(
-                    np.ascontiguousarray(A_scipy_csr.indptr.astype(np.int32)),
-                    dtype=torch.int32,
-                    device=device,
-                ).contiguous()
-                csr_indices = torch.tensor(
-                    np.ascontiguousarray(A_scipy_csr.indices.astype(np.int32)),
-                    dtype=torch.int32,
-                    device=device,
-                ).contiguous()
-                csr_data = torch.tensor(
-                    np.ascontiguousarray(A_scipy_csr.data.astype(np.float32)),
-                    dtype=torch.float32,
-                    device=device,
-                ).contiguous()
-                A_gpu = torch.sparse_csr_tensor(
-                    csr_indptr, csr_indices, csr_data, size=(viz_n, viz_n)
-                )
-        else:
-            A_gpu = torch.from_numpy(A_viz_n.astype(np.float32)).to(device).contiguous()
+        A_gpu = _build_A_gpu_laplacian(A_scipy_csr, A_viz_n, viz_n, device)
         b_gpu = torch.from_numpy(b_np).float().to(device).contiguous()
 
-        if device.type == "cuda":
+        if device.type in ("cuda", "mps"):
 
             def _apply_none_into(r: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
                 z.copy_(r)
                 return z
 
-            x_gpu_none, iters_none_gpu, solve_none_gpu_ms = _dispatch_pcg_matrix_free_cuda(
+            x_gpu_none, iters_none_gpu, solve_none_gpu_ms = _dispatch_pcg_matrix_free_gpu(
                 A_gpu,
                 b_gpu,
                 _apply_none_into,
@@ -1986,7 +2082,7 @@ def main():
                 torch.mul(r, _inv_jac_t.view(-1, 1), out=z)
                 return z
 
-            _, iters_diag_gpu, solve_diag_gpu_ms = _dispatch_pcg_matrix_free_cuda(
+            _, iters_diag_gpu, solve_diag_gpu_ms = _dispatch_pcg_matrix_free_gpu(
                 A_gpu,
                 b_gpu,
                 _apply_jacobi_into,
@@ -1996,11 +2092,15 @@ def main():
                 device=device,
                 check_freq=check_freq,
             )
-            _gpu_pcg_desc = {
+            _eff_be = _effective_pcg_gpu_backend(device, pcg_cuda_backend)
+            _gpu_pcg_desc_map = {
                 "cudagraph": "CUDAGraph replay of one iter (low CPU launch overhead)",
                 "compile": "torch.compile(one_iter) + Python loop (Inductor)",
                 "eager": "pcg_gpu eager (highest per-iter Python overhead)",
-            }.get(pcg_cuda_backend, pcg_cuda_backend)
+            }
+            _gpu_pcg_desc = _gpu_pcg_desc_map.get(_eff_be, _eff_be)
+            if device.type == "mps" and pcg_cuda_backend == "cudagraph":
+                _gpu_pcg_desc += " (MPS: --pcg_cuda_backend cudagraph → compile; no CUDAGraph)"
             _info(f"  Unpreconditioned / Jacobi PCG (GPU): {_gpu_pcg_desc}")
         else:
             x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu(
@@ -2023,10 +2123,18 @@ def main():
                 check_freq=check_freq,
             )
 
+        _pcg_driver_line = (
+            f"{args.leafonly_pcg}; GPU PCG driver: {pcg_cuda_backend}"
+            + (
+                f" (effective: {_effective_pcg_gpu_backend(device, pcg_cuda_backend)})"
+                if device.type == "mps"
+                else ""
+            )
+        )
         if test_only:
-            print(f"  LeafOnly PCG mode: {args.leafonly_pcg}; GPU PCG driver: {pcg_cuda_backend}")
+            print(f"  LeafOnly PCG mode: {_pcg_driver_line}")
         else:
-            _info(f"  LeafOnly PCG mode: {args.leafonly_pcg}; GPU PCG driver: {pcg_cuda_backend}")
+            _info(f"  LeafOnly PCG mode: {_pcg_driver_line}")
 
         if args.leafonly_pcg == "bsr":
             M_sparse_bsr = build_sparse_bsr_preconditioner(
@@ -2040,8 +2148,8 @@ def main():
             )
             verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
 
-            if device.type == "cuda":
-                x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_bsr_cuda(
+            if device.type in ("cuda", "mps"):
+                x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_bsr_gpu(
                     A_gpu,
                     b_gpu,
                     M_sparse_bsr,
@@ -2052,7 +2160,8 @@ def main():
                     check_freq=check_freq,
                 )
                 _bsr_be = {"cudagraph": "CUDAGraph", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
-                    pcg_cuda_backend, pcg_cuda_backend
+                    _effective_pcg_gpu_backend(device, pcg_cuda_backend),
+                    pcg_cuda_backend,
                 )
                 _info(
                     f"  LeafOnly PCG: BSR + {_bsr_be} (z = M @ r)"
@@ -2072,7 +2181,7 @@ def main():
                     device=device,
                     check_freq=check_freq,
                 )
-                _info("  LeafOnly PCG: BSR preconditioner + pcg_gpu (no CUDA graph on this device)")
+                _info("  LeafOnly PCG: BSR preconditioner + pcg_gpu (CPU)")
         else:
             precond_ws = block_diagonal_m_apply_workspace(
                 num_leaves=viz_n // leaf_L,
@@ -2099,8 +2208,8 @@ def main():
                 )
                 return out
 
-            if device.type == "cuda":
-                x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_matrix_free_cuda(
+            if device.type in ("cuda", "mps"):
+                x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_matrix_free_gpu(
                     A_gpu,
                     b_gpu,
                     apply_pcg_fast_into,
@@ -2111,7 +2220,8 @@ def main():
                     check_freq=check_freq,
                 )
                 _mf_be = {"cudagraph": "CUDAGraph replay", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
-                    pcg_cuda_backend, pcg_cuda_backend
+                    _effective_pcg_gpu_backend(device, pcg_cuda_backend),
+                    pcg_cuda_backend,
                 )
                 _info(
                     f"  LeafOnly PCG: {_mf_be} — CSR SpMV + block_diagonal_m_apply_workspace + "
@@ -2133,7 +2243,7 @@ def main():
                     device=device,
                     check_freq=check_freq,
                 )
-                _info("  LeafOnly PCG: matrix-free preconditioner + pcg_gpu (no CUDA graph on this device)")
+                _info("  LeafOnly PCG: matrix-free preconditioner + pcg_gpu (CPU)")
 
         _bf = b_gpu.squeeze(-1)
         _Ax = A_gpu @ x_gpu.squeeze(-1)

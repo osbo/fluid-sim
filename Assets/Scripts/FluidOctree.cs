@@ -3,131 +3,113 @@ using UnityEngine;
 // Octree/Node component of FluidSimulator
 public partial class FluidSimulator : MonoBehaviour
 {
+    // Cache all octree/prefix-sum kernel IDs once in Start() so the layer loop never calls FindKernel.
+    private void InitOctreeKernels()
+    {
+        if (nodesPrefixSumsShader == null || nodesShader == null || radixSortShader == null)
+        {
+            Debug.LogError("One or more octree shaders not assigned. Cannot cache kernel IDs.");
+            return;
+        }
+
+        markUniqueParticlesKernel  = nodesPrefixSumsShader.FindKernel("markUniqueParticles");
+        markUniquesPrefixKernel    = nodesPrefixSumsShader.FindKernel("markUniquesPrefix");
+        scatterUniquesKernel       = nodesPrefixSumsShader.FindKernel("scatterUniques");
+        writeUniqueCountKernel     = nodesPrefixSumsShader.FindKernel("writeUniqueCount");
+        writeNodeCountKernelId     = nodesPrefixSumsShader.FindKernel("writeNodeCount");
+        markActiveNodesKernelId    = nodesPrefixSumsShader.FindKernel("markActiveNodes");
+        scatterActivesKernelId     = nodesPrefixSumsShader.FindKernel("scatterActives");
+        copyNodesKernel            = nodesPrefixSumsShader.FindKernel("copyNodes");
+        clearUniqueBuffersKernelId = nodesPrefixSumsShader.FindKernel("clearUniqueBuffers");
+        clearActiveBuffersKernelId = nodesPrefixSumsShader.FindKernel("clearActiveBuffers");
+        writeDispatchArgsKernelId  = nodesPrefixSumsShader.FindKernel("WriteDispatchArgs");
+
+        createLeavesKernel         = nodesShader.FindKernel("CreateLeaves");
+        processNodesKernel         = nodesShader.FindKernel("ProcessNodes");
+        findNeighborsKernel        = nodesShader.FindKernel("findNeighbors");
+        findReverseKernel          = nodesShader.FindKernel("FindReverseConnections");
+        interpolateFaceVelocitiesKernel = nodesShader.FindKernel("interpolateFaceVelocities");
+        copyFaceVelocitiesKernel   = nodesShader.FindKernel("copyFaceVelocities");
+        extractMortonCodesKernel   = nodesShader.FindKernel("ExtractMortonCodes");
+        initializePhiKernel        = nodesShader.FindKernel("InitializePhi");
+        propagatePhiKernel         = nodesShader.FindKernel("PropagatePhi");
+
+        // dispatchArgsBuffer: 3 uints for DispatchIndirect (threadGroupsX, 1, 1)
+        if (dispatchArgsBuffer == null)
+            dispatchArgsBuffer = new ComputeBuffer(3, sizeof(uint), ComputeBufferType.IndirectArguments);
+    }
+
     private void findUniqueParticles()
     {
         if (numParticles == 0) return;
 
         if (nodesPrefixSumsShader == null)
         {
-            Debug.LogError("Leaves compute shader is not assigned. Please assign `nodesPrefixSumsShader` in the inspector.");
+            Debug.LogError("NodesPrefixSums compute shader is not assigned.");
             return;
         }
 
-        // Find kernels
-        markUniqueParticlesKernel = nodesPrefixSumsShader.FindKernel("markUniqueParticles");
-        markUniquesPrefixKernel = nodesPrefixSumsShader.FindKernel("markUniquesPrefix");
-        scatterUniquesKernel = nodesPrefixSumsShader.FindKernel("scatterUniques");
-        writeUniqueCountKernel = nodesPrefixSumsShader.FindKernel("writeUniqueCount");
-
-        if (markUniqueParticlesKernel < 0 || markUniquesPrefixKernel < 0 || scatterUniquesKernel < 0 || writeUniqueCountKernel < 0)
-        {
-            Debug.LogError("One or more kernels not found in Leaves.compute. Verify #pragma kernel names and shader assignment.");
-            return;
-        }
-
-        // Release and recreate buffers each frame since numParticles changes
-        indicators?.Release();
-        prefixSums?.Release();
-        aux?.Release();
-        aux2?.Release();
-        uniqueIndices?.Release();
-        uniqueCount?.Release();
-
-        // Allocate leaves buffers
-        indicators = new ComputeBuffer(numParticles, sizeof(uint));
-        prefixSums = new ComputeBuffer(numParticles, sizeof(uint));
-
+        // Grow-only buffer allocation — numParticles is fixed, no need to release/recreate each frame.
+        int np = numParticles;
         uint tgSize = 512u;
-        uint numThreadgroups = (uint)((numParticles + (tgSize * 2) - 1) / (tgSize * 2));
+        uint numThreadgroups = (uint)((np + (tgSize * 2) - 1) / (tgSize * 2));
         uint auxSize = (uint)System.Math.Max(1, (int)numThreadgroups);
-        aux = new ComputeBuffer((int)auxSize, sizeof(uint));
-        aux2 = new ComputeBuffer((int)auxSize, sizeof(uint));
 
-        uniqueIndices = new ComputeBuffer(numParticles, sizeof(uint));
-        uniqueCount = new ComputeBuffer(1, sizeof(uint));
+        ResizeBuffer(ref indicators,    np, sizeof(uint));
+        ResizeBuffer(ref prefixSums,    np, sizeof(uint));
+        ResizeBuffer(ref aux,           (int)auxSize, sizeof(uint));
+        ResizeBuffer(ref aux2,          (int)auxSize, sizeof(uint));
+        ResizeBuffer(ref uniqueIndices, np, sizeof(uint));
+        if (uniqueCount == null) uniqueCount = new ComputeBuffer(1, sizeof(uint));
+        if (auxSmall == null)   auxSmall   = new ComputeBuffer(1, sizeof(uint));
 
         int prefixBits = layer * 3;
+        int groupsLinear = (np + 511) / 512;
 
-        // mark uniques
+        // Mark unique particles
         nodesPrefixSumsShader.SetBuffer(markUniqueParticlesKernel, "sortedParticles", particlesBuffer);
         nodesPrefixSumsShader.SetBuffer(markUniqueParticlesKernel, "indicators", indicators);
-        nodesPrefixSumsShader.SetInt("len", numParticles);
-		nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
-        int groupsLinear = (numParticles + 511) / 512;
+        nodesPrefixSumsShader.SetInt("len", np);
+        nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
         nodesPrefixSumsShader.Dispatch(markUniqueParticlesKernel, groupsLinear, 1, 1);
 
-        // Reuse proven radix scan kernels for indicators scan
-        radixPrefixSumKernelId = radixSortShader.FindKernel("prefixSum");
-        radixPrefixFixupKernelId = radixSortShader.FindKernel("prefixFixup");
+        // Prefix scan
+        RunPrefixScan(indicators, prefixSums, np, numThreadgroups, auxSize);
 
-        // First-level scan: indicators -> prefixSums
-        radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", indicators);
-        radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", prefixSums);
-        radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", aux);
-        radixSortShader.SetInt("len", numParticles);
-        radixSortShader.SetInt("zeroff", 1);
-        radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
-
-        if (numThreadgroups > 1)
-        {
-            // Scan aux -> aux2
-            if (auxSmall == null) auxSmall = new ComputeBuffer(1, sizeof(uint));
-            uint auxThreadgroups = 1; // aux length is small
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", aux);
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", aux2);
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
-            radixSortShader.SetInt("len", (int)auxSize);
-            radixSortShader.SetInt("zeroff", 1);
-            radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
-
-            // Fixup: add scanned aux into prefixSums
-            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", prefixSums);
-            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", aux2);
-            radixSortShader.SetInt("len", numParticles);
-            radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
-        }
-
-        // scatterUniques uniques -> uniqueIndices (store corresponding particle index)
+        // Scatter unique indices
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "sortedParticles", particlesBuffer);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "uniqueIndices", uniqueIndices);
-        nodesPrefixSumsShader.SetInt("len", numParticles);
+        nodesPrefixSumsShader.SetInt("len", np);
         nodesPrefixSumsShader.Dispatch(scatterUniquesKernel, groupsLinear, 1, 1);
 
-        // write unique count
+        // Write unique count to GPU buffer
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "uniqueCount", uniqueCount);
-        nodesPrefixSumsShader.SetInt("len", numParticles);
+        nodesPrefixSumsShader.SetInt("len", np);
         nodesPrefixSumsShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
 
-        // Get unique count
+        // One readback needed: numNodes drives CreateLeaves dispatch + layer loop initialization.
         uint[] numNodesCpu = new uint[1];
         uniqueCount.GetData(numNodesCpu);
         numNodes = (int)numNodesCpu[0];
     }
+
     private void CreateLeaves()
     {
-        // Dispatch numNodes threads
         if (nodesShader == null)
         {
-            Debug.LogError("Nodes compute shader is not assigned. Please assign `nodesShader` in the inspector.");
+            Debug.LogError("Nodes compute shader is not assigned.");
             return;
         }
-
         if (numNodes == 0) return;
 
-
-        // Find kernel
-        createLeavesKernel = nodesShader.FindKernel("CreateLeaves");
-
-        // Use ResizeBuffer to prevent frequent reallocations
-        ResizeBuffer(ref nodesBuffer, numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
+        ResizeBuffer(ref nodesBuffer,     numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
         ResizeBuffer(ref tempNodesBuffer, numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
         ResizeBuffer(ref mortonCodesBuffer, numNodes, sizeof(uint));
 
-        // Set buffer data to compute shader
         nodesShader.SetBuffer(createLeavesKernel, "particlesBuffer", particlesBuffer);
         nodesShader.SetBuffer(createLeavesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(createLeavesKernel, "uniqueIndices", uniqueIndices);
@@ -137,255 +119,159 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("minLayer", minLayer);
         nodesShader.SetInt("maxLayer", maxLayer);
 
-        // Dispatch the kernel
         int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(createLeavesKernel, threadGroups, 1, 1);
     }
-    private void findUniqueNodes() // in for loop
+
+    // Marks unique node prefixes, prefix-scans, scatters, writes uniqueCount to GPU,
+    // then writes DispatchIndirect args so ProcessNodes can run without a CPU readback.
+    private void findUniqueNodes()
     {
-        // dispatch numActiveNodes threads, find unique-prefix active nodes
         if (nodesPrefixSumsShader == null)
         {
-            Debug.LogError("NodesPrefixSums compute shader is not assigned. Please assign `nodesPrefixSumsShader` in the inspector.");
+            Debug.LogError("NodesPrefixSums compute shader is not assigned.");
             return;
         }
-
         if (numNodes == 0) return;
 
         ClearUniqueBuffers();
 
-        // Calculate prefix bits: shift right by 3 * layer bits
         int prefixBits = layer * 3;
+        int groupsLinear = (numNodes + 511) / 512;
 
-		// Mark uniques with prefix comparison (active indices)
-		if (markUniquesPrefixKernel == 0)
-		{
-			markUniquesPrefixKernel = nodesPrefixSumsShader.FindKernel("markUniquesPrefix");
-		}
-		nodesPrefixSumsShader.SetBuffer(markUniquesPrefixKernel, "nodesBuffer", nodesBuffer);
-		nodesPrefixSumsShader.SetBuffer(markUniquesPrefixKernel, "indicators", indicators);
-		nodesPrefixSumsShader.SetInt("len", numNodes);
-		nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
-		int groupsLinear = (numNodes + 511) / 512;
-		nodesPrefixSumsShader.Dispatch(markUniquesPrefixKernel, groupsLinear, 1, 1);
-
-        // Reuse proven radix scan kernels for indicators scan
         uint tgSize = 512u;
         uint numThreadgroups = (uint)((numNodes + (tgSize * 2) - 1) / (tgSize * 2));
         uint auxSize = (uint)System.Math.Max(1, (int)numThreadgroups);
 
-        // First-level scan: indicators -> prefixSums
-		radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", indicators);
-		radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", prefixSums);
-		radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", aux);
-		radixSortShader.SetInt("len", numNodes);
-		radixSortShader.SetInt("zeroff", 1);
-		radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
+        nodesPrefixSumsShader.SetBuffer(markUniquesPrefixKernel, "nodesBuffer", nodesBuffer);
+        nodesPrefixSumsShader.SetBuffer(markUniquesPrefixKernel, "indicators", indicators);
+        nodesPrefixSumsShader.SetInt("len", numNodes);
+        nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
+        nodesPrefixSumsShader.Dispatch(markUniquesPrefixKernel, groupsLinear, 1, 1);
 
-        if (numThreadgroups > 1)
-        {
-            // Scan aux -> aux2
-            if (auxSmall == null) auxSmall = new ComputeBuffer(1, sizeof(uint));
-            uint auxThreadgroups = 1; // aux length is small
-			radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", aux);
-			radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", aux2);
-			radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
-			radixSortShader.SetInt("len", (int)auxSize);
-			radixSortShader.SetInt("zeroff", 1);
-			radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
+        RunPrefixScan(indicators, prefixSums, numNodes, numThreadgroups, auxSize);
 
-            // Fixup: add scanned aux into prefixSums
-			radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", prefixSums);
-			radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", aux2);
-			radixSortShader.SetInt("len", numNodes);
-			radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
-        }
-
-        // scatterUniques unique indices
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "uniqueIndices", uniqueIndices);
         nodesPrefixSumsShader.SetInt("len", numNodes);
         nodesPrefixSumsShader.Dispatch(scatterUniquesKernel, groupsLinear, 1, 1);
 
-        // Write unique count
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "uniqueCount", uniqueCount);
         nodesPrefixSumsShader.SetInt("len", numNodes);
         nodesPrefixSumsShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
 
-        uint[] uniqueCountCpu = new uint[1];
-        uniqueCount.GetData(uniqueCountCpu);
-        numUniqueNodes = (int)uniqueCountCpu[0];
+        // Compute DispatchIndirect args on GPU: no CPU readback of numUniqueNodes needed.
+        nodesPrefixSumsShader.SetBuffer(writeDispatchArgsKernelId, "uniqueCount", uniqueCount);
+        nodesPrefixSumsShader.SetBuffer(writeDispatchArgsKernelId, "dispatchArgsBuffer", dispatchArgsBuffer);
+        nodesPrefixSumsShader.Dispatch(writeDispatchArgsKernelId, 1, 1, 1);
     }
-    private void ProcessNodes() // in for loop
+
+    // ProcessNodes uses DispatchIndirect: numUniqueNodes stays on GPU, no readback.
+    private void ProcessNodes()
     {
-        // dispatch numUniqueActiveNodes threads, process nodes
-        // Find the kernel for processing nodes at this level
-        int processNodesKernel = nodesShader.FindKernel("ProcessNodes");
-        
-        // Set buffers for the node processing kernel
         nodesShader.SetBuffer(processNodesKernel, "uniqueIndices", uniqueIndices);
         nodesShader.SetBuffer(processNodesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(processNodesKernel, "mortonCodesBuffer", mortonCodesBuffer);
-        nodesShader.SetInt("numUniqueNodes", numUniqueNodes);
+        nodesShader.SetBuffer(processNodesKernel, "uniqueCount", uniqueCount);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetInt("layer", layer);
         nodesShader.SetInt("minLayer", minLayer);
         nodesShader.SetInt("maxLayer", maxLayer);
-        
-        // Dispatch one thread per unique node
-        int threadGroups = Mathf.CeilToInt(numUniqueNodes / 512.0f);
-        nodesShader.Dispatch(processNodesKernel, threadGroups, 1, 1);
+        nodesShader.DispatchIndirect(processNodesKernel, dispatchArgsBuffer, 0);
     }
-    private void compactNodes() // in for loop
+
+    private void compactNodes()
     {
-        // dispatch numNodes threads, find active nodes
         if (nodesPrefixSumsShader == null)
         {
-            Debug.LogError("NodesPrefixSums compute shader is not assigned. Please assign `nodesPrefixSumsShader` in the inspector.");
+            Debug.LogError("NodesPrefixSums compute shader is not assigned.");
             return;
         }
-
         if (numNodes == 0)
         {
-            Debug.LogError("Num nodes is 0. Please assign `numNodes` in the inspector.");
+            Debug.LogError("Num nodes is 0.");
             return;
         }
+        if (nodeCount == null) nodeCount = new ComputeBuffer(1, sizeof(uint));
 
         ClearActiveBuffers();
 
-        // Initialize buffers if not already created
-        if (nodeCount == null)
-        {
-            nodeCount = new ComputeBuffer(1, sizeof(uint));
-        }
-        if (uniqueCount == null)
-        {
-            uniqueCount = new ComputeBuffer(1, sizeof(uint));
-        }
-
-        // Find kernels
-        markActiveNodesKernel = nodesPrefixSumsShader.FindKernel("markActiveNodes");
-        scatterActivesKernel = nodesPrefixSumsShader.FindKernel("scatterActives");
-        copyNodesKernel = nodesPrefixSumsShader.FindKernel("copyNodes");
-        writeNodeCountKernel = nodesPrefixSumsShader.FindKernel("writeNodeCount");
-
-        if (markActiveNodesKernel < 0 || scatterActivesKernel < 0 || copyNodesKernel < 0 || writeNodeCountKernel < 0)
-        {
-            Debug.LogError("One or more kernels not found in NodesPrefixSums.compute. Verify #pragma kernel names and shader assignment.");
-            return;
-        }
-
-        // Set buffers for the node processing kernel
-        nodesPrefixSumsShader.SetBuffer(markActiveNodesKernel, "nodesBuffer", nodesBuffer);
-        nodesPrefixSumsShader.SetBuffer(markActiveNodesKernel, "indicators", indicators);
-        nodesPrefixSumsShader.SetInt("len", numNodes);
         int groupsLinear = Mathf.Max(1, (numNodes + 511) / 512);
-        nodesPrefixSumsShader.Dispatch(markActiveNodesKernel, groupsLinear, 1, 1);
+
+        nodesPrefixSumsShader.SetBuffer(markActiveNodesKernelId, "nodesBuffer", nodesBuffer);
+        nodesPrefixSumsShader.SetBuffer(markActiveNodesKernelId, "indicators", indicators);
+        nodesPrefixSumsShader.SetInt("len", numNodes);
+        nodesPrefixSumsShader.Dispatch(markActiveNodesKernelId, groupsLinear, 1, 1);
 
         uint tgSize = 512u;
         uint numThreadgroups = (uint)((numNodes + (tgSize * 2) - 1) / (tgSize * 2));
         uint auxSize = (uint)System.Math.Max(1, (int)numThreadgroups);
 
-        // // Debug: Print aux buffer size and thread group info
-        // Debug.Log($"Layer {layer}: Prefix sum parameters - numNodes: {numNodes}, numThreadgroups: {numThreadgroups}, auxSize: {auxSize}");
+        RunPrefixScan(indicators, prefixSums, numNodes, numThreadgroups, auxSize);
 
-		radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", indicators);
-		radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", prefixSums);
-		radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", aux);
-		radixSortShader.SetInt("len", numNodes);
-		radixSortShader.SetInt("zeroff", 1);
-		radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
-
-        if (numThreadgroups > 1)
-        {
-
-            // Scan aux -> aux2
-            if (auxSmall == null) auxSmall = new ComputeBuffer(1, sizeof(uint));
-            uint auxThreadgroups = 1; // aux length is small
-			radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", aux);
-			radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", aux2);
-			radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
-			radixSortShader.SetInt("len", (int)auxSize);
-			radixSortShader.SetInt("zeroff", 1);
-			radixSortShader.Dispatch(radixPrefixSumKernelId, (int)auxThreadgroups, 1, 1);
-
-            // Fixup: add scanned aux into prefixSums
-			radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", prefixSums);
-			radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", aux2);
-			radixSortShader.SetInt("len", numNodes);
-			radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
-        }
-
-        // scatterActives active indices
-        nodesPrefixSumsShader.SetBuffer(scatterActivesKernel, "indicators", indicators);
-        nodesPrefixSumsShader.SetBuffer(scatterActivesKernel, "prefixSums", prefixSums);
-        nodesPrefixSumsShader.SetBuffer(scatterActivesKernel, "nodesBuffer", nodesBuffer);
-        nodesPrefixSumsShader.SetBuffer(scatterActivesKernel, "tempNodesBuffer", tempNodesBuffer);
+        nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "indicators", indicators);
+        nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "prefixSums", prefixSums);
+        nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "nodesBuffer", nodesBuffer);
+        nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "tempNodesBuffer", tempNodesBuffer);
         nodesPrefixSumsShader.SetInt("len", numNodes);
         int scatterGroups = Mathf.Max(1, (numNodes + 511) / 512);
-        nodesPrefixSumsShader.Dispatch(scatterActivesKernel, scatterGroups, 1, 1);
+        nodesPrefixSumsShader.Dispatch(scatterActivesKernelId, scatterGroups, 1, 1);
 
-        // Write active count
-        nodesPrefixSumsShader.SetBuffer(writeNodeCountKernel, "indicators", indicators);
-        nodesPrefixSumsShader.SetBuffer(writeNodeCountKernel, "prefixSums", prefixSums);
-        nodesPrefixSumsShader.SetBuffer(writeNodeCountKernel, "nodeCount", nodeCount);
+        nodesPrefixSumsShader.SetBuffer(writeNodeCountKernelId, "indicators", indicators);
+        nodesPrefixSumsShader.SetBuffer(writeNodeCountKernelId, "prefixSums", prefixSums);
+        nodesPrefixSumsShader.SetBuffer(writeNodeCountKernelId, "nodeCount", nodeCount);
         nodesPrefixSumsShader.SetInt("len", numNodes);
-        nodesPrefixSumsShader.Dispatch(writeNodeCountKernel, 1, 1, 1);
+        nodesPrefixSumsShader.Dispatch(writeNodeCountKernelId, 1, 1, 1);
 
+        // Readback of numNodes is unavoidable here: it gates the next layer's dispatch size
+        // and drives extractMortonCodes / findNeighbors after the loop.
         uint[] nodeCountCpu = new uint[1];
         nodeCount.GetData(nodeCountCpu);
         numNodes = (int)nodeCountCpu[0];
 
-        // copy nodes
         nodesPrefixSumsShader.SetBuffer(copyNodesKernel, "nodesBuffer", nodesBuffer);
         nodesPrefixSumsShader.SetBuffer(copyNodesKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesPrefixSumsShader.SetInt("len", numNodes);
         int copyGroups = Mathf.Max(1, (numNodes + 511) / 512);
         nodesPrefixSumsShader.Dispatch(copyNodesKernel, copyGroups, 1, 1);
     }
+
     private void findNeighbors()
     {
         if (nodesShader == null)
         {
-            Debug.LogError("Nodes compute shader is not assigned. Please assign `nodesShader` in the inspector.");
+            Debug.LogError("Nodes compute shader is not assigned.");
             return;
         }
 
-        // Use ResizeBuffer to prevent frequent reallocations
-        ResizeBuffer(ref neighborsBuffer, numNodes * 24, sizeof(uint));
-        ResizeBuffer(ref diffusionGradientBuffer, numNodes, sizeof(float) * 3);
+        ResizeBuffer(ref neighborsBuffer,        numNodes * 24, sizeof(uint));
+        ResizeBuffer(ref diffusionGradientBuffer, numNodes,     sizeof(float) * 3);
 
-        findNeighborsKernel = nodesShader.FindKernel("findNeighbors");
+        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
+
         nodesShader.SetBuffer(findNeighborsKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "mortonCodesBuffer", mortonCodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
         nodesShader.Dispatch(findNeighborsKernel, threadGroups, 1, 1);
 
-        // Find reverse connections (run once per frame after findNeighbors)
-        // Use ResizeBuffer to prevent frequent reallocations
         ResizeBuffer(ref reverseNeighborsBuffer, numNodes * 24, sizeof(uint));
-        
-        findReverseKernel = nodesShader.FindKernel("FindReverseConnections");
+
         nodesShader.SetBuffer(findReverseKernel, "reverseNeighborsBuffer", reverseNeighborsBuffer);
         nodesShader.SetBuffer(findReverseKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.Dispatch(findReverseKernel, threadGroups, 1, 1);
 
-        interpolateFaceVelocitiesKernel = nodesShader.FindKernel("interpolateFaceVelocities");
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.Dispatch(interpolateFaceVelocitiesKernel, threadGroups, 1, 1);
 
-        // Bring the new, velocity interpolated face velocities from tempNodesBuffer back to nodesBuffer
-        copyFaceVelocitiesKernel = nodesShader.FindKernel("copyFaceVelocities");
         nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetInt("numNodes", numNodes);
@@ -396,122 +282,106 @@ public partial class FluidSimulator : MonoBehaviour
     {
         if (nodesShader == null)
         {
-            Debug.LogError("Nodes compute shader is not assigned. Please assign `nodesShader` in the inspector.");
+            Debug.LogError("Nodes compute shader is not assigned.");
             return;
         }
 
-        // Release and recreate buffers each frame since numNodes changes
         phiBuffer?.Release();
         phiBuffer_Read?.Release();
         dirtyFlagBuffer?.Release();
-        
-        phiBuffer = new ComputeBuffer(numNodes, sizeof(float));
-        phiBuffer_Read = new ComputeBuffer(numNodes, sizeof(float));
+
+        phiBuffer       = new ComputeBuffer(numNodes, sizeof(float));
+        phiBuffer_Read  = new ComputeBuffer(numNodes, sizeof(float));
         dirtyFlagBuffer = new ComputeBuffer(1, sizeof(uint));
-
-        // Find kernels
-        initializePhiKernel = nodesShader.FindKernel("InitializePhi");
-        propagatePhiKernel = nodesShader.FindKernel("PropagatePhi");
-
-        if (initializePhiKernel < 0 || propagatePhiKernel < 0)
-        {
-            Debug.LogError("One or more level set kernels not found. Check Nodes.compute shader compilation.");
-            return;
-        }
 
         int dispatchSize = Mathf.CeilToInt(numNodes / 512.0f);
 
-        // 1. Initialize the Phi field
         nodesShader.SetBuffer(initializePhiKernel, "phiBuffer", phiBuffer);
         nodesShader.SetBuffer(initializePhiKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetInt("numNodes", numNodes);
         nodesShader.Dispatch(initializePhiKernel, dispatchSize, 1, 1);
 
-        // Copy initial phi values to read buffer
-        CopyBuffer(phiBuffer, phiBuffer_Read);
+        // GPU copy phi → phi_Read (no CPU round-trip)
+        GpuCopyBuffer(phiBuffer, phiBuffer_Read);
 
-        // 2. Iteratively Propagate (Relax) the Phi field
-        ComputeBuffer readBuffer = phiBuffer_Read;
-        ComputeBuffer writeBuffer = phiBuffer; // Start with phiBuffer as write buffer
+        ComputeBuffer readBuffer  = phiBuffer_Read;
+        ComputeBuffer writeBuffer = phiBuffer;
         uint[] dirtyData = { 0 };
 
-        int maxIterations = 32; // Safety break, e.g., max grid dimension
+        int maxIterations = 32;
         for (int i = 0; i < maxIterations; i++)
         {
-            // Swap buffers (ping-pong)
             (readBuffer, writeBuffer) = (writeBuffer, readBuffer);
 
-            // Reset the dirty flag to 0 before dispatching
             dirtyData[0] = 0;
             dirtyFlagBuffer.SetData(dirtyData);
 
-            // Set buffers for the PropagatePhi kernel
             nodesShader.SetBuffer(propagatePhiKernel, "phiBuffer_Read", readBuffer);
             nodesShader.SetBuffer(propagatePhiKernel, "phiBuffer", writeBuffer);
             nodesShader.SetBuffer(propagatePhiKernel, "dirtyFlagBuffer", dirtyFlagBuffer);
             nodesShader.SetBuffer(propagatePhiKernel, "nodesBuffer", nodesBuffer);
             nodesShader.SetBuffer(propagatePhiKernel, "neighborsBuffer", neighborsBuffer);
             nodesShader.SetInt("numNodes", numNodes);
-
-            // Run the propagation
             nodesShader.Dispatch(propagatePhiKernel, dispatchSize, 1, 1);
 
-            // Check the dirty flag
             dirtyFlagBuffer.GetData(dirtyData);
-
-            if (dirtyData[0] == 0)
-            {
-                // No nodes changed their phi value. We are done.
-                break; 
-            }
+            if (dirtyData[0] == 0) break;
         }
 
-        // At this point, `writeBuffer` holds the final, correct phi values.
-        // If the final write was to phiBuffer_Read, copy it back to phiBuffer
         if (writeBuffer == phiBuffer_Read)
-        {
-            CopyBuffer(phiBuffer_Read, phiBuffer);
-        }
-
-        // float[] phiCPU = new float[numNodes];
-        // phiBuffer.GetData(phiCPU);
-
-        // float maxPhi = phiCPU.Max();
-        // float minPhi = phiCPU.Min();
-        // str = $"max phi: {maxPhi}, min phi: {minPhi}, max-min: {maxPhi - minPhi}";
-        // Debug.Log(str);
+            GpuCopyBuffer(phiBuffer_Read, phiBuffer);
     }
+
     private void ClearUniqueBuffers()
     {
-        if (nodesPrefixSumsShader == null)
-        {
-            Debug.LogError("NodesPrefixSums compute shader is not assigned. Please assign `nodesPrefixSumsShader` in the inspector.");
-            return;
-        }
+        if (nodesPrefixSumsShader == null) return;
         if (numParticles == 0) return;
 
-        int clearUniqueBuffersKernel = nodesPrefixSumsShader.FindKernel("clearUniqueBuffers");
-        nodesPrefixSumsShader.SetBuffer(clearUniqueBuffersKernel, "indicators", indicators);
-        nodesPrefixSumsShader.SetBuffer(clearUniqueBuffersKernel, "uniqueIndices", uniqueIndices);
+        nodesPrefixSumsShader.SetBuffer(clearUniqueBuffersKernelId, "indicators", indicators);
+        nodesPrefixSumsShader.SetBuffer(clearUniqueBuffersKernelId, "uniqueIndices", uniqueIndices);
         nodesPrefixSumsShader.SetInt("len", numParticles);
         int groupsLinear = (numParticles + 511) / 512;
-        nodesPrefixSumsShader.Dispatch(clearUniqueBuffersKernel, groupsLinear, 1, 1);
+        nodesPrefixSumsShader.Dispatch(clearUniqueBuffersKernelId, groupsLinear, 1, 1);
     }
+
     private void ClearActiveBuffers()
     {
-        if (nodesPrefixSumsShader == null)
-        {
-            Debug.LogError("NodesPrefixSums compute shader is not assigned. Please assign `nodesPrefixSumsShader` in the inspector.");
-            return;
-        }
+        if (nodesPrefixSumsShader == null) return;
         if (numParticles == 0) return;
-        
-        int clearActiveBuffersKernel = nodesPrefixSumsShader.FindKernel("clearActiveBuffers");
-        nodesPrefixSumsShader.SetBuffer(clearActiveBuffersKernel, "indicators", indicators);
+
+        nodesPrefixSumsShader.SetBuffer(clearActiveBuffersKernelId, "indicators", indicators);
         nodesPrefixSumsShader.SetInt("len", numParticles);
         int groupsLinear = (numParticles + 511) / 512;
-        nodesPrefixSumsShader.Dispatch(clearActiveBuffersKernel, groupsLinear, 1, 1);
+        nodesPrefixSumsShader.Dispatch(clearActiveBuffersKernelId, groupsLinear, 1, 1);
     }
+
+    // Shared helper: runs a two-level exclusive prefix scan (same logic used in three places).
+    private void RunPrefixScan(ComputeBuffer input, ComputeBuffer output, int len,
+                                uint numThreadgroups, uint auxSize)
+    {
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", input);
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", output);
+        radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", aux);
+        radixSortShader.SetInt("len", len);
+        radixSortShader.SetInt("zeroff", 1);
+        radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
+
+        if (numThreadgroups > 1)
+        {
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", aux);
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", aux2);
+            radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
+            radixSortShader.SetInt("len", (int)auxSize);
+            radixSortShader.SetInt("zeroff", 1);
+            radixSortShader.Dispatch(radixPrefixSumKernelId, 1, 1, 1);
+
+            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", output);
+            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", aux2);
+            radixSortShader.SetInt("len", len);
+            radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
+        }
+    }
+
     // Deinterleave morton code to get 3D grid coordinates (matches compute shader)
     private Vector3Int DeinterleaveMorton(uint m)
     {
@@ -527,21 +397,17 @@ public partial class FluidSimulator : MonoBehaviour
 
     private Vector3 DecodeMorton3D(Node node)
     {
-        // Calculate cell center from morton code at the node's actual layer
-        // This matches the logic in UpdateParticles.compute and the shaders
         uint shift = (uint)(node.layer * 3);
         uint cellMortonCode = node.mortonCode & ~((1u << (int)shift) - 1);
         Vector3Int cellGridMin = DeinterleaveMorton(cellMortonCode);
-        
-        // Calculate cell center in grid space (0-1023)
+
         float cellSideLength = Mathf.Pow(2, node.layer);
         Vector3 cellCenter = new Vector3(
             cellGridMin.x + cellSideLength * 0.5f,
             cellGridMin.y + cellSideLength * 0.5f,
             cellGridMin.z + cellSideLength * 0.5f
         );
-        
-        // Convert from grid space (0-1023) to world space
+
         Vector3 simulationSize = simulationBounds.bounds.max - simulationBounds.bounds.min;
         return simulationBounds.bounds.min + new Vector3(
             cellCenter.x / 1024.0f * simulationSize.x,
