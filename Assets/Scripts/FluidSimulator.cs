@@ -8,7 +8,7 @@ using System.IO;
 // Main FluidSimulator class - split into partial classes for better organization
 // Core simulation logic: particle management, main loop, initialization
 // See: FluidEnums.cs, FluidRendering.cs, FluidPreconditioner.cs,
-//      FluidOctree.cs, FluidSolver.cs, FluidLeafOnlyInputs.cs, RadixSort.cs
+//      FluidOctree.cs, FluidSolver.cs, FluidLeafOnlyInputs.cs, FluidLeafOnlyWeights.cs, RadixSort.cs
 public partial class FluidSimulator : MonoBehaviour
 {
     public BoxCollider simulationBounds;
@@ -316,6 +316,7 @@ public partial class FluidSimulator : MonoBehaviour
         // Cache all kernel IDs once so hot paths never call FindKernel
         InitSolverKernels();
         InitOctreeKernels();
+        TryLoadLeafOnlyWeightsFromDisk();
 
         // Create quad mesh and args buffers for node and particle rendering
         CreateQuadMesh();
@@ -744,6 +745,7 @@ public partial class FluidSimulator : MonoBehaviour
         mortonCodesBuffer?.Release();
         ReleasePreconditionerBuffers();
         ReleaseLeafOnlyBuffers();
+        ReleaseLeafOnlyWeightsBuffers();
 
         // Clean up render textures
         if (fluidDepthTexture != null) fluidDepthTexture.Release();
