@@ -1,0 +1,112 @@
+// Diagonal dense leaf edge features (K, L, L, 4): [Δx, Δy, Δz, mean A_ij] — matches
+// leafonly/data.py build_diag_dense_edge_feats_from_positions(..., with_block_key_column=False).
+
+#pragma kernel LeafOnly_DiagEdgeFeatGeom
+#pragma kernel LeafOnly_DiagEdgeFeatClearScratch
+#pragma kernel LeafOnly_DiagEdgeFeatAccumA_Serial
+#pragma kernel LeafOnly_DiagEdgeFeatWriteCh3
+
+StructuredBuffer<float> leafXPacked;
+RWStructuredBuffer<float> leafDiagEdgeFeatsOut;
+
+RWStructuredBuffer<float> leafDiagA_Sum;
+RWStructuredBuffer<uint> leafDiagA_Count;
+
+StructuredBuffer<uint> leafDiagCsrRows;
+StructuredBuffer<uint> leafDiagCsrCols;
+// Same normalization as LeafOnly_ScaleCsrValues / dataset edge_values (÷ scale_A).
+StructuredBuffer<float> leafDiagCsrVals;
+
+int leafNPadded;
+int leafLeafSize;
+int leafNumLeaves;
+int leafCsrNnz;
+
+[numthreads(256, 1, 1)]
+void LeafOnly_DiagEdgeFeatGeom(uint3 id : SV_DispatchThreadID)
+{
+    uint L = (uint)leafLeafSize;
+    uint K = (uint)leafNumLeaves;
+    uint cells = K * L * L;
+    uint t = id.x;
+    if (t >= cells)
+        return;
+
+    uint b = t / (L * L);
+    uint rem = t - b * L * L;
+    uint i = rem / L;
+    uint j = rem - i * L;
+
+    uint bi = b * L + i;
+    uint bj = b * L + j;
+    uint oi = bi * 9u;
+    uint oj = bj * 9u;
+
+    float3 pi = float3(leafXPacked[oi + 0u], leafXPacked[oi + 1u], leafXPacked[oi + 2u]);
+    float3 pj = float3(leafXPacked[oj + 0u], leafXPacked[oj + 1u], leafXPacked[oj + 2u]);
+    float3 d = pj - pi;
+
+    uint base = t * 4u;
+    leafDiagEdgeFeatsOut[base + 0u] = d.x;
+    leafDiagEdgeFeatsOut[base + 1u] = d.y;
+    leafDiagEdgeFeatsOut[base + 2u] = d.z;
+    leafDiagEdgeFeatsOut[base + 3u] = 0.0;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_DiagEdgeFeatClearScratch(uint3 id : SV_DispatchThreadID)
+{
+    uint L = (uint)leafLeafSize;
+    uint K = (uint)leafNumLeaves;
+    uint n = K * L * L;
+    uint i = id.x;
+    if (i < n)
+    {
+        leafDiagA_Sum[i] = 0.0;
+        leafDiagA_Count[i] = 0u;
+    }
+}
+
+// CSR order matches PyTorch mean per cell when each cell has ≤1 edge; multi-edge order may differ slightly vs COO.
+[numthreads(1, 1, 1)]
+void LeafOnly_DiagEdgeFeatAccumA_Serial(uint3 id : SV_DispatchThreadID)
+{
+    uint L = (uint)leafLeafSize;
+    uint K = (uint)leafNumLeaves;
+    uint N = (uint)leafNPadded;
+    int nnz = leafCsrNnz;
+    for (int e = 0; e < nnz; e++)
+    {
+        uint r = leafDiagCsrRows[e];
+        uint c = leafDiagCsrCols[e];
+        if (r >= N || c >= N)
+            continue;
+        uint br = r / L;
+        uint bc = c / L;
+        if (br != bc)
+            continue;
+        uint rl = r - br * L;
+        uint cl = c - br * L;
+        uint idx = br * L * L + rl * L + cl;
+        float v = leafDiagCsrVals[e];
+        leafDiagA_Sum[idx] += v;
+        leafDiagA_Count[idx] += 1u;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_DiagEdgeFeatWriteCh3(uint3 id : SV_DispatchThreadID)
+{
+    uint L = (uint)leafLeafSize;
+    uint K = (uint)leafNumLeaves;
+    uint cells = K * L * L;
+    uint t = id.x;
+    if (t >= cells)
+        return;
+
+    uint cnt = leafDiagA_Count[t];
+    float ch3 = 0.0;
+    if (cnt > 0u)
+        ch3 = leafDiagA_Sum[t] / (float)cnt;
+    leafDiagEdgeFeatsOut[t * 4u + 3u] = ch3;
+}

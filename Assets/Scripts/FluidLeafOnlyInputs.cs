@@ -356,6 +356,9 @@ public partial class FluidSimulator : MonoBehaviour
 
         Debug.Log($"[LeafOnlyParity] phase={phase} tensor=meta nnz={nnz} (CSR nonzeros after build)");
 
+        DispatchLeafOnlyDiagEdgeFeatsAndLogParity(nPad, nnz);
+        DispatchLeafOnlyOffEdgeFeatsAndLogParity(nPad, nnz);
+
         if (leafOnlyCompactEdgeCount != null && leafOnlyGcnEdgeRows != null && leafOnlyGcnEdgeCols != null && leafOnlyGcnEdgeVals != null)
         {
             uint[] ec = new uint[1];
@@ -387,6 +390,15 @@ public partial class FluidSimulator : MonoBehaviour
                 Debug.Log($"[LeafOnlyParity] phase={phase} tensor=gcn_edges_head[{headE}]={sb}");
             }
         }
+
+        int mOff = LeafOnlyHMatrixStatic.NumOffBlocks;
+        var invHm = CultureInfo.InvariantCulture;
+        Debug.Log(
+            $"[LeafOnlyParity] phase={phase} tensor=hmatrix_meta M_off={mOff} " +
+            $"MAX_NUM_LEAVES={LeafOnlyHMatrixStatic.MaxNumLeaves} ETA={LeafOnlyHMatrixStatic.Eta.ToString("G9", invHm)}");
+        float[] hmFlat = LeafOnlyHMatrixStatic.GetFlatInterleavedFloats();
+        LeafOnlyParitySummarize(phase, "hmatrix_off_r0_c0_s_flat", hmFlat, mOff * 3);
+        LeafOnlyParityHead(phase, "hmatrix_off_r0_c0_s_flat", hmFlat, mOff * 3, 48);
 
         if (LeafOnlyWeightsLoadedSuccessfully && leafOnlyCompactEdgeCount != null)
         {
@@ -445,6 +457,27 @@ public partial class FluidSimulator : MonoBehaviour
         Debug.Log($"[LeafOnlyParity] phase={phase} tensor={name}_head[{c}]={parts}");
     }
 
+    /// <summary>Parity slice at <paramref name="start"/> (inclusive), same log pattern as <c>InspectParity._parity_head_phase_at</c>.</summary>
+    internal static void LeafOnlyParityHeadAt(string phase, string name, float[] data, int nTotal, int start, int k)
+    {
+        if (data == null || nTotal <= 0 || start < 0 || start >= nTotal)
+        {
+            Debug.Log($"[LeafOnlyParity] phase={phase} tensor={name}_at{start}_head[0]=");
+            return;
+        }
+
+        int c = Mathf.Min(k, nTotal - start);
+        var inv = CultureInfo.InvariantCulture;
+        var parts = new System.Text.StringBuilder();
+        for (int i = 0; i < c; i++)
+        {
+            if (i > 0) parts.Append(',');
+            parts.Append(data[start + i].ToString("G9", inv));
+        }
+
+        Debug.Log($"[LeafOnlyParity] phase={phase} tensor={name}_at{start}_head[{c}]={parts}");
+    }
+
     private void ReleaseLeafOnlyBuffers()
     {
         leafOnlyRowAbsSum?.Release();
@@ -483,5 +516,7 @@ public partial class FluidSimulator : MonoBehaviour
         leafOnlyPrefixAuxSmall = null;
 
         ReleaseLeafOnlyEmbedBuffers();
+        ReleaseLeafOnlyDiagEdgeFeatsBuffers();
+        ReleaseLeafOnlyOffEdgeFeatsBuffers();
     }
 }

@@ -44,6 +44,8 @@ public partial class FluidSimulator : MonoBehaviour
 
         InitLeafOnlyInputKernels();
         InitLeafOnlyEmbedKernels();
+        InitLeafOnlyDiagEdgeFeatsKernels();
+        InitLeafOnlyOffEdgeFeatsKernels();
 
         applyPressureGradientKernel = nodesShader.FindKernel("ApplyPressureGradient");
         applyExternalForcesKernel   = nodesShader.FindKernel("ApplyExternalForces");
