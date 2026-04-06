@@ -16,7 +16,7 @@ public partial class FluidSimulator : MonoBehaviour
     [Tooltip("Disable to skip LeafOnly input dispatches (saves GPU time while debugging other paths).")]
     public bool buildLeafOnlyInputsEachPressureSolve = true;
 
-    [Tooltip("After each LeafOnly GPU build, read back buffers and print [LeafOnlyParity] lines (matches InspectLeafOnlyUnityParity.py). GPU readback — costly if every frame.")]
+    [Tooltip("After each LeafOnly GPU build, read back buffers and print [LeafOnlyParity] lines (matches InspectParity.py). GPU readback — costly if every frame.")]
     public bool debugLeafOnlyParityLog = true;
 
     [Tooltip("If true, parity lines print only once per play mode session (recommended). If false, prints every pressure solve while debugLeafOnlyParityLog is on.")]
@@ -307,7 +307,7 @@ public partial class FluidSimulator : MonoBehaviour
         leafOnlyInputsShader.Dispatch(leafOnlyWriteCompactEdgeCountKernel, 1, 1, 1);
     }
 
-    /// <summary>Same numeric format as <c>InspectLeafOnlyUnityParity.py</c> (<c>phase=unity</c>).</summary>
+    /// <summary>Same numeric format as <c>InspectParity.py</c> (<c>phase=unity</c>).</summary>
     private void LogLeafOnlyParityToConsole(int numNodesReal, int nPad, int nTake, int maxNnzBound)
     {
         const string phase = "unity";
@@ -387,9 +387,17 @@ public partial class FluidSimulator : MonoBehaviour
                 Debug.Log($"[LeafOnlyParity] phase={phase} tensor=gcn_edges_head[{headE}]={sb}");
             }
         }
+
+        if (LeafOnlyWeightsLoadedSuccessfully && leafOnlyCompactEdgeCount != null)
+        {
+            uint[] ecTok = new uint[1];
+            leafOnlyCompactEdgeCount.GetData(ecTok, 0, 0, 1);
+            int eTok = (int)ecTok[0];
+            DispatchLeafOnlyEmbedForwardAndLogParity(nPad, eTok);
+        }
     }
 
-    private static void LeafOnlyParitySummarize(string phase, string name, float[] data, int n)
+    internal static void LeafOnlyParitySummarize(string phase, string name, float[] data, int n)
     {
         if (data == null || n <= 0)
         {
@@ -417,7 +425,7 @@ public partial class FluidSimulator : MonoBehaviour
             $"mean={mean.ToString("G9", inv)} sum_abs={sumAbs.ToString("G9", inv)} l2={l2.ToString("G9", inv)}");
     }
 
-    private static void LeafOnlyParityHead(string phase, string name, float[] data, int n, int k = 16)
+    internal static void LeafOnlyParityHead(string phase, string name, float[] data, int n, int k = 16)
     {
         if (data == null || n <= 0)
         {
@@ -473,5 +481,7 @@ public partial class FluidSimulator : MonoBehaviour
         leafOnlyPrefixAux2 = null;
         leafOnlyPrefixAuxSmall?.Release();
         leafOnlyPrefixAuxSmall = null;
+
+        ReleaseLeafOnlyEmbedBuffers();
     }
 }
