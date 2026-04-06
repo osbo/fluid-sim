@@ -11,6 +11,10 @@ lexicographically first frame under --data_folder). Python lines use phase=pytor
 Embedding parity: compare tensor ``token_after_enc`` (Unity runs embed + enc_input_proj on GPU after the
 input tensors). PyTorch reference is ``model.embed`` then ``model.enc_input_proj`` (see end of main()).
 
+Layer 0 (non-highway): compare ``h_diag_after_layer0`` and ``off_stream_after_layer0`` (Unity CPU eager-softmax
+mirror in ``FluidLeafOnlyCpuLayer1Parity.cs`` vs PyTorch ``_layer0_transformer_reference_tensors`` with
+``eager_attention=True``).
+
 Dense diagonal attention RPE: ``diag_edge_feats`` (K×L×L×4), same as ``build_diag_dense_edge_feats_from_positions``
 (no attn_mask; channels 0–2 = position deltas, 3 = mean in-leaf matrix entry per cell). Unity builds this on GPU
 (``LeafOnlyDiagEdgeFeats.compute``) from ``leafXPacked`` + CSR ``A``.
@@ -58,6 +62,7 @@ from leafonly.architecture import (  # noqa: E402
     LeafOnlyNet,
     apply_block_diagonal_M_physical,
     default_attention_layout,
+    pool_leaf_edge_feats,
     unpack_precond,
 )
 from leafonly.checkpoint import leaf_only_arch_from_checkpoint, load_leaf_only_weights  # noqa: E402
@@ -106,6 +111,104 @@ def _head(name: str, t: torch.Tensor, k: int) -> None:
         return
     parts = ",".join(f"{float(v):.9g}" for v in x)
     print(f"[LeafOnlyParity] phase=pytorch tensor={name}_head[{int(x.numel())}]={parts}")
+
+
+def _parity_head_at(name: str, t: torch.Tensor, start: int, k: int) -> None:
+    flat = t.detach().float().cpu().reshape(-1)
+    n = int(flat.numel())
+    if n == 0 or start < 0 or start >= n:
+        print(f"[LeafOnlyParity] phase=pytorch tensor={name}_at{start}_head[0]=")
+        return
+    c = min(k, n - start)
+    parts = ",".join(f"{float(flat[start + i]):.9g}" for i in range(c))
+    print(f"[LeafOnlyParity] phase=pytorch tensor={name}_at{start}_head[{c}]={parts}")
+
+
+def _layer0_transformer_reference_tensors(
+    model: LeafOnlyNet,
+    h: torch.Tensor,
+    ef_diag: torch.Tensor,
+    ef_off: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_values: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    eager_attention: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Match ``_apply_transformer_stacks`` for layer index 0 with ``highway_ffn=False`` and ``M_off>0``:
+    diag block then strip + off block. Uses ``eager_attention=True`` so logits match manual softmax (Unity CPU).
+    """
+    if bool(getattr(model, "highway_ffn", False)):
+        raise ValueError("layer0 parity helper requires checkpoint with highway_ffn=0 / use_highways=False")
+    B, N, C_h = h.shape
+    L = int(model.leaf_size)
+    K = N // L
+    M_off = int(model.num_h_off)
+
+    ef = ef_diag
+    if int(model.diag_token_pool) > 1 and bool(model.diag_dense_attention) and ef is not None:
+        ef = pool_leaf_edge_feats(ef, L, int(model.diag_token_pool))
+
+    h_diag = model._pool_full_leaf_to_diag_tokens(h, B, K, L, C_h)
+    h_lv_diag = h_diag.view(B, K, int(model.leaf_apply_size), C_h)
+    diag_prep_block = None if model.diag_dense_attention else h_lv_diag.mean(dim=2, keepdim=True)
+    diag_prep_matrix = h.mean(dim=1, keepdim=True).unsqueeze(1).expand(-1, K, -1, -1)
+    attn_kw_diag = dict(
+        edge_index=edge_index,
+        edge_values=edge_values,
+        positions=positions,
+        save_attention=False,
+        attn_mask=None,
+        edge_feats=ef,
+        prep_block_node=diag_prep_block,
+        prep_matrix_node=diag_prep_matrix,
+        eager_attention=eager_attention,
+    )
+    blk_d = model.blocks[0]
+    x_mid_d = blk_d.forward_attn(h_diag, **attn_kw_diag)
+    h_diag = blk_d.forward_mlp(x_mid_d)
+
+    if M_off <= 0:
+        return h_diag, None
+
+    oe = ef_off
+    if bool(model.off_diag_dense_attention) and int(model.off_token_pool) > 1:
+        oe = pool_leaf_edge_feats(oe, L, int(model.off_token_pool))
+    Ls_o = int(model.leaf_apply_off)
+    if oe.dim() == 4:
+        oe5 = oe.unsqueeze(0).expand(B, M_off, -1, -1, -1)
+    else:
+        oe5 = oe.contiguous()
+    off_edge_feats = oe5.reshape(B * M_off, 1, Ls_o, Ls_o, 4)
+
+    strip0 = model._build_off_strip(h, B, K, L, C_h, M_off)
+    Bm = B * M_off
+    off_prep_block = (
+        None
+        if model.off_diag_dense_attention
+        else strip0.view(Bm, 1, Ls_o, C_h).mean(dim=2, keepdim=True)
+    )
+    off_prep_matrix = strip0.mean(dim=1, keepdim=True).unsqueeze(1).unsqueeze(1)
+    attn_kw_off = dict(
+        edge_index=edge_index,
+        edge_values=edge_values,
+        positions=positions,
+        save_attention=False,
+        attn_mask=None,
+        edge_feats=off_edge_feats,
+        prep_block_node=off_prep_block,
+        prep_matrix_node=off_prep_matrix,
+        eager_attention=eager_attention,
+    )
+    strip = model._build_off_strip(
+        model._diag_tokens_to_full_leaf(h_diag, B, K, L, C_h), B, K, L, C_h, M_off
+    )
+    off_in = strip
+    blk_o = model.off_diag_blocks[0]
+    x_mid_o = blk_o.forward_attn(off_in, **attn_kw_off)
+    off_stream = blk_o.forward_mlp(x_mid_o)
+    return h_diag, off_stream
 
 
 def _unity_stats_and_global(
@@ -755,12 +858,54 @@ def main() -> None:
         _head("precondJac", jac, 16)
 
     # Token embedding path (after enc_input_proj in PyTorch = after NormAndProject in Unity shader).
+    h0_ref = None
+    off0_ref = None
+    layer0_err: str | None = None
     with torch.inference_mode():
         h0 = model.embed(x_leaf, edge_index_leaf, edge_values_leaf, global_features=global_features)
         h_enc = model.enc_input_proj(h0)
+        if int(ckpt["num_layers"]) >= 1 and not cli_hw:
+            try:
+                h0_ref, off0_ref = _layer0_transformer_reference_tensors(
+                    model,
+                    h_enc,
+                    ef_diag,
+                    ef_off,
+                    edge_index_leaf,
+                    edge_values_leaf,
+                    x_leaf[0, :, :3],
+                    eager_attention=True,
+                )
+            except Exception as ex:
+                layer0_err = f"{type(ex).__name__}: {ex}"
+
     _summarize("token_after_enc", h_enc)
     _head("token_after_enc", h_enc, 16)
     _head("token_after_enc", h_enc, 32)
+
+    if layer0_err is not None:
+        print(f"[LeafOnlyParity] phase=pytorch tensor=h_diag_after_layer0 skipped ({layer0_err})")
+    elif h0_ref is not None:
+        flat_d = h0_ref.reshape(-1)
+        _summarize("h_diag_after_layer0", flat_d)
+        _head("h_diag_after_layer0", flat_d, 16)
+        _head("h_diag_after_layer0", flat_d, 32)
+        n_h = int(flat_d.numel())
+        if n_h > 64:
+            _parity_head_at("h_diag_after_layer0", flat_d, n_h // 2, 48)
+        if off0_ref is not None:
+            flat_o = off0_ref.reshape(-1)
+            _summarize("off_stream_after_layer0", flat_o)
+            _head("off_stream_after_layer0", flat_o, 16)
+            _head("off_stream_after_layer0", flat_o, 32)
+            n_o = int(flat_o.numel())
+            if n_o > 64:
+                _parity_head_at("off_stream_after_layer0", flat_o, n_o // 2, 48)
+        print(
+            f"[LeafOnlyParity] phase=pytorch tensor=layer1_ref_meta eager_attention=1 "
+            f"K={n_pad // int(LEAF_SIZE)} L_diag={int(model.leaf_apply_size)} "
+            f"L_off={int(model.leaf_apply_off)} M_off={int(model.num_h_off)}"
+        )
 
     if args.no_apply:
         return

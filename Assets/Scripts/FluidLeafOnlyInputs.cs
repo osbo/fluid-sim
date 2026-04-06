@@ -406,6 +406,7 @@ public partial class FluidSimulator : MonoBehaviour
             leafOnlyCompactEdgeCount.GetData(ecTok, 0, 0, 1);
             int eTok = (int)ecTok[0];
             DispatchLeafOnlyEmbedForwardAndLogParity(nPad, eTok);
+            DispatchLeafOnlyCpuLayer1ParityAndLog(nPad);
         }
     }
 
