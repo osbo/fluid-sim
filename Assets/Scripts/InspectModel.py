@@ -13,7 +13,8 @@ Use ``--fast-plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``ei
 
 CUDA Graph (``--pcg-cuda-backend cudagraph``, default on CUDA) records real GPU kernels and replays them — low CPU launch overhead. On Apple MPS there is no CUDAGraph; the same flag selects ``torch.compile(one PCG iter)`` + a Python loop. Use ``--pcg-cuda-backend compile`` explicitly for Inductor on both; ``eager`` keeps per-iter Python dispatch.
 
-GPU PCG runs in float64 by default (better for stiff systems); use ``--no-gpu-pcg-fp64`` for float32 (often faster on easy data). The neural preconditioner stays float32; casts bridge residual / search directions at the PCG loop.
+GPU PCG runs in float64 by default on CUDA (better for stiff systems); use ``--no-gpu-pcg-fp64`` for float32 (often faster on easy data).
+On MPS, float64 PCG is unsupported, so float32 is used automatically (same as ``--no-gpu-pcg-fp64``). The neural preconditioner stays float32; casts bridge residual / search directions at the PCG loop.
 
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
@@ -1997,8 +1998,9 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "GPU PCG (A, b, x, r, p, Ap) in float64 (default); LeafOnly / Jacobi preconditioner stays float32. "
+            "GPU PCG (A, b, x, r, p, Ap) in float64 (default on CUDA); LeafOnly / Jacobi preconditioner stays float32. "
             "Use --no-gpu-pcg-fp64 for float32 PCG (faster on well-conditioned data). "
+            "MPS always uses float32 PCG (float64 is not supported). "
             "With --leafonly-pcg bsr, mixed precision uses eager PCG (not CUDAGraph)."
         ),
     )
@@ -2084,6 +2086,11 @@ def main():
     if device.type == "mps":
         # Fewer .item() / host syncs per solve than K=3; major win vs CUDA Graph + CUDA events.
         check_freq = max(check_freq, 10)
+        if gpu_pcg_fp64:
+            gpu_pcg_fp64 = False
+            _info(
+                "  MPS: using float32 GPU PCG (same as --no-gpu-pcg-fp64); MPS does not support float64 tensors."
+            )
 
     _info(f"Loading data from {data_folder}")
     dataset = FluidGraphDataset([Path(data_folder)])
