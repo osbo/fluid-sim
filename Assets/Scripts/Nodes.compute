@@ -224,11 +224,12 @@ uint upperBoundMorton(uint target, uint left_bound, uint right_bound)
 void CreateLeaves(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
-    
+    uint numLeaves = uniqueCount[0];
+    if (threadIndex >= numLeaves) return;
+
     // Get the index range for particles in this node
     uint rangeStart = uniqueIndices[threadIndex];
-    uint rangeEnd = threadIndex + 1 < numNodes ?
+    uint rangeEnd = threadIndex + 1 < numLeaves ?
         uniqueIndices[threadIndex + 1] : numParticles;
 
     // --- Define Node Geometry ---

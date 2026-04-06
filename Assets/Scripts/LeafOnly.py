@@ -46,11 +46,11 @@ def _build_parser():
     )
     parser.add_argument("--steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument(
         "--num-layers",
         type=int,
-        default=3,
+        default=1,
         help="Transformer depth: number of diagonal-leaf blocks and H-off blocks (each stack). Checkpoint must match.",
     )
     parser.add_argument("--num-heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
