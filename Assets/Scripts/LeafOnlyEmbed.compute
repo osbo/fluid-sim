@@ -1,0 +1,249 @@
+// LeafOnly: PhysicsAwareEmbedding (lift + sparse GCN + LayerNorm) + enc_input_proj.
+// Weight order matches leafonly/checkpoint.py save_leaf_only_weights (transpose=True linear weights).
+
+#pragma kernel LeafOnly_EmbedLift
+#pragma kernel LeafOnly_EmbedClearAggr
+#pragma kernel LeafOnly_EmbedNeighLinear
+#pragma kernel LeafOnly_EmbedGcnEdgeScatterSerial
+#pragma kernel LeafOnly_EmbedGcnCombine
+#pragma kernel LeafOnly_EmbedLayerNorm
+#pragma kernel LeafOnly_EmbedEncProj
+
+static const float LN_EPS = 1e-5;
+static const float GELU_ALPHA = 0.044715;
+static const float GELU_SQRT2PI = 0.7978845608; // sqrt(2/pi)
+
+float LeafOnlyGelu(float x)
+{
+    float x3 = x * x * x;
+    float t = GELU_SQRT2PI * (x + GELU_ALPHA * x3);
+    return 0.5 * x * (1.0 + tanh(t));
+}
+
+StructuredBuffer<float> leafOnlyWeights;
+
+StructuredBuffer<float> leafXPacked;
+StructuredBuffer<float> leafGlobalFeatures;
+
+StructuredBuffer<float> leafEmbedHIn;
+RWStructuredBuffer<float> leafEmbedHOut;
+RWStructuredBuffer<float> leafEmbedNeighLin;
+
+RWStructuredBuffer<float> leafEmbedAggrFloat;
+
+StructuredBuffer<uint> leafGcnEdgeRows;
+StructuredBuffer<uint> leafGcnEdgeCols;
+StructuredBuffer<float> leafGcnEdgeVals;
+
+RWStructuredBuffer<float> leafTokenAfterEnc;
+
+int leafNPadded;
+int leafDModel;
+int leafLiftIn;       // 6 + global_features_dim (training uses 18)
+int leafCompactEdgeCount;
+
+int offLift0W;
+int offLift0B;
+int offLift2W;
+int offLift2B;
+
+int offGcnSelfW;
+int offGcnSelfB;
+int offGcnNeighW;
+int offGcnNeighB;
+int offGcnGate0W;
+int offGcnGate0B;
+int offGcnGate2W;
+int offGcnGate2B;
+
+int offNormW;
+int offNormB;
+int offEncW;
+int offEncB;
+
+float W(int baseOff, int i, int o)
+{
+    return leafOnlyWeights[baseOff + i * leafDModel + o];
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_EmbedLift(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafNPadded)
+        return;
+
+    uint dm = (uint)leafDModel;
+    uint li = (uint)leafLiftIn;
+
+    float xf[32];
+    uint baseX = n * 9u;
+    for (uint k = 0; k < 6u; k++)
+        xf[k] = leafXPacked[baseX + 3u + k];
+    for (uint k = 0; k < 12u && (6u + k) < li; k++)
+        xf[6u + k] = leafGlobalFeatures[k];
+
+    // lift[0]: Linear(li -> dm) + GELU
+    float tmp[128];
+    for (uint o = 0; o < dm; o++)
+    {
+        float s = leafOnlyWeights[offLift0B + o];
+        for (uint i = 0; i < li; i++)
+            s += xf[i] * W(offLift0W, (int)i, (int)o);
+        tmp[o] = LeafOnlyGelu(s);
+    }
+
+    // lift[2]: Linear(dm -> dm), no GELU (matches nn.Sequential)
+    for (uint o = 0; o < dm; o++)
+    {
+        float s = leafOnlyWeights[offLift2B + o];
+        for (uint i = 0; i < dm; i++)
+            s += tmp[i] * W(offLift2W, (int)i, (int)o);
+        leafEmbedHOut[n * dm + o] = s;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_EmbedClearAggr(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint n = (uint)leafNPadded * (uint)leafDModel;
+    if (i < n)
+        leafEmbedAggrFloat[i] = 0.0;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_EmbedNeighLinear(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafNPadded)
+        return;
+
+    uint dm = (uint)leafDModel;
+    uint base = n * dm;
+    for (uint o = 0; o < dm; o++)
+    {
+        float s = leafOnlyWeights[offGcnNeighB + o];
+        for (uint i = 0; i < dm; i++)
+            s += leafEmbedHIn[base + i] * W(offGcnNeighW, (int)i, (int)o);
+        leafEmbedNeighLin[base + o] = s;
+    }
+}
+
+// Single-threaded, edge-list order (matches torch index_add_ along compact COO order).
+[numthreads(1, 1, 1)]
+void LeafOnly_EmbedGcnEdgeScatterSerial(uint3 id : SV_DispatchThreadID)
+{
+    uint dm = (uint)leafDModel;
+    uint E = (uint)leafCompactEdgeCount;
+    for (uint e = 0; e < E; e++)
+    {
+        uint row = leafGcnEdgeRows[e];
+        uint col = leafGcnEdgeCols[e];
+        float w = leafGcnEdgeVals[e];
+        uint baseC = col * dm;
+        uint baseR = row * dm;
+        for (uint c = 0; c < dm; c++)
+            leafEmbedAggrFloat[baseR + c] += leafEmbedNeighLin[baseC + c] * w;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_EmbedGcnCombine(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafNPadded)
+        return;
+
+    uint dm = (uint)leafDModel;
+    uint base = n * dm;
+
+    float selfv[128];
+    float agv[128];
+    float mid[128];
+    float delta[128];
+
+    for (uint o = 0; o < dm; o++)
+    {
+        float s = leafOnlyWeights[offGcnSelfB + o];
+        for (uint i = 0; i < dm; i++)
+            s += leafEmbedHIn[base + i] * W(offGcnSelfW, (int)i, (int)o);
+        selfv[o] = s;
+    }
+
+    for (uint o = 0; o < dm; o++)
+        agv[o] = leafEmbedAggrFloat[base + o];
+
+    uint d2 = dm * 2u;
+    for (uint o = 0; o < dm; o++)
+    {
+        float s = leafOnlyWeights[offGcnGate0B + o];
+        for (uint i = 0; i < d2; i++)
+        {
+            float xc = (i < dm) ? selfv[i] : agv[i - dm];
+            s += xc * leafOnlyWeights[offGcnGate0W + i * leafDModel + o];
+        }
+        mid[o] = LeafOnlyGelu(s);
+    }
+
+    for (uint o = 0; o < dm; o++)
+    {
+        float s = leafOnlyWeights[offGcnGate2B + o];
+        for (uint i = 0; i < dm; i++)
+            s += mid[i] * W(offGcnGate2W, (int)i, (int)o);
+        delta[o] = s;
+    }
+
+    for (uint o = 0; o < dm; o++)
+        leafEmbedHOut[base + o] = leafEmbedHIn[base + o] + delta[o];
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_EmbedLayerNorm(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafNPadded)
+        return;
+
+    uint dm = (uint)leafDModel;
+    uint base = n * dm;
+
+    float mean = 0.0;
+    for (uint c = 0; c < dm; c++)
+        mean += leafEmbedHIn[base + c];
+    mean /= (float)dm;
+
+    float var = 0.0;
+    for (uint c = 0; c < dm; c++)
+    {
+        float d = leafEmbedHIn[base + c] - mean;
+        var += d * d;
+    }
+    var /= (float)dm;
+    float invStd = rsqrt(var + LN_EPS);
+
+    for (uint c = 0; c < dm; c++)
+    {
+        float y = (leafEmbedHIn[base + c] - mean) * invStd;
+        y = y * leafOnlyWeights[offNormW + c] + leafOnlyWeights[offNormB + c];
+        leafEmbedHOut[base + c] = y;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_EmbedEncProj(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafNPadded)
+        return;
+
+    uint dm = (uint)leafDModel;
+    uint base = n * dm;
+    for (uint o = 0; o < dm; o++)
+    {
+        float s = leafOnlyWeights[offEncB + o];
+        for (uint i = 0; i < dm; i++)
+            s += leafEmbedHIn[base + i] * W(offEncW, (int)i, (int)o);
+        leafTokenAfterEnc[base + o] = s;
+    }
+}

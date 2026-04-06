@@ -43,6 +43,7 @@ public partial class FluidSimulator : MonoBehaviour
         radixPrefixFixupKernelId    = radixSortShader.FindKernel("prefixFixup");
 
         InitLeafOnlyInputKernels();
+        InitLeafOnlyEmbedKernels();
 
         applyPressureGradientKernel = nodesShader.FindKernel("ApplyPressureGradient");
         applyExternalForcesKernel   = nodesShader.FindKernel("ApplyExternalForces");
