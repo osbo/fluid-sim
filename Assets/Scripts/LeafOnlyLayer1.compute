@@ -1,0 +1,437 @@
+// LeafOnly: first transformer layer on GPU — diag block (L×L dense attention + FFN), H-strip pool,
+// off block (Ls×Ls). Matches checkpoint _write_transformer_block + architecture _apply_transformer_stacks (highway=0).
+// GELU uses tanh form (same as LeafOnlyEmbed.compute). d_model <= 128, L_diag <= 128, L_off <= 32, nh <= 8.
+
+#pragma kernel LeafOnly_L1_CopyFromEnc
+#pragma kernel LeafOnly_L1_CopyAToSkipA
+#pragma kernel LeafOnly_L1_CopyAToSkipB
+#pragma kernel LeafOnly_L1_CopyBuf
+#pragma kernel LeafOnly_L1_Clear
+#pragma kernel LeafOnly_L1_LayerNorm
+#pragma kernel LeafOnly_L1_QKV
+#pragma kernel LeafOnly_L1_AttnRow
+#pragma kernel LeafOnly_L1_ProjAddSkip
+#pragma kernel LeafOnly_L1_FFN
+#pragma kernel LeafOnly_L1_ClearPad
+#pragma kernel LeafOnly_L1_CopyLeavesToPad
+#pragma kernel LeafOnly_L1_StripAccum
+#pragma kernel LeafOnly_L1_StripPoolToOff
+#pragma kernel LeafOnly_L1_PoolOffEdgeFeats
+
+static const float LN_EPS = 1e-5;
+static const float GELU_ALPHA = 0.044715;
+static const float GELU_SQRT2PI = 0.7978845608;
+
+float LeafOnlyL1Gelu(float x)
+{
+    float x3 = x * x * x;
+    float t = GELU_SQRT2PI * (x + GELU_ALPHA * x3);
+    return 0.5 * x * (1.0 + tanh(t));
+}
+
+StructuredBuffer<float> leafOnlyWeights;
+StructuredBuffer<float> leafTokenAfterEnc;
+StructuredBuffer<float> leafL1EdgeFeats;
+StructuredBuffer<float> leafOffEdgeFeatsRaw;
+StructuredBuffer<float> leafL1HmWRow;
+StructuredBuffer<float> leafL1HmWCol;
+
+RWStructuredBuffer<float> leafL1BufA;
+RWStructuredBuffer<float> leafL1BufB;
+RWStructuredBuffer<float> leafL1Qkv;
+RWStructuredBuffer<float> leafL1Comb;
+RWStructuredBuffer<float> leafL1SkipA;
+RWStructuredBuffer<float> leafL1SkipB;
+RWStructuredBuffer<float> leafL1HPad;
+RWStructuredBuffer<float> leafL1Strip;
+RWStructuredBuffer<float> leafL1OffEdgeLs;
+RWStructuredBuffer<float> leafL1OffBufA;
+RWStructuredBuffer<float> leafL1OffBufB;
+RWStructuredBuffer<float> leafL1OffQkv;
+RWStructuredBuffer<float> leafL1OffComb;
+RWStructuredBuffer<float> leafL1OffSkipA;
+RWStructuredBuffer<float> leafL1OffSkipB;
+
+int leafDModel;
+int leafNumHeads;
+int leafDHead;
+int leafL1NTok;
+int leafL1NSeq;
+int leafL1SeqLen;
+int leafL1AttnTotal;
+int leafL1EdgeFloatsPerSeq;
+int leafL1MlpHidden;
+
+int leafKActive;
+int leafKMax;
+int leafMOff;
+int leafLeafSize;
+int leafLsOff;
+int leafOffPool;
+
+int tbNorm1W, tbNorm1B;
+int tbQkvW, tbQkvB;
+int tbProjW, tbProjB;
+int tbEg0W, tbEg0B;
+int tbEg2W, tbEg2B;
+int tbNorm2W, tbNorm2B;
+int tbMlp0W, tbMlp0B;
+int tbMlp2W, tbMlp2B;
+
+int leafL1ClearCount;
+int leafL1CopyCount;
+int leafL1CopySrcOff;
+int leafL1CopyDstOff;
+
+float TbW2(int baseOff, int i, int o, int outDim)
+{
+    return leafOnlyWeights[baseOff + i * outDim + o];
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_CopyFromEnc(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)leafL1NTok * (uint)leafDModel)
+        return;
+    leafL1BufA[i] = leafTokenAfterEnc[i];
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_CopyAToSkipA(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)leafL1NTok * (uint)leafDModel)
+        return;
+    leafL1SkipA[i] = leafL1BufA[i];
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_CopyAToSkipB(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)leafL1NTok * (uint)leafDModel)
+        return;
+    leafL1SkipB[i] = leafL1BufA[i];
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_CopyBuf(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)leafL1CopyCount)
+        return;
+    leafL1BufB[leafL1CopyDstOff + i] = leafL1BufA[leafL1CopySrcOff + i];
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_Clear(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)leafL1ClearCount)
+        return;
+    leafL1Comb[i] = 0.0;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_LayerNorm(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafL1NTok)
+        return;
+    uint dm = (uint)leafDModel;
+    uint base = n * dm;
+    float mean = 0.0;
+    for (uint c = 0; c < dm; c++)
+        mean += leafL1BufA[base + c];
+    mean /= (float)dm;
+    float var = 0.0;
+    for (uint c = 0; c < dm; c++)
+    {
+        float d = leafL1BufA[base + c] - mean;
+        var += d * d;
+    }
+    var /= (float)dm;
+    float invStd = rsqrt(var + LN_EPS);
+    for (uint c = 0; c < dm; c++)
+    {
+        float y = (leafL1BufA[base + c] - mean) * invStd;
+        y = y * leafOnlyWeights[tbNorm1W + c] + leafOnlyWeights[tbNorm1B + c];
+        leafL1BufB[base + c] = y;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_QKV(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafL1NTok)
+        return;
+    uint dm = (uint)leafDModel;
+    uint out3 = 3u * dm;
+    uint base = n * out3;
+    uint baseIn = n * dm;
+    for (uint o = 0; o < out3; o++)
+    {
+        float s = leafOnlyWeights[tbQkvB + o];
+        for (uint i = 0; i < dm; i++)
+            s += leafL1BufB[baseIn + i] * TbW2(tbQkvW, (int)i, (int)o, (int)out3);
+        leafL1Qkv[base + o] = s;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_AttnRow(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= (uint)leafL1AttnTotal)
+        return;
+    uint L = (uint)leafL1SeqLen;
+    uint nh = (uint)leafNumHeads;
+    uint dh = (uint)leafDHead;
+    uint dm = (uint)leafDModel;
+    uint q = idx % L;
+    uint t2 = idx / L;
+    uint h = t2 % nh;
+    uint s = t2 / nh;
+    float scale = rsqrt((float)dh);
+    float sLin[128];
+    float m = -1e30;
+    for (uint k = 0; k < L; k++)
+    {
+        uint qTok = s * L + q;
+        uint kTok = s * L + k;
+        float dotv = 0.0;
+        for (uint u = 0; u < dh; u++)
+        {
+            float qv = leafL1Qkv[qTok * 3u * dm + h * dh + u];
+            float kv = leafL1Qkv[kTok * 3u * dm + dm + h * dh + u];
+            dotv += qv * kv;
+        }
+        uint e0 = (uint)leafL1EdgeFloatsPerSeq * s + (q * L + k) * 4u;
+        float lb = (q == k) ? 1.0 : leafL1EdgeFeats[e0 + 3u];
+        float sc = dotv * scale + lb;
+        sLin[k] = sc;
+        m = max(m, sc);
+    }
+    float sum = 0.0;
+    for (uint k2 = 0; k2 < L; k2++)
+    {
+        sLin[k2] = exp(sLin[k2] - m);
+        sum += sLin[k2];
+    }
+    for (uint k3 = 0; k3 < L; k3++)
+        sLin[k3] /= sum;
+
+    uint outTok = s * L + q;
+    uint outBase = outTok * dm + h * dh;
+    for (uint u = 0; u < dh; u++)
+    {
+        float accS = 0.0;
+        float accE = 0.0;
+        for (uint k4 = 0; k4 < L; k4++)
+        {
+            uint kTok2 = s * L + k4;
+            float vk = leafL1Qkv[kTok2 * 3u * dm + 2u * dm + h * dh + u];
+            accS += sLin[k4] * vk;
+            uint e1 = (uint)leafL1EdgeFloatsPerSeq * s + (q * L + k4) * 4u;
+            float e00, e01, e02, e03;
+            if (q == k4)
+            {
+                e00 = 0.0;
+                e01 = 0.0;
+                e02 = 0.0;
+                e03 = 1.0;
+            }
+            else
+            {
+                e00 = leafL1EdgeFeats[e1];
+                e01 = leafL1EdgeFeats[e1 + 1u];
+                e02 = leafL1EdgeFeats[e1 + 2u];
+                e03 = leafL1EdgeFeats[e1 + 3u];
+            }
+            float egHid[16];
+            uint egH = 16u;
+            for (uint z = 0; z < egH; z++)
+            {
+                float t = leafOnlyWeights[tbEg0B + z];
+                t += e00 * leafOnlyWeights[tbEg0W + 0 * (int)egH + z];
+                t += e01 * leafOnlyWeights[tbEg0W + 1 * (int)egH + z];
+                t += e02 * leafOnlyWeights[tbEg0W + 2 * (int)egH + z];
+                t += e03 * leafOnlyWeights[tbEg0W + 3 * (int)egH + z];
+                egHid[z] = LeafOnlyL1Gelu(t);
+            }
+            float lwh = 0.0;
+            for (uint z2 = 0; z2 < egH; z2++)
+                lwh += egHid[z2] * leafOnlyWeights[tbEg2W + (int)z2 * (int)nh + h];
+            lwh += leafOnlyWeights[tbEg2B + h];
+            accE += lwh * vk;
+        }
+        leafL1Comb[outBase + u] = accS + accE;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_ProjAddSkip(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafL1NTok)
+        return;
+    uint dm = (uint)leafDModel;
+    uint base = n * dm;
+    for (uint o = 0; o < dm; o++)
+    {
+        float s = leafOnlyWeights[tbProjB + o];
+        for (uint i = 0; i < dm; i++)
+            s += leafL1Comb[base + i] * TbW2(tbProjW, (int)i, (int)o, (int)dm);
+        leafL1BufA[base + o] = leafL1SkipA[base + o] + s;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_FFN(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafL1NTok)
+        return;
+    uint dm = (uint)leafDModel;
+    uint hidden = (uint)leafL1MlpHidden;
+    uint base = n * dm;
+    float mean = 0.0;
+    for (uint c = 0; c < dm; c++)
+        mean += leafL1BufA[base + c];
+    mean /= (float)dm;
+    float var = 0.0;
+    for (uint c = 0; c < dm; c++)
+    {
+        float d = leafL1BufA[base + c] - mean;
+        var += d * d;
+    }
+    var /= (float)dm;
+    float invStd = rsqrt(var + LN_EPS);
+    float xn[128];
+    for (uint c = 0; c < dm; c++)
+    {
+        float y = (leafL1BufA[base + c] - mean) * invStd;
+        xn[c] = y * leafOnlyWeights[tbNorm2W + c] + leafOnlyWeights[tbNorm2B + c];
+    }
+    float hid[512];
+    for (uint o = 0; o < hidden; o++)
+    {
+        float s = leafOnlyWeights[tbMlp0B + o];
+        for (uint i = 0; i < dm; i++)
+            s += xn[i] * TbW2(tbMlp0W, (int)i, (int)o, (int)hidden);
+        hid[o] = LeafOnlyL1Gelu(s);
+    }
+    for (uint o2 = 0; o2 < dm; o2++)
+    {
+        float s2 = leafOnlyWeights[tbMlp2B + o2];
+        for (uint j = 0; j < hidden; j++)
+            s2 += hid[j] * TbW2(tbMlp2W, (int)j, (int)o2, (int)dm);
+        leafL1BufB[base + o2] = leafL1SkipB[base + o2] + s2;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_ClearPad(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    uint sz = (uint)leafKMax * (uint)leafLeafSize * (uint)leafDModel;
+    if (n >= sz)
+        return;
+    leafL1HPad[n] = 0.0;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_CopyLeavesToPad(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    uint dm = (uint)leafDModel;
+    uint L = (uint)leafLeafSize;
+    uint total = (uint)leafKActive * L * dm;
+    if (n >= total)
+        return;
+    leafL1HPad[n] = leafL1BufB[n];
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_StripAccum(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint dm = (uint)leafDModel;
+    uint L = (uint)leafLeafSize;
+    uint M = (uint)leafMOff;
+    uint Kmx = (uint)leafKMax;
+    uint total = M * L * dm;
+    if (idx >= total)
+        return;
+    uint c = idx % dm;
+    uint t2 = idx / dm;
+    uint l = t2 % L;
+    uint m = t2 / L;
+    float rp = 0.0;
+    float cp = 0.0;
+    for (uint k = 0; k < Kmx; k++)
+    {
+        float v = leafL1HPad[(k * L + l) * dm + c];
+        rp += leafL1HmWRow[m * Kmx + k] * v;
+        cp += leafL1HmWCol[m * Kmx + k] * v;
+    }
+    leafL1Strip[(m * L + l) * dm + c] = rp + cp;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_StripPoolToOff(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint dm = (uint)leafDModel;
+    uint L = (uint)leafLeafSize;
+    uint Ls = (uint)leafLsOff;
+    uint p = (uint)leafOffPool;
+    uint M = (uint)leafMOff;
+    uint total = M * Ls * dm;
+    if (idx >= total)
+        return;
+    uint c = idx % dm;
+    uint t2 = idx / dm;
+    uint ls = t2 % Ls;
+    uint m = t2 / Ls;
+    float acc = 0.0;
+    for (uint t = 0; t < p; t++)
+    {
+        uint l = ls * p + t;
+        acc += leafL1Strip[(m * L + l) * dm + c];
+    }
+    leafL1OffBufA[(m * Ls + ls) * dm + c] = acc / (float)p;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_PoolOffEdgeFeats(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint L = (uint)leafLeafSize;
+    uint Ls = (uint)leafLsOff;
+    uint p = (uint)leafOffPool;
+    uint M = (uint)leafMOff;
+    uint cells = M * Ls * Ls;
+    if (idx >= cells)
+        return;
+    uint jp = idx % Ls;
+    uint t2 = idx / Ls;
+    uint ip = t2 % Ls;
+    uint m = t2 / Ls;
+    for (uint ch = 0; ch < 4u; ch++)
+    {
+        float acc = 0.0;
+        for (uint di = 0; di < p; di++)
+        for (uint dj = 0; dj < p; dj++)
+        {
+            uint i = ip * p + di;
+            uint j = jp * p + dj;
+            uint src = ((m * L + i) * L + j) * 4u + ch;
+            acc += leafOffEdgeFeatsRaw[src];
+        }
+        uint dst = ((m * Ls + ip) * Ls + jp) * 4u + ch;
+        leafL1OffEdgeLs[dst] = acc / (float)(p * p);
+    }
+}

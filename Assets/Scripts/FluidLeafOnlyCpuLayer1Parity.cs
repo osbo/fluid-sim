@@ -15,12 +15,12 @@ public partial class FluidSimulator
 
     private static bool s_warnedLeafOnlyLayer1CpuSkip;
 
-    private struct LeafOnlyTbWeightOffsets
+    internal struct LeafOnlyTbWeightOffsets
     {
         public int Norm1W, Norm1B, QkvW, QkvB, ProjW, ProjB, Eg0W, Eg0B, Eg2W, Eg2B, Norm2W, Norm2B, Mlp0W, Mlp0B, Mlp2W, Mlp2B;
     }
 
-    private static int LeafOnlyEmbedPhaseFloatCount(in LeafOnlyCheckpointHeader h, int globalFeatDim)
+    internal static int LeafOnlyEmbedPhaseFloatCount(in LeafOnlyCheckpointHeader h, int globalFeatDim)
     {
         int dm = h.DModel;
         int liftIn = 6 + globalFeatDim;
@@ -36,7 +36,7 @@ public partial class FluidSimulator
         return idx;
     }
 
-    private static int LeafOnlyTransformerBlockFloatCount(in LeafOnlyCheckpointHeader h)
+    internal static int LeafOnlyTransformerBlockFloatCount(in LeafOnlyCheckpointHeader h)
     {
         if (h.DecoupledRouteGates != 0 || h.HighwayFfnMlp != 0)
             return -1;
@@ -56,7 +56,7 @@ public partial class FluidSimulator
         return n;
     }
 
-    private static void LeafOnlyTbOffsetsFromBase(int @base, in LeafOnlyCheckpointHeader h, out LeafOnlyTbWeightOffsets o)
+    internal static void LeafOnlyTbOffsetsFromBase(int @base, in LeafOnlyCheckpointHeader h, out LeafOnlyTbWeightOffsets o)
     {
         int d = h.DModel;
         int nh = h.NumHeads;
