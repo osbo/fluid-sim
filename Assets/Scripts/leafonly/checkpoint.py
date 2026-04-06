@@ -21,7 +21,60 @@ CHECKPOINT_HEAD_EXT_MAGIC = 0x48454144  # b"DAEH" little-endian
 CHECKPOINT_HEAD_EXT_VER = 1
 
 
+def _validate_parsed_leaf_only_header(
+    path: Path,
+    *,
+    d_model: int,
+    leaf_size: int,
+    input_dim: int,
+    num_layers: int,
+    num_heads: int,
+    use_gcn: int,
+    num_gcn_layers: int,
+    leaf_apply_diag: int,
+    leaf_apply_off: int,
+) -> None:
+    """
+    Sanity-check ints after struct unpack. Matches Unity ``FluidLeafOnlyWeights.ValidateArchitecture``:
+    invalid files fail here instead of returning nonsense or dying mid-tensor read.
+    """
+    bad: list[str] = []
+    if not (8 <= int(d_model) <= 4096):
+        bad.append(f"d_model={d_model}")
+    if not (8 <= int(leaf_size) <= 512):
+        bad.append(f"leaf_size={leaf_size}")
+    if int(input_dim) != 9:
+        bad.append(f"input_dim={input_dim} (expected 9)")
+    if not (1 <= int(num_layers) <= 64):
+        bad.append(f"num_layers={num_layers}")
+    if not (1 <= int(num_heads) <= 128):
+        bad.append(f"num_heads={num_heads}")
+    if int(use_gcn) != 1:
+        bad.append(f"use_gcn={use_gcn} (expected 1)")
+    if not (0 <= int(num_gcn_layers) <= 32):
+        bad.append(f"num_gcn_layers={num_gcn_layers}")
+    if not (1 <= int(leaf_apply_diag) <= 512):
+        bad.append(f"leaf_apply_diag={leaf_apply_diag}")
+    if not (1 <= int(leaf_apply_off) <= 512):
+        bad.append(f"leaf_apply_off={leaf_apply_off}")
+    if bad:
+        hex64 = path.read_bytes()[:64].hex()
+        raise ValueError(
+            "Invalid LeafOnly checkpoint header at file offset 0 ("
+            + ", ".join(bad)
+            + f"). first64_hex={hex64}. "
+            "Expected the raw binary written by save_leaf_only_weights (leaf_only_weights.bytes). "
+            "Unity loads the same path via File.ReadAllBytes; this file is a different format or corrupt."
+        )
+
+
 def read_leaf_only_header(path):
+    """
+    Parse the int header at **file offset 0** (optional UTF-8 BOM is not skipped here — use a raw ``save_leaf_only_weights`` file).
+
+    Raises:
+        ValueError: If the leading ints are not a valid LeafOnly checkpoint (same rules as Unity ``FluidLeafOnlyWeights``).
+    """
     path = Path(path)
     with open(path, "rb") as f:
         prefix = f.read(52)
@@ -120,6 +173,19 @@ def read_leaf_only_header(path):
                         pos += 8
                         mlp_heads = 1
     header_bytes = pos
+
+    _validate_parsed_leaf_only_header(
+        path,
+        d_model=int(d_model),
+        leaf_size=int(leaf_size),
+        input_dim=int(input_dim),
+        num_layers=int(num_layers),
+        num_heads=int(num_heads),
+        use_gcn=int(use_gcn),
+        num_gcn_layers=int(num_gcn_layers),
+        leaf_apply_diag=int(leaf_apply_diag),
+        leaf_apply_off=int(leaf_apply_off),
+    )
 
     return (
         d_model,

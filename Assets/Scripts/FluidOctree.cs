@@ -20,6 +20,7 @@ public partial class FluidSimulator : MonoBehaviour
         markActiveNodesKernelId    = nodesPrefixSumsShader.FindKernel("markActiveNodes");
         scatterActivesKernelId     = nodesPrefixSumsShader.FindKernel("scatterActives");
         writeDispatchArgsKernelId  = nodesPrefixSumsShader.FindKernel("WriteDispatchArgs");
+        copyNodesKernelId          = nodesPrefixSumsShader.FindKernel("copyNodes");
 
         createLeavesKernel         = nodesShader.FindKernel("CreateLeaves");
         processNodesKernel         = nodesShader.FindKernel("ProcessNodes");
@@ -88,7 +89,12 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetInt("len", np);
         nodesPrefixSumsShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
 
-        // One readback needed: numNodes drives CreateLeaves dispatch + layer loop initialization.
+        // Write dispatch args so CreateLeaves can use DispatchIndirect (GPU-resolved count).
+        nodesPrefixSumsShader.SetBuffer(writeDispatchArgsKernelId, "uniqueCount", uniqueCount);
+        nodesPrefixSumsShader.SetBuffer(writeDispatchArgsKernelId, "dispatchArgsBuffer", dispatchArgsBuffer);
+        nodesPrefixSumsShader.Dispatch(writeDispatchArgsKernelId, 1, 1, 1);
+
+        // Readback needed: numNodes drives buffer sizing and layer loop initialization.
         uint[] numNodesCpu = new uint[1];
         uniqueCount.GetData(numNodesCpu);
         numNodes = (int)numNodesCpu[0];
@@ -111,13 +117,11 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(createLeavesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(createLeavesKernel, "uniqueIndices", uniqueIndices);
         nodesShader.SetBuffer(createLeavesKernel, "mortonCodesBuffer", mortonCodesBuffer);
-        nodesShader.SetInt("numNodes", numNodes);
+        nodesShader.SetBuffer(createLeavesKernel, "uniqueCount", uniqueCount);
         nodesShader.SetInt("numParticles", numParticles);
         nodesShader.SetInt("minLayer", minLayer);
         nodesShader.SetInt("maxLayer", maxLayer);
-
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        nodesShader.Dispatch(createLeavesKernel, threadGroups, 1, 1);
+        nodesShader.DispatchIndirect(createLeavesKernel, dispatchArgsBuffer, 0);
     }
 
     // Marks unique node prefixes, prefix-scans, scatters, writes uniqueCount to GPU,

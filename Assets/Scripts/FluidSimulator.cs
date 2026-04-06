@@ -77,6 +77,7 @@ public partial class FluidSimulator : MonoBehaviour
     private int csrFinalizeRowPtrKernelId;
     private int csrFillKernelId;
     // Cached octree/prefix-sum kernel IDs
+    private int copyNodesKernelId;
     private int writeDispatchArgsKernelId;
     private int writeUniqueCountKernelId2;  // alias for writeUniqueCountKernel (already a field above)
     private int writeNodeCountKernelId;
@@ -517,20 +518,15 @@ public partial class FluidSimulator : MonoBehaviour
 
     private void StoreOldVelocities()
     {
-        // Release and recreate nodesBufferOld each frame since numNodes changes
-        nodesBufferOld?.Release();
-        nodesBufferOld = new ComputeBuffer(numNodes, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3);
-        
-        // Copy current nodesBuffer to nodesBufferOld
-        if (nodesBuffer != null && nodesBufferOld != null)
-        {
-            // Get data from nodesBuffer
-            Node[] nodesData = new Node[numNodes];
-            nodesBuffer.GetData(nodesData);
-            
-            // Set data to nodesBufferOld
-            nodesBufferOld.SetData(nodesData);
-        }
+        const int nodeStride = sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3;
+        ResizeBuffer(ref nodesBufferOld, numNodes, nodeStride);
+
+        // GPU copy: copyNodes kernel writes tempNodesBuffer[i] → nodesBuffer[i],
+        // so bind src→tempNodesBuffer slot, dst→nodesBuffer slot.
+        nodesPrefixSumsShader.SetBuffer(copyNodesKernelId, "tempNodesBuffer", nodesBuffer);
+        nodesPrefixSumsShader.SetBuffer(copyNodesKernelId, "nodesBuffer", nodesBufferOld);
+        nodesPrefixSumsShader.SetInt("len", numNodes);
+        nodesPrefixSumsShader.Dispatch(copyNodesKernelId, Mathf.CeilToInt(numNodes / 512.0f), 1, 1);
     }
 
     private void UpdateParticles()

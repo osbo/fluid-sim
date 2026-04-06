@@ -13,7 +13,7 @@ Known Unity vs dataset differences (see --match_unity_shader):
 
 Run (from Assets/Scripts):
   python3 InspectLeafOnlyUnityParity.py --frame 0
-  python3 InspectLeafOnlyUnityParity.py --frame 0 --match_unity_shader --weights leaf_only_weights.bytes
+  python3 InspectLeafOnlyUnityParity.py --frame 0 --match_unity_shader --weights ../StreamingAssets/leaf_only_weights_sim_8192.bytes
   python3 InspectLeafOnlyUnityParity.py --frame 0 --print_unity_inputs --inputs_parity_only
 
 Optional: compare apply step with r=all_ones (default) or random (--r random).
@@ -32,6 +32,8 @@ import torch
 import torch.nn.functional as F
 
 _script_dir = Path(__file__).resolve().parent
+# Same file Unity loads via StreamingAssets (FluidSimulator.leafOnlyWeightsStreamingAssetsName).
+_DEFAULT_WEIGHTS_PATH = _script_dir.parent / "StreamingAssets" / "leaf_only_weights_sim_8192.bytes"
 if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
 
@@ -414,7 +416,7 @@ def main() -> None:
         "--weights",
         type=Path,
         default=None,
-        help="leaf_only_weights.bytes path (default: script_dir/leaf_only_weights.bytes)",
+        help=f"Checkpoint .bytes (default: {_DEFAULT_WEIGHTS_PATH})",
     )
     p.add_argument(
         "--match_unity_shader",
@@ -455,8 +457,7 @@ def main() -> None:
     if data_folder is None:
         data_folder = _script_dir.parent / "StreamingAssets" / "TestData"
     data_folder = Path(data_folder).resolve()
-    weights_path = Path(args.weights) if args.weights else _script_dir / "leaf_only_weights.bytes"
-    weights_path = weights_path.resolve()
+    weights_path = Path(args.weights).resolve() if args.weights else _DEFAULT_WEIGHTS_PATH.resolve()
 
     dataset = FluidGraphDataset([data_folder])
     if len(dataset) == 0:
