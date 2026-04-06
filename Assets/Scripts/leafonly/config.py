@@ -42,7 +42,7 @@ HUTCHINSON_PROBE_JACOBI_OMEGA = 0.6
 
 # Upper cap on nodes; leaf grid in checkpoints is still sized for this maximum (MAX_NUM_LEAVES = MAX_MIXED_SIZE // LEAF_SIZE).
 # Per-frame padded size is ``problem_padded_num_nodes(num_nodes)`` (aligned, min(frame, MAX_MIXED_SIZE)) — no identity tail when smaller.
-MAX_MIXED_SIZE = 8192
+MAX_MIXED_SIZE = 4096
 # Minimum **aligned** active nodes to keep a frame: n_active = ⌊min(num_nodes, MAX)/LEAF⌋·LEAF.
 # Must be ≤ your smallest frame's aligned count. Do not set this to MAX_MIXED_SIZE unless every frame has ≥ that many nodes.
 MIN_MIXED_SIZE = LEAF_SIZE

@@ -80,10 +80,10 @@ def main():
     script_dir = Path(__file__).parent
     default_data = script_dir.parent / "StreamingAssets" / "TestData"
 
-    parser.add_argument("--data_folder", type=str, default=str(default_data))
+    parser.add_argument("--data-folder", type=str, default=str(default_data))
     parser.add_argument("--frame", type=int, default=600,
                         help="Dataset frame index (same as InspectModel default).")
-    parser.add_argument("--viz_limit", type=int, default=0,
+    parser.add_argument("--viz-limit", type=int, default=0,
                         help="Max size of A to use. Default 0 = full N.")
     parser.add_argument("--output", "-o", type=str, default=None,
                         help="Path to save plot (default: script_dir/rank_decay_plot.png)")
