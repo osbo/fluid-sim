@@ -231,7 +231,7 @@ def print_comprehensive_attention_profiler(
     ``LeafOnlyNet.forward`` after ``_pool_full_leaf_to_diag_tokens``; ``h_proj0`` stays full ``K * LEAF_SIZE``
     for H-off strip pooling. ``dtp`` is ``model.diag_token_pool`` (same role as ``otp`` for off-diag).
 
-    Pass ``eager_attention=True`` inside ``leaf_attn_kw`` / ``off_attn_kw`` (via ``--profile_attention`` on
+    Pass ``eager_attention=True`` inside ``leaf_attn_kw`` / ``off_attn_kw`` (via ``--profile-attention`` on
     the CLI) so the mass table uses materialized softmax weights. With fused SDPA only, mass stats are omitted
     (table shows '-') because weights are not defined for profiling separately from the forward kernel.
     """
@@ -370,7 +370,7 @@ def print_comprehensive_attention_profiler(
     else:
         print(
             "Attention mass table: not computed under fused SDPA (rows show '-'). "
-            "Use --profile_attention with --evaluate_gradients for materialized masses."
+            "Use --profile-attention with --evaluate-gradients for materialized masses."
         )
 
     mass_headers = [
@@ -1479,7 +1479,7 @@ def evaluate_gradient_interference(args, runtime):
     total_ms = sum(v for _, v in timing_rows) + 1e-12
     timed_rows = [[name, f"{ms:.3f}", f"{(100.0 * ms / total_ms):.1f}%"] for name, ms in timing_rows]
     _print_table(
-        "Component Timing (--evaluate_gradients)",
+        "Component Timing (--evaluate-gradients)",
         ["Component", "ms/call", "% of measured total"],
         timed_rows,
     )

@@ -168,17 +168,17 @@ def _build_train_args(base_args, d_model, num_layers, num_gcn_layers, use_jacobi
 
 def _build_parser():
     p = argparse.ArgumentParser()
-    p.add_argument("--target_step", type=int, default=10000)
+    p.add_argument("--target-step", type=int, default=10000)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--d_model", type=int, default=512)
-    p.add_argument("--num_heads", type=int, default=8)
+    p.add_argument("--d-model", type=int, default=512)
+    p.add_argument("--num-heads", type=int, default=8)
     p.add_argument("--frame", type=int, default=600)
-    p.add_argument("--use_single_frame", action="store_true")
-    p.add_argument("--num_frames", type=int, default=50)
+    p.add_argument("--use-single-frame", action="store_true")
+    p.add_argument("--num-frames", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--contexts_per_step", type=int, default=4)
-    p.add_argument("--output_csv", type=str, default="leafonly_ablation_results.csv")
-    p.add_argument("--weights_dir", type=str, default="leafonly_ablation_weights")
+    p.add_argument("--contexts-per-step", type=int, default=4)
+    p.add_argument("--output-csv", type=str, default="leafonly_ablation_results.csv")
+    p.add_argument("--weights-dir", type=str, default="leafonly_ablation_weights")
     p.add_argument("--limit", type=int, default=0, help="Optional: run only first N configs (0 = all).")
     return p
 

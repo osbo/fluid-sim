@@ -1,7 +1,7 @@
 """
 LeafOnly: train HODLR-style block preconditioner (32x32 diagonal leaves + off-diagonal low-rank blocks).
 Attention is within each 32-node block. Run with python3 LeafOnly.py; view_size defaults to 512.
-Add --mixed_sizes to train on dynamically varying block sizes for scale invariance.
+Add --mixed-sizes to train on dynamically varying block sizes for scale invariance.
 """
 import warnings
 # Suppress deprecation from torch._inductor (torch.compile path); fixed in newer PyTorch
@@ -1325,25 +1325,25 @@ def train_leaf_only():
     script_dir = Path(__file__).resolve().parent
     default_data = script_dir.parent / "StreamingAssets" / "TestData"
     parser.add_argument('--steps', type=int, default=50000)
-    parser.add_argument('--data_folder', type=str, default=str(default_data))
+    parser.add_argument('--data-folder', type=str, default=str(default_data))
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--d_model', type=int, default=256)
-    parser.add_argument('--num_layers', type=int, default=2)
-    parser.add_argument('--num_heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
-    parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use_single_frame is True. Default: 600.')
-    parser.add_argument('--use_single_frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num_frames (random sample or all).')
-    parser.add_argument('--num_frames', type=int, default=50, help='When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.')
+    parser.add_argument('--max-grad-norm', type=float, default=1.0)
+    parser.add_argument('--d-model', type=int, default=256)
+    parser.add_argument('--num-layers', type=int, default=2)
+    parser.add_argument('--num-heads', type=int, default=2, help='LeafBlockAttention heads; must divide d_model')
+    parser.add_argument('--frame', type=int, default=600, help='Frame index to use when --use-single-frame is True. Default: 600.')
+    parser.add_argument('--use-single-frame', type=bool, default=False, help='If True, train on a single frame (--frame). If False, use --num-frames (random sample or all).')
+    parser.add_argument('--num-frames', type=int, default=50, help='When --use-single-frame False: number of frames to randomly sample; 0 = use all frames.')
     parser.add_argument('--save', type=str, default=str(script_dir / "leaf_only_weights.bytes"))
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--view_size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
-    parser.add_argument('--use_global_node', type=bool, default=True, help='When True, use 33rd global node per block. When False, masked attention on 32x32 only.')
-    parser.add_argument('--use_gcn', type=bool, default=True, help='When True, run SparsePhysicsGCN before transformer blocks (graph message passing). When False, raw inputs pass through lift only.')
-    parser.add_argument('--print_timing', type=bool, default=True, help='On step 200, print detailed timing of each training substep')
-    parser.add_argument('--mixed_sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance. Default False = train on whole matrix per frame.')
-    parser.add_argument('--contexts_per_step', type=int, default=1, help='Gradient accumulation: number of random cached contexts per optimizer step.')
-    parser.add_argument('--continue_training', action='store_true', help='Load initial weights from the saved .bytes file (--save) and continue training from that state.')
-    parser.add_argument('--evaluate_gradients', action='store_true', help='Run gradient interference analysis (includes HODLR level analysis) then exit.')
+    parser.add_argument('--view-size', type=int, default=VIEW_SIZE, help=f"Number of nodes (padded to power-of-2*{LEAF_SIZE} if needed); 0 = use all nodes in frame. Default {VIEW_SIZE}")
+    parser.add_argument('--use-global-node', type=bool, default=True, help='When True, use 33rd global node per block. When False, masked attention on 32x32 only.')
+    parser.add_argument('--use-gcn', type=bool, default=True, help='When True, run SparsePhysicsGCN before transformer blocks (graph message passing). When False, raw inputs pass through lift only.')
+    parser.add_argument('--print-timing', type=bool, default=True, help='On step 200, print detailed timing of each training substep')
+    parser.add_argument('--mixed-sizes', type=bool, default=True, help='Train on randomly sampled sub-graph sizes to force scale invariance. Default False = train on whole matrix per frame.')
+    parser.add_argument('--contexts-per-step', type=int, default=1, help='Gradient accumulation: number of random cached contexts per optimizer step.')
+    parser.add_argument('--continue-training', action='store_true', help='Load initial weights from the saved .bytes file (--save) and continue training from that state.')
+    parser.add_argument('--evaluate-gradients', action='store_true', help='Run gradient interference analysis (includes HODLR level analysis) then exit.')
     args = parser.parse_args()
     use_global_node = args.use_global_node
     use_gcn = args.use_gcn
@@ -1373,16 +1373,16 @@ def train_leaf_only():
     if args.use_single_frame:
         frame_idx = min(args.frame, len(dataset) - 1)
         frame_indices = [frame_idx]
-        print(f"  [startup] Using single frame index {frame_idx} (--use_single_frame True, --frame {args.frame})")
+        print(f"  [startup] Using single frame index {frame_idx} (--use-single-frame True, --frame {args.frame})")
     else:
         rng = random.Random(args.seed)
         if args.num_frames <= 0:
             frame_indices = list(range(len(dataset)))
-            print(f"  [startup] Using all {len(frame_indices)} frames (--num_frames 0)")
+            print(f"  [startup] Using all {len(frame_indices)} frames (--num-frames 0)")
         else:
             n_sample = min(args.num_frames, len(dataset))
             frame_indices = sorted(rng.sample(range(len(dataset)), n_sample))
-            print(f"  [startup] Random sample of {n_sample} frames (--num_frames {args.num_frames})")
+            print(f"  [startup] Random sample of {n_sample} frames (--num-frames {args.num_frames})")
 
     base_sizes = [128, 256, 512, 1024, 2048, 4096, 8192]
 
@@ -1497,7 +1497,7 @@ def train_leaf_only():
             load_leaf_only_weights(model, args.save)
             print(f"  [startup] continue_training: Loaded initial state from {args.save}")
         else:
-            raise SystemExit(f"--continue_training given but save file not found: {args.save}")
+            raise SystemExit(f"--continue-training given but save file not found: {args.save}")
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     print_hodlr_structure(max_n_pad, LEAF_SIZE, RANK_BASE_LEVEL1)

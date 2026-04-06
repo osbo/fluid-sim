@@ -6,10 +6,14 @@ Preconditioners for Conjugate Gradient Solvers on GPUs* (NeurIPS 2025;
 `LearningSparsePreconditioner4GPU <https://github.com/Adversarr/LearningSparsePreconditioner4GPU>`_):
 Diag (Jacobi), IC-class (``ilupp.IChol0`` or scipy ``spilu`` fallback), PyAMG / AMGX. On CUDA, the benchmark always runs a second AMGX session: PCG with ``MULTICOLOR_DILU`` (scalar CSR; AMGX ``MULTICOLOR_ILU`` GPU path is 4×4-only).
 
-Use ``--test_only`` to run the PCG benchmark path and print only that summary (no plots, profiling, or dense AMG build).
-Use ``--fast_plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``eig(A·M)``, ``cond(A·M)``, and A-eigenmode error curves (saves many minutes for n in the thousands).
+Use ``--test-only`` to run the PCG benchmark path and print only that summary (no plots, profiling, or dense AMG build).
+Use ``--fast-plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``eig(A·M)``, ``cond(A·M)``, and A-eigenmode error curves (saves many minutes for n in the thousands).
 
-CUDA Graph (``--pcg_cuda_backend cudagraph``, default on CUDA) records real GPU kernels and replays them — low CPU launch overhead. On Apple MPS there is no CUDAGraph; the same flag selects ``torch.compile(one PCG iter)`` + a Python loop. Use ``--pcg_cuda_backend compile`` explicitly for Inductor on both; ``eager`` keeps per-iter Python dispatch.
+**pyamgx / AMGX:** ``libamgxsh`` must load ``libcublas`` and ``libcusolver`` from a matching CUDA toolkit. Set ``INSPECTMODEL_AMGX_CUDA_HOME`` to the toolkit root used to build AMGX (or ``INSPECTMODEL_AMGX_LD_EXTRA`` to its ``lib64``) if auto-discovery fails. To align with ``module load cuda`` (CUDA 13), rebuild AMGX and pyamgx against that toolkit (see NVIDIA AMGX CMake: ``-DCMAKE_CUDA_ARCHITECTURES=...``, ``CUDAToolkit_ROOT``).
+
+CUDA Graph (``--pcg-cuda-backend cudagraph``, default on CUDA) records real GPU kernels and replays them — low CPU launch overhead. On Apple MPS there is no CUDAGraph; the same flag selects ``torch.compile(one PCG iter)`` + a Python loop. Use ``--pcg-cuda-backend compile`` explicitly for Inductor on both; ``eager`` keeps per-iter Python dispatch.
+
+GPU PCG runs in float64 by default (better for stiff systems); use ``--no-gpu-pcg-fp64`` for float32 (often faster on easy data). The neural preconditioner stays float32; casts bridge residual / search directions at the PCG loop.
 
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
@@ -21,6 +25,8 @@ larger values add uniform strip mean-pooling (masks/features pooled to match). I
 those indices, increase apply rank or decrease ``HMATRIX_ETA`` for smaller tiles.
 """
 import argparse
+import ctypes
+import glob
 import sys
 import time
 import os
@@ -39,10 +45,202 @@ _script_dir = Path(__file__).resolve().parent
 if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
 
-import LeafOnly as _leaf_only_script  # noqa: E402 — DEFAULT_USE_HIGHWAYS, highway help, checkpoint errors
 
-# Used before main() so optional-dependency import warnings stay quiet in test-only runs.
-_TEST_ONLY_CLI = "--test_only" in sys.argv
+def _preload_conda_libstdcxx_global() -> None:
+    """Load conda env ``libstdc++.so.6`` with ``RTLD_GLOBAL`` before other native extensions.
+
+    HPC ``module load cuda`` often leaves Spack GCC on ``LD_LIBRARY_PATH``; matplotlib can still bind
+    that older ``libstdc++.so.6`` via RPATH order. Preloading shims ``CXXABI_1.3.15`` without shell
+    ``export`` or ``LD_PRELOAD``. Linux only. Set ``INSPECTMODEL_NO_LIBSTDC_PRELOAD=1`` to skip.
+    """
+    if sys.platform != "linux":
+        return
+    if os.environ.get("INSPECTMODEL_NO_LIBSTDC_PRELOAD", "").strip().lower() in ("1", "yes", "true"):
+        return
+    prefix = os.environ.get("CONDA_PREFIX", "").strip()
+    if not prefix and os.path.isdir(os.path.join(sys.prefix, "conda-meta")):
+        prefix = os.path.abspath(sys.prefix)
+    if not prefix:
+        return
+    lib = os.path.join(prefix, "lib")
+    for name in ("libstdc++.so.6", "libstdc++.so"):
+        path = os.path.join(lib, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            return
+        return
+
+
+# libamgxsh must resolve libcublas + libcusolver from the *same* CUDA toolkit. If ``import torch`` runs
+# first (via LeafOnly → leafonly.config), the wheel/conda libcublas wins and toolkit libcusolver then
+# fails with undefined symbols. Prepend toolkit lib64 before any torch import.
+_AMGX_LD_TOOLKIT_LIB64: Optional[str] = None
+
+
+def _prepend_ld_library_path_for_amgx_before_any_torch() -> None:
+    """
+    Prepend ``INSPECTMODEL_AMGX_LD_EXTRA`` + CUDA library dirs for ``pyamgx`` / ``libamgxsh``.
+
+    Scans toolkit roots (``INSPECTMODEL_AMGX_CUDA_HOME``, ``CUDA_HOME``, ``CUDA_PATH``, ORCD
+    ``.../pkg/cuda/*/``, ``/usr/local/cuda``) and their ``lib64``, ``lib``, and
+    ``targets/x86_64-linux/lib``. Picks dirs with a usable cublas+cusolver pair (CUDA 12-style
+    ``libcusolver.so.11`` or CUDA 13-style ``libcusolver.so.12``). Prepends **all** library dirs from
+    the **same** toolkit root as the best-scoring dir so split installs still resolve.
+
+    After toolkit dirs, prepends ``$CONDA_PREFIX/lib`` (when set) **before** the rest of
+    ``LD_LIBRARY_PATH`` so HPC ``module load gcc`` does not force an old ``libstdc++.so.6`` ahead of
+    conda's (fixes matplotlib ``CXXABI_1.3.15`` errors). CUDA dirs stay first so conda does not shadow
+    toolkit ``libcublas``/``libcusolver`` for the first ``pyamgx`` load.
+    Spack GCC paths are dropped from the inherited tail unless ``INSPECTMODEL_KEEP_SPACK_LD=1``.
+    Filtering always runs (even when no CUDA dirs are prepended) so a minimal ``module load cuda``
+    + conda env works on fresh shells.
+    """
+    global _AMGX_LD_TOOLKIT_LIB64
+    head: list[str] = []
+    seen: set[str] = set()
+
+    def _filter_ld_tail(ld: str) -> str:
+        """Drop Spack GCC ``lib64`` entries from inherited ``LD_LIBRARY_PATH`` (Lmod ``module load gcc`` / CUDA deps).
+
+        Set ``INSPECTMODEL_KEEP_SPACK_LD=1`` to keep them.
+        """
+        if os.environ.get("INSPECTMODEL_KEEP_SPACK_LD", "").strip().lower() in ("1", "yes", "true"):
+            return ld
+        out: list[str] = []
+        for p in ld.split(os.pathsep):
+            p = p.strip()
+            if not p or "/spack/pkg/gcc" in p:
+                continue
+            out.append(p)
+        return os.pathsep.join(out)
+
+    def _add(p: str) -> None:
+        q = os.path.abspath(p)
+        if q in seen or not os.path.isdir(q):
+            return
+        seen.add(q)
+        head.append(q)
+
+    raw = os.environ.get("INSPECTMODEL_AMGX_LD_EXTRA", "")
+    if raw.strip():
+        for part in raw.split(os.pathsep):
+            part = part.strip()
+            if part:
+                _add(part)
+
+    def _cuda_lib_subdirs(root: str) -> list[str]:
+        out: list[str] = []
+        for rel in (("lib64",), ("lib",), ("targets", "x86_64-linux", "lib")):
+            p = os.path.join(root, *rel)
+            if os.path.isdir(p):
+                out.append(os.path.abspath(p))
+        return out
+
+    def _amgx_cuda_lib_score(d: str) -> int:
+        """Higher is better: need cublas + cusolver in the same directory for a consistent pick."""
+        p = lambda name: os.path.isfile(os.path.join(d, name))
+        has_blas = p("libcublas.so.12") or p("libcublas.so.11") or p("libcublas.so.13")
+        if not has_blas:
+            return 0
+        if p("libcusolver.so.11"):
+            return 4
+        if p("libcusolver.so.12"):
+            return 3
+        return 0
+
+    roots: list[str] = []
+    rseen: set[str] = set()
+
+    def _add_root(r: str) -> None:
+        q = os.path.abspath(os.path.expanduser(r.strip()))
+        if not q or q in rseen or not os.path.isdir(q):
+            return
+        rseen.add(q)
+        roots.append(q)
+
+    for key in ("INSPECTMODEL_AMGX_CUDA_HOME", "CUDA_HOME", "CUDA_PATH"):
+        v = os.environ.get(key, "")
+        if v:
+            _add_root(v)
+    try:
+        for g in sorted(glob.glob("/orcd/software/core/001/pkg/cuda/*/")):
+            _add_root(g.rstrip("/"))
+    except OSError:
+        pass
+    for fb in ("/orcd/software/core/001/pkg/cuda/12.9.1", "/orcd/software/core/001/pkg/cuda/13.1.0", "/usr/local/cuda"):
+        _add_root(fb)
+
+    root_for_dir: dict[str, str] = {}
+    scored_dirs: list[tuple[int, str]] = []
+    for root in roots:
+        for d in _cuda_lib_subdirs(root):
+            root_for_dir[d] = root
+            s = _amgx_cuda_lib_score(d)
+            if s > 0:
+                scored_dirs.append((s, d))
+
+    toolkit_dirs: list[str] = []
+    best_root: Optional[str] = None
+    if scored_dirs:
+        scored_dirs.sort(key=lambda t: (-t[0], t[1]))
+        best_s, best_d = scored_dirs[0]
+        _AMGX_LD_TOOLKIT_LIB64 = best_d
+        best_root = root_for_dir.get(best_d)
+        if best_root is not None:
+            for d in _cuda_lib_subdirs(best_root):
+                if d not in toolkit_dirs:
+                    toolkit_dirs.append(d)
+    else:
+        _AMGX_LD_TOOLKIT_LIB64 = None
+
+    for d in toolkit_dirs:
+        _add(d)
+
+    cur = os.environ.get("LD_LIBRARY_PATH", "")
+    cur_f = _filter_ld_tail(cur)
+
+    conda_lib: list[str] = []
+    _cp = os.environ.get("CONDA_PREFIX", "").strip()
+    if not _cp and os.path.isdir(os.path.join(sys.prefix, "conda-meta")):
+        _cp = os.path.abspath(sys.prefix)
+    if _cp:
+        _cl = os.path.abspath(os.path.join(_cp, "lib"))
+        if os.path.isdir(_cl) and _cl not in seen:
+            seen.add(_cl)
+            conda_lib.append(_cl)
+
+    if not head and not conda_lib:
+        if cur_f != cur:
+            os.environ["LD_LIBRARY_PATH"] = cur_f
+        return
+
+    # CUDA/toolkit first (pyamgx), then conda ``lib``, then tail with Spack gcc paths removed.
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(head + conda_lib + ([cur_f] if cur_f else []))
+
+
+_prepend_ld_library_path_for_amgx_before_any_torch()
+_preload_conda_libstdcxx_global()
+
+# Used before optional-import warnings (pyamgx, pyamg) so ``--test-only`` stays quiet.
+_TEST_ONLY_CLI = "--test-only" in sys.argv
+
+# ``import pyamgx`` before LeafOnly/torch so ``libamgxsh`` binds cublas+cusolver from the same toolkit;
+# if torch loads first, its RUNPATH libcublas wins and toolkit libcusolver fails symbol checks.
+AMGX_IMPORT_ERROR = None  # str if pyamgx failed to import (shown in PCG summary when CUDA + --test-only)
+try:
+    import pyamgx  # noqa: E402
+
+    HAS_AMGX = True
+except (ImportError, OSError) as e:
+    HAS_AMGX = False
+    AMGX_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    if not _TEST_ONLY_CLI:
+        print("Warning: 'pyamgx' not available. AMGX (GPU) comparison will be skipped.", e)
+
+import LeafOnly as _leaf_only_script  # noqa: E402 — DEFAULT_USE_HIGHWAYS, highway help, checkpoint errors
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -58,30 +256,80 @@ except ImportError:
     if not _TEST_ONLY_CLI:
         print("Warning: 'pyamg' not installed. AMG baseline will be skipped.")
 
-AMGX_IMPORT_ERROR = None  # str if pyamgx failed to import (shown in PCG summary when CUDA + --test_only)
-try:
-    import pyamgx
-    HAS_AMGX = True
-except (ImportError, OSError) as e:
-    HAS_AMGX = False
-    AMGX_IMPORT_ERROR = f"{type(e).__name__}: {e}"
-    if not _TEST_ONLY_CLI:
-        print("Warning: 'pyamgx' not available. AMGX (GPU) comparison will be skipped.", e)
 import torch
+
+
+def _prepend_ld_library_path_torch_nvidia_for_pyamgx_retry() -> None:
+    """After ``import torch``: prepend bundled ``nvidia/*`` dirs so a second ``import pyamgx`` can succeed."""
+    extra: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        p = os.path.abspath(path)
+        if p in seen or not os.path.isdir(p):
+            return
+        seen.add(p)
+        extra.append(p)
+
+    try:
+        tp = Path(torch.__file__).resolve().parent
+        _add(str(tp / "lib"))
+        site = tp.parent
+        for rel in (
+            "nvidia/cublas/lib",
+            "nvidia/cusparse/lib",
+            "nvidia/cusolver/lib",
+            "nvidia/cuda_runtime/lib",
+            "nvidia/nvjitlink/lib",
+            "nvidia/cublas/lib64",
+            "nvidia/cusolver/lib64",
+        ):
+            _add(str((site / rel).resolve()))
+    except Exception:
+        return
+    if not extra:
+        return
+    cur = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(extra + ([cur] if cur else []))
+
+
+if not HAS_AMGX:
+    _prepend_ld_library_path_torch_nvidia_for_pyamgx_retry()
+    try:
+        import pyamgx  # noqa: E402
+
+        HAS_AMGX = True
+        AMGX_IMPORT_ERROR = None
+    except (ImportError, OSError) as e:
+        AMGX_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+        if not _TEST_ONLY_CLI:
+            print("Warning: 'pyamgx' retry after torch still failed. AMGX (GPU) skipped.", e)
 
 
 def _amgx_skip_followup_lines(import_err: str):
     """Short lines for the PCG table (avoids one huge wrapped line in narrow terminals)."""
     err = import_err or ""
     lines = []
-    if "libcusolver.so.11" in err or "libcusolver.so.12" in err:
+    if "cublasSetEnvironmentMode" in err or "undefined symbol" in err:
         lines.append(
-            "  → CUDA cuSOLVER mismatch: pyamgx/AMGX was built expecting a different libcusolver.so.N than "
-            "your runtime. Add a matching CUDA toolkit to LD_LIBRARY_PATH, or install pyamgx built for "
-            "the same CUDA major as PyTorch (e.g. cu11 wheel vs cu12)."
+            "  → Mixed CUDA stacks: ``import pyamgx`` must run before ``import torch`` (InspectModel does "
+            "this) with toolkit ``lib64`` on ``LD_LIBRARY_PATH`` and **without** conda ``lib64`` ahead "
+            "of that toolkit. Set ``INSPECTMODEL_AMGX_LD_EXTRA`` if needed."
+        )
+    elif "libcusolver.so.11" in err or "libcusolver.so.12" in err:
+        lines.append(
+            "  → ``libamgxsh`` is tied to the CUDA it was built with (often ``libcusolver.so.11`` for CUDA 12, "
+            "``.so.12`` for CUDA 13). InspectModel scans toolkit roots (set ``INSPECTMODEL_AMGX_CUDA_HOME`` "
+            "or ``INSPECTMODEL_AMGX_LD_EXTRA`` if needed). If only CUDA 13 libs exist, rebuild AMGX/pyamgx "
+            "against that toolkit."
+        )
+    elif "libcublas.so" in err and "cannot open shared object file" in err:
+        lines.append(
+            "  → No CUDA math ``lib64`` (or ``targets/.../lib``) on ``LD_LIBRARY_PATH`` before ``pyamgx`` "
+            "— set ``INSPECTMODEL_AMGX_CUDA_HOME`` to the toolkit you built AMGX with."
         )
     lines.append(
-        "  → With --test_only, the pyamgx import warning at startup is suppressed; run without it once to see it."
+        "  → With --test-only, the pyamgx import warning at startup is suppressed; run without it once to see it."
     )
     return lines
 
@@ -745,7 +993,9 @@ def _build_A_gpu_laplacian(
     Match the simulation: SpMV on sparse ``A``. CUDA uses CSR; MPS uses CSR when supported
     (else dense fallback — O(n²) per matvec).
     """
-    np_f = A_dense_f64.astype(np.float32)
+    torch_dt = dtype if dtype in (torch.float32, torch.float64) else torch.float32
+    np_dt = np.float64 if torch_dt == torch.float64 else np.float32
+    np_f = A_dense_f64.astype(np_dt, copy=False)
     if device.type == "cuda":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -760,8 +1010,8 @@ def _build_A_gpu_laplacian(
                 device=device,
             ).contiguous()
             csr_data = torch.tensor(
-                np.ascontiguousarray(A_scipy_csr.data.astype(np.float32)),
-                dtype=torch.float32,
+                np.ascontiguousarray(A_scipy_csr.data.astype(np_dt)),
+                dtype=torch_dt,
                 device=device,
             ).contiguous()
         return torch.sparse_csr_tensor(
@@ -780,8 +1030,8 @@ def _build_A_gpu_laplacian(
             device=device,
         ).contiguous()
         csr_data = torch.tensor(
-            np.ascontiguousarray(A_scipy_csr.data.astype(np.float32)),
-            dtype=torch.float32,
+            np.ascontiguousarray(A_scipy_csr.data.astype(np_dt)),
+            dtype=torch_dt,
             device=device,
         ).contiguous()
         try:
@@ -789,7 +1039,7 @@ def _build_A_gpu_laplacian(
                 csr_indptr, csr_indices, csr_data, size=(viz_n, viz_n)
             )
             _torch_gpu_sync(device)
-            probe = torch.zeros(viz_n, 1, device=device, dtype=dtype)
+            probe = torch.zeros(viz_n, 1, device=device, dtype=torch_dt)
             _ = torch.sparse.mm(A_csr, probe)
             _torch_gpu_sync(device)
             return A_csr
@@ -1348,6 +1598,19 @@ def _effective_pcg_gpu_backend(device: torch.device, backend: str) -> str:
     return backend
 
 
+def _resolve_gpu_pcg_backend(
+    device: torch.device, user_backend: str, gpu_pcg_fp64: bool, leafonly_pcg: str
+) -> str:
+    """
+    Float64 PCG with float32 BSR ``M`` needs a Python-side cast wrapper; CUDAGraph/compile capture assumes
+    homogeneous dtypes inside one_iter. Fall back to eager for ``bsr`` when ``gpu_pcg_fp64``.
+    """
+    eff = _effective_pcg_gpu_backend(device, user_backend)
+    if gpu_pcg_fp64 and leafonly_pcg == "bsr" and eff in ("cudagraph", "compile"):
+        return "eager"
+    return eff
+
+
 def _dispatch_pcg_matrix_free_gpu(
     A_gpu,
     b_gpu,
@@ -1693,23 +1956,23 @@ def _run_amgx_pcg_session(
 def main():
     parser = argparse.ArgumentParser(description="Inspect LeafOnly preconditioner and compare solvers.")
     parser.add_argument(
-        "--test_only",
+        "--test-only",
         action="store_true",
         help="Only print the PCG benchmark summary; skip plots, spectral/HM profiling, and dense AMG build.",
     )
     parser.add_argument(
-        "--leafonly_pcg",
+        "--leafonly-pcg",
         choices=("bsr", "matrix_free"),
         default="matrix_free",
         help=(
             "LeafOnly PCG preconditioner representation: matrix_free (default) = allocation-free "
             "apply_block_diagonal_m_into + block_diagonal_m_apply_workspace; bsr = materialized BSR SpMV. "
-            "On CUDA/MPS, the solve loop driver is --pcg_cuda_backend (cudagraph | compile | eager; "
+            "On CUDA/MPS, the solve loop driver is --pcg-cuda-backend (cudagraph | compile | eager; "
             "on MPS, cudagraph maps to compile)."
         ),
     )
     parser.add_argument(
-        "--pcg_cuda_backend",
+        "--pcg-cuda-backend",
         choices=("cudagraph", "compile", "eager"),
         default="cudagraph",
         help=(
@@ -1719,7 +1982,7 @@ def main():
         ),
     )
     parser.add_argument(
-        "--pcg_check_freq",
+        "--pcg-check-freq",
         type=int,
         default=3,
         metavar="K",
@@ -1727,6 +1990,16 @@ def main():
             "GPU PCG: evaluate stopping residual every K iterations. Larger K cuts host sync overhead "
             "(faster) but may overshoot tolerance by up to K-1 iterations. "
             "On MPS, K is raised to at least 10 unless you pass a larger value."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-pcg-fp64",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "GPU PCG (A, b, x, r, p, Ap) in float64 (default); LeafOnly / Jacobi preconditioner stays float32. "
+            "Use --no-gpu-pcg-fp64 for float32 PCG (faster on well-conditioned data). "
+            "With --leafonly-pcg bsr, mixed precision uses eager PCG (not CUDAGraph)."
         ),
     )
     parser.add_argument(
@@ -1753,7 +2026,7 @@ def main():
         help=_leaf_only_script.USE_HIGHWAYS_HELP,
     )
     parser.add_argument(
-        "--fast_plot",
+        "--fast-plot",
         action="store_true",
         help=(
             "Skip expensive dense panels: full eig(A), eig(AM), cond(AM), and A-eigenmode error curves. "
@@ -1762,7 +2035,7 @@ def main():
     )
     parser.add_argument(
         "--data-folder",
-        "--dataset_folders",
+        "--dataset-folders",
         type=str,
         default=None,
         metavar="DIR",
@@ -1772,6 +2045,7 @@ def main():
     test_only = bool(args.test_only)
     fast_plot = bool(getattr(args, "fast_plot", False))
     pcg_cuda_backend = str(getattr(args, "pcg_cuda_backend", "cudagraph"))
+    gpu_pcg_fp64 = bool(getattr(args, "gpu_pcg_fp64", True))
 
     def _info(*a, **k):
         if not test_only:
@@ -1985,9 +2259,9 @@ def main():
         if device.type == "cuda":
             torch.cuda.synchronize()
 
-        # Time pure forward only (same idea as leafonly.eval ``--evaluate_gradients`` component table’s
+        # Time pure forward only (same idea as leafonly.eval ``--evaluate-gradients`` component table’s
         # encoder + heads; training/eval Hutchinson loss also builds Jacobi-smoothed Z, which is not here).
-        # Running ``build_sparse_bsr_preconditioner`` (when ``--leafonly_pcg bsr``) or other large
+        # Running ``build_sparse_bsr_preconditioner`` (when ``--leafonly-pcg bsr``) or other large
         # materialization first allocates big buffers and can leave the GPU in a different memory state,
         # skewing this line.
         inference_ms = _timed_ms(_fwd, device, warmup=0, repeat=10)
@@ -2085,7 +2359,9 @@ def main():
     b_np = b_np / (np.linalg.norm(b_np) + 1e-12)
     b_np = b_np.reshape(-1, 1)
 
-    A_scipy_csr = csr_matrix(A_viz_n.astype(np.float32))
+    pcg_elem_dtype = torch.float64 if gpu_pcg_fp64 else torch.float32
+    _np_pcg = np.float64 if gpu_pcg_fp64 else np.float32
+    A_scipy_csr = csr_matrix(A_viz_n.astype(_np_pcg))
 
     precond_s = precond_out.detach().contiguous()
     jacobi_s = jacobi_inv_diag.detach().contiguous()
@@ -2094,8 +2370,18 @@ def main():
     A_f64 = A_viz_n.astype(np.float64)
     leaf_rel_res = float("nan")
     with torch.inference_mode():
-        A_gpu = _build_A_gpu_laplacian(A_scipy_csr, A_viz_n, viz_n, device)
-        b_gpu = torch.from_numpy(b_np).float().to(device).contiguous()
+        pcg_gpu_backend_eff = _resolve_gpu_pcg_backend(
+            device, pcg_cuda_backend, gpu_pcg_fp64, str(args.leafonly_pcg)
+        )
+        A_gpu = _build_A_gpu_laplacian(
+            A_scipy_csr, A_viz_n, viz_n, device, dtype=pcg_elem_dtype
+        )
+        b_gpu = torch.from_numpy(b_np).to(device=device, dtype=pcg_elem_dtype).contiguous()
+        if gpu_pcg_fp64:
+            _info(
+                "  GPU PCG: float64 A,b and iterates (matches CPU PCG numerics); "
+                "LeafOnly preconditioner stays float32 (cast r→float32, z→float64)."
+            )
 
         if device.type in ("cuda", "mps"):
 
@@ -2107,16 +2393,15 @@ def main():
                 A_gpu,
                 b_gpu,
                 _apply_none_into,
-                backend=pcg_cuda_backend,
+                backend=pcg_gpu_backend_eff,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=check_freq,
             )
-            _inv_jac = (
-                1.0 / np.maximum(np.abs(np.diag(A_f64).astype(np.float64)), 1e-30)
-            ).astype(np.float32)
-            _inv_jac_t = torch.from_numpy(_inv_jac).to(device=device).contiguous()
+            _inv_jac_np = 1.0 / np.maximum(np.abs(np.diag(A_f64).astype(np.float64)), 1e-30)
+            _inv_jac = _inv_jac_np.astype(_np_pcg)
+            _inv_jac_t = torch.from_numpy(_inv_jac).to(device=device, dtype=pcg_elem_dtype).contiguous()
 
             def _apply_jacobi_into(r: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
                 torch.mul(r, _inv_jac_t.view(-1, 1), out=z)
@@ -2126,13 +2411,13 @@ def main():
                 A_gpu,
                 b_gpu,
                 _apply_jacobi_into,
-                backend=pcg_cuda_backend,
+                backend=pcg_gpu_backend_eff,
                 tol=pcg_tol,
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=check_freq,
             )
-            _eff_be = _effective_pcg_gpu_backend(device, pcg_cuda_backend)
+            _eff_be = pcg_gpu_backend_eff
             _gpu_pcg_desc_map = {
                 "cudagraph": "CUDAGraph replay of one iter (low CPU launch overhead)",
                 "compile": "torch.compile(one_iter) + Python loop (Inductor)",
@@ -2140,7 +2425,7 @@ def main():
             }
             _gpu_pcg_desc = _gpu_pcg_desc_map.get(_eff_be, _eff_be)
             if device.type == "mps" and pcg_cuda_backend == "cudagraph":
-                _gpu_pcg_desc += " (MPS: --pcg_cuda_backend cudagraph → compile; no CUDAGraph)"
+                _gpu_pcg_desc += " (MPS: --pcg-cuda-backend cudagraph → compile; no CUDAGraph)"
             _info(f"  Unpreconditioned / Jacobi PCG (GPU): {_gpu_pcg_desc}")
         else:
             x_gpu_none, iters_none_gpu, solve_none_gpu_ms = pcg_gpu(
@@ -2170,6 +2455,8 @@ def main():
                 if device.type == "mps"
                 else ""
             )
+            + (f"; resolved_backend={pcg_gpu_backend_eff}" if pcg_gpu_backend_eff != pcg_cuda_backend else "")
+            + ("; elem=float64" if gpu_pcg_fp64 else "")
         )
         if test_only:
             print(
@@ -2194,20 +2481,40 @@ def main():
             verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
 
             if device.type in ("cuda", "mps"):
-                x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_bsr_gpu(
-                    A_gpu,
-                    b_gpu,
-                    M_sparse_bsr,
-                    backend=pcg_cuda_backend,
-                    tol=pcg_tol,
-                    max_iter=pcg_max_iter,
-                    device=device,
-                    check_freq=check_freq,
-                )
-                _bsr_be = {"cudagraph": "CUDAGraph", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
-                    _effective_pcg_gpu_backend(device, pcg_cuda_backend),
-                    pcg_cuda_backend,
-                )
+                if gpu_pcg_fp64:
+                    bsr_r_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
+
+                    def _apply_bsr_fp64(r: torch.Tensor) -> torch.Tensor:
+                        z = torch.empty_like(r)
+                        bsr_r_f32.copy_(r)
+                        z.copy_(M_sparse_bsr @ bsr_r_f32)
+                        return z
+
+                    x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
+                        A_gpu,
+                        b_gpu,
+                        _apply_bsr_fp64,
+                        tol=pcg_tol,
+                        max_iter=pcg_max_iter,
+                        device=device,
+                        check_freq=check_freq,
+                    )
+                    _bsr_be = "eager (fp64 PCG + fp32 BSR M·r)"
+                else:
+                    x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_bsr_gpu(
+                        A_gpu,
+                        b_gpu,
+                        M_sparse_bsr,
+                        backend=pcg_gpu_backend_eff,
+                        tol=pcg_tol,
+                        max_iter=pcg_max_iter,
+                        device=device,
+                        check_freq=check_freq,
+                    )
+                    _bsr_be = {"cudagraph": "CUDAGraph", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
+                        pcg_gpu_backend_eff,
+                        pcg_cuda_backend,
+                    )
                 _info(
                     f"  LeafOnly PCG: BSR + {_bsr_be} (z = M @ r)"
                     + (f"; n={viz_n}" if viz_n != n_pad else "")
@@ -2235,37 +2542,57 @@ def main():
                 M_h=NUM_HMATRIX_OFF_BLOCKS,
                 La_o=leaf_apply_off_L,
                 device=device,
-                dtype=b_gpu.dtype,
+                dtype=torch.float32,
             )
             warmup_hmatrix_prolong_gpu(device)
 
-            def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-                # Views only; apply_block_diagonal_m_into writes out in-place (no alloc) — safe inside CUDAGraph.
-                apply_block_diagonal_m_into(
-                    precond_s,
-                    r.reshape(1, viz_n, 1),
-                    out.reshape(1, viz_n, 1),
-                    jacobi_s_phys,
-                    precond_ws,
-                    leaf_size=leaf_L,
-                    leaf_apply_size=leaf_apply_diag_L,
-                    leaf_apply_off=leaf_apply_off_L,
-                )
-                return out
+            if gpu_pcg_fp64:
+                pcg_r_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
+                pcg_z_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
+
+                def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                    pcg_r_f32.copy_(r)
+                    apply_block_diagonal_m_into(
+                        precond_s,
+                        pcg_r_f32.reshape(1, viz_n, 1),
+                        pcg_z_f32.reshape(1, viz_n, 1),
+                        jacobi_s_phys,
+                        precond_ws,
+                        leaf_size=leaf_L,
+                        leaf_apply_size=leaf_apply_diag_L,
+                        leaf_apply_off=leaf_apply_off_L,
+                    )
+                    out.copy_(pcg_z_f32)
+                    return out
+            else:
+
+                def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                    # Views only; apply_block_diagonal_m_into writes out in-place (no alloc) — safe inside CUDAGraph.
+                    apply_block_diagonal_m_into(
+                        precond_s,
+                        r.reshape(1, viz_n, 1),
+                        out.reshape(1, viz_n, 1),
+                        jacobi_s_phys,
+                        precond_ws,
+                        leaf_size=leaf_L,
+                        leaf_apply_size=leaf_apply_diag_L,
+                        leaf_apply_off=leaf_apply_off_L,
+                    )
+                    return out
 
             if device.type in ("cuda", "mps"):
                 x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_matrix_free_gpu(
                     A_gpu,
                     b_gpu,
                     apply_pcg_fast_into,
-                    backend=pcg_cuda_backend,
+                    backend=pcg_gpu_backend_eff,
                     tol=pcg_tol,
                     max_iter=pcg_max_iter,
                     device=device,
                     check_freq=check_freq,
                 )
                 _mf_be = {"cudagraph": "CUDAGraph replay", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
-                    _effective_pcg_gpu_backend(device, pcg_cuda_backend),
+                    pcg_gpu_backend_eff,
                     pcg_cuda_backend,
                 )
                 _info(
@@ -2388,8 +2715,8 @@ def main():
 
     print("\nPCG solve A x = b (relative residual tol={:.0e})".format(pcg_tol))
     print("Unpreconditioned (CG):")
-    print(f"  Setup: {setup_none_ms:.2f} ms, solve (GPU): {solve_none_gpu_ms:.2f} ms, {iters_none_gpu} iterations, total: {total_none_gpu_ms:.2f} ms")
     print(f"  Setup: {setup_none_ms:.2f} ms, solve (CPU): {solve_none_cpu_ms:.2f} ms, {iters_none_cpu} iterations, total: {total_none_cpu_ms:.2f} ms")
+    print(f"  Setup: {setup_none_ms:.2f} ms, solve (GPU): {solve_none_gpu_ms:.2f} ms, {iters_none_gpu} iterations, total: {total_none_gpu_ms:.2f} ms")
     print("Diag (Jacobi; paper Table 7: Eigen CPU / custom GPU):")
     print(f"  Setup: {setup_diag_cpu_ms:.2f} ms, solve (CPU): {solve_diag_cpu_ms:.2f} ms, {iters_diag_cpu} iterations, total: {total_diag_cpu_ms:.2f} ms")
     print(f"  Setup: {setup_diag_gpu_ms:.2f} ms, solve (GPU): {solve_diag_gpu_ms:.2f} ms, {iters_diag_gpu} iterations, total: {total_diag_gpu_ms:.2f} ms")
@@ -2470,7 +2797,7 @@ def main():
         eig_A_cache: tuple[np.ndarray, np.ndarray] | None = None
         eig_A_err: str | None = None
         if fast_plot:
-            _info("  Skipped eig(A) and AM spectrum panels (--fast_plot).")
+            _info("  Skipped eig(A) and AM spectrum panels (--fast-plot).")
         else:
             try:
                 t_eig = time.perf_counter()
@@ -2536,7 +2863,7 @@ def main():
             ax_a.text(
                 0.5,
                 0.5,
-                "Skipped (--fast_plot)",
+                "Skipped (--fast-plot)",
                 transform=ax_a.transAxes,
                 ha="center",
                 va="center",
@@ -2640,7 +2967,7 @@ def main():
                 ax_d.text(
                     0.5,
                     0.5,
-                    "Skipped (--fast_plot)\n(full eig(AM) is slow for large n)",
+                    "Skipped (--fast-plot)\n(full eig(AM) is slow for large n)",
                     transform=ax_d.transAxes,
                     ha="center",
                     va="center",
@@ -2672,7 +2999,7 @@ def main():
             if fast_plot:
                 msg = [
                     f"Method: {name}",
-                    "Cond(AM): skipped (--fast_plot)",
+                    "Cond(AM): skipped (--fast-plot)",
                     "Improvement: —",
                     f"Frobenius Err: {err_fro:.4f}",
                 ]
@@ -2694,7 +3021,7 @@ def main():
                 ax_ray.text(
                     0.5,
                     0.5,
-                    "Skipped (--fast_plot)",
+                    "Skipped (--fast-plot)",
                     transform=ax_ray.transAxes,
                     ha="center",
                     va="center",

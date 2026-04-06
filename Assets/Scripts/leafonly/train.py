@@ -111,16 +111,16 @@ def train_leaf_only(args, runtime):
     if args.use_single_frame:
         frame_idx = min(args.frame, len(dataset) - 1)
         frame_indices = [frame_idx]
-        print(f"  [startup] Using single frame index {frame_idx} (--use_single_frame True, --frame {args.frame})")
+        print(f"  [startup] Using single frame index {frame_idx} (--use-single-frame True, --frame {args.frame})")
     else:
         rng = random.Random(args.seed)
         if args.num_frames <= 0:
             frame_indices = list(range(len(dataset)))
-            print(f"  [startup] Using all {len(frame_indices)} frames (--num_frames 0)")
+            print(f"  [startup] Using all {len(frame_indices)} frames (--num-frames 0)")
         else:
             n_sample = min(args.num_frames, len(dataset))
             frame_indices = sorted(rng.sample(range(len(dataset)), n_sample))
-            print(f"  [startup] Random sample of {n_sample} frames (--num_frames {args.num_frames})")
+            print(f"  [startup] Random sample of {n_sample} frames (--num-frames {args.num_frames})")
 
     rebuild_context_cache = bool(getattr(args, "rebuild_context_cache", False))
     cache_dir = data_path / ".leafonly_training_context_cache"
@@ -350,7 +350,7 @@ def train_leaf_only(args, runtime):
             ms_load = (time.perf_counter() - t_seg) * 1000.0
             print(f"  [startup] continue_training: Loaded initial state from {save_path}")
         else:
-            raise SystemExit(f"--continue_training given but save file not found: {save_path}")
+            raise SystemExit(f"--continue-training given but save file not found: {save_path}")
 
     t_seg = time.perf_counter()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -362,7 +362,7 @@ def train_leaf_only(args, runtime):
         threshold=5e-3,
         threshold_mode="rel",
         cooldown=1,
-        min_lr=max(args.lr * 1e-2, 1e-6),
+        min_lr=max(args.lr * 1e-3, 1e-6),
     )
     ms_optim = (time.perf_counter() - t_seg) * 1000.0
     print(

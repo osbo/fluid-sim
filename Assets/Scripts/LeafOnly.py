@@ -34,63 +34,63 @@ def _build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--data-folder",
-        "--dataset_folders",
+        "--dataset-folders",
         type=str,
         default=None,
         metavar="DIR",
         help=(
             "Directory to scan for frames (rglob nodes.bin under it). "
             "Default: StreamingAssets/TestData from fixed_runtime_config. "
-            "Repo train.py maps --dataset_folders to this flag."
+            "Repo train.py maps --dataset-folders to this flag."
         ),
     )
     parser.add_argument("--steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--d_model", type=int, default=64)
+    parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument(
-        "--num_layers",
+        "--num-layers",
         type=int,
-        default=1,
+        default=3,
         help="Transformer depth: number of diagonal-leaf blocks and H-off blocks (each stack). Checkpoint must match.",
     )
-    parser.add_argument("--num_heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
-    parser.add_argument("--frame", type=int, default=600, help="Frame index to use when --use_single_frame is True. Default: 600.")
-    parser.add_argument("--use_single_frame", action="store_true", help="Train on a single frame (--frame) instead of random-frame sampling.")
-    parser.add_argument("--num_frames", type=int, default=50, help="When --use_single_frame False: number of frames to randomly sample; 0 = use all frames.")
+    parser.add_argument("--num-heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
+    parser.add_argument("--frame", type=int, default=600, help="Frame index to use when --use-single-frame is True. Default: 600.")
+    parser.add_argument("--use-single-frame", action="store_true", help="Train on a single frame (--frame) instead of random-frame sampling.")
+    parser.add_argument("--num-frames", type=int, default=50, help="When --use-single-frame False: number of frames to randomly sample; 0 = use all frames.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--contexts_per_step", type=int, default=4, help="Gradient accumulation: number of random cached contexts per optimizer step.")
-    parser.add_argument("--continue_training", action="store_true", help="Load initial weights from the saved .bytes file and continue training from that state.")
+    parser.add_argument("--contexts-per-step", type=int, default=4, help="Gradient accumulation: number of random cached contexts per optimizer step.")
+    parser.add_argument("--continue-training", action="store_true", help="Load initial weights from the saved .bytes file and continue training from that state.")
     parser.add_argument(
         "--rebuild-context-cache",
         action="store_true",
         help="Ignore TestData/.leafonly_training_context_cache/ and rebuild contexts from frame files.",
     )
     parser.add_argument(
-        "--evaluate_gradients",
+        "--evaluate-gradients",
         action="store_true",
         help="Run gradient interference analysis then exit (includes component timing + attention profiler for all Leaf/H-off layers).",
     )
     parser.add_argument(
-        "--profile_attention",
+        "--profile-attention",
         action="store_true",
         help=(
-            "With --evaluate_gradients: run attention with eager materialized softmax (not fused SDPA) when "
+            "With --evaluate-gradients: run attention with eager materialized softmax (not fused SDPA) when "
             "building the attention mass table so masses match the forward path. Omit for faster profiling "
             "(mass rows show '-'; fused SDPA does not expose weights for that table)."
         ),
     )
     parser.add_argument(
-        "--peek_parameters",
+        "--peek-parameters",
         action="store_true",
         help=(
-            "With --evaluate_gradients: print tensor statistics (trainable weights, float/index buffers, "
-            "layout hyperparameters). No effect without --evaluate_gradients."
+            "With --evaluate-gradients: print tensor statistics (trainable weights, float/index buffers, "
+            "layout hyperparameters). No effect without --evaluate-gradients."
         ),
     )
-    parser.add_argument("--num_gcn_layers", type=int, default=2, choices=[2], help="Fixed number of GCN layers (kept at 2).")
+    parser.add_argument("--num-gcn-layers", type=int, default=2, choices=[2], help="Fixed number of GCN layers (kept at 2).")
     _al = attention_layout_choices(LEAF_SIZE)
     parser.add_argument(
-        "--attention_layout",
+        "--attention-layout",
         type=str,
         default=default_attention_layout(LEAF_SIZE),
         choices=list(_al),
@@ -100,7 +100,7 @@ def _build_parser():
             f"{LEAF_SIZE}×{LEAF_SIZE + 2} (+ block + matrix node). Must match leafonly.config.LEAF_SIZE."
         ),
     )
-    parser.add_argument("--target_step", type=int, default=10000, help="Step index to track in logs/metrics.")
+    parser.add_argument("--target-step", type=int, default=10000, help="Step index to track in logs/metrics.")
     parser.add_argument(
         "--probe-vectors",
         type=int,
@@ -110,7 +110,7 @@ def _build_parser():
             "Monte-Carlo probe count for ||M A Z - Z||^2 loss (columns of Z). "
             "Default -1: use max(64, ceil(sqrt(n_pad))) as before. "
             "Smaller K (e.g. 64, 128) speeds AZ/MAZ and backward roughly linearly; noisier gradient. "
-            "With --evaluate_gradients, the fixed-frame Hutchinson variance probe uses K=64 when this is -1."
+            "With --evaluate-gradients, the fixed-frame Hutchinson variance probe uses K=64 when this is -1."
         ),
     )
     parser.add_argument(
@@ -133,7 +133,7 @@ def _build_parser():
         ),
     )
     parser.add_argument(
-        "--strip_build_mode",
+        "--strip-build-mode",
         type=str,
         choices=("einsum", "no_einsum"),
         default="einsum",
