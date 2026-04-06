@@ -42,6 +42,8 @@ public partial class FluidSimulator : MonoBehaviour
         radixPrefixSumKernelId      = radixSortShader.FindKernel("prefixSum");
         radixPrefixFixupKernelId    = radixSortShader.FindKernel("prefixFixup");
 
+        InitLeafOnlyInputKernels();
+
         applyPressureGradientKernel = nodesShader.FindKernel("ApplyPressureGradient");
         applyExternalForcesKernel   = nodesShader.FindKernel("ApplyExternalForces");
         calculateDensityGradientKernel = nodesShader.FindKernel("CalculateDensityGradient");
@@ -189,6 +191,8 @@ public partial class FluidSimulator : MonoBehaviour
         csrBuilderShader.SetBuffer(csrFillKernelId, "valuesBuffer", csrValues);
         csrBuilderShader.SetInt("numNodes", numNodes);
         csrBuilderShader.Dispatch(csrFillKernelId, csrGroups, 1, 1);
+
+        DispatchLeafOnlyGpuInputs(numNodes, maxNnz);
 
         // Init Pressure x=0 via GPU Scale(0) — no CPU allocation
         cgSolverShader.SetBuffer(scaleKernelId, "yBuffer", pressureBuffer);

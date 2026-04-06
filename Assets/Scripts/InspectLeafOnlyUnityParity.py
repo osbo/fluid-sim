@@ -2,22 +2,22 @@
 """
 Cross-check LeafOnly GPU inference / apply against Unity [LeafOnlyParity] logs.
 
-Unity: enable FluidSimulator.debugLeafOnlyPyTorchParity, run one pressure solve; copy console lines
+Unity: enable FluidSimulator.debugLeafOnlyParityLog, run one pressure solve; copy console lines
 starting with [LeafOnlyParity]. This script prints the same tensor names and summary stats (min, max,
 mean, sum_abs, l2) from PyTorch on a recorded frame (default: dataset index 0 = lexicographically
-first frame under --data_folder).
+first frame under --data_folder). Python lines use phase=pytorch; Unity uses phase=unity.
 
 Known Unity vs dataset differences (see --match_unity_shader):
-  • LiftEmbedding zeros diffusion features (x[:, 5:8]); FluidGraphDataset usually fills them from
-    diffusion_gradient.bin.
-  • FinalizeNodeStats uses scale_A = max_i(sum_j |A_ij|) (row sums). FluidGraphDataset uses
-    min(max_row_sum, max_col_sum). Use --match_unity_shader to align both.
+  • Zeroing normalized x[:, 5:8] in PyTorch vs filled diffusion from diffusion_gradient.bin.
+  • LeafOnlyInputs.compute uses scale_A = min(max row |A| sum, max col |A| sum) (same as FluidGraphDataset).
 
 Run (from Assets/Scripts):
   python3 InspectLeafOnlyUnityParity.py --frame 0
   python3 InspectLeafOnlyUnityParity.py --frame 0 --match_unity_shader --weights leaf_only_weights.bytes
+  python3 InspectLeafOnlyUnityParity.py --frame 0 --print_unity_inputs --inputs_parity_only
 
 Optional: compare apply step with r=all_ones (default) or random (--r random).
+  --print_unity_inputs emits the same tensor names as Unity FluidLeafOnlyInputs parity logs (x_leaf, ...).
 """
 
 from __future__ import annotations
@@ -131,6 +131,276 @@ def _unity_stats_and_global(
     return stats, global_feat
 
 
+def _read_raw_coo(frame_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    fp = Path(frame_path)
+    rows = np.fromfile(fp / "edge_index_rows.bin", dtype=np.uint32)
+    cols = np.fromfile(fp / "edge_index_cols.bin", dtype=np.uint32)
+    vals = np.fromfile(fp / "A_values.bin", dtype=np.float32)
+    return rows, cols, vals
+
+
+def _scale_a_and_csr_scaled(
+    rows: np.ndarray, cols: np.ndarray, vals: np.ndarray, num_nodes: int
+) -> tuple[float, np.ndarray]:
+    """Match LeafOnlyInputs.compute / FluidGraphDataset: min(max row abs-sum, max col abs-sum)."""
+    n = int(num_nodes)
+    row_sums = np.zeros(max(n, 1), dtype=np.float64)
+    col_sums = np.zeros(max(n, 1), dtype=np.float64)
+    for r, c, v in zip(rows, cols, vals):
+        ri, ci = int(r), int(c)
+        if 0 <= ri < n:
+            row_sums[ri] += abs(float(v))
+        if 0 <= ci < n:
+            col_sums[ci] += abs(float(v))
+    max_row = float(row_sums.max()) if n else 1.0
+    max_col = float(col_sums.max()) if n else 1.0
+    scale_a = float(min(max_row, max_col))
+    if not math.isfinite(scale_a) or scale_a <= 1e-30:
+        scale_a = 1.0
+    csr_scaled = (vals.astype(np.float64) / scale_a).astype(np.float32)
+    return scale_a, csr_scaled
+
+
+def _unity_leaf_moments_np(
+    num_nodes: int,
+    mass: np.ndarray,
+    diffusion_grad: np.ndarray,
+    diag: np.ndarray,
+    scale_a: float,
+) -> np.ndarray:
+    """Match LeafOnly_WriteScaleAndMoments in LeafOnlyInputs.compute (16 floats; tail unused on GPU)."""
+    n = int(num_nodes)
+    if n <= 0:
+        out = np.zeros(16, dtype=np.float32)
+        out[0] = 1.0
+        return out
+
+    inv_n = 1.0 / float(n)
+    m = mass[:n].astype(np.float64)
+    m_sym = np.sign(m) * np.log1p(np.abs(m))
+    sum_m = float(m_sym.sum())
+    sum_m2 = float((m_sym * m_sym).sum())
+    mass_mean = sum_m * inv_n
+    mass_var = max(0.0, sum_m2 * inv_n - mass_mean * mass_mean)
+    mass_std = math.sqrt(mass_var) + 1e-8
+
+    g = diffusion_grad[:n].astype(np.float64)
+    d_sym = np.sign(g) * np.log1p(np.abs(g))
+    sum_d = d_sym.sum(axis=0)
+    sum_d2 = (d_sym * d_sym).sum(axis=0)
+    d_mean = sum_d * inv_n
+    d_var = np.maximum(0.0, sum_d2 * inv_n - d_mean * d_mean)
+    d_std = np.sqrt(d_var) + 1e-8
+
+    diag_f = diag[:n].astype(np.float64)
+    s = scale_a if math.isfinite(scale_a) and scale_a > 1e-30 else 1.0
+    dn = diag_f / s
+    dg_mean = float(dn.mean())
+    dg_var = max(0.0, float((dn * dn).mean() - dg_mean * dg_mean))
+    dg_std = math.sqrt(dg_var) + 1e-8
+
+    moments = np.zeros(16, dtype=np.float32)
+    moments[0] = np.float32(mass_mean)
+    moments[1] = np.float32(mass_std)
+    moments[2] = np.float32(d_mean[0])
+    moments[3] = np.float32(d_std[0])
+    moments[4] = np.float32(d_mean[1])
+    moments[5] = np.float32(d_std[1])
+    moments[6] = np.float32(d_mean[2])
+    moments[7] = np.float32(d_std[2])
+    moments[8] = np.float32(dg_mean)
+    moments[9] = np.float32(dg_std)
+    moments[10] = np.float32(math.log2(max(1.0, float(n))))
+    moments[11] = 0.0
+    return moments
+
+
+def _global_features_from_moments(moments: np.ndarray) -> np.ndarray:
+    """Match LeafOnlyInputs.compute global_features layout after moments write."""
+    gf = np.zeros(12, dtype=np.float32)
+    gf[0] = moments[10]
+    gf[1] = 0.0
+    gf[2] = moments[0]
+    gf[3] = moments[1]
+    gf[4] = moments[8]
+    gf[5] = moments[9]
+    gf[6] = moments[2]
+    gf[7] = moments[3]
+    gf[8] = moments[4]
+    gf[9] = moments[5]
+    gf[10] = moments[6]
+    gf[11] = moments[7]
+    return gf
+
+
+def _build_x_leaf_features_np(
+    num_nodes: int,
+    n_pad: int,
+    n_take: int,
+    positions: np.ndarray,
+    layer: np.ndarray,
+    mass: np.ndarray,
+    diffusion_grad: np.ndarray,
+    diag: np.ndarray,
+    moments: np.ndarray,
+    scale_a: float,
+    zero_diffusion: bool,
+) -> np.ndarray:
+    """Row-major (n_pad * 9,) matching LeafOnly_BuildX9 (same normalization as dataset)."""
+    mm, ms = float(moments[0]), float(moments[1])
+    d0m, d0s = float(moments[2]), float(moments[3])
+    d1m, d1s = float(moments[4]), float(moments[5])
+    d2m, d2s = float(moments[6]), float(moments[7])
+    s = scale_a if math.isfinite(scale_a) and scale_a > 1e-30 else 1.0
+
+    x = np.zeros((n_pad, 9), dtype=np.float32)
+    for i in range(n_take):
+        pos = positions[i].astype(np.float64) / 1024.0
+        layer_n = float(layer[i]) / 4.0
+        m = float(mass[i])
+        m_sym = float(np.sign(m)) * math.log1p(abs(m))
+        m_n = (m_sym - mm) / ms
+
+        g = diffusion_grad[i].astype(np.float64)
+        d_sym = np.sign(g) * np.log1p(np.abs(g))
+        d_n = (d_sym - np.array([d0m, d1m, d2m], dtype=np.float64)) / np.array(
+            [d0s, d1s, d2s], dtype=np.float64
+        )
+
+        diag_n = float(diag[i]) / s
+        x[i, 0] = np.float32(pos[0])
+        x[i, 1] = np.float32(pos[1])
+        x[i, 2] = np.float32(pos[2])
+        x[i, 3] = np.float32(layer_n)
+        x[i, 4] = np.float32(m_n)
+        x[i, 5] = np.float32(d_n[0])
+        x[i, 6] = np.float32(d_n[1])
+        x[i, 7] = np.float32(d_n[2])
+        x[i, 8] = np.float32(diag_n)
+
+    if zero_diffusion:
+        x[:, 5:8] = 0.0
+    return x.reshape(-1)
+
+
+def _parity_summarize_phase(phase: str, name: str, data: np.ndarray) -> None:
+    x = np.asarray(data, dtype=np.float64).reshape(-1)
+    n = int(x.size)
+    if n == 0:
+        print(f"[LeafOnlyParity] phase={phase} tensor={name} n=0 (empty)")
+        return
+    xmin = float(x.min())
+    xmax = float(x.max())
+    mean = float(x.mean())
+    sum_abs = float(np.abs(x).sum())
+    l2 = float(np.sqrt((x * x).sum()))
+    print(
+        f"[LeafOnlyParity] phase={phase} tensor={name} n={n} min={xmin:.9g} max={xmax:.9g} "
+        f"mean={mean:.9g} sum_abs={sum_abs:.9g} l2={l2:.9g}"
+    )
+
+
+def _parity_head_phase(phase: str, name: str, data: np.ndarray, k: int = 16) -> None:
+    x = np.asarray(data, dtype=np.float64).reshape(-1)
+    n = int(x.size)
+    if n == 0:
+        print(f"[LeafOnlyParity] phase={phase} tensor={name}_head[0]=")
+        return
+    c = min(k, n)
+    parts = ",".join(f"{float(x[i]):.9g}" for i in range(c))
+    print(f"[LeafOnlyParity] phase={phase} tensor={name}_head[{c}]={parts}")
+
+
+def print_unity_style_input_parity_lines(
+    *,
+    phase: str,
+    num_nodes_real: int,
+    n_pad: int,
+    n_take: int,
+    align_label: str,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    vals_raw: np.ndarray,
+    frame_path: Path,
+    match_unity_shader: bool,
+) -> None:
+    """Emit the same [LeafOnlyParity] tensor lines as FluidLeafOnlyInputs.LogLeafOnlyParityToConsole."""
+    n_floor = (min(num_nodes_real, int(MAX_MIXED_SIZE)) // int(LEAF_SIZE)) * int(LEAF_SIZE)
+    print(
+        f"[LeafOnlyParity] phase={phase} num_nodes_real={num_nodes_real} align={align_label} n_pad={n_pad} "
+        f"n_take={n_take} num_leaves={n_pad // int(LEAF_SIZE)} problem_padded_floor={n_floor} "
+        f"MAX_MIXED_SIZE={MAX_MIXED_SIZE}"
+    )
+
+    scale_a, csr_scaled = _scale_a_and_csr_scaled(rows, cols, vals_raw, num_nodes_real)
+    nnz = int(vals_raw.shape[0])
+
+    raw_nodes = np.fromfile(Path(frame_path) / "nodes.bin", dtype=NODE_DTYPE)[:num_nodes_real]
+    positions = np.asarray(raw_nodes["position"], dtype=np.float32)
+    layer = np.asarray(raw_nodes["layer"], dtype=np.float32)
+    mass = np.asarray(raw_nodes["mass"], dtype=np.float32)
+    dg_path = Path(frame_path) / "diffusion_gradient.bin"
+    if dg_path.exists():
+        diffusion_full = np.fromfile(dg_path, dtype=np.float32).reshape(num_nodes_real, 3)
+    else:
+        diffusion_full = np.zeros((num_nodes_real, 3), dtype=np.float32)
+
+    diag = np.zeros(num_nodes_real, dtype=np.float32)
+    for r, c, v in zip(rows, cols, vals_raw):
+        if int(r) == int(c):
+            diag[int(r)] = np.float32(v)
+
+    diffusion_for_moments = (
+        np.zeros((num_nodes_real, 3), dtype=np.float32) if match_unity_shader else diffusion_full
+    )
+    moments = _unity_leaf_moments_np(num_nodes_real, mass, diffusion_for_moments, diag, scale_a)
+    gf = _global_features_from_moments(moments)
+
+    x_flat = _build_x_leaf_features_np(
+        num_nodes_real,
+        n_pad,
+        n_take,
+        positions,
+        layer,
+        mass,
+        diffusion_full,
+        diag,
+        moments,
+        scale_a,
+        zero_diffusion=match_unity_shader,
+    )
+
+    _parity_summarize_phase(phase, "x_leaf", x_flat)
+    _parity_head_phase(phase, "x_leaf", x_flat, 16)
+    _parity_summarize_phase(phase, "global_features", gf)
+    _parity_head_phase(phase, "global_features", gf, 12)
+    _parity_summarize_phase(phase, "scale_A", np.array([scale_a], dtype=np.float32))
+    _parity_summarize_phase(phase, "leaf_moments", moments)
+    _parity_head_phase(phase, "leaf_moments", moments, 16)
+
+    if nnz > 0:
+        _parity_summarize_phase(phase, "csr_values_scaled", csr_scaled)
+        _parity_head_phase(phase, "csr_values_scaled", csr_scaled, 16)
+    else:
+        print(f"[LeafOnlyParity] phase={phase} tensor=csr_values_scaled n=0 (empty)")
+
+    print(f"[LeafOnlyParity] phase={phase} tensor=meta nnz={nnz} (CSR nonzeros after build)")
+
+    n_edge_active = min(num_nodes_real, n_pad)
+    em = (rows < n_edge_active) & (cols < n_edge_active)
+    r2 = rows[em]
+    c2 = cols[em]
+    v2 = csr_scaled[em]
+    compact_nnz = int(r2.shape[0])
+    print(f"[LeafOnlyParity] phase={phase} tensor=gcn_meta compact_nnz={compact_nnz} n_edge_active={n_edge_active}")
+    if compact_nnz > 0:
+        head_e = min(16, compact_nnz)
+        parts = ";".join(
+            f"({int(r2[i])},{int(c2[i])},{float(v2[i]):.9g})" for i in range(head_e)
+        )
+        print(f"[LeafOnlyParity] phase={phase} tensor=gcn_edges_head[{head_e}]={parts}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Print LeafOnly PyTorch parity stats for Unity comparison.")
     p.add_argument(
@@ -149,7 +419,7 @@ def main() -> None:
     p.add_argument(
         "--match_unity_shader",
         action="store_true",
-        help="Zero diffusion in x and rebuild global_features like Unity FinalizeNodeStats (recommended).",
+        help="Zero x[:,5:8] and compute moments with zero diffusion (compare to Unity with cleared gradients).",
     )
     p.add_argument(
         "--align",
@@ -167,7 +437,19 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0, help="RNG seed when --r random.")
     p.add_argument("--no_apply", action="store_true", help="Skip M@r apply summaries.")
     p.add_argument("--compile", action="store_true", help="torch.compile the model (may hide bugs).")
+    p.add_argument(
+        "--print_unity_inputs",
+        action="store_true",
+        help="Print [LeafOnlyParity] lines matching Unity (x_leaf, global_features, scale_A, csr, gcn, …).",
+    )
+    p.add_argument(
+        "--inputs_parity_only",
+        action="store_true",
+        help="Load only the dataset frame and print --print_unity_inputs (no checkpoint or model).",
+    )
     args = p.parse_args()
+    if args.inputs_parity_only:
+        args.print_unity_inputs = True
 
     data_folder = args.data_folder
     if data_folder is None:
@@ -176,6 +458,44 @@ def main() -> None:
     weights_path = Path(args.weights) if args.weights else _script_dir / "leaf_only_weights.bytes"
     weights_path = weights_path.resolve()
 
+    dataset = FluidGraphDataset([data_folder])
+    if len(dataset) == 0:
+        raise SystemExit(f"No frames under {data_folder}")
+    fi = max(0, min(int(args.frame), len(dataset) - 1))
+    batch = dataset[fi]
+    frame_path = batch.get("frame_path", "")
+    num_nodes_real = int(batch["num_nodes"])
+    if args.align == "floor":
+        n_pad = int(problem_padded_num_nodes(num_nodes_real))
+    else:
+        n_pad = _leaf_align_n(num_nodes_real, "ceil")
+    n_pad = min(n_pad, int(MAX_MIXED_SIZE))
+    n_inspect_floor = int(problem_padded_num_nodes(num_nodes_real))
+    n_take = min(num_nodes_real, n_pad)
+
+    print(f"[LeafOnlyParity] phase=pytorch frame_index={fi} frame_path={frame_path}")
+
+    if args.print_unity_inputs:
+        rows_u, cols_u, vals_u = _read_raw_coo(Path(frame_path))
+        print_unity_style_input_parity_lines(
+            phase="pytorch",
+            num_nodes_real=num_nodes_real,
+            n_pad=n_pad,
+            n_take=n_take,
+            align_label=args.align,
+            rows=rows_u,
+            cols=cols_u,
+            vals_raw=vals_u,
+            frame_path=Path(frame_path),
+            match_unity_shader=args.match_unity_shader,
+        )
+
+    if args.inputs_parity_only:
+        return
+
+    if not weights_path.is_file():
+        raise SystemExit(f"Weights not found: {weights_path}")
+
     if torch.cuda.is_available():
         device = torch.device("cuda")
         torch.set_float32_matmul_precision("high")
@@ -183,9 +503,6 @@ def main() -> None:
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-
-    if not weights_path.is_file():
-        raise SystemExit(f"Weights not found: {weights_path}")
 
     ckpt = leaf_only_arch_from_checkpoint(weights_path)
     if ckpt is None:
@@ -201,26 +518,12 @@ def main() -> None:
         raise SystemExit(_leaf_only_script.CHECKPOINT_ERR_NO_HIGHWAY_IN_FILE_NEED_CLI_OFF)
     ck_ffn = int(ckpt.get("ffn_concat_width", 3 if ck_hw else 1))
 
-    dataset = FluidGraphDataset([data_folder])
-    if len(dataset) == 0:
-        raise SystemExit(f"No frames under {data_folder}")
-    fi = max(0, min(int(args.frame), len(dataset) - 1))
-    batch = dataset[fi]
-    frame_path = batch.get("frame_path", "")
-    print(f"[LeafOnlyParity] phase=pytorch frame_index={fi} frame_path={frame_path}")
     print(f"[LeafOnlyParity] phase=pytorch device={device} match_unity_shader={args.match_unity_shader}")
-
-    num_nodes_real = int(batch["num_nodes"])
-    if args.align == "floor":
-        n_pad = int(problem_padded_num_nodes(num_nodes_real))
-    else:
-        n_pad = _leaf_align_n(num_nodes_real, "ceil")
-    n_pad = min(n_pad, int(MAX_MIXED_SIZE))
-    n_inspect_floor = int(problem_padded_num_nodes(num_nodes_real))
-    print(
-        f"[LeafOnlyParity] phase=pytorch num_nodes_real={num_nodes_real} align={args.align} n_pad={n_pad} "
-        f"num_leaves={n_pad // int(LEAF_SIZE)} problem_padded_floor={n_inspect_floor} MAX_MIXED_SIZE={MAX_MIXED_SIZE}"
-    )
+    if not args.print_unity_inputs:
+        print(
+            f"[LeafOnlyParity] phase=pytorch num_nodes_real={num_nodes_real} align={args.align} n_pad={n_pad} "
+            f"num_leaves={n_pad // int(LEAF_SIZE)} problem_padded_floor={n_inspect_floor} MAX_MIXED_SIZE={MAX_MIXED_SIZE}"
+        )
 
     x = batch["x"].unsqueeze(0).to(device).clone()
     ei, ev = batch["edge_index"], batch["edge_values"]
@@ -252,7 +555,6 @@ def main() -> None:
         if global_features.dim() == 1:
             global_features = global_features.unsqueeze(0)  # (1, 12)
 
-    n_take = min(num_nodes_real, n_pad)
     x_leaf = x[:, :n_take, :].clone()
     if n_pad > n_take:
         x_leaf = F.pad(x_leaf, (0, 0, 0, n_pad - n_take), value=0.0)

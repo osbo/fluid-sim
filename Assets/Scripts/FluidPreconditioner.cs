@@ -18,8 +18,8 @@ public partial class FluidSimulator : MonoBehaviour
             if (!warnedNeuralFallback)
             {
                 warnedNeuralFallback = true;
-                Debug.LogWarning(
-                    "PreconditionerType.Neural: old sparse-G preconditioner was removed. Using Jacobi until LeafOnly (matrix-free) is integrated.");
+                Debug.Log(
+                    "PreconditionerType.Neural: sparse-G path removed; using Jacobi until LeafOnly matrix-free apply is wired. Set preconditioner to Jacobi to silence.");
             }
         }
 

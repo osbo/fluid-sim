@@ -8,7 +8,7 @@ using System.IO;
 // Main FluidSimulator class - split into partial classes for better organization
 // Core simulation logic: particle management, main loop, initialization
 // See: FluidEnums.cs, FluidRendering.cs, FluidPreconditioner.cs,
-//      FluidOctree.cs, FluidSolver.cs, RadixSort.cs
+//      FluidOctree.cs, FluidSolver.cs, FluidLeafOnlyInputs.cs, RadixSort.cs
 public partial class FluidSimulator : MonoBehaviour
 {
     public BoxCollider simulationBounds;
@@ -743,6 +743,7 @@ public partial class FluidSimulator : MonoBehaviour
         dirtyFlagBuffer?.Release();
         mortonCodesBuffer?.Release();
         ReleasePreconditionerBuffers();
+        ReleaseLeafOnlyBuffers();
 
         // Clean up render textures
         if (fluidDepthTexture != null) fluidDepthTexture.Release();
