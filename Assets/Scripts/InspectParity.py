@@ -11,6 +11,17 @@ lexicographically first frame under --data_folder). Python lines use phase=pytor
 Embedding parity: compare tensor ``token_after_enc`` (Unity runs embed + enc_input_proj on GPU after the
 input tensors). PyTorch reference is ``model.embed`` then ``model.enc_input_proj`` (see end of main()).
 
+Dense diagonal attention RPE: ``diag_edge_feats`` (K×L×L×4), same as ``build_diag_dense_edge_feats_from_positions``
+(no attn_mask; channels 0–2 = position deltas, 3 = mean in-leaf matrix entry per cell). Unity builds this on GPU
+(``LeafOnlyDiagEdgeFeats.compute``) from ``leafXPacked`` + CSR ``A``.
+
+Static H off-block partition: ``hmatrix_meta`` + ``hmatrix_off_r0_c0_s_flat`` (length ``3 * M_off``), matching
+``leafonly/hmatrix.py`` / ``LeafOnlyHMatrixStatic.cs`` (``MAX_NUM_LEAVES``, ``HMATRIX_ETA``); no per-frame data.
+
+Dense off-diagonal H-tile RPE: ``off_edge_feats`` (``M_off×L×L×4``), ``build_hmatrix_off_dense_rpe_from_positions``;
+Unity ``LeafOnlyOffEdgeFeats.compute``. Logs: ``off_edge_feats_meta``, full stats, ``_head[32]``, ``_at{mid}_head[48]``,
+``_at{n-32}_head[32]``.
+
 Known Unity vs dataset differences (see --match_unity_shader):
   • Zeroing normalized x[:, 5:8] in PyTorch vs filled diffusion from diffusion_gradient.bin.
   • LeafOnlyInputs.compute uses scale_A = min(max row |A| sum, max col |A| sum) (same as FluidGraphDataset).
@@ -50,7 +61,13 @@ from leafonly.architecture import (  # noqa: E402
     unpack_precond,
 )
 from leafonly.checkpoint import leaf_only_arch_from_checkpoint, load_leaf_only_weights  # noqa: E402
-from leafonly.config import LEAF_SIZE, MAX_MIXED_SIZE, problem_padded_num_nodes  # noqa: E402
+from leafonly.config import (  # noqa: E402
+    HMATRIX_ETA,
+    LEAF_SIZE,
+    MAX_MIXED_SIZE,
+    MAX_NUM_LEAVES,
+    problem_padded_num_nodes,
+)
 
 
 def _leaf_align_n(num_nodes_real: int, mode: str) -> int:
@@ -62,7 +79,7 @@ def _leaf_align_n(num_nodes_real: int, mode: str) -> int:
     if mode == "floor":
         return (n // L) * L
     raise ValueError(mode)
-from leafonly.data import NODE_DTYPE, FluidGraphDataset  # noqa: E402
+from leafonly.data import NODE_DTYPE, FluidGraphDataset, build_leaf_block_connectivity  # noqa: E402
 
 
 def _summarize(name: str, t: torch.Tensor) -> None:
@@ -317,6 +334,98 @@ def _parity_head_phase(phase: str, name: str, data: np.ndarray, k: int = 16) -> 
     print(f"[LeafOnlyParity] phase={phase} tensor={name}_head[{c}]={parts}")
 
 
+def _parity_head_phase_at(phase: str, name: str, data: np.ndarray, start: int, k: int) -> None:
+    x = np.asarray(data, dtype=np.float64).reshape(-1)
+    n = int(x.size)
+    if n == 0 or start < 0 or start >= n:
+        print(f"[LeafOnlyParity] phase={phase} tensor={name}_at{start}_head[0]=")
+        return
+    c = min(int(k), n - start)
+    parts = ",".join(f"{float(x[start + i]):.9g}" for i in range(c))
+    print(f"[LeafOnlyParity] phase={phase} tensor={name}_at{start}_head[{c}]={parts}")
+
+
+def _print_off_edge_feats_parity_lines(phase: str, flat: np.ndarray) -> None:
+    from leafonly.hmatrix import HM_R0_CPU
+
+    x = np.asarray(flat, dtype=np.float64).reshape(-1)
+    n = int(x.size)
+    m = int(HM_R0_CPU.shape[0])
+    print(
+        f"[LeafOnlyParity] phase={phase} tensor=off_edge_feats_meta M_off={m} "
+        f"L={int(LEAF_SIZE)} n={n}"
+    )
+    _parity_summarize_phase(phase, "off_edge_feats", x)
+    _parity_head_phase(phase, "off_edge_feats", x, 32)
+    mid = (n // 2 // 4) * 4
+    _parity_head_phase_at(phase, "off_edge_feats", x, mid, 48)
+    _parity_head_phase_at(phase, "off_edge_feats", x, max(0, n - 32), 32)
+
+
+def print_off_edge_feats_parity_from_x_flat(
+    *,
+    phase: str,
+    x_flat: np.ndarray,
+    n_pad: int,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    csr_scaled: np.ndarray,
+    num_nodes_real: int,
+) -> None:
+    """CPU reference matching Unity off shader (positions = x[:, :3], CSR ÷ scale_A)."""
+    import torch
+
+    from leafonly.data import build_hmatrix_off_dense_rpe_from_positions
+    from leafonly.hmatrix import HM_C0_CPU, HM_R0_CPU, HM_S_CPU
+
+    k_leaves = n_pad // int(LEAF_SIZE)
+    n_edge_active = min(int(num_nodes_real), int(n_pad))
+    em = (rows < n_edge_active) & (cols < n_edge_active)
+    r_e = rows[em]
+    c_e = cols[em]
+    v_e = csr_scaled[em]
+    if r_e.size == 0:
+        ei = torch.zeros((2, 0), dtype=torch.long)
+        ev = torch.zeros(0, dtype=torch.float32)
+    else:
+        ei = torch.from_numpy(np.stack([r_e.astype(np.int64), c_e.astype(np.int64)], axis=0)).long()
+        ev = torch.from_numpy(v_e.astype(np.float32)).float()
+    x2 = np.asarray(x_flat, dtype=np.float32).reshape(n_pad, 9)
+    pos = torch.from_numpy(np.ascontiguousarray(x2[:, :3])).float()
+    ef = build_hmatrix_off_dense_rpe_from_positions(
+        pos,
+        HM_R0_CPU,
+        HM_C0_CPU,
+        HM_S_CPU,
+        int(k_leaves),
+        int(LEAF_SIZE),
+        torch.float32,
+        edge_index=ei,
+        edge_values=ev,
+        with_block_key_column=False,
+    )
+    flat = ef.reshape(-1).detach().float().cpu().numpy().astype(np.float64)
+    _print_off_edge_feats_parity_lines(phase, flat)
+
+
+def print_hmatrix_static_parity_lines(phase: str) -> None:
+    """Same static off-tile triples as ``leafonly.hmatrix`` / Unity ``LeafOnlyHMatrixStatic``."""
+    from leafonly.hmatrix import HM_C0_CPU, HM_R0_CPU, HM_S_CPU
+
+    m = int(HM_R0_CPU.shape[0])
+    r0 = HM_R0_CPU.numpy().astype(np.int64)
+    c0 = HM_C0_CPU.numpy().astype(np.int64)
+    s = HM_S_CPU.numpy().astype(np.int64)
+    flat = np.stack([r0, c0, s], axis=1).reshape(-1).astype(np.float64)
+    eta_s = f"{float(HMATRIX_ETA):.9g}"
+    print(
+        f"[LeafOnlyParity] phase={phase} tensor=hmatrix_meta M_off={m} "
+        f"MAX_NUM_LEAVES={MAX_NUM_LEAVES} ETA={eta_s}"
+    )
+    _parity_summarize_phase(phase, "hmatrix_off_r0_c0_s_flat", flat)
+    _parity_head_phase(phase, "hmatrix_off_r0_c0_s_flat", flat, 48)
+
+
 def print_unity_style_input_parity_lines(
     *,
     phase: str,
@@ -392,6 +501,16 @@ def print_unity_style_input_parity_lines(
 
     print(f"[LeafOnlyParity] phase={phase} tensor=meta nnz={nnz} (CSR nonzeros after build)")
 
+    print_off_edge_feats_parity_from_x_flat(
+        phase=phase,
+        x_flat=x_flat,
+        n_pad=n_pad,
+        rows=rows,
+        cols=cols,
+        csr_scaled=csr_scaled,
+        num_nodes_real=num_nodes_real,
+    )
+
     n_edge_active = min(num_nodes_real, n_pad)
     em = (rows < n_edge_active) & (cols < n_edge_active)
     r2 = rows[em]
@@ -405,6 +524,8 @@ def print_unity_style_input_parity_lines(
             f"({int(r2[i])},{int(c2[i])},{float(v2[i]):.9g})" for i in range(head_e)
         )
         print(f"[LeafOnlyParity] phase={phase} tensor=gcn_edges_head[{head_e}]={parts}")
+
+    print_hmatrix_static_parity_lines(phase)
 
 
 def main() -> None:
@@ -479,6 +600,9 @@ def main() -> None:
     n_take = min(num_nodes_real, n_pad)
 
     print(f"[LeafOnlyParity] phase=pytorch frame_index={fi} frame_path={frame_path}")
+
+    if not args.print_unity_inputs:
+        print_hmatrix_static_parity_lines("pytorch")
 
     if args.print_unity_inputs:
         rows_u, cols_u, vals_u = _read_raw_coo(Path(frame_path))
@@ -563,6 +687,24 @@ def main() -> None:
     x_leaf = x[:, :n_take, :].clone()
     if n_pad > n_take:
         x_leaf = F.pad(x_leaf, (0, 0, 0, n_pad - n_take), value=0.0)
+
+    _, ef_diag, _, ef_off = build_leaf_block_connectivity(
+        edge_index_leaf,
+        edge_values_leaf,
+        x_leaf[0, :, :3],
+        int(LEAF_SIZE),
+        device,
+        x_leaf.dtype,
+        off_diag_dense_attention=True,
+        diag_dense_attention=True,
+    )
+    _summarize("diag_edge_feats", ef_diag.reshape(-1))
+    _head("diag_edge_feats", ef_diag.reshape(-1), 32)
+
+    # ``--print_unity_inputs`` already printed off_edge_feats from CPU x_flat; skip duplicate block.
+    if not args.print_unity_inputs:
+        off_flat = ef_off.reshape(-1).detach().float().cpu().numpy().astype(np.float64)
+        _print_off_edge_feats_parity_lines("pytorch", off_flat)
 
     model = LeafOnlyNet(
         input_dim=int(ckpt["input_dim"]),

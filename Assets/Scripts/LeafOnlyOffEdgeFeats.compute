@@ -1,0 +1,158 @@
+// Off-diagonal dense H-tile edge features (M, L, L, 4) — leafonly/data.py
+// build_hmatrix_off_dense_rpe_from_positions(..., with_block_key_column=False).
+
+#pragma kernel LeafOnly_OffEdgeFeatGeom
+#pragma kernel LeafOnly_OffEdgeFeatClearScratch
+#pragma kernel LeafOnly_OffEdgeFeatAccumA_Serial
+#pragma kernel LeafOnly_OffEdgeFeatWriteCh3
+
+StructuredBuffer<float> leafXPacked;
+RWStructuredBuffer<float> leafOffEdgeFeatsOut;
+
+RWStructuredBuffer<float> leafOffA_Sum;
+RWStructuredBuffer<uint> leafOffA_Count;
+
+StructuredBuffer<uint> leafOffHMR0;
+StructuredBuffer<uint> leafOffHMC0;
+StructuredBuffer<uint> leafOffHMS;
+
+StructuredBuffer<uint> leafOffCsrRows;
+StructuredBuffer<uint> leafOffCsrCols;
+StructuredBuffer<float> leafOffCsrVals;
+
+int leafNPadded;
+int leafLeafSize;
+int leafNumLeaves;
+int leafNumOffTiles;
+int leafCsrNnz;
+
+[numthreads(256, 1, 1)]
+void LeafOnly_OffEdgeFeatGeom(uint3 id : SV_DispatchThreadID)
+{
+    uint M = (uint)leafNumOffTiles;
+    uint L = (uint)leafLeafSize;
+    uint K = (uint)leafNumLeaves;
+    uint total = M * L * L;
+    uint t = id.x;
+    if (t >= total)
+        return;
+
+    uint m = t / (L * L);
+    uint rem = t - m * L * L;
+    uint i = rem / L;
+    uint j = rem - i * L;
+
+    uint rr0 = leafOffHMR0[m];
+    uint cc0 = leafOffHMC0[m];
+    uint sv = leafOffHMS[m];
+
+    float3 pr = 0.0;
+    uint cntR = 0u;
+    for (uint rr = rr0; rr < rr0 + sv; rr++)
+    {
+        if (rr < K)
+        {
+            uint o = (rr * L + i) * 9u;
+            pr += float3(leafXPacked[o + 0u], leafXPacked[o + 1u], leafXPacked[o + 2u]);
+            cntR++;
+        }
+    }
+
+    float3 pc = 0.0;
+    uint cntC = 0u;
+    for (uint cc = cc0; cc < cc0 + sv; cc++)
+    {
+        if (cc < K)
+        {
+            uint o = (cc * L + j) * 9u;
+            pc += float3(leafXPacked[o + 0u], leafXPacked[o + 1u], leafXPacked[o + 2u]);
+            cntC++;
+        }
+    }
+
+    uint base = t * 4u;
+    if (cntR == 0u || cntC == 0u)
+    {
+        leafOffEdgeFeatsOut[base + 0u] = 0.0;
+        leafOffEdgeFeatsOut[base + 1u] = 0.0;
+        leafOffEdgeFeatsOut[base + 2u] = 0.0;
+        leafOffEdgeFeatsOut[base + 3u] = 0.0;
+        return;
+    }
+
+    pr /= (float)cntR;
+    pc /= (float)cntC;
+    float3 d = pc - pr;
+    leafOffEdgeFeatsOut[base + 0u] = d.x;
+    leafOffEdgeFeatsOut[base + 1u] = d.y;
+    leafOffEdgeFeatsOut[base + 2u] = d.z;
+    leafOffEdgeFeatsOut[base + 3u] = 0.0;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_OffEdgeFeatClearScratch(uint3 id : SV_DispatchThreadID)
+{
+    uint M = (uint)leafNumOffTiles;
+    uint L = (uint)leafLeafSize;
+    uint n = M * L * L;
+    uint i = id.x;
+    if (i < n)
+    {
+        leafOffA_Sum[i] = 0.0;
+        leafOffA_Count[i] = 0u;
+    }
+}
+
+[numthreads(1, 1, 1)]
+void LeafOnly_OffEdgeFeatAccumA_Serial(uint3 id : SV_DispatchThreadID)
+{
+    uint L = (uint)leafLeafSize;
+    uint K = (uint)leafNumLeaves;
+    uint M = (uint)leafNumOffTiles;
+    uint N = (uint)leafNPadded;
+    int nnz = leafCsrNnz;
+
+    for (int e = 0; e < nnz; e++)
+    {
+        uint r = leafOffCsrRows[e];
+        uint c = leafOffCsrCols[e];
+        if (r >= N || c >= N)
+            continue;
+        uint br = r / L;
+        uint bc = c / L;
+        uint rl = r - br * L;
+        uint cl = c - bc * L;
+        float v = leafOffCsrVals[e];
+
+        for (uint m = 0u; m < M; m++)
+        {
+            uint rr0 = leafOffHMR0[m];
+            uint cc0 = leafOffHMC0[m];
+            uint sv = leafOffHMS[m];
+            bool stripR = (br >= rr0) && (br < rr0 + sv);
+            bool stripC = (bc >= cc0) && (bc < cc0 + sv);
+            if (!stripR || !stripC)
+                continue;
+            uint idx = m * L * L + rl * L + cl;
+            leafOffA_Sum[idx] += v;
+            leafOffA_Count[idx] += 1u;
+        }
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_OffEdgeFeatWriteCh3(uint3 id : SV_DispatchThreadID)
+{
+    uint M = (uint)leafNumOffTiles;
+    uint L = (uint)leafLeafSize;
+    uint cells = M * L * L;
+    uint t = id.x;
+    if (t >= cells)
+        return;
+
+    uint cnt = leafOffA_Count[t];
+    float ch3 = 0.0;
+    if (cnt > 0u)
+        ch3 = leafOffA_Sum[t] / (float)cnt;
+    leafOffEdgeFeatsOut[t * 4u + 3u] = ch3;
+}
