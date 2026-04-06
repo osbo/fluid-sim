@@ -1,11 +1,9 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
 using System;
-using System.Linq;
 using System.Runtime.InteropServices;
 using UnityEngine.Rendering;
 using System.IO;
-using System.Collections.Generic;
 
 // Main FluidSimulator class - split into partial classes for better organization
 // Core simulation logic: particle management, main loop, initialization
@@ -22,7 +20,6 @@ public partial class FluidSimulator : MonoBehaviour
     public ComputeShader nodesShader;
     public ComputeShader cgSolverShader;
     public ComputeShader csrBuilderShader; // NEW: CSR construction shader
-    public ComputeShader preconditionerShader; // Assign Preconditioner.compute in Inspector
     public int numParticles = 1048576;
     
     // CG Solver parameters
@@ -65,9 +62,6 @@ public partial class FluidSimulator : MonoBehaviour
     private int buildMatrixAKernelId;
     private int applyMatrixAndDotKernelId;
     private int spmvCsrKernelId;
-    private int precomputeIndicesKernelId;
-    private int applySparseGTKernelId;
-    private int applySparseGAndDotKernelId;
     private int applyJacobiKernelId;
     private int globalReduceSumKernelId;
     private int copyFloatKernelId;
@@ -116,19 +110,10 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer phiBuffer;
     private ComputeBuffer phiBuffer_Read;
     private ComputeBuffer dirtyFlagBuffer;
-    private ComputeBuffer tokenBuffer; // For neural preconditioner token assembly
-    private ComputeBuffer tokenBufferOut; // Output buffer for transformer layers
-    private ComputeBuffer matrixGBuffer; // Output buffer for preconditioner matrix G
-    private ComputeBuffer zBuffer; // Intermediate buffer for PCG preconditioner application (used as 'u' in shader)
     private ComputeBuffer zVectorBuffer; // Preconditioned residual vector 'z' for PCG
     private ComputeBuffer cgAlphaBuffer;
     private ComputeBuffer cgBetaBuffer;
     private ComputeBuffer cgRhoBuffer;
-    private ComputeBuffer scatterIndicesBuffer; // NEW: Pre-computed scatter indices for optimization
-    private ComputeBuffer bufferQ; // Q buffer for attention
-    private ComputeBuffer bufferK; // K buffer for attention
-    private ComputeBuffer bufferV; // V buffer for attention
-    private ComputeBuffer bufferAttn; // Attention output buffer
     private ComputeBuffer diffusionGradientBuffer; // Precomputed normalized density gradient per node
     private ComputeBuffer dispatchArgsBuffer;       // 3-uint indirect dispatch args for DispatchIndirect
     // CSR matrix representation of A
@@ -137,20 +122,10 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer csrColIndices;
     private ComputeBuffer csrRowIndices; // Explicit row indices (edge_index[0])
     private ComputeBuffer csrValues;
-    public TextAsset modelWeightsAsset; // Assign model_weights.bytes from Assets/Scripts/ in Inspector
-    private Dictionary<string, ComputeBuffer> weightBuffers = new Dictionary<string, ComputeBuffer>();
-    private float p_mean;
-    private float p_std;
-    private int d_model, num_heads, num_layers, input_dim;
     
     // Helper array to avoid allocating every frame for GPU reduction
     private float[] reductionResult = new float[1];
     
-    // Model architecture constants
-    private const int WINDOW_SIZE = 256;  // Window size for attention (down from 512)
-    private const int NUM_HEADS = 4;     // Number of attention heads
-    
-    // add previous active node count, but that can be a cpu variable 
     
     // Number of nodes, active nodes, and unique active nodes
     private int numNodes;
@@ -166,7 +141,7 @@ public partial class FluidSimulator : MonoBehaviour
     public float frameRate = 30.0f;
     [Range(0, 10)] public int minLayer = 4;
     [Range(0, 10)] public int maxLayer = 10;
-    public PreconditionerType preconditioner = PreconditionerType.Neural;
+    public PreconditionerType preconditioner = PreconditionerType.Jacobi;
 
     private bool hasShownWaitMessage = false;
     private int frameNumber = 0;
@@ -342,9 +317,6 @@ public partial class FluidSimulator : MonoBehaviour
         InitSolverKernels();
         InitOctreeKernels();
 
-        // Load neural preconditioner model metadata
-        LoadModelMetadata();
-        
         // Create quad mesh and args buffers for node and particle rendering
         CreateQuadMesh();
         CreateArgsBuffer();
@@ -771,9 +743,7 @@ public partial class FluidSimulator : MonoBehaviour
         dirtyFlagBuffer?.Release();
         mortonCodesBuffer?.Release();
         ReleasePreconditionerBuffers();
-        foreach(var b in weightBuffers.Values) b?.Release();
-        weightBuffers.Clear();
-        
+
         // Clean up render textures
         if (fluidDepthTexture != null) fluidDepthTexture.Release();
         if (fluidNormalTexture != null) fluidNormalTexture.Release();
