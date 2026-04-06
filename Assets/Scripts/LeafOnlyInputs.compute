@@ -1,0 +1,324 @@
+// GPU build of LeafOnly model inputs from live pressure-graph buffers (matches leafonly/data.py layout).
+// Row/col |A| sums and scaled CSR are parallel; moments use one group (O(n) in shader; n capped by MAX_MIXED).
+
+#pragma kernel LeafOnly_ClearAbsSums
+#pragma kernel LeafOnly_RowAbsSumCSR
+#pragma kernel LeafOnly_ColAbsFixedFromCSR
+#pragma kernel LeafOnly_WriteScaleAndMoments
+#pragma kernel LeafOnly_ScaleCsrValues
+#pragma kernel LeafOnly_BuildX9
+#pragma kernel LeafOnly_CopyTotalNnz
+#pragma kernel LeafOnly_EdgeActiveMask
+#pragma kernel LeafOnly_CompactGcnEdges
+#pragma kernel LeafOnly_WriteCompactEdgeCount
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+struct faceVelocities { float left, right, bottom, top, front, back; };
+
+struct Node {
+    float3 position;
+    float3 velocity;
+    faceVelocities velocities;
+    float mass;
+    uint layer;
+    uint mortonCode;
+    uint active;
+};
+
+static const uint LEAF_ONLY_LEAF_SIZE = 128u;
+static const uint LEAF_ONLY_MAX_MIXED = 8192u;
+static const uint COL_ABS_SCALE = 1048576u; // 2^20 fixed-point for InterlockedAdd
+
+StructuredBuffer<Node> leafNodesBuffer;
+StructuredBuffer<float> leafMatrixABuffer;
+StructuredBuffer<float3> leafDiffusionGradientBuffer;
+
+StructuredBuffer<uint> leafCsrRowPtr;
+StructuredBuffer<uint> leafCsrColIndices;
+StructuredBuffer<uint> leafCsrEdgeRow; // row index per CSR nonzero (edge_index[0])
+StructuredBuffer<float> leafCsrValues;
+
+RWStructuredBuffer<float> leafRowAbsSum;
+RWStructuredBuffer<uint> leafColAbsFixed;
+
+RWStructuredBuffer<float> leafScaleA;           // [1]
+RWStructuredBuffer<uint> leafTotalNnz;          // [1] total CSR nnz (rowPtr[N])
+RWStructuredBuffer<float> leafMoments;          // packed stats for BuildX (see C#)
+RWStructuredBuffer<float> leafGlobalFeatures;   // [12]
+RWStructuredBuffer<float> leafXPacked;          // [nPad * 9] row-major per node
+RWStructuredBuffer<float> leafCsrValuesScaled;
+
+RWStructuredBuffer<uint> leafEdgeValid;       // 0/1 per original CSR index (prefix input)
+RWStructuredBuffer<uint> leafEdgeScanExclusive; // exclusive prefix of leafEdgeValid (len = maxNnz)
+RWStructuredBuffer<uint> leafGcnEdgeRows;
+RWStructuredBuffer<uint> leafGcnEdgeCols;
+RWStructuredBuffer<float> leafGcnEdgeVals;
+RWStructuredBuffer<uint> leafCompactEdgeCount; // [1] number of active edges after mask
+
+uint leafNumNodes;
+uint leafNPadded;
+uint leafNTake;
+uint leafNEdgeActive; // min(num_nodes, n_pad), matches Python n_edge_active
+uint leafMaxNnzBound;
+uint leafBufferCapacity;
+
+// -----------------------------------------------------------------------------
+
+[numthreads(256, 1, 1)]
+void LeafOnly_ClearAbsSums(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= leafBufferCapacity) return;
+    leafRowAbsSum[i] = 0.0;
+    leafColAbsFixed[i] = 0u;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_RowAbsSumCSR(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= leafNumNodes) return;
+    uint start = leafCsrRowPtr[i];
+    uint end = leafCsrRowPtr[i + 1u];
+    float s = 0.0;
+    for (uint j = start; j < end; j++)
+        s += abs(leafCsrValues[j]);
+    leafRowAbsSum[i] = s;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_ColAbsFixedFromCSR(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= leafNumNodes) return;
+    uint start = leafCsrRowPtr[i];
+    uint end = leafCsrRowPtr[i + 1u];
+    for (uint j = start; j < end; j++)
+    {
+        uint c = leafCsrColIndices[j];
+        float av = abs(leafCsrValues[j]);
+        uint add = (uint)(av * (float)COL_ABS_SCALE + 0.5f);
+        InterlockedAdd(leafColAbsFixed[c], add);
+    }
+}
+
+// leafMoments layout (float indices):
+// 0 massMean, 1 massStd,
+// 2 d0m,3 d0s, 4 d1m,5 d1s, 6 d2m,7 d2s,
+// 8 diagMean, 9 diagStd
+// 10 log2n (as float), 11 reserved
+
+[numthreads(1, 1, 1)]
+void LeafOnly_WriteScaleAndMoments(uint3 id : SV_DispatchThreadID)
+{
+    uint N = leafNumNodes;
+    if (N == 0u)
+    {
+        leafScaleA[0] = 1.0;
+        return;
+    }
+
+    float maxRow = 0.0;
+    for (uint i = 0u; i < N; i++)
+        maxRow = max(maxRow, leafRowAbsSum[i]);
+
+    float maxCol = 0.0;
+    for (uint j = 0u; j < N; j++)
+    {
+        float c = (float)leafColAbsFixed[j] / (float)COL_ABS_SCALE;
+        maxCol = max(maxCol, c);
+    }
+
+    float scaleA = min(maxRow, maxCol);
+    if (!isfinite(scaleA) || scaleA <= 1e-30f)
+        scaleA = 1.0f;
+    leafScaleA[0] = scaleA;
+
+    float invN = 1.0f / (float)N;
+    float sumM = 0.0, sumM2 = 0.0;
+    float3 sumD = 0.0;
+    float3 sumD2 = 0.0;
+    float sumDg = 0.0, sumDg2 = 0.0;
+
+    for (uint k = 0u; k < N; k++)
+    {
+        Node nd = leafNodesBuffer[k];
+        float m = nd.mass;
+        float mSym = sign(m) * log(1.0f + abs(m));
+        sumM += mSym;
+        sumM2 += mSym * mSym;
+
+        float3 g = leafDiffusionGradientBuffer[k];
+        float3 dSym = float3(
+            sign(g.x) * log(1.0f + abs(g.x)),
+            sign(g.y) * log(1.0f + abs(g.y)),
+            sign(g.z) * log(1.0f + abs(g.z)));
+        sumD += dSym;
+        sumD2 += dSym * dSym;
+
+        float diag = leafMatrixABuffer[0u * N + k];
+        float dn = diag / scaleA;
+        sumDg += dn;
+        sumDg2 += dn * dn;
+    }
+
+    float massMean = sumM * invN;
+    float massVar = max(0.0f, sumM2 * invN - massMean * massMean);
+    float massStd = sqrt(massVar) + 1e-8f;
+
+    float3 dMean = sumD * invN;
+    float3 dVar = max(0.0f, sumD2 * invN - dMean * dMean);
+    float3 dStd = sqrt(dVar) + 1e-8f;
+
+    float dgMean = sumDg * invN;
+    float dgVar = max(0.0f, sumDg2 * invN - dgMean * dgMean);
+    float dgStd = sqrt(dgVar) + 1e-8f;
+
+    leafMoments[0] = massMean;
+    leafMoments[1] = massStd;
+    leafMoments[2] = dMean.x;
+    leafMoments[3] = dStd.x;
+    leafMoments[4] = dMean.y;
+    leafMoments[5] = dStd.y;
+    leafMoments[6] = dMean.z;
+    leafMoments[7] = dStd.z;
+    leafMoments[8] = dgMean;
+    leafMoments[9] = dgStd;
+    leafMoments[10] = log2(max(1.0f, (float)N));
+    leafMoments[11] = 0.0;
+
+    // global_features (12): leafonly/data.py order
+    leafGlobalFeatures[0] = leafMoments[10];
+    leafGlobalFeatures[1] = 0.0;
+    leafGlobalFeatures[2] = massMean;
+    leafGlobalFeatures[3] = massStd;
+    leafGlobalFeatures[4] = dgMean;
+    leafGlobalFeatures[5] = dgStd;
+    leafGlobalFeatures[6] = dMean.x;
+    leafGlobalFeatures[7] = dStd.x;
+    leafGlobalFeatures[8] = dMean.y;
+    leafGlobalFeatures[9] = dStd.y;
+    leafGlobalFeatures[10] = dMean.z;
+    leafGlobalFeatures[11] = dStd.z;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_ScaleCsrValues(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint nnz = leafTotalNnz[0];
+    if (idx >= nnz || idx >= leafMaxNnzBound) return;
+    float s = leafScaleA[0];
+    if (!isfinite(s) || s <= 1e-30f) s = 1.0f;
+    leafCsrValuesScaled[idx] = leafCsrValues[idx] / s;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_BuildX9(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= leafNPadded) return;
+
+    uint base = i * 9u;
+    if (i >= leafNTake)
+    {
+        for (uint c = 0u; c < 9u; c++)
+            leafXPacked[base + c] = 0.0;
+        return;
+    }
+
+    float scaleA = leafScaleA[0];
+    if (!isfinite(scaleA) || scaleA <= 1e-30f) scaleA = 1.0f;
+
+    float mm = leafMoments[0], ms = leafMoments[1];
+    float d0m = leafMoments[2], d0s = leafMoments[3];
+    float d1m = leafMoments[4], d1s = leafMoments[5];
+    float d2m = leafMoments[6], d2s = leafMoments[7];
+
+    Node nd = leafNodesBuffer[i];
+    float3 pos = nd.position / 1024.0f;
+    float layerN = (float)nd.layer / 4.0f;
+    float m = nd.mass;
+    float mSym = sign(m) * log(1.0f + abs(m));
+    float mN = (mSym - mm) / ms;
+
+    float3 g = leafDiffusionGradientBuffer[i];
+    float3 dSym = float3(
+        sign(g.x) * log(1.0f + abs(g.x)),
+        sign(g.y) * log(1.0f + abs(g.y)),
+        sign(g.z) * log(1.0f + abs(g.z)));
+    float3 dN = (dSym - float3(d0m, d1m, d2m)) / float3(d0s, d1s, d2s);
+
+    float diag = leafMatrixABuffer[0u * leafNumNodes + i];
+    float diagN = diag / scaleA;
+
+    leafXPacked[base + 0] = pos.x;
+    leafXPacked[base + 1] = pos.y;
+    leafXPacked[base + 2] = pos.z;
+    leafXPacked[base + 3] = layerN;
+    leafXPacked[base + 4] = mN;
+    leafXPacked[base + 5] = dN.x;
+    leafXPacked[base + 6] = dN.y;
+    leafXPacked[base + 7] = dN.z;
+    leafXPacked[base + 8] = diagN;
+}
+
+[numthreads(1, 1, 1)]
+void LeafOnly_CopyTotalNnz(uint3 id : SV_DispatchThreadID)
+{
+    if (leafNumNodes == 0u)
+    {
+        leafTotalNnz[0] = 0u;
+        return;
+    }
+    leafTotalNnz[0] = leafCsrRowPtr[leafNumNodes];
+}
+
+// GCN edge list: same mask as Python (row < n_edge_active && col < n_edge_active), values = scaled CSR.
+
+[numthreads(256, 1, 1)]
+void LeafOnly_EdgeActiveMask(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= leafMaxNnzBound) return;
+
+    uint nnz = leafTotalNnz[0];
+    uint na = leafNEdgeActive;
+    if (idx >= nnz)
+    {
+        leafEdgeValid[idx] = 0u;
+        return;
+    }
+
+    uint r = leafCsrEdgeRow[idx];
+    uint c = leafCsrColIndices[idx];
+    leafEdgeValid[idx] = (r < na && c < na) ? 1u : 0u;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_CompactGcnEdges(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint nnz = leafTotalNnz[0];
+    if (idx >= nnz || idx >= leafMaxNnzBound) return;
+    if (leafEdgeValid[idx] == 0u) return;
+
+    uint dst = leafEdgeScanExclusive[idx];
+    leafGcnEdgeRows[dst] = leafCsrEdgeRow[idx];
+    leafGcnEdgeCols[dst] = leafCsrColIndices[idx];
+    leafGcnEdgeVals[dst] = leafCsrValuesScaled[idx];
+}
+
+[numthreads(1, 1, 1)]
+void LeafOnly_WriteCompactEdgeCount(uint3 id : SV_DispatchThreadID)
+{
+    uint nnz = leafTotalNnz[0];
+    if (nnz == 0u)
+    {
+        leafCompactEdgeCount[0] = 0u;
+        return;
+    }
+    uint last = nnz - 1u;
+    leafCompactEdgeCount[0] = leafEdgeScanExclusive[last] + leafEdgeValid[last];
+}
