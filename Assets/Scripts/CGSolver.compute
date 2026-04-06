@@ -5,10 +5,6 @@
 #pragma kernel Scale
 #pragma kernel CalculateDivergence
 #pragma kernel DotProduct
-#pragma kernel ApplySparseGAndDot
-#pragma kernel ApplySparseGT
-#pragma kernel ClearBufferFloat
-#pragma kernel PrecomputeIndices
 #pragma kernel ApplyJacobi // Keep this
 #pragma kernel GlobalReduceSum
 #pragma kernel SpMV_CSR
@@ -37,17 +33,11 @@ struct Node
 RWStructuredBuffer<Node> nodesBuffer;
 RWStructuredBuffer<float> divergenceBuffer;
 RWStructuredBuffer<uint> neighborsBuffer;
-StructuredBuffer<uint> reverseNeighborsBuffer;
 
 RWStructuredBuffer<float> pBuffer; 
 RWStructuredBuffer<float> ApBuffer;
 RWStructuredBuffer<float> xBuffer;
 RWStructuredBuffer<float> yBuffer;
-
-// Neural / Preconditioner Buffers
-RWStructuredBuffer<float> matrixGBuffer;
-RWStructuredBuffer<float> zBuffer;
-RWStructuredBuffer<uint> scatterIndicesBuffer;
 
 // NEW: The Laplacian Matrix A [N * 25]
 // Slot 0 = Diagonal, Slots 1-24 = Neighbors 0-23
@@ -312,10 +302,6 @@ void SpMV_CSR(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : 
     }
 }
 
-// ... [REMAINING KERNELS: CalculateDivergence, Axpy, Scale, etc. UNCHANGED] ...
-// Copy the rest of the original file from "void CalculateDivergence..." downwards.
-// IMPORTANT: Keep PrecomputeIndices, ApplySparseGT, etc., for the preconditioner logic.
-
 [numthreads(512, 1, 1)]
 void CalculateDivergence(uint3 id : SV_DispatchThreadID)
 {
@@ -370,94 +356,6 @@ void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id 
         GroupMemoryBarrierWithGroupSync();
     }
     if (li == 0) divergenceBuffer[Gid.x] = s_data[0];
-}
-
-// ... [Include PrecomputeIndices, ApplySparseGT, ApplySparseGAndDot, ClearBufferFloat, ApplyJacobi, GlobalReduceSum from original file] ...
-// (These are needed if you toggle the preconditioner back on later)
-[numthreads(512, 1, 1)]
-void PrecomputeIndices(uint3 id : SV_DispatchThreadID) {
-    uint i = id.x;
-    if (i >= numNodes) return;
-    for (int n = 0; n < 24; n++) {
-        uint k = neighborsBuffer[n * numNodes + i];
-        scatterIndicesBuffer[n * numNodes + i] = (k < numNodes) ? k : 0xFFFFFFFF;
-    }
-}
-
-groupshared float s_x[512];
-[numthreads(512, 1, 1)]
-void ApplySparseGT(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
-    uint i = id.x; uint li = Gtid.x; uint group_start_idx = Gid.x * 512;
-    if (i < numNodes) s_x[li] = xBuffer[i]; else s_x[li] = 0.0;
-    GroupMemoryBarrierWithGroupSync();
-    if (i >= numNodes) return;
-    float r_i = s_x[li]; if (!isfinite(r_i)) r_i = 0.0;
-    float g_diag = matrixGBuffer[i]; if (!isfinite(g_diag)) g_diag = 0.0;
-    float sum = g_diag * r_i;
-    for (int n = 0; n < 24; n++) {
-        uint k = scatterIndicesBuffer[n * numNodes + i];
-        if (k != 0xFFFFFFFF) {
-            uint revSlot = reverseNeighborsBuffer[i * 24 + n];
-            if (revSlot < 24) {
-                float g_ki = matrixGBuffer[(1 + revSlot) * numNodes + k];
-                if (!isfinite(g_ki)) g_ki = 0.0;
-                float r_k;
-                if (k >= group_start_idx && k < group_start_idx + 512) r_k = s_x[k - group_start_idx];
-                else r_k = xBuffer[k];
-                if (!isfinite(r_k)) r_k = 0.0;
-                sum += g_ki * r_k;
-            }
-        }
-    }
-    if (!isfinite(sum)) sum = 0.0;
-    zBuffer[i] = sum;
-}
-
-groupshared float s_precon_dot[256];
-groupshared float s_z_values[256];
-[numthreads(256, 1, 1)]
-void ApplySparseGAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
-    uint i = id.x; uint li = Gtid.x; uint group_start_idx = Gid.x * 256;
-    if (i < numNodes) s_z_values[li] = zBuffer[i];
-    GroupMemoryBarrierWithGroupSync();
-    float z_val = 0.0; float r_val = 0.0;
-    if (i < numNodes) {
-        float u_val = s_z_values[li]; if (!isfinite(u_val)) u_val = 0.0;
-        r_val = xBuffer[i]; if (!isfinite(r_val)) r_val = 0.0;
-        float z_sum = 0.0;
-        float g_diag = matrixGBuffer[i]; if (!isfinite(g_diag)) g_diag = 0.0;
-        z_sum += u_val * g_diag;
-        for(int k=0; k<24; k++) {
-            uint n_idx = neighborsBuffer[k * numNodes + i];
-            if(n_idx < numNodes) {
-                float g_coeff = matrixGBuffer[(k + 1) * numNodes + i];
-                if (!isfinite(g_coeff)) g_coeff = 0.0;
-                float u_neighbor;
-                if (n_idx >= group_start_idx && n_idx < group_start_idx + 256) u_neighbor = s_z_values[n_idx - group_start_idx];
-                else u_neighbor = zBuffer[n_idx];
-                if (!isfinite(u_neighbor)) u_neighbor = 0.0;
-                z_sum += g_coeff * u_neighbor;
-            }
-        }
-        z_sum += 1e-4 * r_val;
-        if (!isfinite(z_sum)) z_sum = 0.0;
-        z_val = z_sum;
-        yBuffer[i] = z_val;
-    }
-    float product = r_val * z_val;
-    if (!isfinite(product)) product = 0.0;
-    s_precon_dot[li] = product;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (li < s) s_precon_dot[li] += s_precon_dot[li + s];
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (li == 0) divergenceBuffer[Gid.x] = s_precon_dot[0];
-}
-
-[numthreads(512, 1, 1)]
-void ClearBufferFloat(uint3 id : SV_DispatchThreadID) {
-    if (id.x < numNodes) zBuffer[id.x] = 0.0;
 }
 
 // --- REPLACED KERNEL: ApplyJacobi ---

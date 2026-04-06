@@ -25,9 +25,6 @@ public partial class FluidSimulator : MonoBehaviour
         axpyKernel                  = cgSolverShader.FindKernel("Axpy");
         scaleKernelId               = cgSolverShader.FindKernel("Scale");
         dotProductKernel            = cgSolverShader.FindKernel("DotProduct");
-        precomputeIndicesKernelId   = cgSolverShader.FindKernel("PrecomputeIndices");
-        applySparseGTKernelId       = cgSolverShader.FindKernel("ApplySparseGT");
-        applySparseGAndDotKernelId  = cgSolverShader.FindKernel("ApplySparseGAndDot");
         applyJacobiKernelId         = cgSolverShader.FindKernel("ApplyJacobi");
         globalReduceSumKernelId     = cgSolverShader.FindKernel("GlobalReduceSum");
         copyFloatKernelId           = cgSolverShader.FindKernel("CopyFloat");
@@ -107,10 +104,6 @@ public partial class FluidSimulator : MonoBehaviour
             csrValues?.Release();
             csrValues = new ComputeBuffer(maxNnz, sizeof(float));
         }
-        if (scatterIndicesBuffer == null || scatterIndicesBuffer.count < requiredSize * 24) {
-            scatterIndicesBuffer?.Release(); scatterIndicesBuffer = new ComputeBuffer(requiredSize * 24, 4);
-        }
-
         if (cgAlphaBuffer == null) cgAlphaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgBetaBuffer == null) cgBetaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgRhoBuffer == null) cgRhoBuffer = new ComputeBuffer(1, sizeof(float));
@@ -197,15 +190,6 @@ public partial class FluidSimulator : MonoBehaviour
         csrBuilderShader.SetInt("numNodes", numNodes);
         csrBuilderShader.Dispatch(csrFillKernelId, csrGroups, 1, 1);
 
-        // Preconditioner setup (Neural)
-        if (preconditioner == PreconditionerType.Neural && preconditionerShader != null) {
-            RunNeuralPreconditioner();
-            cgSolverShader.SetBuffer(precomputeIndicesKernelId, "neighborsBuffer", neighborsBuffer);
-            cgSolverShader.SetBuffer(precomputeIndicesKernelId, "scatterIndicesBuffer", scatterIndicesBuffer);
-            cgSolverShader.SetInt("numNodes", numNodes);
-            Dispatch(precomputeIndicesKernelId, numNodes);
-        }
-
         // Init Pressure x=0 via GPU Scale(0) — no CPU allocation
         cgSolverShader.SetBuffer(scaleKernelId, "yBuffer", pressureBuffer);
         cgSolverShader.SetFloat("a", 0.0f);
@@ -216,10 +200,7 @@ public partial class FluidSimulator : MonoBehaviour
         GpuCopyBuffer(divergenceBuffer, residualBuffer);
 
         // --- Step 2: Preconditioned Initialization (rho on GPU only) ---
-        ApplyPreconditionerInitStoreRhoGpu(
-            residualBuffer, zVectorBuffer,
-            applySparseGTKernelId, applySparseGAndDotKernelId, applySparseGAndDotKernelId,
-            applyJacobiKernelId);
+        ApplyPreconditionerInitStoreRhoGpu(residualBuffer, zVectorBuffer, applyJacobiKernelId);
 
         // p = z (GPU copy)
         GpuCopyBuffer(zVectorBuffer, pBuffer);
@@ -283,10 +264,7 @@ public partial class FluidSimulator : MonoBehaviour
 
             // 4. z = M^-1 r, rho_new = r·z → divergence[0]; beta and rho on GPU
             dotProductSw.Start();
-            ApplyPreconditionerPcgIterationGpu(
-                residualBuffer, zVectorBuffer,
-                applySparseGTKernelId, applySparseGAndDotKernelId, applySparseGAndDotKernelId,
-                applyJacobiKernelId);
+            ApplyPreconditionerPcgIterationGpu(residualBuffer, zVectorBuffer, applyJacobiKernelId);
             DispatchComputeBeta();
             dotProductSw.Stop();
 
