@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.InputSystem;
 using System;
 using System.Collections.Generic;
@@ -28,6 +29,8 @@ public partial class FluidSimulator : MonoBehaviour
     // CG Solver parameters
     public int maxCgIterations = 400;
     public float convergenceThreshold = 1e-05f;
+    [Tooltip("How often (in PCG iterations) to evaluate ||r||² for stopping when using GPU indirect PCG. Neural preconditioner uses the same interval for CPU checks.")]
+    public int cgConvergenceCheckInterval = 5;
     
     // Simulation parameters
     private float maxDetailCellSize;
@@ -74,6 +77,7 @@ public partial class FluidSimulator : MonoBehaviour
     private int axpyAlphaKernelId;
     private int axpyNegAlphaKernelId;
     private int scaleAddBetaKernelId;
+    private int checkConvergenceKernelId;
     // Cached CSR builder kernel IDs
     private int csrCountNnzKernelId;
     private int csrFinalizeRowPtrKernelId;
@@ -121,6 +125,11 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer cgAlphaBuffer;
     private ComputeBuffer cgBetaBuffer;
     private ComputeBuffer cgRhoBuffer;
+    /// <summary>9 uints: 3× DispatchIndirect triples — SpMV (256), 512-thread ops, 1-group ops. Zeros stop PCG work.</summary>
+    private ComputeBuffer cgPcgIndirectArgsBuffer;
+    private ComputeBuffer cgPcgIterationStatBuffer;
+    private readonly uint[] cgPcgIndirectArgsScratch = new uint[9];
+    private readonly uint[] cgPcgIterationStatScratch = new uint[1];
     private ComputeBuffer diffusionGradientBuffer; // Precomputed normalized density gradient per node
     private ComputeBuffer dispatchArgsBuffer;       // 3-uint indirect dispatch args for DispatchIndirect
     private ComputeBuffer particlePrefixElementCountBuffer; // [0] = numParticles for find-unique prefix scans
@@ -876,6 +885,8 @@ public partial class FluidSimulator : MonoBehaviour
         cgAlphaBuffer?.Release();
         cgBetaBuffer?.Release();
         cgRhoBuffer?.Release();
+        cgPcgIndirectArgsBuffer?.Release();
+        cgPcgIterationStatBuffer?.Release();
         pBuffer?.Release();
         ApBuffer?.Release();
         pressureBuffer?.Release();
