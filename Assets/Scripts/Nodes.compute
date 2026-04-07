@@ -63,9 +63,11 @@ RWStructuredBuffer<float3> diffusionGradientBuffer;     // output: precomputed n
 RWStructuredBuffer<uint> dirtyFlagBuffer;               // single-element buffer for convergence flag
 RWStructuredBuffer<uint> uniqueCount;                   // [0] = numUniqueNodes, written by writeUniqueCount
 
-uint numUniqueNodes;                              // number of unique morton codes (kept for non-DispatchIndirect callers)
-uint numNodes;                                          // number of nodes
+StructuredBuffer<uint> nodeCountBuffer;                 // [0] = active node count (logical); avoids CPU readback for bounds
+uint numNodesCapacity;                                  // SoA stride (preallocated width); >= nodeCountBuffer[0]
 uint numParticles;                                      // total number of particles
+
+uint NAct() { return nodeCountBuffer[0]; }
 uint layer;                                             // current hierarchical layer
 float deltaTime;                                        // time step for pressure gradient application
 uint minLayer;                                      // initial layer
@@ -168,7 +170,7 @@ float calculateMassWeight(float selfMass, float neighborMass)
 // Run this after compaction to keep the SoA buffer in sync
 [numthreads(512,1,1)]
 void ExtractMortonCodes(uint3 id : SV_DispatchThreadID) {
-    if(id.x >= numNodes) return;
+    if(id.x >= NAct()) return;
     mortonCodesBuffer[id.x] = nodesBuffer[id.x].mortonCode;
 }
 
@@ -347,11 +349,23 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
     if (threadIndex >= numUnique) return;
 
     uint uniqueStart = uniqueIndices[threadIndex];
-    uint uniqueEnd = threadIndex + 1 < numUnique ? uniqueIndices[threadIndex + 1] : numNodes;
+    uint uniqueEnd = threadIndex + 1 < numUnique ? uniqueIndices[threadIndex + 1] : NAct();
     uint numNodesInGroup = uniqueEnd - uniqueStart;
 
-    // Safety check: prevent infinite loops
-    if (numNodesInGroup <= 1 || uniqueStart >= uniqueEnd || uniqueEnd > numNodes) return;
+    // Safety check: prevent out of bounds
+    if (uniqueStart >= uniqueEnd || uniqueEnd > NAct()) return;
+
+    // Isolated prefix group: downgrade layer so later passes don't burn neighbor searches on a lone cell.
+    if (numNodesInGroup <= 1)
+    {
+        Node isolated = nodesBuffer[uniqueStart];
+        if (isolated.layer > layer)
+        {
+            isolated.layer = layer - 1;
+            nodesBuffer[uniqueStart] = isolated;
+        }
+        return;
+    }
 
     bool coarsen = true;
     for (uint i = uniqueStart; i < uniqueEnd; i++)
@@ -394,11 +408,11 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             uint upper = (nPrefix + 1u) << shift; // start of next region
 
             // Find the last node in this region by finding first node in next region, then subtract 1
-            uint idx_next = lowerBoundMorton(upper, 0, numNodes);
+            uint idx_next = lowerBoundMorton(upper, 0, NAct());
             uint idx_leq = (idx_next > 0) ? idx_next - 1u : 0u;
 
             // Skip if no valid neighbor found
-            if (idx_leq >= numNodes)
+            if (idx_leq >= NAct())
             {
                 coarsen = false;
                 break;
@@ -418,8 +432,8 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
             else {
                 // Child neighbor case: need to verify all 4 child nodes exist
                 if (shift >= 3) {
-                    uint idx_target = lowerBoundMorton(target, 0, numNodes); // low child bound
-                    uint idx_upper = lowerBoundMorton(upper, 0, numNodes); // high child bound
+                    uint idx_target = lowerBoundMorton(target, 0, NAct()); // low child bound
+                    uint idx_upper = lowerBoundMorton(upper, 0, NAct()); // high child bound
                     if (idx_target < idx_upper)
                     {
                         uint nPrefixShifted = nPrefix << 3;
@@ -644,15 +658,15 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
 void findNeighbors(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
+    if (threadIndex >= NAct()) return;
 
     Node node = nodesBuffer[threadIndex];
 
     // Initialize neighbors to invalid index (numNodes) for all 24 slots
-    // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
+    // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
     for (uint k = 0; k < 24; k++)
     {
-        neighborsBuffer[k * numNodes + threadIndex] = numNodes;
+        neighborsBuffer[k * numNodesCapacity + threadIndex] = NAct();
     }
 
     // all face neighbors of this node. It's bounded to 2:1 ratio
@@ -672,8 +686,8 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
         uint gridDim = 1u << (kMortonAxisBits - node.layer);
         if (nx < 0 || ny < 0 || nz < 0 || nx >= (int)gridDim || ny >= (int)gridDim || nz >= (int)gridDim)
         {
-            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-            neighborsBuffer[faceOffset(d) * numNodes + threadIndex] = numNodes + 1;
+            // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+            neighborsBuffer[faceOffset(d) * numNodesCapacity + threadIndex] = NAct() + 1;
             continue; // Skip this neighbor direction
         }
         
@@ -688,11 +702,11 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
         uint upper = (nPrefix + 1u) << shift; // start of next region
 
         // Find the last node in this region by finding first node in next region, then subtract 1
-        uint idx_next = lowerBoundMorton(upper, 0, numNodes);
+        uint idx_next = lowerBoundMorton(upper, 0, NAct());
         uint idx_leq = (idx_next > 0) ? idx_next - 1u : 0u;
 
         // Skip if no valid neighbor found
-        if (idx_leq >= numNodes) continue;
+        if (idx_leq >= NAct()) continue;
 
         Node nNode = nodesBuffer[idx_leq];
         uint idx_leq_mc = nNode.mortonCode;
@@ -702,22 +716,22 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
         if (idx_leq_mc_prefix == nPrefix && idx_leq_layer == node.layer)
         {
             // same-layer neighbor
-            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-            neighborsBuffer[faceOffset(d) * numNodes + threadIndex] = idx_leq;
+            // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+            neighborsBuffer[faceOffset(d) * numNodesCapacity + threadIndex] = idx_leq;
         }
         else if ((idx_leq_mc >> (shift + 3)) == (nPrefix >> 3) && idx_leq_layer == node.layer + 1)
         {
             // parent neighbor
-            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-            neighborsBuffer[faceOffset(d) * numNodes + threadIndex] = idx_leq;
+            // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+            neighborsBuffer[faceOffset(d) * numNodesCapacity + threadIndex] = idx_leq;
         }
         else
         {
             // child neighbor path only valid if shift >= 3 (layer >= 1)
             if (shift >= 3)
             {
-                uint idx_target = lowerBoundMorton(target, 0, numNodes); // low child bound
-                uint idx_upper = lowerBoundMorton(upper, 0, numNodes); // high child bound
+                uint idx_target = lowerBoundMorton(target, 0, NAct()); // low child bound
+                uint idx_upper = lowerBoundMorton(upper, 0, NAct()); // high child bound
                 if (idx_target < idx_upper)
                 {
                     uint nPrefixShifted = nPrefix << 3;
@@ -768,8 +782,8 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
                             uint idx_sub_layer = cNode.layer;
                             if (idx_sub_mc_prefix == subPrefix && idx_sub_layer == node.layer - 1)
                             {
-                                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-                                neighborsBuffer[(faceOffset(d) + i) * numNodes + threadIndex] = idx_sub;
+                                // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+                                neighborsBuffer[(faceOffset(d) + i) * numNodesCapacity + threadIndex] = idx_sub;
                             }
                         }
                     }
@@ -783,19 +797,19 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
 void FindReverseConnections(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= numNodes) return;
+    if (i >= NAct()) return;
 
     // For every one of my neighbor slots...
     for (int n = 0; n < 24; n++)
     {
         // 1. Who is my neighbor?
-        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-        uint k = neighborsBuffer[n * numNodes + i];
+        // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+        uint k = neighborsBuffer[n * numNodesCapacity + i];
         
         // Default to "Invalid" if no neighbor exists
         uint reverseSlot = 99; 
 
-        if (k < numNodes)
+        if (k < NAct())
         {
             // 2. Search K's list to find ME (i)
             // This loop is expensive, but we only do it ONCE.
@@ -809,8 +823,8 @@ void FindReverseConnections(uint3 id : SV_DispatchThreadID)
 
             for (int slot = startSlot; slot < endSlot; slot++)
             {
-                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-                if (neighborsBuffer[slot * numNodes + k] == i)
+                // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+                if (neighborsBuffer[slot * numNodesCapacity + k] == i)
                 {
                     reverseSlot = slot;
                     break;
@@ -828,7 +842,7 @@ void FindReverseConnections(uint3 id : SV_DispatchThreadID)
 void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
+    if (threadIndex >= NAct()) return;
 
     Node node = nodesBuffer[threadIndex];
     Node outNode = node; 
@@ -838,11 +852,11 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
 
     for (int d = 0; d < 6; d++) {
         uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
-        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-        uint n0_idx = neighborsBuffer[faceSlotBase * numNodes + threadIndex]; 
+        // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+        uint n0_idx = neighborsBuffer[faceSlotBase * numNodesCapacity + threadIndex]; 
 
         // --- 1. Wall Boundary (Neumann) ---
-        if (n0_idx == numNodes + 1) {
+        if (n0_idx == NAct() + 1) {
              if (d == 0) outNode.velocities.left = 0;
              else if (d == 1) outNode.velocities.right = 0;
              else if (d == 2) outNode.velocities.bottom = 0;
@@ -853,7 +867,7 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
         }
 
         bool isCoarserOrSame = false;
-        if (n0_idx < numNodes) {
+        if (n0_idx < NAct()) {
             Node n0 = nodesBuffer[n0_idx];
             float m_j = n0.mass; // Get neighbor mass
 
@@ -886,9 +900,9 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
                     int numChildren = 0;
                     
                     for (int k = 0; k < 4; k++) {
-                        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-                        uint child_idx = neighborsBuffer[(neighborFaceSlotBase + k) * numNodes + n0_idx];
-                        if (child_idx < numNodes) {
+                        // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+                        uint child_idx = neighborsBuffer[(neighborFaceSlotBase + k) * numNodesCapacity + n0_idx];
+                        if (child_idx < NAct()) {
                             Node childNode = nodesBuffer[child_idx];
                             float childVal = selectOpposingFace(childNode.velocities, neighborD);
                             
@@ -931,9 +945,9 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
             int validChildCount = 0;
 
             for (int k = 0; k < 4; k++) {
-                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
-                if (child_idx < numNodes) {
+                // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodesCapacity + threadIndex];
+                if (child_idx < NAct()) {
                     Node childNode = nodesBuffer[child_idx];
                     
                     // Accumulate Mass and Velocity
@@ -973,7 +987,7 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
 void copyFaceVelocities(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
+    if (threadIndex >= NAct()) return;
 
     nodesBuffer[threadIndex] = tempNodesBuffer[threadIndex];
 }
@@ -991,7 +1005,7 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
 
     // --- Phase 1: Collaborative Load into LDS ---
     // ALL threads must participate, so only guard the write.
-    if (threadIndex < numNodes)
+    if (threadIndex < NAct())
     {
         s_grad_nodes[li] = nodesBuffer[threadIndex];
         s_grad_pressure[li] = pressureBuffer[threadIndex];
@@ -1000,7 +1014,7 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
     GroupMemoryBarrierWithGroupSync();
 
     // Threads with no work can exit now.
-    if (threadIndex >= numNodes) return;
+    if (threadIndex >= NAct()) return;
 
     // Read own data from fast LDS
     Node node = s_grad_nodes[li];
@@ -1012,17 +1026,17 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
     for (int d = 0; d < 6; d++)
     {
         uint faceSlotBase = d * 4; // Base slot for this face (0, 4, 8, 12, 16, 20)
-        // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + threadIndex];
+        // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodesCapacity + threadIndex];
         float pressure_gradient = 0.0;
-        bool isBoundary = (neighbor_idx == numNodes + 1);
+        bool isBoundary = (neighbor_idx == NAct() + 1);
 
         if (isBoundary) // Neumann BC: zero flux
         {
             pressure_gradient = 0.0;
             // pressure_gradient -= p_i / dx_i;
         }
-        else if (neighbor_idx < numNodes)
+        else if (neighbor_idx < NAct())
         {
             // This is the general case for a valid neighbor.
             // We fetch the node data first, using the cache if possible,
@@ -1062,8 +1076,8 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
                 int numChildren = 0;
                 for (int k = 0; k < 4; k++)
                 {
-                    uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
-                    if (child_idx < numNodes)
+                    uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodesCapacity + threadIndex];
+                    if (child_idx < NAct())
                     {
                         sumChildren += pressureBuffer[child_idx];
                         numChildren += 1;
@@ -1082,9 +1096,9 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
             int numChildren = 0;
             for (int k = 0; k < 4; k++)
             {
-                // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
-                if (child_idx < numNodes)
+                // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodesCapacity + threadIndex];
+                if (child_idx < NAct())
                 {
                     // Note: Not caching child reads here. A potential future optimization
                     // is to check if child_idx is in the group's LDS block.
@@ -1122,7 +1136,7 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
 void ApplyExternalForces(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= numNodes) return;
+    if (i >= NAct()) return;
 
     Node node = nodesBuffer[i];
     
@@ -1150,7 +1164,7 @@ void ApplyExternalForces(uint3 id : SV_DispatchThreadID)
 void InitializePhi(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
+    if (threadIndex >= NAct()) return;
 
     bool isSurfaceNode = false;
 
@@ -1164,14 +1178,14 @@ void InitializePhi(uint3 id : SV_DispatchThreadID)
         // Check all 4 potential neighbors on this face
         for (int k = 0; k < 4; k++)
         {
-            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-            uint neighbor_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
+            // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+            uint neighbor_idx = neighborsBuffer[(faceSlotBase + k) * numNodesCapacity + threadIndex];
 
-            if (neighbor_idx < numNodes || neighbor_idx == numNodes + 1)
+            if (neighbor_idx < NAct() || neighbor_idx == NAct() + 1)
             {
                 hasFluidNeighborOnFace = true;
             }
-            else if (neighbor_idx == numNodes) // "air"
+            else if (neighbor_idx == NAct()) // "air"
             {
                 hasAirNeighborOnFace = true;
             }
@@ -1201,7 +1215,7 @@ void InitializePhi(uint3 id : SV_DispatchThreadID)
 void PropagatePhi(uint3 id : SV_DispatchThreadID)
 {
     uint threadIndex = id.x;
-    if (threadIndex >= numNodes) return;
+    if (threadIndex >= NAct()) return;
 
     Node selfNode = nodesBuffer[threadIndex];
     float selfSide = exp2((float)selfNode.layer);
@@ -1218,11 +1232,11 @@ void PropagatePhi(uint3 id : SV_DispatchThreadID)
         // Check all 4 potential neighbors on this face (for 2:1 balance)
         for (int k = 0; k < 4; k++)
         {
-            // SoA layout: neighborsBuffer[slot * numNodes + nodeIndex]
-            uint neighbor_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + threadIndex];
+            // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
+            uint neighbor_idx = neighborsBuffer[(faceSlotBase + k) * numNodesCapacity + threadIndex];
 
             // Only check valid fluid nodes
-            if (neighbor_idx < numNodes)
+            if (neighbor_idx < NAct())
             {
                 // Read the neighbor's phi value
                 float neighborPhi = phiBuffer_Read[neighbor_idx];
@@ -1264,7 +1278,7 @@ void PropagatePhi(uint3 id : SV_DispatchThreadID)
 void CalculateDensityGradient(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= numNodes) return;
+    if (i >= NAct()) return;
 
     Node node = nodesBuffer[i];
     float dx = exp2((float)node.layer);
@@ -1281,17 +1295,17 @@ void CalculateDensityGradient(uint3 id : SV_DispatchThreadID)
 
     // --- X Axis ---
     {
-        uint idxLeft = neighborsBuffer[0 * numNodes + i];
-        uint idxRight = neighborsBuffer[4 * numNodes + i];
+        uint idxLeft = neighborsBuffer[0 * numNodesCapacity + i];
+        uint idxRight = neighborsBuffer[4 * numNodesCapacity + i];
         
         float rhoLeft = selfDensity;
-        if (idxLeft < numNodes) {
+        if (idxLeft < NAct()) {
             float ndx = exp2((float)nodesBuffer[idxLeft].layer);
             rhoLeft = nodesBuffer[idxLeft].mass / max(1e-6, ndx*ndx*ndx);
         }
         
         float rhoRight = selfDensity;
-        if (idxRight < numNodes) {
+        if (idxRight < NAct()) {
             float ndx = exp2((float)nodesBuffer[idxRight].layer);
             rhoRight = nodesBuffer[idxRight].mass / max(1e-6, ndx*ndx*ndx);
         }
@@ -1302,17 +1316,17 @@ void CalculateDensityGradient(uint3 id : SV_DispatchThreadID)
 
     // --- Y Axis ---
     {
-        uint idxBottom = neighborsBuffer[8 * numNodes + i];
-        uint idxTop = neighborsBuffer[12 * numNodes + i];
+        uint idxBottom = neighborsBuffer[8 * numNodesCapacity + i];
+        uint idxTop = neighborsBuffer[12 * numNodesCapacity + i];
         
         float rhoBottom = selfDensity;
-        if (idxBottom < numNodes) {
+        if (idxBottom < NAct()) {
             float ndx = exp2((float)nodesBuffer[idxBottom].layer);
             rhoBottom = nodesBuffer[idxBottom].mass / max(1e-6, ndx*ndx*ndx);
         }
         
         float rhoTop = selfDensity;
-        if (idxTop < numNodes) {
+        if (idxTop < NAct()) {
             float ndx = exp2((float)nodesBuffer[idxTop].layer);
             rhoTop = nodesBuffer[idxTop].mass / max(1e-6, ndx*ndx*ndx);
         }
@@ -1323,17 +1337,17 @@ void CalculateDensityGradient(uint3 id : SV_DispatchThreadID)
 
     // --- Z Axis ---
     {
-        uint idxFront = neighborsBuffer[16 * numNodes + i];
-        uint idxBack = neighborsBuffer[20 * numNodes + i];
+        uint idxFront = neighborsBuffer[16 * numNodesCapacity + i];
+        uint idxBack = neighborsBuffer[20 * numNodesCapacity + i];
         
         float rhoFront = selfDensity;
-        if (idxFront < numNodes) {
+        if (idxFront < NAct()) {
             float ndx = exp2((float)nodesBuffer[idxFront].layer);
             rhoFront = nodesBuffer[idxFront].mass / max(1e-6, ndx*ndx*ndx);
         }
         
         float rhoBack = selfDensity;
-        if (idxBack < numNodes) {
+        if (idxBack < NAct()) {
             float ndx = exp2((float)nodesBuffer[idxBack].layer);
             rhoBack = nodesBuffer[idxBack].mass / max(1e-6, ndx*ndx*ndx);
         }

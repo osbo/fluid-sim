@@ -11,6 +11,8 @@
 #pragma kernel clearActiveBuffers
 #pragma kernel copyNodes
 #pragma kernel WriteDispatchArgs
+#pragma kernel WriteDispatchArgsFromCount
+#pragma kernel CopyUintBuffer
 
 #define SCAN_BLOCKSIZE 512
 
@@ -56,9 +58,19 @@ RWStructuredBuffer<uint> uniqueIndices;          // output: indices of first occ
 RWStructuredBuffer<uint> uniqueCount;            // output: [0] = number of indicators
 RWStructuredBuffer<uint> nodeCount;              // output: [0] = number of active nodes
 RWStructuredBuffer<uint> dispatchArgsBuffer;     // output: [threadGroupsX, 1, 1] for DispatchIndirect
+RWStructuredBuffer<uint> dispatchArgsFromCountSrc; // input for WriteDispatchArgsFromCount (single uint)
+RWStructuredBuffer<uint> copyUintSrc;
+RWStructuredBuffer<uint> copyUintDst;
+RWStructuredBuffer<uint> mortonCodesBuffer;      // SoA morton codes; fused update in scatterActives
 
-uint len;                                        // total number of items
+StructuredBuffer<uint> prefixElementCount;       // [0] = active element count (replaces uniform len for GPU-driven length)
+uint len;                                        // unused when prefixElementCount bound; kept for Unity compatibility
 uint prefixBits;                                 // number of bits to shift right for prefix comparison
+
+uint PrefixLen()
+{
+    return prefixElementCount[0];
+}
 
 // groupshared for scan
 groupshared uint scan_array[SCAN_BLOCKSIZE * 2];
@@ -70,7 +82,8 @@ void markUniqueParticles(uint3 id : SV_DispatchThreadID, uint3 Gtid : SV_GroupTh
     uint i = id.x;
     uint local_i = Gtid.x;
 
-    if (i < len)
+    uint L = PrefixLen();
+    if (i < L)
     {
         // Load morton code into shared memory
         morton_codes[local_i] = sortedParticles[i].mortonCode >> prefixBits;
@@ -78,7 +91,7 @@ void markUniqueParticles(uint3 id : SV_DispatchThreadID, uint3 Gtid : SV_GroupTh
     
     GroupMemoryBarrierWithGroupSync();
 
-    if (i < len)
+    if (i < L)
     {
         uint isUnique = 0;
         if (i == 0) {
@@ -106,15 +119,15 @@ void markUniquesPrefix(uint3 id : SV_DispatchThreadID, uint3 Gtid : SV_GroupThre
     uint i = id.x;
     uint local_i = Gtid.x;
 
-    if (i < len)
+    uint L = PrefixLen();
+    if (i < L)
     {
-        // Load morton code into shared memory
-        morton_codes[local_i] = nodesBuffer[i].mortonCode >> prefixBits;
+        morton_codes[local_i] = mortonCodesBuffer[i] >> prefixBits;
     }
-    
+
     GroupMemoryBarrierWithGroupSync();
 
-    if (i < len)
+    if (i < L)
     {
         uint isUnique = 0;
         if (i == 0) {
@@ -124,10 +137,9 @@ void markUniquesPrefix(uint3 id : SV_DispatchThreadID, uint3 Gtid : SV_GroupThre
             if (local_i > 0) {
                 prev_code = morton_codes[local_i - 1];
             } else {
-                // First thread in the block reads from global memory
-                prev_code = nodesBuffer[i - 1].mortonCode >> prefixBits;
+                prev_code = mortonCodesBuffer[i - 1] >> prefixBits;
             }
-            
+
             uint curr_code = morton_codes[local_i];
             isUnique = (curr_code != prev_code) ? 1u : 0u;
         }
@@ -140,7 +152,8 @@ void markUniquesPrefix(uint3 id : SV_DispatchThreadID, uint3 Gtid : SV_GroupThre
 void markActiveNodes(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= len) return;
+    uint L = PrefixLen();
+    if (i >= L) return;
 
     indicators[i] = nodesBuffer[i].active & 1u; // Check last bit
 }
@@ -150,12 +163,13 @@ void prefixSum(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
 {
     uint threadIdx = Gtid.x;
     uint blockIdx = Gid.x;
+    uint L = PrefixLen();
     uint t1 = threadIdx + 2 * blockIdx * SCAN_BLOCKSIZE;
     uint t2 = t1 + SCAN_BLOCKSIZE;
 
     // Load inputs
-    scan_array[threadIdx] = (t1 < len) ? indicators[t1] : 0u;
-    scan_array[threadIdx + SCAN_BLOCKSIZE] = (t2 < len) ? indicators[t2] : 0u;
+    scan_array[threadIdx] = (t1 < L) ? indicators[t1] : 0u;
+    scan_array[threadIdx + SCAN_BLOCKSIZE] = (t2 < L) ? indicators[t2] : 0u;
     GroupMemoryBarrierWithGroupSync();
 
     // Upsweep
@@ -176,10 +190,10 @@ void prefixSum(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
     GroupMemoryBarrierWithGroupSync();
 
     // Write exclusive results (shift right by 1 within each block)
-    if (t1 < len) {
+    if (t1 < L) {
         prefixSums[t1] = (threadIdx == 0) ? 0u : scan_array[threadIdx - 1];
     }
-    if (t2 < len) {
+    if (t2 < L) {
         uint idx = threadIdx + SCAN_BLOCKSIZE - 1;
         prefixSums[t2] = scan_array[idx];
     }
@@ -193,18 +207,19 @@ void prefixFixup(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
 {
     uint threadIdx = Gtid.x;
     uint blockIdx = Gid.x;
+    uint L = PrefixLen();
     uint start = threadIdx + 2 * blockIdx * SCAN_BLOCKSIZE;
     uint block_sum = aux2[blockIdx];
 
-    if (start < len)                    prefixSums[start] += block_sum;
-    if (start + SCAN_BLOCKSIZE < len)   prefixSums[start + SCAN_BLOCKSIZE] += block_sum;
+    if (start < L)                    prefixSums[start] += block_sum;
+    if (start + SCAN_BLOCKSIZE < L)   prefixSums[start + SCAN_BLOCKSIZE] += block_sum;
 }
 
 [numthreads(512, 1, 1)]
 void scatterUniques(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= len) return;
+    if (i >= PrefixLen()) return;
 
     if (indicators[i] == 1u) {
         uint dst = prefixSums[i];
@@ -216,11 +231,13 @@ void scatterUniques(uint3 id : SV_DispatchThreadID)
 void scatterActives(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= len) return;
+    if (i >= PrefixLen()) return;
 
     if (indicators[i] == 1u) {
         uint dst = prefixSums[i];
-        tempNodesBuffer[dst] = nodesBuffer[i];
+        Node n = nodesBuffer[i];
+        tempNodesBuffer[dst] = n;
+        mortonCodesBuffer[dst] = n.mortonCode;
     }
 }
 
@@ -228,23 +245,25 @@ void scatterActives(uint3 id : SV_DispatchThreadID)
 void copyNodes(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= len) return;
+    if (i >= PrefixLen()) return;
     nodesBuffer[i] = tempNodesBuffer[i];
 }
 
 [numthreads(1, 1, 1)]
 void writeUniqueCount(uint3 id : SV_DispatchThreadID)
 {
-    if (len == 0) { uniqueCount[0] = 0; return; }
-    uint last = len - 1;
+    uint L = PrefixLen();
+    if (L == 0) { uniqueCount[0] = 0; return; }
+    uint last = L - 1;
     uniqueCount[0] = prefixSums[last] + indicators[last];
 }
 
 [numthreads(1, 1, 1)]
 void writeNodeCount(uint3 id : SV_DispatchThreadID)
 {
-    if (len == 0) { nodeCount[0] = 0; return; }
-    uint last = len - 1;
+    uint L = PrefixLen();
+    if (L == 0) { nodeCount[0] = 0; return; }
+    uint last = L - 1;
     nodeCount[0] = prefixSums[last] + indicators[last];
 }
 
@@ -252,7 +271,7 @@ void writeNodeCount(uint3 id : SV_DispatchThreadID)
 void clearUniqueBuffers(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= len) return;
+    if (i >= PrefixLen()) return;
 
     indicators[i] = 0;
     uniqueIndices[i] = 0;
@@ -262,7 +281,7 @@ void clearUniqueBuffers(uint3 id : SV_DispatchThreadID)
 void clearActiveBuffers(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= len) return;
+    if (i >= PrefixLen()) return;
 
     indicators[i] = 0;
 }
@@ -276,4 +295,20 @@ void WriteDispatchArgs(uint3 id : SV_DispatchThreadID)
     dispatchArgsBuffer[0] = max(1u, (count + 511u) / 512u);
     dispatchArgsBuffer[1] = 1u;
     dispatchArgsBuffer[2] = 1u;
+}
+
+// Same layout as WriteDispatchArgs but count comes from any single-uint buffer (e.g. nodeCount).
+[numthreads(1, 1, 1)]
+void WriteDispatchArgsFromCount(uint3 id : SV_DispatchThreadID)
+{
+    uint count = dispatchArgsFromCountSrc[0];
+    dispatchArgsBuffer[0] = max(1u, (count + 511u) / 512u);
+    dispatchArgsBuffer[1] = 1u;
+    dispatchArgsBuffer[2] = 1u;
+}
+
+[numthreads(1, 1, 1)]
+void CopyUintBuffer(uint3 id : SV_DispatchThreadID)
+{
+    copyUintDst[0] = copyUintSrc[0];
 }

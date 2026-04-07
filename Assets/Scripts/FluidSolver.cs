@@ -114,6 +114,11 @@ public partial class FluidSimulator : MonoBehaviour
         if (cgAlphaBuffer == null) cgAlphaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgBetaBuffer == null) cgBetaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgRhoBuffer == null) cgRhoBuffer = new ComputeBuffer(1, sizeof(float));
+
+        // neighborsBuffer uses SoA stride maxNodesCapacity (see Nodes.compute); matrixABuffer still uses numNodes stride.
+        cgSolverShader.SetInt("numNodesCapacity", maxNodesCapacity);
+        csrBuilderShader.SetInt("numNodesCapacity", maxNodesCapacity);
+
         // --- Step 1: Calculate Divergence (RHS 'b') ---
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
@@ -347,12 +352,11 @@ public partial class FluidSimulator : MonoBehaviour
             return;
         }
 
+        BindNodesOctreeCounts();
         nodesShader.SetBuffer(applyPressureGradientKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(applyPressureGradientKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetBuffer(applyPressureGradientKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer);
-
-        nodesShader.SetInt("numNodes", numNodes);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);
         nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
@@ -481,8 +485,8 @@ public partial class FluidSimulator : MonoBehaviour
     {
         if (nodesShader == null) return;
 
+        BindNodesOctreeCounts();
         nodesShader.SetBuffer(applyExternalForcesKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetInt("numNodes", numNodes);
         nodesShader.SetFloat("gravity", gravity);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);

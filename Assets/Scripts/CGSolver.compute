@@ -55,6 +55,7 @@ StructuredBuffer<uint> csrColIndices;     // [totalNNZ]
 StructuredBuffer<float> csrValues;        // [totalNNZ]
 
 uint numNodes;
+uint numNodesCapacity; // SoA stride for neighborsBuffer (matches Nodes.compute); logical count is numNodes
 float a; 
 float deltaTime;
 uint reductionCount;
@@ -84,7 +85,7 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
     for (int d = 0; d < 6; d++)
     {
         uint faceSlotBase = d * 4;
-        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodes + i];
+        uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodesCapacity + i];
 
         // Case 1: True Boundary (Neumann) - No contribution
         if (neighbor_idx == numNodes + 1) { continue; }
@@ -121,7 +122,7 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
             
             for (int k = 0; k < 4; k++)
             {
-                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodes + i];
+                uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodesCapacity + i];
                 uint slot = faceSlotBase + k;
 
                 if (child_idx < numNodes) // Case 3: Child
@@ -191,7 +192,7 @@ void ApplyMatrixAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, ui
         // Iterate all 24 slots
         for (int k = 0; k < 24; k++)
         {
-            uint neighbor_idx = neighborsBuffer[k * numNodes + i];
+            uint neighbor_idx = neighborsBuffer[k * numNodesCapacity + i];
 
             // Optimization: If weight is 0, skip (though reading weight costs bandwidth)
             // Better Optimization: Check neighbor validity first
