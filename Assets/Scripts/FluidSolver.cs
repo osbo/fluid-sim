@@ -47,6 +47,7 @@ public partial class FluidSimulator : MonoBehaviour
         InitLeafOnlyDiagEdgeFeatsKernels();
         InitLeafOnlyOffEdgeFeatsKernels();
         InitLeafOnlyLayer1GpuKernels();
+        InitLeafOnlyPrecondApplyKernels();
 
         applyPressureGradientKernel = nodesShader.FindKernel("ApplyPressureGradient");
         applyExternalForcesKernel   = nodesShader.FindKernel("ApplyExternalForces");
@@ -197,6 +198,9 @@ public partial class FluidSimulator : MonoBehaviour
         csrBuilderShader.Dispatch(csrFillKernelId, csrGroups, 1, 1);
 
         DispatchLeafOnlyGpuInputs(numNodes, maxNnz);
+
+        if (preconditioner == PreconditionerType.Neural)
+            LeafOnlyEnsureJacobiInvDiagFromMatrixA(LeafOnlyLastNPadded);
 
         // Init Pressure x=0 via GPU Scale(0) — no CPU allocation
         cgSolverShader.SetBuffer(scaleKernelId, "yBuffer", pressureBuffer);

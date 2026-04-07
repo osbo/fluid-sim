@@ -1,14 +1,17 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 using UnityEngine.Rendering;
 using System.IO;
 
 // Main FluidSimulator class - split into partial classes for better organization
 // Core simulation logic: particle management, main loop, initialization
 // See: FluidEnums.cs, FluidRendering.cs, FluidPreconditioner.cs,
-//      FluidOctree.cs, FluidSolver.cs, FluidLeafOnlyInputs.cs, FluidLeafOnlyWeights.cs, RadixSort.cs
+//      FluidOctree.cs, FluidSolver.cs, FluidLeafOnlyInputs.cs, FluidLeafOnlyWeights.cs,
+//      FluidLeafOnlyPrecondApply.cs, RadixSort.cs
 public partial class FluidSimulator : MonoBehaviour
 {
     public BoxCollider simulationBounds;
@@ -142,6 +145,21 @@ public partial class FluidSimulator : MonoBehaviour
     public float frameRate = 30.0f;
     [Range(0, 10)] public int minLayer = 4;
     [Range(0, 10)] public int maxLayer = 10;
+    [Tooltip("Each frame: GPU readback of nodesBuffer and Debug.Log of how many nodes sit at each layer index (after findNeighbors).")]
+    public bool logLayerCountsPerFrame = true;
+    [Header("Debug: spatial cell overlaps")]
+    [Tooltip("When overlaps exist, emit a second log with sample node pairs (index, morton, layer, active, mass, position). Overlap = same (layer, mortonCode >> 3*layer).")]
+    public bool logSpatialOverlapDetails = false;
+    [Tooltip("After CreateLeaves: readback + leaf-pack stats (duplicate full morton, minLayer buckets, coarse maxLayer noise). Does not use the solver cell key.")]
+    public bool diagSpatialOverlapAfterCreateLeaves = false;
+    [Tooltip("After SortParticles: readback + morton monotonicity / duplicate morton counts (O(n) on GPU buffer).")]
+    public bool diagInspectParticleMortonAfterSort = false;
+    [Tooltip("Append deinterleaved grid (x,y,z) and cellMin@layer to overlap sample lines.")]
+    public bool diagSpatialOverlapVerboseTraces = false;
+    [Tooltip("GPU readback + overlap check after each compactNodes inside the layer loop. Very heavy.")]
+    public bool diagSpatialOverlapAfterEachLayerCompact = false;
+    [Tooltip("GPU readback + overlap check after each ProcessNodes, before compact. Distinguishes 'ProcessNodes wrote dup actives' vs 'compact scatter' issues. Very heavy.")]
+    public bool diagSpatialOverlapAfterProcessNodes = false;
     public PreconditionerType preconditioner = PreconditionerType.Jacobi;
 
     private bool hasShownWaitMessage = false;
@@ -198,6 +216,14 @@ public partial class FluidSimulator : MonoBehaviour
     }
 
     private Node[] nodesCPU;
+    private readonly int[] layerCountHistogramScratch = new int[16];
+    private readonly int[] spatialDupPerLayerScratch = new int[16];
+    private readonly Dictionary<ulong, int> spatialOverlapFirstIndexScratch = new Dictionary<ulong, int>(65536);
+    /// <summary>Reused for uint-keyed probes (full morton, particle counts). Cleared per use.</summary>
+    private readonly Dictionary<uint, int> inspectUintKeyScratch = new Dictionary<uint, int>(65536);
+    private readonly List<(int firstIdx, int secondIdx)> spatialOverlapPairScratch = new List<(int, int)>(16);
+    private readonly StringBuilder layerCountLogSb = new StringBuilder(128);
+    private readonly StringBuilder spatialOverlapDetailSb = new StringBuilder(512);
     private Particle[] particlesCPU;
     private string str;
 
@@ -405,6 +431,8 @@ public partial class FluidSimulator : MonoBehaviour
         var sortSw = System.Diagnostics.Stopwatch.StartNew();
         SortParticles();
         sortSw.Stop();
+        if (diagInspectParticleMortonAfterSort)
+            LogParticleMortonInspection("After SortParticles");
 
         // Step 2: Find unique particles and create leaves
         var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
@@ -414,6 +442,8 @@ public partial class FluidSimulator : MonoBehaviour
         var createLeavesSw = System.Diagnostics.Stopwatch.StartNew();
         CreateLeaves();
         createLeavesSw.Stop();
+        if (diagSpatialOverlapAfterCreateLeaves)
+            LogCreateLeavesPackInspection();
 
         // Step 3: Layer loop (layers 1-10)
         var layerLoopSw = System.Diagnostics.Stopwatch.StartNew();
@@ -422,6 +452,8 @@ public partial class FluidSimulator : MonoBehaviour
             
             findUniqueNodes();
             ProcessNodes();
+            if (diagSpatialOverlapAfterProcessNodes)
+                LogSpatialOverlapStage($"After ProcessNodes before compact (octree layer={layer})", maxSamplePairs: 12, activeNodesOnly: true, verboseTraces: diagSpatialOverlapVerboseTraces);
             compactNodes();
 
             // --- NEW: Refresh SoA Buffer after compaction ---
@@ -442,6 +474,8 @@ public partial class FluidSimulator : MonoBehaviour
         var findNeighborsSw = System.Diagnostics.Stopwatch.StartNew();
         findNeighbors();
         findNeighborsSw.Stop();
+
+        string layerCountsLine = BuildLayerCountsSummaryForLog();
 
         // Step 4.5: Calculate density gradients
         var calculateGradientsSw = System.Diagnostics.Stopwatch.StartNew();
@@ -483,6 +517,7 @@ public partial class FluidSimulator : MonoBehaviour
                  $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Avg Frame Time: {averageFrameTimeMs:F2} ms\n" +
                  $"• # Nodes: {numNodes}\n" +
+                 (layerCountsLine != null ? $"• {layerCountsLine}\n" : "") +
                  $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                  $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
@@ -497,6 +532,416 @@ public partial class FluidSimulator : MonoBehaviour
                  $"• Rendering: {lastRenderTimeMs:F2} ms\n" +
                  $"• CG Iterations: {lastCgIterations}\n" +
                  $"• Avg CG Iterations: {averageCgIterationsText}");
+    }
+
+    /// <summary>Non-null when <see cref="logLayerCountsPerFrame"/> is true: nodes-per-layer after findNeighbors (GPU readback).</summary>
+    private string BuildLayerCountsSummaryForLog()
+    {
+        if (!logLayerCountsPerFrame)
+            return null;
+        if (numNodes <= 0 || nodesBuffer == null)
+            return "Nodes per layer: (none)";
+
+        if (nodesCPU == null || nodesCPU.Length < numNodes)
+            nodesCPU = new Node[Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512))];
+
+        nodesBuffer.GetData(nodesCPU, 0, 0, numNodes);
+
+        AnalyzeNodesCpuForHistogramAndSpatialOverlaps(
+            recordSamplePairs: logSpatialOverlapDetails,
+            maxSamplePairs: 16,
+            activeNodesOnly: false,
+            out int dupCount,
+            out _);
+
+        int[] h = layerCountHistogramScratch;
+        layerCountLogSb.Clear();
+        layerCountLogSb.Append("Nodes per layer:");
+        bool any = false;
+        for (int L = 0; L < h.Length; L++)
+        {
+            if (h[L] == 0) continue;
+            layerCountLogSb.Append(' ').Append('L').Append(L).Append('=').Append(h[L]);
+            any = true;
+        }
+
+        if (!any)
+            layerCountLogSb.Append(" (no counts — unexpected)");
+
+        if (dupCount > 0)
+        {
+            int[] dupPerLayer = spatialDupPerLayerScratch;
+            layerCountLogSb.Append(" | OVERLAPS(same cell @ layer): ").Append(dupCount).Append(" (");
+            bool firstDup = true;
+            for (int L = 0; L < dupPerLayer.Length; L++)
+            {
+                if (dupPerLayer[L] == 0) continue;
+                if (!firstDup) layerCountLogSb.Append(", ");
+                layerCountLogSb.Append('L').Append(L).Append('=').Append(dupPerLayer[L]);
+                firstDup = false;
+            }
+            layerCountLogSb.Append(") [key = (layer, morton>>3*layer)]");
+        }
+
+        if (logSpatialOverlapDetails && dupCount > 0)
+            Debug.LogWarning(BuildSpatialOverlapSamplesMessage("After findNeighbors (frame summary readback)", diagSpatialOverlapVerboseTraces));
+
+        return layerCountLogSb.ToString();
+    }
+
+    /// <summary>Same convention as <c>Nodes.compute</c> / wireframe: 10 bits per axis.</summary>
+    private static void DeinterleaveMorton(uint m, out uint gx, out uint gy, out uint gz)
+    {
+        gx = 0;
+        gy = 0;
+        gz = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            gx |= ((m >> (3 * i + 0)) & 1u) << i;
+            gy |= ((m >> (3 * i + 1)) & 1u) << i;
+            gz |= ((m >> (3 * i + 2)) & 1u) << i;
+        }
+    }
+
+    private static uint CellMortonMinCorner(uint mortonCode, int layer)
+    {
+        int shift = layer * 3;
+        if (shift <= 0) return mortonCode;
+        if (shift >= 32) return 0u;
+        uint mask = (1u << shift) - 1u;
+        return mortonCode & ~mask;
+    }
+
+    /// <summary>Solver cell identity: same <paramref name="layerIndex"/> and same morton prefix at that scale.</summary>
+    private static ulong SpatialCellKeyAtLayer(uint mortonCode, int layerIndex)
+    {
+        int L = layerIndex;
+        if (L < 0) L = 0;
+        int shift = L * 3;
+        uint prefix = shift >= 32 ? 0u : mortonCode >> shift;
+        return ((ulong)(uint)L << 32) | prefix;
+    }
+
+    /// <summary>Matches GPU octree cell identity: same layer and same morton prefix at that layer = same spatial cell.</summary>
+    private static ulong SpatialCellKey(in Node n) =>
+        SpatialCellKeyAtLayer(n.mortonCode, (int)n.layer);
+
+    private void AppendNodeTraceLine(StringBuilder sb, int idx, in Node n, bool verbose)
+    {
+        int L = (int)n.layer;
+        int sh = Mathf.Clamp(L, 0, 15) * 3;
+        uint prefix = sh >= 32 ? 0u : n.mortonCode >> sh;
+        sb.Append("    [").Append(idx).Append("] layer=").Append(L)
+            .Append(" morton=0x").Append(n.mortonCode.ToString("X8"))
+            .Append(" prefix@L=0x").Append(prefix.ToString("X8"))
+            .Append(" active=").Append(n.active)
+            .Append(" mass=").Append(n.mass.ToString("G6", System.Globalization.CultureInfo.InvariantCulture))
+            .Append(" pos=").Append(n.position.ToString("F4"));
+        if (!verbose)
+        {
+            sb.Append('\n');
+            return;
+        }
+        DeinterleaveMorton(n.mortonCode, out uint gx, out uint gy, out uint gz);
+        sb.Append("\n      grid(full morton)=( ").Append(gx).Append(", ").Append(gy).Append(", ").Append(gz).Append(" )");
+        uint cellMc = CellMortonMinCorner(n.mortonCode, L);
+        DeinterleaveMorton(cellMc, out uint cx, out uint cy, out uint cz);
+        uint side = L >= 31 ? 0u : (1u << Mathf.Clamp(L, 0, 30));
+        sb.Append(" | cellMin@storedL=( ").Append(cx).Append(", ").Append(cy).Append(", ").Append(cz)
+            .Append(" ) cellSideGrid=").Append(side).Append('\n');
+    }
+
+    /// <summary>Assumes <see cref="nodesCPU"/> is filled for <see cref="numNodes"/>. Clears and fills histogram + overlap scratch.</summary>
+    /// <param name="activeNodesOnly">If true, only nodes with <c>active != 0</c> (skip merged/inactive slots still present before compact).</param>
+    private void AnalyzeNodesCpuForHistogramAndSpatialOverlaps(bool recordSamplePairs, int maxSamplePairs, bool activeNodesOnly, out int dupCount, out int mortonOrderInversions)
+    {
+        int[] h = layerCountHistogramScratch;
+        int[] dupPerLayer = spatialDupPerLayerScratch;
+        Array.Clear(h, 0, h.Length);
+        Array.Clear(dupPerLayer, 0, dupPerLayer.Length);
+        spatialOverlapFirstIndexScratch.Clear();
+        spatialOverlapPairScratch.Clear();
+
+        dupCount = 0;
+        mortonOrderInversions = 0;
+        uint prevMorton = 0;
+        bool havePrev = false;
+
+        for (int i = 0; i < numNodes; i++)
+        {
+            ref Node n = ref nodesCPU[i];
+            if (activeNodesOnly && n.active == 0)
+                continue;
+
+            int L = (int)n.layer;
+            if (L >= 0 && L < h.Length)
+                h[L]++;
+
+            if (!activeNodesOnly)
+            {
+                if (havePrev && n.mortonCode < prevMorton)
+                    mortonOrderInversions++;
+                prevMorton = n.mortonCode;
+                havePrev = true;
+            }
+
+            ulong key = SpatialCellKey(in n);
+            if (spatialOverlapFirstIndexScratch.TryGetValue(key, out int firstI))
+            {
+                dupCount++;
+                if (L >= 0 && L < dupPerLayer.Length)
+                    dupPerLayer[L]++;
+                if (recordSamplePairs && spatialOverlapPairScratch.Count < maxSamplePairs)
+                    spatialOverlapPairScratch.Add((firstI, i));
+            }
+            else
+                spatialOverlapFirstIndexScratch[key] = i;
+        }
+    }
+
+    private string BuildSpatialOverlapSamplesMessage(string stageTag, bool verbose)
+    {
+        spatialOverlapDetailSb.Clear();
+        spatialOverlapDetailSb.Append("[SpatialOverlap] ").Append(stageTag)
+            .Append(" — duplicate (layer, morton prefix) cells; samples follow.\n");
+        foreach (var p in spatialOverlapPairScratch)
+        {
+            spatialOverlapDetailSb.Append("  pair: ").Append(p.firstIdx).Append(" vs ").Append(p.secondIdx).Append('\n');
+            AppendNodeTraceLine(spatialOverlapDetailSb, p.firstIdx, nodesCPU[p.firstIdx], verbose);
+            AppendNodeTraceLine(spatialOverlapDetailSb, p.secondIdx, nodesCPU[p.secondIdx], verbose);
+        }
+        return spatialOverlapDetailSb.ToString();
+    }
+
+    /// <summary>Optional pipeline checkpoints: GPU readback + overlap stats (and optional morton-order check).</summary>
+    /// <param name="activeNodesOnly">Use true after ProcessNodes (inactive siblings still in the buffer until compact).</param>
+    private void LogSpatialOverlapStage(string stageTag, int maxSamplePairs = 12, bool activeNodesOnly = false, bool verboseTraces = false)
+    {
+        if (numNodes <= 0 || nodesBuffer == null)
+        {
+            Debug.Log($"{stageTag} — numNodes=0, skip overlap check.");
+            return;
+        }
+
+        if (nodesCPU == null || nodesCPU.Length < numNodes)
+            nodesCPU = new Node[Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512))];
+
+        nodesBuffer.GetData(nodesCPU, 0, 0, numNodes);
+        AnalyzeNodesCpuForHistogramAndSpatialOverlaps(
+            recordSamplePairs: true,
+            maxSamplePairs: maxSamplePairs,
+            activeNodesOnly: activeNodesOnly,
+            out int dupCount,
+            out int inv);
+
+        if (dupCount == 0)
+        {
+            if (!activeNodesOnly && inv > 0)
+                Debug.LogWarning($"[SpatialOverlap] {stageTag} — no duplicate cells but mortonOrderInversions={inv} (expected sorted mortonCodesBuffer order), numNodes={numNodes}");
+            else
+                Debug.Log($"{stageTag} — spatial overlaps=0, mortonOrderInversions={(activeNodesOnly ? "n/a" : inv.ToString())}, numNodes={numNodes}, activeOnly={activeNodesOnly}");
+            return;
+        }
+
+        spatialOverlapDetailSb.Clear();
+        spatialOverlapDetailSb.Append("[SpatialOverlap] ").Append(stageTag)
+            .Append(" numNodes=").Append(numNodes)
+            .Append(" activeOnly=").Append(activeNodesOnly)
+            .Append(" duplicateCells=").Append(dupCount)
+            .Append(" mortonOrderInversions=").Append(activeNodesOnly ? "n/a" : inv.ToString())
+            .Append(activeNodesOnly ? "\n" : " (inversions imply buffer not sorted by mortonCode)\n");
+        foreach (var p in spatialOverlapPairScratch)
+        {
+            spatialOverlapDetailSb.Append("  pair: ").Append(p.firstIdx).Append(" vs ").Append(p.secondIdx).Append('\n');
+            AppendNodeTraceLine(spatialOverlapDetailSb, p.firstIdx, nodesCPU[p.firstIdx], verboseTraces);
+            AppendNodeTraceLine(spatialOverlapDetailSb, p.secondIdx, nodesCPU[p.secondIdx], verboseTraces);
+        }
+        Debug.LogWarning(spatialOverlapDetailSb.ToString());
+    }
+
+    /// <summary>CreateLeaves: all leaves share <c>node.layer == maxLayer</c>, so solver-style (layer,prefix) collisions are expected noise. Report meaningful invariants instead.</summary>
+    private void LogCreateLeavesPackInspection()
+    {
+        if (numNodes <= 0 || nodesBuffer == null)
+        {
+            Debug.Log("[LeafInspect] After CreateLeaves: numNodes=0, skip.");
+            return;
+        }
+
+        if (nodesCPU == null || nodesCPU.Length < numNodes)
+            nodesCPU = new Node[Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512))];
+
+        nodesBuffer.GetData(nodesCPU, 0, 0, numNodes);
+
+        inspectUintKeyScratch.Clear();
+        int duplicateFullMortonExtra = 0;
+        int sampleA = -1, sampleB = -1;
+        for (int i = 0; i < numNodes; i++)
+        {
+            uint mc = nodesCPU[i].mortonCode;
+            if (inspectUintKeyScratch.TryGetValue(mc, out int firstI))
+            {
+                duplicateFullMortonExtra++;
+                if (sampleA < 0)
+                {
+                    sampleA = firstI;
+                    sampleB = i;
+                }
+            }
+            else
+                inspectUintKeyScratch[mc] = i;
+        }
+
+        spatialOverlapFirstIndexScratch.Clear();
+        int dupMinLayerBuckets = 0;
+        int minLayerSampleA = -1, minLayerSampleB = -1;
+        for (int i = 0; i < numNodes; i++)
+        {
+            ulong k = SpatialCellKeyAtLayer(nodesCPU[i].mortonCode, minLayer);
+            if (spatialOverlapFirstIndexScratch.TryGetValue(k, out int firstI))
+            {
+                dupMinLayerBuckets++;
+                if (minLayerSampleA < 0)
+                {
+                    minLayerSampleA = firstI;
+                    minLayerSampleB = i;
+                }
+            }
+            else
+                spatialOverlapFirstIndexScratch[k] = i;
+        }
+
+        spatialOverlapFirstIndexScratch.Clear();
+        int coarseCollisionsAtMaxLayer = 0;
+        for (int i = 0; i < numNodes; i++)
+        {
+            ulong k = SpatialCellKeyAtLayer(nodesCPU[i].mortonCode, maxLayer);
+            if (spatialOverlapFirstIndexScratch.ContainsKey(k))
+                coarseCollisionsAtMaxLayer++;
+            else
+                spatialOverlapFirstIndexScratch[k] = i;
+        }
+
+        int mortonInv = 0;
+        for (int i = 1; i < numNodes; i++)
+        {
+            if (nodesCPU[i].mortonCode < nodesCPU[i - 1].mortonCode)
+                mortonInv++;
+        }
+
+        Array.Clear(layerCountHistogramScratch, 0, layerCountHistogramScratch.Length);
+        for (int i = 0; i < numNodes; i++)
+        {
+            int L = (int)nodesCPU[i].layer;
+            if (L >= 0 && L < layerCountHistogramScratch.Length)
+                layerCountHistogramScratch[L]++;
+        }
+
+        spatialOverlapDetailSb.Clear();
+        spatialOverlapDetailSb.Append("[LeafInspect] After CreateLeaves numNodes=").Append(numNodes)
+            .Append("\n  duplicateFullMortonExtra=").Append(duplicateFullMortonExtra)
+            .Append(" (expect 0 — two leaves with identical particle morton)")
+            .Append("\n  duplicateMinLayerBuckets=").Append(dupMinLayerBuckets)
+            .Append(" (expect 0 — should match findUniqueParticles @ minLayer)")
+            .Append("\n  coarseBucketCollisionsAtMaxLayer=").Append(coarseCollisionsAtMaxLayer)
+            .Append(" (expected large; every node.layer=maxLayer so many leaves share a coarse key — not a bug)")
+            .Append("\n  mortonOrderInversions=").Append(mortonInv)
+            .Append(" (expect 0 if sorted by morton)")
+            .Append("\n  storedLayerHistogram: ");
+        bool anyL = false;
+        for (int L = 0; L < layerCountHistogramScratch.Length; L++)
+        {
+            if (layerCountHistogramScratch[L] == 0) continue;
+            if (anyL) spatialOverlapDetailSb.Append(' ');
+            spatialOverlapDetailSb.Append('L').Append(L).Append('=').Append(layerCountHistogramScratch[L]);
+            anyL = true;
+        }
+        spatialOverlapDetailSb.Append('\n');
+
+        if (duplicateFullMortonExtra > 0 || dupMinLayerBuckets > 0 || mortonInv > 0)
+        {
+            if (duplicateFullMortonExtra > 0 && sampleA >= 0)
+            {
+                spatialOverlapDetailSb.Append("  sample duplicate full morton: indices ").Append(sampleA).Append(" vs ").Append(sampleB).Append('\n');
+                AppendNodeTraceLine(spatialOverlapDetailSb, sampleA, nodesCPU[sampleA], diagSpatialOverlapVerboseTraces);
+                AppendNodeTraceLine(spatialOverlapDetailSb, sampleB, nodesCPU[sampleB], diagSpatialOverlapVerboseTraces);
+            }
+            if (dupMinLayerBuckets > 0 && minLayerSampleA >= 0)
+            {
+                spatialOverlapDetailSb.Append("  sample duplicate minLayer=").Append(minLayer).Append(" bucket: indices ")
+                    .Append(minLayerSampleA).Append(" vs ").Append(minLayerSampleB).Append('\n');
+                AppendNodeTraceLine(spatialOverlapDetailSb, minLayerSampleA, nodesCPU[minLayerSampleA], diagSpatialOverlapVerboseTraces);
+                AppendNodeTraceLine(spatialOverlapDetailSb, minLayerSampleB, nodesCPU[minLayerSampleB], diagSpatialOverlapVerboseTraces);
+            }
+            Debug.LogWarning(spatialOverlapDetailSb.ToString());
+        }
+        else
+            Debug.Log(spatialOverlapDetailSb.ToString());
+    }
+
+    private void LogParticleMortonInspection(string stageTag)
+    {
+        if (particlesBuffer == null || numParticles <= 0)
+        {
+            Debug.Log($"[ParticleInspect] {stageTag}: no particles, skip.");
+            return;
+        }
+
+        if (particlesCPU == null || particlesCPU.Length < numParticles)
+            particlesCPU = new Particle[numParticles];
+
+        particlesBuffer.GetData(particlesCPU, 0, 0, numParticles);
+
+        int sortInversions = 0;
+        for (int i = 1; i < numParticles; i++)
+        {
+            if (particlesCPU[i].mortonCode < particlesCPU[i - 1].mortonCode)
+                sortInversions++;
+        }
+
+        int consecutiveEqual = 0;
+        for (int i = 1; i < numParticles; i++)
+        {
+            if (particlesCPU[i].mortonCode == particlesCPU[i - 1].mortonCode)
+                consecutiveEqual++;
+        }
+
+        inspectUintKeyScratch.Clear();
+        for (int i = 0; i < numParticles; i++)
+        {
+            uint m = particlesCPU[i].mortonCode;
+            inspectUintKeyScratch.TryGetValue(m, out int c);
+            inspectUintKeyScratch[m] = c + 1;
+        }
+
+        int distinctMorton = inspectUintKeyScratch.Count;
+        int mortonValuesWithCountGt1 = 0;
+        foreach (var kv in inspectUintKeyScratch)
+        {
+            if (kv.Value > 1)
+                mortonValuesWithCountGt1++;
+        }
+
+        int extraParticleSlots = numParticles - distinctMorton;
+
+        spatialOverlapDetailSb.Clear();
+        spatialOverlapDetailSb.Append("[ParticleInspect] ").Append(stageTag)
+            .Append(" numParticles=").Append(numParticles)
+            .Append("\n  morton sort inversions=").Append(sortInversions)
+            .Append(" (expect 0 after radix sort — if >0, sort is broken)")
+            .Append("\n  consecutive equal morton pairs=").Append(consecutiveEqual)
+            .Append("\n  distinct morton codes=").Append(distinctMorton)
+            .Append("\n  morton codes with count>1=").Append(mortonValuesWithCountGt1)
+            .Append("\n  extra particle slots vs distinct=").Append(extraParticleSlots)
+            .Append(" (= sum of (count-1) over duplicated codes)")
+            .Append("\n  Note: many particles sharing one morton is normal — EncodeMorton3D uses 10 bits/axis (~1M cells);")
+            .Append("\n  ~1M particles pack into fewer distinct codes, so duplicates do not imply a sort or leaf bug by themselves.")
+            .Append('\n');
+
+        if (sortInversions > 0)
+            Debug.LogWarning(spatialOverlapDetailSb.ToString());
+        else
+            Debug.Log(spatialOverlapDetailSb.ToString());
     }
 
     private void CalculateDensityGradients()

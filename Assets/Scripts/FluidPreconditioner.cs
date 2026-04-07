@@ -3,7 +3,7 @@ using UnityEngine;
 // Preconditioner hooks for PCG. Legacy sparse-G / V-cycle path removed; LeafOnly matrix-free apply TBD.
 public partial class FluidSimulator : MonoBehaviour
 {
-    private static bool warnedNeuralFallback;
+    private static bool warnedNeuralPackedFallback;
 
     private void ApplyPreconditioner(ComputeBuffer r, ComputeBuffer z_out, int kJacobi)
     {
@@ -15,11 +15,15 @@ public partial class FluidSimulator : MonoBehaviour
 
         if (preconditioner == PreconditionerType.Neural)
         {
-            if (!warnedNeuralFallback)
+            if (TryDispatchLeafOnlyPrecondPackedApply(r, z_out))
+                return;
+            if (!warnedNeuralPackedFallback)
             {
-                warnedNeuralFallback = true;
+                warnedNeuralPackedFallback = true;
                 Debug.Log(
-                    "PreconditionerType.Neural: sparse-G path removed; using Jacobi until LeafOnly matrix-free apply is wired. Set preconditioner to Jacobi to silence.");
+                    "PreconditionerType.Neural: LeafOnly packed GPU apply did not run (Editor auto-loads LeafOnlyPrecondApply.compute; " +
+                    "packed data uploads after layer-1 forward; assign shader in player builds; weights + checkpoint layout must match). " +
+                    "Falling back to Jacobi. Set preconditioner to Jacobi to silence.");
             }
         }
 

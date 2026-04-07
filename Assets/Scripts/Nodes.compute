@@ -614,8 +614,8 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         aggregatedNode.position = weightedPosition;
         aggregatedNode.velocity = weightedVelocity;
         aggregatedNode.velocities = aggregatedVelocities;
-        // Parent cell is one level coarser than children (larger exp2(layer) in this codebase).
-        aggregatedNode.layer = min(minSubLayer + 1u, kMortonAxisBits);
+        // Parent cell is at the current coarsening level.
+        aggregatedNode.layer = layer;
         aggregatedNode.mass = totalMass;
         aggregatedNode.mortonCode = nodesBuffer[uniqueStart].mortonCode;
         aggregatedNode.active = 1u; // Set last bit to 1

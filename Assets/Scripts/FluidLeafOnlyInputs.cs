@@ -230,14 +230,22 @@ public partial class FluidSimulator : MonoBehaviour
         int xGroups = Mathf.CeilToInt(nPad / 256.0f);
         leafOnlyInputsShader.Dispatch(leafOnlyBuildXKernel, xGroups, 1, 1);
 
-        if (debugLeafOnlyParityLog)
+        bool runFullParityLog = debugLeafOnlyParityLog
+            && (!debugLeafOnlyParityLogOnce || !s_leafOnlyParityLoggedThisSession);
+        if (runFullParityLog)
         {
-            if (!debugLeafOnlyParityLogOnce || !s_leafOnlyParityLoggedThisSession)
-            {
-                LogLeafOnlyParityToConsole(numNodes, nPad, nTake, maxNnz);
-                if (debugLeafOnlyParityLogOnce)
-                    s_leafOnlyParityLoggedThisSession = true;
-            }
+            LogLeafOnlyParityToConsole(numNodes, nPad, nTake, maxNnz);
+            if (debugLeafOnlyParityLogOnce)
+                s_leafOnlyParityLoggedThisSession = true;
+        }
+        else if (preconditioner == PreconditionerType.Neural && LeafOnlyWeightsLoadedSuccessfully && leafOnlyCompactEdgeCount != null)
+        {
+            // Packed M depends on current x_leaf / graph; refresh every pressure solve (parity path only runs when runFullParityLog).
+            uint[] ecNeural = new uint[1];
+            leafOnlyCompactEdgeCount.GetData(ecNeural, 0, 0, 1);
+            int eNeural = (int)ecNeural[0];
+            DispatchLeafOnlyEmbedForwardAndLogParity(nPad, eNeural, logParityTensors: false);
+            DispatchLeafOnlyLayer1GpuForwardAndLogParity(nPad, logParityTensors: false);
         }
     }
 
@@ -407,6 +415,7 @@ public partial class FluidSimulator : MonoBehaviour
             int eTok = (int)ecTok[0];
             DispatchLeafOnlyEmbedForwardAndLogParity(nPad, eTok);
             DispatchLeafOnlyLayer1GpuForwardAndLogParity(nPad);
+            LeafOnlyParityLogGpuPackedApplyOnes(phase);
         }
     }
 
@@ -520,5 +529,6 @@ public partial class FluidSimulator : MonoBehaviour
         ReleaseLeafOnlyLayer1GpuBuffers();
         ReleaseLeafOnlyDiagEdgeFeatsBuffers();
         ReleaseLeafOnlyOffEdgeFeatsBuffers();
+        ReleaseLeafOnlyPrecondApplyBuffers();
     }
 }

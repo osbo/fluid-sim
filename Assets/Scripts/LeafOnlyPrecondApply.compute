@@ -1,0 +1,393 @@
+// Packed LeafOnly preconditioner apply z += M r (K_dim=1). Matches leafonly/architecture.py
+// apply_block_diagonal_m_physical for highway=0, dense blocks, static H layout.
+#pragma kernel LeafOnly_PrecondClearZ
+#pragma kernel LeafOnly_PrecondClearScratch
+#pragma kernel LeafOnly_PrecondPoolDiag
+#pragma kernel LeafOnly_PrecondDiag
+#pragma kernel LeafOnly_PrecondProjUV
+#pragma kernel LeafOnly_PrecondRowStrip
+#pragma kernel LeafOnly_PrecondColStrip
+#pragma kernel LeafOnly_PrecondBmmCol
+#pragma kernel LeafOnly_PrecondBmmRowT
+#pragma kernel LeafOnly_PrecondProlongRow
+#pragma kernel LeafOnly_PrecondProlongCol
+#pragma kernel LeafOnly_PrecondNodeAcc
+#pragma kernel LeafOnly_PrecondJacobi
+
+StructuredBuffer<float> leafPrecondPacked;
+StructuredBuffer<float> leafPrecondR;
+RWStructuredBuffer<float> leafPrecondZ;
+RWStructuredBuffer<float> leafPrecondScratch;
+
+StructuredBuffer<int> leafHmR0;
+StructuredBuffer<int> leafHmC0;
+StructuredBuffer<int> leafHmS;
+
+int leafNumPad;
+int leafNTake;
+int leafKLeaves;
+int leafL;
+int leafLaD;
+int leafLaO;
+int leafPoolD;
+int leafMOff;
+int leafDiagSize;
+int leafOffBase;
+int leafUBase;
+int leafVBase;
+int leafJacobiPackedBase;
+int leafHasJacobi;
+int leafScratchRowStrip;
+int leafScratchColStrip;
+int leafScratchYr;
+int leafScratchYc;
+int leafScratchXPool;
+int leafScratchXu;
+int leafScratchXv;
+int leafScratchYrPad;
+int leafScratchYcPad;
+
+StructuredBuffer<float> leafJacobiInvDiag;
+
+int leafScratchClearCount;
+
+float TbDiag(int k, int row, int col)
+{
+    uint kk = (uint)k;
+    uint ld = (uint)leafLaD;
+    uint idx = kk * ld * ld + (uint)row * ld + (uint)col;
+    return leafPrecondPacked[idx];
+}
+
+float TbOffB(int m, int row, int col)
+{
+    uint mo = (uint)leafMOff;
+    uint lo = (uint)leafLaO;
+    uint idx = (uint)leafOffBase + (uint)m * lo * lo + (uint)row * lo + (uint)col;
+    return leafPrecondPacked[idx];
+}
+
+float TbNodeU(int k, int i, int o)
+{
+    uint kk = (uint)k;
+    uint L = (uint)leafL;
+    uint lo = (uint)leafLaO;
+    uint idx = (uint)leafUBase + kk * L * lo + (uint)i * lo + (uint)o;
+    return leafPrecondPacked[idx];
+}
+
+float TbNodeV(int k, int i, int o)
+{
+    uint kk = (uint)k;
+    uint L = (uint)leafL;
+    uint lo = (uint)leafLaO;
+    uint idx = (uint)leafVBase + kk * L * lo + (uint)i * lo + (uint)o;
+    return leafPrecondPacked[idx];
+}
+
+float RSafe(int lin)
+{
+    if (lin < 0 || lin >= leafNTake)
+        return 0.0;
+    return leafPrecondR[lin];
+}
+
+// True when block m's row range [r0,r0+s) and col range [c0,c0+s) are both fully within active leaves.
+// Mirrors Python: valid = ((HM_R0+HM_S) <= na) & ((HM_C0+HM_S) <= na)
+bool BlockValid(uint m)
+{
+    int r0 = leafHmR0[m];
+    int c0 = leafHmC0[m];
+    int ss = leafHmS[m];
+    return (r0 + ss <= leafKLeaves) && (c0 + ss <= leafKLeaves);
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondClearZ(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafNumPad)
+        return;
+    leafPrecondZ[n] = 0.0;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondClearScratch(uint3 id : SV_DispatchThreadID)
+{
+    uint n = id.x;
+    if (n >= (uint)leafScratchClearCount)
+        return;
+    leafPrecondScratch[n] = 0.0;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondPoolDiag(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint K = (uint)leafKLeaves;
+    uint LaD = (uint)leafLaD;
+    uint total = K * LaD;
+    if (idx >= total)
+        return;
+    uint k = idx / LaD;
+    uint j = idx % LaD;
+    uint L = (uint)leafL;
+    uint pd = (uint)leafPoolD;
+    float acc = 0.0;
+    for (uint dd = 0; dd < pd; dd++)
+    {
+        int lin = (int)(k * L + j * pd + dd);
+        acc += RSafe(lin);
+    }
+    acc /= (float)pd;
+    uint base = (uint)leafScratchXPool;
+    leafPrecondScratch[base + idx] = acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondDiag(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint K = (uint)leafKLeaves;
+    uint L = (uint)leafL;
+    uint total = K * L;
+    if (idx >= total)
+        return;
+    uint k = idx / L;
+    uint ti = idx % L;
+    uint LaD = (uint)leafLaD;
+    uint pd = (uint)leafPoolD;
+    uint row = ti / pd;
+    float acc = 0.0;
+    uint poolBase = (uint)leafScratchXPool;
+    for (uint j = 0; j < LaD; j++)
+    {
+        float xp = leafPrecondScratch[poolBase + k * LaD + j];
+        acc += TbDiag((int)k, (int)row, (int)j) * xp;
+    }
+    float prev = leafPrecondZ[idx];
+    leafPrecondZ[idx] = prev + acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondProjUV(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint K = (uint)leafKLeaves;
+    uint LaO = (uint)leafLaO;
+    uint total = K * LaO;
+    if (idx >= total)
+        return;
+    uint k = idx / LaO;
+    uint o = idx % LaO;
+    uint L = (uint)leafL;
+    float uSum = 0.0;
+    float vSum = 0.0;
+    for (uint i = 0; i < L; i++)
+    {
+        float rv = RSafe((int)(k * L + i));
+        uSum += TbNodeU((int)k, (int)i, (int)o) * rv;
+        vSum += TbNodeV((int)k, (int)i, (int)o) * rv;
+    }
+    uint bu = (uint)leafScratchXu;
+    uint bv = (uint)leafScratchXv;
+    leafPrecondScratch[bu + idx] = uSum;
+    leafPrecondScratch[bv + idx] = vSum;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondRowStrip(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint M = (uint)leafMOff;
+    uint LaO = (uint)leafLaO;
+    uint total = M * LaO;
+    if (idx >= total)
+        return;
+    uint m = idx / LaO;
+    uint o = idx % LaO;
+    int r0 = leafHmR0[m];
+    int ss = leafHmS[m];
+    uint Kmax = (uint)leafKLeaves;
+    float acc = 0.0;
+    uint bu = (uint)leafScratchXu;
+    for (int kk = 0; kk < ss; kk++)
+    {
+        int k = r0 + kk;
+        if (k >= 0 && (uint)k < Kmax)
+            acc += leafPrecondScratch[bu + (uint)k * LaO + o];
+    }
+    uint dst = (uint)leafScratchRowStrip;
+    leafPrecondScratch[dst + idx] = acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondColStrip(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint M = (uint)leafMOff;
+    uint LaO = (uint)leafLaO;
+    uint total = M * LaO;
+    if (idx >= total)
+        return;
+    uint m = idx / LaO;
+    uint o = idx % LaO;
+    int c0 = leafHmC0[m];
+    int ss = leafHmS[m];
+    uint Kmax = (uint)leafKLeaves;
+    float acc = 0.0;
+    uint bv = (uint)leafScratchXv;
+    for (int kk = 0; kk < ss; kk++)
+    {
+        int k = c0 + kk;
+        if (k >= 0 && (uint)k < Kmax)
+            acc += leafPrecondScratch[bv + (uint)k * LaO + o];
+    }
+    uint dst = (uint)leafScratchColStrip;
+    leafPrecondScratch[dst + idx] = acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondBmmCol(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint M = (uint)leafMOff;
+    uint LaO = (uint)leafLaO;
+    uint total = M * LaO;
+    if (idx >= total)
+        return;
+    uint m = idx / LaO;
+    uint o = idx % LaO;
+    uint dst = (uint)leafScratchYr;
+    if (!BlockValid(m))
+    {
+        leafPrecondScratch[dst + idx] = 0.0;
+        return;
+    }
+    float acc = 0.0;
+    uint src = (uint)leafScratchColStrip;
+    for (uint p = 0; p < LaO; p++)
+    {
+        float b = TbOffB((int)m, (int)o, (int)p);
+        acc += b * leafPrecondScratch[src + m * LaO + p];
+    }
+    leafPrecondScratch[dst + idx] = acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondBmmRowT(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint M = (uint)leafMOff;
+    uint LaO = (uint)leafLaO;
+    uint total = M * LaO;
+    if (idx >= total)
+        return;
+    uint m = idx / LaO;
+    uint o = idx % LaO;
+    uint dst = (uint)leafScratchYc;
+    if (!BlockValid(m))
+    {
+        leafPrecondScratch[dst + idx] = 0.0;
+        return;
+    }
+    float acc = 0.0;
+    uint src = (uint)leafScratchRowStrip;
+    for (uint p = 0; p < LaO; p++)
+    {
+        float b = TbOffB((int)m, (int)p, (int)o);
+        acc += b * leafPrecondScratch[src + m * LaO + p];
+    }
+    leafPrecondScratch[dst + idx] = acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondProlongRow(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint K = (uint)leafKLeaves;
+    uint LaO = (uint)leafLaO;
+    uint total = K * LaO;
+    if (idx >= total)
+        return;
+    uint k = idx / LaO;
+    uint o = idx % LaO;
+    uint M = (uint)leafMOff;
+    float acc = 0.0;
+    uint yr = (uint)leafScratchYr;
+    for (uint m = 0; m < M; m++)
+    {
+        int r0 = leafHmR0[m];
+        int ss = leafHmS[m];
+        if ((int)k >= r0 && (int)k < r0 + ss)
+            acc += leafPrecondScratch[yr + m * LaO + o];
+    }
+    uint dst = (uint)leafScratchYrPad;
+    leafPrecondScratch[dst + idx] = acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondProlongCol(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint K = (uint)leafKLeaves;
+    uint LaO = (uint)leafLaO;
+    uint total = K * LaO;
+    if (idx >= total)
+        return;
+    uint k = idx / LaO;
+    uint o = idx % LaO;
+    uint M = (uint)leafMOff;
+    float acc = 0.0;
+    uint yc = (uint)leafScratchYc;
+    for (uint m = 0; m < M; m++)
+    {
+        int c0 = leafHmC0[m];
+        int ss = leafHmS[m];
+        if ((int)k >= c0 && (int)k < c0 + ss)
+            acc += leafPrecondScratch[yc + m * LaO + o];
+    }
+    uint dst = (uint)leafScratchYcPad;
+    leafPrecondScratch[dst + idx] = acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondNodeAcc(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint K = (uint)leafKLeaves;
+    uint L = (uint)leafL;
+    uint total = K * L;
+    if (idx >= total)
+        return;
+    uint k = idx / L;
+    uint i = idx % L;
+    uint LaO = (uint)leafLaO;
+    uint br = (uint)leafScratchYrPad;
+    uint bc = (uint)leafScratchYcPad;
+    float acc = 0.0;
+    for (uint o = 0; o < LaO; o++)
+    {
+        float yrp = leafPrecondScratch[br + k * LaO + o];
+        float ycp = leafPrecondScratch[bc + k * LaO + o];
+        acc += TbNodeU((int)k, (int)i, (int)o) * yrp;
+        acc += TbNodeV((int)k, (int)i, (int)o) * ycp;
+    }
+    float prev = leafPrecondZ[idx];
+    leafPrecondZ[idx] = prev + acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_PrecondJacobi(uint3 id : SV_DispatchThreadID)
+{
+    if (leafHasJacobi == 0)
+        return;
+    uint n = id.x;
+    if (n >= (uint)leafNumPad)
+        return;
+    float rv = RSafe((int)n);
+    float jac = leafPrecondPacked[(uint)leafJacobiPackedBase + n];
+    float invd = leafJacobiInvDiag[n];
+    float prev = leafPrecondZ[n];
+    leafPrecondZ[n] = prev + jac * invd * rv;
+}

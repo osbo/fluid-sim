@@ -173,8 +173,8 @@ public partial class FluidSimulator : MonoBehaviour
         leafOnlyEmbedShader.Dispatch(kernel, groups, 1, 1);
     }
 
-    /// <summary>Runs embed + enc on GPU and logs <c>[LeafOnlyParity] tensor=token_after_enc</c> lines.</summary>
-    private void DispatchLeafOnlyEmbedForwardAndLogParity(int nPad, int compactEdgeCount)
+    /// <summary>Runs embed + enc on GPU. When <paramref name="logParityTensors"/>, logs <c>[LeafOnlyParity] tensor=token_after_enc</c> lines.</summary>
+    private void DispatchLeafOnlyEmbedForwardAndLogParity(int nPad, int compactEdgeCount, bool logParityTensors = true)
     {
         const string phase = "unity";
         if (leafOnlyEmbedShader == null)
@@ -283,6 +283,9 @@ public partial class FluidSimulator : MonoBehaviour
         leafOnlyEmbedShader.SetBuffer(leafOnlyEmbedEncProjKernel, "leafEmbedHIn", hOut);
         leafOnlyEmbedShader.SetBuffer(leafOnlyEmbedEncProjKernel, "leafTokenAfterEnc", leafOnlyTokenAfterEnc);
         DispatchLeafOnlyEmbed1D(leafOnlyEmbedEncProjKernel, nPad);
+
+        if (!logParityTensors)
+            return;
 
         int nTok = nPad * dm;
         var tok = new float[nTok];
