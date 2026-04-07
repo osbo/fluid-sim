@@ -230,6 +230,9 @@ public partial class FluidSimulator : MonoBehaviour
         numNodes = (int)nodeCountCpu[0];
 
         (nodesBuffer, tempNodesBuffer) = (tempNodesBuffer, nodesBuffer);
+
+        if (diagSpatialOverlapAfterEachLayerCompact)
+            LogSpatialOverlapStage($"After compactNodes (octree ProcessNodes layer={layer})", maxSamplePairs: 12, activeNodesOnly: false, verboseTraces: diagSpatialOverlapVerboseTraces);
     }
 
     private void findNeighbors()

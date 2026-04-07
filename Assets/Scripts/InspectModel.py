@@ -7,6 +7,7 @@ Preconditioners for Conjugate Gradient Solvers on GPUs* (NeurIPS 2025;
 Diag (Jacobi), IC-class (``ilupp.IChol0`` or scipy ``spilu`` fallback), PyAMG / AMGX. On CUDA, the benchmark always runs a second AMGX session: PCG with ``MULTICOLOR_DILU`` (scalar CSR; AMGX ``MULTICOLOR_ILU`` GPU path is 4×4-only).
 
 Use ``--test-only`` to run the PCG benchmark path and print only that summary (no plots, profiling, or dense AMG build).
+Use ``--frame N`` and ``--weights PATH`` to select the dataset index and checkpoint (defaults: frame 600, ``leaf_only_weights.bytes`` beside this script).
 Use ``--fast-plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``eig(A·M)``, ``cond(A·M)``, and A-eigenmode error curves (saves many minutes for n in the thousands).
 
 **pyamgx / AMGX:** ``libamgxsh`` must load ``libcublas`` and ``libcusolver`` from a matching CUDA toolkit. Set ``INSPECTMODEL_AMGX_CUDA_HOME`` to the toolkit root used to build AMGX (or ``INSPECTMODEL_AMGX_LD_EXTRA`` to its ``lib64``) if auto-discovery fails. To align with ``module load cuda`` (CUDA 13), rebuild AMGX and pyamgx against that toolkit (see NVIDIA AMGX CMake: ``-DCMAKE_CUDA_ARCHITECTURES=...``, ``CUDAToolkit_ROOT``).
@@ -2043,6 +2044,20 @@ def main():
         metavar="DIR",
         help="Frame root (rglob nodes.bin). Default: StreamingAssets/TestData next to Assets.",
     )
+    parser.add_argument(
+        "--frame",
+        type=int,
+        default=600,
+        metavar="N",
+        help="Dataset frame index (sorted frame paths under --data-folder). Default: 600 (legacy).",
+    )
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Leaf-only checkpoint .bytes. Default: leaf_only_weights.bytes next to InspectModel.py.",
+    )
     args = parser.parse_args()
     test_only = bool(args.test_only)
     fast_plot = bool(getattr(args, "fast_plot", False))
@@ -2067,9 +2082,11 @@ def main():
         data_folder = Path(_df_arg).expanduser().resolve()
     else:
         data_folder = script_dir.parent / "StreamingAssets" / "TestData"
-    leaf_only_weights_path = script_dir / "leaf_only_weights.bytes"
+    if args.weights:
+        leaf_only_weights_path = Path(args.weights).expanduser().resolve()
+    else:
+        leaf_only_weights_path = script_dir / "leaf_only_weights.bytes"
     out_path = script_dir / "inspect_model_plot.png"
-    frame_idx = 600
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available():
@@ -2096,7 +2113,7 @@ def main():
     dataset = FluidGraphDataset([Path(data_folder)])
     if len(dataset) == 0:
         raise SystemExit("No frames found (need nodes.bin, edge_index_*.bin, A_values.bin).")
-    frame_idx = min(frame_idx, len(dataset) - 1)
+    frame_idx = max(0, min(int(args.frame), len(dataset) - 1))
     batch = dataset[frame_idx]
 
     x = batch['x'].unsqueeze(0).to(device)

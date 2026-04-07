@@ -18,6 +18,21 @@ CPU fallback. PyTorch reference: ``_layer0_transformer_reference_tensors`` with 
 Packed forward tails (``precondDiag``, ``precondOff``, ``precondU``, ``precondV``, ``precondJac``): Unity GPU
 kernels match ``LeafOnlyNet.forward`` / ``unpack_precond`` when ``mlp_heads=1`` and weights align.
 
+Concatenated pack (``packed_precond``): same tight order as ``LeafOnlyNet.forward`` output —
+``[diag active][off][node_U][node_V][jacobi]``. Unity logs this after layer-1 GPU when both head and tail
+kernels run; it also uploads into ``FluidSimulator.leafOnlyPrecondPackedBuffer`` when that buffer's float count
+matches (otherwise call ``TryAllocLeafOnlyPrecondPackedBuffer()`` on the simulator). Compare Unity vs PyTorch
+``packed_precond`` summary lines directly.
+
+M@r apply: omit ``--no_apply`` to print ``apply_block_diagonal_m_physical`` summaries on random/ones ``r`` in PyTorch.
+Unity ``PreconditionerType.Neural`` uses ``LeafOnlyPrecondApply.compute`` when the shader is assigned, the packed
+buffer is filled (see above), and ``LeafOnlyLastNPadded`` matches the solve; optional ``leafOnlyJacobiInvDiagBuffer``
+for the gated diagonal term.
+
+PCG benchmark (same code path as ``InspectModel.py --test-only``): pass ``--pcg`` to re-invoke ``InspectModel.py``
+after parity logs. That run uses ``problem_padded_num_nodes`` (floor leaf alignment), ``torch.compile`` on the net,
+matrix-free (or BSR) GPU PCG, Jacobi / none / LeafOnly baselines — identical to a direct ``InspectModel.py`` call.
+
 Dense diagonal attention RPE: ``diag_edge_feats`` (K×L×L×4), same as ``build_diag_dense_edge_feats_from_positions``
 (no attn_mask; channels 0–2 = position deltas, 3 = mean in-leaf matrix entry per cell). Unity builds this on GPU
 (``LeafOnlyDiagEdgeFeats.compute``) from ``leafXPacked`` + CSR ``A``.
@@ -46,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -680,6 +696,39 @@ def main() -> None:
         action="store_true",
         help="Load only the dataset frame and print --print_unity_inputs (no checkpoint or model).",
     )
+    p.add_argument(
+        "--pcg",
+        action="store_true",
+        help=(
+            "After parity output, run InspectModel.py --test-only on the same --frame / --data_folder / --weights "
+            "(same PCG loop as InspectModel; uses problem_padded_num_nodes, not necessarily --align ceil)."
+        ),
+    )
+    p.add_argument(
+        "--pcg-leafonly-mode",
+        choices=("matrix_free", "bsr"),
+        default="matrix_free",
+        help="Forwarded to InspectModel --leafonly-pcg when using --pcg.",
+    )
+    p.add_argument(
+        "--pcg-cuda-backend",
+        choices=("cudagraph", "compile", "eager"),
+        default="cudagraph",
+        help="Forwarded to InspectModel --pcg-cuda-backend when using --pcg.",
+    )
+    p.add_argument(
+        "--pcg-check-freq",
+        type=int,
+        default=3,
+        metavar="K",
+        help="Forwarded to InspectModel --pcg-check-freq when using --pcg.",
+    )
+    p.add_argument(
+        "--pcg-gpu-fp64",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Forwarded to InspectModel --gpu-pcg-fp64 / --no-gpu-pcg-fp64 when using --pcg (MPS forces float32).",
+    )
     args = p.parse_args()
     if args.inputs_parity_only:
         args.print_unity_inputs = True
@@ -910,40 +959,82 @@ def main() -> None:
             f"L_off={int(model.leaf_apply_off)} M_off={int(model.num_h_off)}"
         )
 
-    if args.no_apply:
-        return
-
-    A = torch.zeros(n_pad, n_pad, device=device, dtype=x.dtype)
-    A[edge_index_leaf[0], edge_index_leaf[1]] = edge_values_leaf
-    diag_a = torch.diagonal(A)
-    jacobi_inv = torch.zeros(1, n_pad, device=device, dtype=x.dtype)
-    jacobi_inv[0, :n_edge_active] = torch.where(
-        diag_a[:n_edge_active].abs() > 1e-12,
-        1.0 / diag_a[:n_edge_active],
-        torch.zeros_like(diag_a[:n_edge_active]),
-    )
-
-    if args.r == "ones":
-        r = torch.ones(1, n_pad, 1, device=device, dtype=x.dtype)
-    else:
-        g = torch.Generator(device=device)
-        g.manual_seed(int(args.seed))
-        r = torch.randn(1, n_pad, 1, device=device, dtype=x.dtype, generator=g)
-
-    _summarize("apply_r", r)
-    _head("apply_r", r, 16)
-
-    with torch.inference_mode():
-        z = apply_block_diagonal_M_physical(
-            packed,
-            r,
-            leaf_size=LEAF_SIZE,
-            leaf_apply_size=La_d,
-            leaf_apply_off=La_o,
-            jacobi_inv_diag=jacobi_inv,
+    if not args.no_apply:
+        A = torch.zeros(n_pad, n_pad, device=device, dtype=x.dtype)
+        A[edge_index_leaf[0], edge_index_leaf[1]] = edge_values_leaf
+        diag_a = torch.diagonal(A)
+        jacobi_inv = torch.zeros(1, n_pad, device=device, dtype=x.dtype)
+        jacobi_inv[0, :n_edge_active] = torch.where(
+            diag_a[:n_edge_active].abs() > 1e-12,
+            1.0 / diag_a[:n_edge_active],
+            torch.zeros_like(diag_a[:n_edge_active]),
         )
-    _summarize("apply_z", z)
-    _head("apply_z", z, 16)
+
+        if args.r == "ones":
+            r = torch.ones(1, n_pad, 1, device=device, dtype=x.dtype)
+        else:
+            g = torch.Generator(device=device)
+            g.manual_seed(int(args.seed))
+            r = torch.randn(1, n_pad, 1, device=device, dtype=x.dtype, generator=g)
+
+        _summarize("apply_r", r)
+        _head("apply_r", r, 16)
+
+        with torch.inference_mode():
+            z = apply_block_diagonal_M_physical(
+                packed,
+                r,
+                leaf_size=LEAF_SIZE,
+                leaf_apply_size=La_d,
+                leaf_apply_off=La_o,
+                jacobi_inv_diag=jacobi_inv,
+            )
+        _summarize("apply_z", z)
+        _head("apply_z", z, 16)
+
+    if args.pcg:
+        _run_inspect_model_pcg_subprocess(args, fi, weights_path, data_folder)
+
+
+def _run_inspect_model_pcg_subprocess(
+    args: argparse.Namespace,
+    frame_index: int,
+    weights_path: Path,
+    data_folder: Path,
+) -> None:
+    """Spawn InspectModel.py --test-only (identical PCG benchmark to a direct InspectModel run)."""
+    if args.inputs_parity_only:
+        raise SystemExit("--pcg is incompatible with --inputs_parity_only")
+    if not weights_path.is_file():
+        raise SystemExit(f"--pcg requires weights file: {weights_path}")
+    im_py = _script_dir / "InspectModel.py"
+    if not im_py.is_file():
+        raise SystemExit(f"InspectModel.py not found next to InspectParity: {im_py}")
+    cmd = [
+        sys.executable,
+        str(im_py),
+        "--test-only",
+        "--frame",
+        str(frame_index),
+        "--weights",
+        str(weights_path),
+        "--data-folder",
+        str(data_folder),
+        "--leafonly-pcg",
+        str(args.pcg_leafonly_mode),
+        "--pcg-cuda-backend",
+        str(args.pcg_cuda_backend),
+        "--pcg-check-freq",
+        str(args.pcg_check_freq),
+    ]
+    if args.pcg_gpu_fp64:
+        cmd.append("--gpu-pcg-fp64")
+    else:
+        cmd.append("--no-gpu-pcg-fp64")
+    cmd.append("--off-diag-dense-attn")
+    cmd.append("--diag-dense-attn")
+    print(f"[LeafOnlyParity] phase=pytorch pcg_subprocess={' '.join(cmd)}")
+    subprocess.check_call(cmd, cwd=str(_script_dir))
 
 
 if __name__ == "__main__":

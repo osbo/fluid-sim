@@ -78,6 +78,7 @@ public partial class FluidSimulator
     private static bool s_warnedLeafOnlyLayer1GpuLeafApply;
     private static bool s_warnedLeafOnlyLayer1HeadKernelsMissing;
     private static bool s_warnedLeafOnlyLayer1TailKernelsMissing;
+    private static bool s_warnedLeafOnlyPrecondPackedBufferSize;
 
     private void InitLeafOnlyLayer1GpuKernels()
     {
@@ -412,8 +413,11 @@ public partial class FluidSimulator
         leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondJacobi, "leafL1PrecondJac", leafL1PrecondJac);
     }
 
-    private void LeafOnlyLayer1LogPrecondNodeJacParity(string phase, int nPad, int laO)
+    private void LeafOnlyLayer1LogPrecondNodeJacParity(string phase, int nPad, int laO, bool logParityTensors = true)
     {
+        if (!logParityTensors)
+            return;
+
         int nUv = nPad * laO;
         var u = new float[nUv];
         leafL1PrecondU.GetData(u, 0, 0, nUv);
@@ -443,8 +447,60 @@ public partial class FluidSimulator
             LeafOnlyParityHeadAt(phase, "precondJac", jac, nPad, nPad / 2, 48);
     }
 
-    /// <summary>Runs GPU layer 1 and logs <c>h_diag_after_layer0</c> / <c>off_stream_after_layer0</c> parity lines.</summary>
-    private void DispatchLeafOnlyLayer1GpuForwardAndLogParity(int nPad)
+    /// <summary>
+    /// Concatenates GPU precond tensors in PyTorch <c>LeafOnlyNet.forward</c> order (diag | off | U | V | jac),
+    /// logs <c>packed_precond</c> for <c>InspectParity.py</c>, and uploads to <see cref="leafOnlyPrecondPackedBuffer"/> when its length matches.
+    /// </summary>
+    private void LeafOnlyLayer1PackLogAndUploadPackedPrecond(
+        string phase,
+        int kAct,
+        int nPad,
+        int laD,
+        int laO,
+        int mOff,
+        bool canGpuHeads,
+        bool canGpuTail,
+        bool logParityTensors = true)
+    {
+        if (!canGpuHeads || !canGpuTail)
+            return;
+
+        int nPreD = kAct * laD * laD;
+        int nPreO = mOff * laO * laO;
+        int nUv = nPad * laO;
+        int nJac = nPad;
+        int total = nPreD + nPreO + nUv + nUv + nJac;
+
+        var packed = new float[total];
+        leafL1PrecondDiag.GetData(packed, 0, 0, nPreD);
+        if (nPreO > 0)
+            leafL1PrecondOff.GetData(packed, nPreD, 0, nPreO);
+        leafL1PrecondU.GetData(packed, nPreD + nPreO, 0, nUv);
+        leafL1PrecondV.GetData(packed, nPreD + nPreO + nUv, 0, nUv);
+        leafL1PrecondJac.GetData(packed, nPreD + nPreO + nUv + nUv, 0, nJac);
+
+        if (logParityTensors)
+        {
+            LeafOnlyParitySummarize(phase, "packed_precond", packed, total);
+            LeafOnlyParityHead(phase, "packed_precond", packed, total, 16);
+            if (total > 16)
+                LeafOnlyParityHead(phase, "packed_precond", packed, total, 32);
+        }
+
+        bool usedPublic = leafOnlyPrecondPackedBuffer != null && leafOnlyPrecondPackedBuffer.count == total;
+        LeafOnlyUploadPackedPrecondFromHost(packed, total);
+        if (!usedPublic && leafOnlyPrecondPackedBuffer != null && leafOnlyPrecondPackedBuffer.count != total
+            && !s_warnedLeafOnlyPrecondPackedBufferSize)
+        {
+            s_warnedLeafOnlyPrecondPackedBufferSize = true;
+            Debug.Log(
+                "[LeafOnlyParity] leafOnlyPrecondPackedBuffer length mismatch (expected " + total
+                + " floats); GPU precond apply uses an internal packed buffer. Clear the field or call TryAllocLeafOnlyPrecondPackedBuffer() to assign a matching buffer.");
+        }
+    }
+
+    /// <summary>Runs GPU layer 1. When <paramref name="logParityTensors"/>, logs <c>h_diag_after_layer0</c> / <c>off_stream_after_layer0</c> parity lines.</summary>
+    private void DispatchLeafOnlyLayer1GpuForwardAndLogParity(int nPad, bool logParityTensors = true)
     {
         const string phase = "unity";
         if (leafOnlyLayer1Shader == null)
@@ -674,35 +730,47 @@ public partial class FluidSimulator
             leafOnlyLayer1Shader.Dispatch(leafL1KPrecondDiagUUt, LeafOnlyLayer1Groups256(kAct * laD * laD), 1, 1);
         }
 
-        var hDiagHost = new float[nTok];
-        leafL1BufB.GetData(hDiagHost, 0, 0, nTok);
-        LeafOnlyParitySummarize(phase, "h_diag_after_layer0", hDiagHost, nTok);
-        LeafOnlyParityHead(phase, "h_diag_after_layer0", hDiagHost, nTok, 16);
-        LeafOnlyParityHead(phase, "h_diag_after_layer0", hDiagHost, nTok, 32);
-        if (nTok > 64)
-            LeafOnlyParityHeadAt(phase, "h_diag_after_layer0", hDiagHost, nTok, nTok / 2, 48);
+        if (logParityTensors)
+        {
+            var hDiagHost = new float[nTok];
+            leafL1BufB.GetData(hDiagHost, 0, 0, nTok);
+            LeafOnlyParitySummarize(phase, "h_diag_after_layer0", hDiagHost, nTok);
+            LeafOnlyParityHead(phase, "h_diag_after_layer0", hDiagHost, nTok, 16);
+            LeafOnlyParityHead(phase, "h_diag_after_layer0", hDiagHost, nTok, 32);
+            if (nTok > 64)
+                LeafOnlyParityHeadAt(phase, "h_diag_after_layer0", hDiagHost, nTok, nTok / 2, 48);
+        }
 
         if (mOff <= 0)
         {
             if (canGpuHeads)
             {
                 int nPreD0 = kAct * laD * laD;
-                var preD0 = new float[nPreD0];
-                leafL1PrecondDiag.GetData(preD0, 0, 0, nPreD0);
-                LeafOnlyParitySummarize(phase, "precondDiag", preD0, nPreD0);
-                LeafOnlyParityHead(phase, "precondDiag", preD0, nPreD0, 16);
-                LeafOnlyParityHead(phase, "precondDiag", preD0, nPreD0, 32);
-                if (nPreD0 > 64)
-                    LeafOnlyParityHeadAt(phase, "precondDiag", preD0, nPreD0, nPreD0 / 2, 48);
-                Debug.Log(
-                    $"[LeafOnlyParity] phase={phase} tensor=leaf_blocks_meta path=gpu K={kAct} La_diag={laD} M_off=0 (UUt)");
+                if (logParityTensors)
+                {
+                    var preD0 = new float[nPreD0];
+                    leafL1PrecondDiag.GetData(preD0, 0, 0, nPreD0);
+                    LeafOnlyParitySummarize(phase, "precondDiag", preD0, nPreD0);
+                    LeafOnlyParityHead(phase, "precondDiag", preD0, nPreD0, 16);
+                    LeafOnlyParityHead(phase, "precondDiag", preD0, nPreD0, 32);
+                    if (nPreD0 > 64)
+                        LeafOnlyParityHeadAt(phase, "precondDiag", preD0, nPreD0, nPreD0 / 2, 48);
+                    Debug.Log(
+                        $"[LeafOnlyParity] phase={phase} tensor=leaf_blocks_meta path=gpu K={kAct} La_diag={laD} M_off=0 (UUt)");
+                }
             }
 
             if (canGpuTail)
-                LeafOnlyLayer1LogPrecondNodeJacParity(phase, nPad, laO);
+                LeafOnlyLayer1LogPrecondNodeJacParity(phase, nPad, laO, logParityTensors);
 
-            var invC = CultureInfo.InvariantCulture;
-            Debug.Log($"[LeafOnlyParity] phase={phase} tensor=layer1_gpu_meta path=gpu K={kAct.ToString(invC)} L_diag={lFull.ToString(invC)} M_off=0");
+            LeafOnlyLayer1PackLogAndUploadPackedPrecond(phase, kAct, nPad, laD, laO, 0, canGpuHeads, canGpuTail, logParityTensors);
+
+            if (logParityTensors)
+            {
+                var invC = CultureInfo.InvariantCulture;
+                Debug.Log($"[LeafOnlyParity] phase={phase} tensor=layer1_gpu_meta path=gpu K={kAct.ToString(invC)} L_diag={lFull.ToString(invC)} M_off=0");
+            }
+
             return;
         }
 
@@ -748,46 +816,57 @@ public partial class FluidSimulator
             leafOnlyLayer1Shader.Dispatch(leafL1KPrecondOffUVt, LeafOnlyLayer1Groups256(mOff * laO * laO), 1, 1);
         }
 
-        var offHost = new float[nOffTok];
-        leafL1OffBufB.GetData(offHost, 0, 0, nOffTok);
-        LeafOnlyParitySummarize(phase, "off_stream_after_layer0", offHost, nOffTok);
-        LeafOnlyParityHead(phase, "off_stream_after_layer0", offHost, nOffTok, 16);
-        LeafOnlyParityHead(phase, "off_stream_after_layer0", offHost, nOffTok, 32);
-        if (nOffTok > 64)
-            LeafOnlyParityHeadAt(phase, "off_stream_after_layer0", offHost, nOffTok, nOffTok / 2, 48);
+        if (logParityTensors)
+        {
+            var offHost = new float[nOffTok];
+            leafL1OffBufB.GetData(offHost, 0, 0, nOffTok);
+            LeafOnlyParitySummarize(phase, "off_stream_after_layer0", offHost, nOffTok);
+            LeafOnlyParityHead(phase, "off_stream_after_layer0", offHost, nOffTok, 16);
+            LeafOnlyParityHead(phase, "off_stream_after_layer0", offHost, nOffTok, 32);
+            if (nOffTok > 64)
+                LeafOnlyParityHeadAt(phase, "off_stream_after_layer0", offHost, nOffTok, nOffTok / 2, 48);
+        }
 
         if (canGpuHeads)
         {
             int nPreD = kAct * laD * laD;
             int nPreO = mOff * laO * laO;
-            var preDArr = new float[nPreD];
-            leafL1PrecondDiag.GetData(preDArr, 0, 0, nPreD);
-            LeafOnlyParitySummarize(phase, "precondDiag", preDArr, nPreD);
-            LeafOnlyParityHead(phase, "precondDiag", preDArr, nPreD, 16);
-            LeafOnlyParityHead(phase, "precondDiag", preDArr, nPreD, 32);
-            if (nPreD > 64)
-                LeafOnlyParityHeadAt(phase, "precondDiag", preDArr, nPreD, nPreD / 2, 48);
-            var preOArr = new float[nPreO];
-            leafL1PrecondOff.GetData(preOArr, 0, 0, nPreO);
-            LeafOnlyParitySummarize(phase, "precondOff", preOArr, nPreO);
-            LeafOnlyParityHead(phase, "precondOff", preOArr, nPreO, 16);
-            if (nPreO > 16)
-                LeafOnlyParityHead(phase, "precondOff", preOArr, nPreO, 32);
-            if (nPreO > 64)
-                LeafOnlyParityHeadAt(phase, "precondOff", preOArr, nPreO, nPreO / 2, 48);
-            Debug.Log(
-                $"[LeafOnlyParity] phase={phase} tensor=leaf_blocks_meta path=gpu K={kAct} La_diag={laD} La_off={laO} M_off={mOff} (UUt / UVt)");
+            if (logParityTensors)
+            {
+                var preDArr = new float[nPreD];
+                leafL1PrecondDiag.GetData(preDArr, 0, 0, nPreD);
+                LeafOnlyParitySummarize(phase, "precondDiag", preDArr, nPreD);
+                LeafOnlyParityHead(phase, "precondDiag", preDArr, nPreD, 16);
+                LeafOnlyParityHead(phase, "precondDiag", preDArr, nPreD, 32);
+                if (nPreD > 64)
+                    LeafOnlyParityHeadAt(phase, "precondDiag", preDArr, nPreD, nPreD / 2, 48);
+                var preOArr = new float[nPreO];
+                leafL1PrecondOff.GetData(preOArr, 0, 0, nPreO);
+                LeafOnlyParitySummarize(phase, "precondOff", preOArr, nPreO);
+                LeafOnlyParityHead(phase, "precondOff", preOArr, nPreO, 16);
+                if (nPreO > 16)
+                    LeafOnlyParityHead(phase, "precondOff", preOArr, nPreO, 32);
+                if (nPreO > 64)
+                    LeafOnlyParityHeadAt(phase, "precondOff", preOArr, nPreO, nPreO / 2, 48);
+                Debug.Log(
+                    $"[LeafOnlyParity] phase={phase} tensor=leaf_blocks_meta path=gpu K={kAct} La_diag={laD} La_off={laO} M_off={mOff} (UUt / UVt)");
+            }
         }
 
         if (canGpuTail)
-            LeafOnlyLayer1LogPrecondNodeJacParity(phase, nPad, laO);
+            LeafOnlyLayer1LogPrecondNodeJacParity(phase, nPad, laO, logParityTensors);
+
+        LeafOnlyLayer1PackLogAndUploadPackedPrecond(phase, kAct, nPad, laD, laO, mOff, canGpuHeads, canGpuTail, logParityTensors);
 
         LeafOnlyLayer1RebindMainStreamToDiag();
         leafOnlyLayer1Shader.SetBuffer(leafL1KAttnRow, "leafL1EdgeFeats", LeafOnlyDiagEdgeFeatsBuffer);
 
-        var inv = CultureInfo.InvariantCulture;
-        Debug.Log(
-            $"[LeafOnlyParity] phase={phase} tensor=layer1_gpu_meta path=gpu K={kAct.ToString(inv)} L_diag={lFull.ToString(inv)} " +
-            $"L_off={lsOff.ToString(inv)} M_off={mOff.ToString(inv)} d_model={d.ToString(inv)} heads={nh.ToString(inv)}");
+        if (logParityTensors)
+        {
+            var inv = CultureInfo.InvariantCulture;
+            Debug.Log(
+                $"[LeafOnlyParity] phase={phase} tensor=layer1_gpu_meta path=gpu K={kAct.ToString(inv)} L_diag={lFull.ToString(inv)} " +
+                $"L_off={lsOff.ToString(inv)} M_off={mOff.ToString(inv)} d_model={d.ToString(inv)} heads={nh.ToString(inv)}");
+        }
     }
 }
