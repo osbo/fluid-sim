@@ -203,6 +203,7 @@ public partial class FluidSimulator : MonoBehaviour
         switch (renderingMode)
         {
             case RenderingMode.Particles:
+            case RenderingMode.ParticlesVelocity:
                 currentMaterial = particlesMaterial;
                 break;
             case RenderingMode.Depth:
@@ -243,7 +244,7 @@ public partial class FluidSimulator : MonoBehaviour
         currentMaterial.SetBuffer("_Particles", particlesBuffer);
         
         // Set radius for Particles mode or Depth modes
-        if (renderingMode == RenderingMode.Particles)
+        if (renderingMode == RenderingMode.Particles || renderingMode == RenderingMode.ParticlesVelocity)
         {
             currentMaterial.SetFloat("_Radius", particleRadius);
         }
@@ -278,13 +279,15 @@ public partial class FluidSimulator : MonoBehaviour
         CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
         
         // Set depth scale and min value for Particles mode (calculated dynamically)
-        if (renderingMode == RenderingMode.Particles)
+        if (renderingMode == RenderingMode.Particles || renderingMode == RenderingMode.ParticlesVelocity)
         {
             // Get the calculated values (convert from exponents to actual values)
             float calculatedMinValue = Mathf.Exp(calculatedDepthMinValue);
             float calculatedScale = Mathf.Exp(calculatedDepthDisplayScale);
             currentMaterial.SetFloat("_Scale", calculatedScale);
             currentMaterial.SetFloat("_MinValue", calculatedMinValue);
+            currentMaterial.SetFloat("_UseVelocityColor", renderingMode == RenderingMode.ParticlesVelocity ? 1f : 0f);
+            currentMaterial.SetFloat("_VelocityReferenceSpeed", Mathf.Max(particleVelocityColorReference, 1e-4f));
         }
         
         // Calculate fade start: start fading slightly before the nearest point
