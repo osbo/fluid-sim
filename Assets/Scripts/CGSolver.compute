@@ -15,6 +15,7 @@
 #pragma kernel AxpyAlpha
 #pragma kernel AxpyNegAlpha
 #pragma kernel ScaleAddBeta
+#pragma kernel CheckConvergence
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
@@ -59,6 +60,14 @@ uint numNodesCapacity; // SoA stride for neighborsBuffer (matches Nodes.compute)
 float a; 
 float deltaTime;
 uint reductionCount;
+
+// PCG indirect early-out (see FluidSolver.DispatchIndirect triples in cgPcgIndirectArgsBuffer):
+// [0..2] = SpMV_CSR (256 threads/group), [3..5] = 512-thread kernels, [6..8] = 1-group kernels (reduce/alpha/beta/...)
+RWStructuredBuffer<uint> cgIndirectDispatchArgs;
+RWStructuredBuffer<uint> cgPcgIterationStat; // 1-based iteration index when converged; 0 = not stopped this solve
+float convergenceThreshold;
+float initialResidualSq; // GpuDotProduct(r,r) at PCG start; used for blow-up test
+uint pcgLoopK; // 0-based PCG iteration index when convergence check runs
 
 // Shared memory for dot product reduction (used by DotProduct)
 groupshared float s_data[512];
@@ -446,4 +455,24 @@ void CopyFloat(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
     if (i >= numNodes) return;
     yBuffer[i] = xBuffer[i];
+}
+
+// After DotProduct + GlobalReduceSum on residual: divergenceBuffer[0] = r·r
+[numthreads(1, 1, 1)]
+void CheckConvergence(uint3 id : SV_DispatchThreadID)
+{
+    float r_dot_r = divergenceBuffer[0];
+    if (!isfinite(r_dot_r)) r_dot_r = 0.0;
+
+    bool belowTol = (r_dot_r < convergenceThreshold);
+    bool blowUp = (initialResidualSq > 1e-30f) && (r_dot_r > (10.0f * initialResidualSq));
+
+    if (belowTol || blowUp)
+    {
+        cgIndirectDispatchArgs[0] = 0u;
+        cgIndirectDispatchArgs[3] = 0u;
+        cgIndirectDispatchArgs[6] = 0u;
+        // 1-based count matches lastCgIterations (k=0 -> first iter done -> 1)
+        cgPcgIterationStat[0] = pcgLoopK + 1u;
+    }
 }

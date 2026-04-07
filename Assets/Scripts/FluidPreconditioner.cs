@@ -53,6 +53,32 @@ public partial class FluidSimulator : MonoBehaviour
         GpuDotProductReduceNoReadback(r, z_out);
     }
 
+    /// <summary>Same as <see cref="ApplyPreconditionerPcgIterationGpu"/> but uses <see cref="cgPcgIndirectArgsBuffer"/> for 512-thread and copy paths (PCG indirect early-out).</summary>
+    private void ApplyPreconditionerPcgIterationGpuIndirect(ComputeBuffer r, ComputeBuffer z_out, int kJacobi, int groups512Uniform)
+    {
+        if (preconditioner == PreconditionerType.None)
+        {
+            GpuCopyBufferIndirect(r, z_out);
+        }
+        else if (preconditioner == PreconditionerType.Jacobi)
+        {
+            if (kJacobi >= 0 && matrixABuffer != null)
+            {
+                cgSolverShader.SetBuffer(kJacobi, "xBuffer", r);
+                cgSolverShader.SetBuffer(kJacobi, "yBuffer", z_out);
+                cgSolverShader.SetBuffer(kJacobi, "matrixABuffer", matrixABuffer);
+                cgSolverShader.SetInt("numNodes", numNodes);
+                cgSolverShader.DispatchIndirect(kJacobi, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
+            }
+            else
+                GpuCopyBufferIndirect(r, z_out);
+        }
+        else
+            GpuCopyBufferIndirect(r, z_out);
+
+        GpuDotProductReduceNoReadbackIndirect(r, z_out, groups512Uniform);
+    }
+
     private void ApplyPreconditionerInitStoreRhoGpu(ComputeBuffer r, ComputeBuffer z_out, int kJacobi)
     {
         ApplyPreconditionerPcgIterationGpu(r, z_out, kJacobi);
