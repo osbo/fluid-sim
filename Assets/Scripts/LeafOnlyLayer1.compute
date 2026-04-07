@@ -1,5 +1,5 @@
 // LeafOnly: first transformer layer on GPU — diag block (L×L dense attention + FFN), H-strip pool,
-// off block (Ls×Ls). Matches checkpoint _write_transformer_block + architecture _apply_transformer_stacks (highway=0).
+// off block (Ls×Ls), then precond leaf heads (leaf UUᵀ, off UVᵀ) on GPU. Matches checkpoint + _get_leaf_blocks.
 // GELU uses tanh form (same as LeafOnlyEmbed.compute). d_model <= 128, L_diag <= 128, L_off <= 32, nh <= 8.
 
 #pragma kernel LeafOnly_L1_CopyFromEnc
@@ -17,6 +17,13 @@
 #pragma kernel LeafOnly_L1_StripAccum
 #pragma kernel LeafOnly_L1_StripPoolToOff
 #pragma kernel LeafOnly_L1_PoolOffEdgeFeats
+#pragma kernel LeafOnly_L1_BuildHeadUDiag
+#pragma kernel LeafOnly_L1_PrecondDiagUUt
+#pragma kernel LeafOnly_L1_BuildHeadUVOff
+#pragma kernel LeafOnly_L1_PrecondOffUVt
+#pragma kernel LeafOnly_L1_PrecondNodeU
+#pragma kernel LeafOnly_L1_PrecondNodeV
+#pragma kernel LeafOnly_L1_PrecondJacobi
 
 static const float LN_EPS = 1e-5;
 static const float GELU_ALPHA = 0.044715;
@@ -52,6 +59,15 @@ RWStructuredBuffer<float> leafL1OffComb;
 RWStructuredBuffer<float> leafL1OffSkipA;
 RWStructuredBuffer<float> leafL1OffSkipB;
 
+RWStructuredBuffer<float> leafL1HeadUDiag;
+RWStructuredBuffer<float> leafL1PrecondDiag;
+RWStructuredBuffer<float> leafL1HeadUOff;
+RWStructuredBuffer<float> leafL1HeadVOff;
+RWStructuredBuffer<float> leafL1PrecondOff;
+RWStructuredBuffer<float> leafL1PrecondU;
+RWStructuredBuffer<float> leafL1PrecondV;
+RWStructuredBuffer<float> leafL1PrecondJac;
+
 int leafDModel;
 int leafNumHeads;
 int leafDHead;
@@ -82,6 +98,15 @@ int leafL1ClearCount;
 int leafL1CopyCount;
 int leafL1CopySrcOff;
 int leafL1CopyDstOff;
+
+int headLeafW0, headLeafB0, headLeafW1, headLeafB1;
+int headOffUW0, headOffUB0, headOffUW1, headOffUB1;
+int headOffVW0, headOffVB0, headOffVW1, headOffVB1;
+int leafLaDiag;
+int leafLaOff;
+int leafL1DiagStridePerLeaf;
+
+int headNodeUW, headNodeUB, headNodeVW, headNodeVB, headJacobiW, headJacobiB;
 
 float TbW2(int baseOff, int i, int o, int outDim)
 {
@@ -434,4 +459,178 @@ void LeafOnly_L1_PoolOffEdgeFeats(uint3 id : SV_DispatchThreadID)
         uint dst = ((m * Ls + ip) * Ls + jp) * 4u + ch;
         leafL1OffEdgeLs[dst] = acc / (float)(p * p);
     }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_BuildHeadUDiag(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint La = (uint)leafLaDiag;
+    uint K = (uint)leafKActive;
+    uint dm = (uint)leafDModel;
+    uint n = K * La;
+    if (idx >= n || La > 128u || dm > 128u)
+        return;
+    uint k = idx / La;
+    uint t = idx % La;
+    uint stride = (uint)leafL1DiagStridePerLeaf;
+    uint x0 = (k * stride + t) * dm;
+    float hid[128];
+    for (uint o = 0; o < dm; o++)
+    {
+        float acc = leafOnlyWeights[headLeafB0 + o];
+        for (uint i = 0; i < dm; i++)
+            acc += leafL1BufB[x0 + i] * TbW2(headLeafW0, i, o, dm);
+        hid[o] = LeafOnlyL1Gelu(acc);
+    }
+    uint outBase = k * La * La + t * La;
+    for (uint o = 0; o < La; o++)
+    {
+        float acc2 = leafOnlyWeights[headLeafB1 + o];
+        for (uint i = 0; i < dm; i++)
+            acc2 += hid[i] * TbW2(headLeafW1, i, o, La);
+        leafL1HeadUDiag[outBase + o] = acc2;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_PrecondDiagUUt(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint La = (uint)leafLaDiag;
+    uint K = (uint)leafKActive;
+    uint per = La * La;
+    uint n = K * per;
+    if (idx >= n)
+        return;
+    uint k = idx / per;
+    uint rem = idx % per;
+    uint p = rem / La;
+    uint q = rem % La;
+    uint base = k * per;
+    float s = 0.0;
+    for (uint kk = 0; kk < La; kk++)
+        s += leafL1HeadUDiag[base + p * La + kk] * leafL1HeadUDiag[base + q * La + kk];
+    leafL1PrecondDiag[idx] = s;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_BuildHeadUVOff(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint La = (uint)leafLaOff;
+    uint M = (uint)leafMOff;
+    uint dm = (uint)leafDModel;
+    uint n = M * La;
+    if (idx >= n || La > 32u || dm > 128u)
+        return;
+    uint m = idx / La;
+    uint tt = idx % La;
+    uint x0 = (m * La + tt) * dm;
+    float hid[128];
+    for (uint o = 0; o < dm; o++)
+    {
+        float acc = leafOnlyWeights[headOffUB0 + o];
+        for (uint i = 0; i < dm; i++)
+            acc += leafL1OffBufB[x0 + i] * TbW2(headOffUW0, i, o, dm);
+        hid[o] = LeafOnlyL1Gelu(acc);
+    }
+    uint base = m * La * La + tt * La;
+    for (uint o = 0; o < La; o++)
+    {
+        float acc2 = leafOnlyWeights[headOffUB1 + o];
+        for (uint i = 0; i < dm; i++)
+            acc2 += hid[i] * TbW2(headOffUW1, i, o, La);
+        leafL1HeadUOff[base + o] = acc2;
+    }
+    for (uint o = 0; o < dm; o++)
+    {
+        float acc = leafOnlyWeights[headOffVB0 + o];
+        for (uint i = 0; i < dm; i++)
+            acc += leafL1OffBufB[x0 + i] * TbW2(headOffVW0, i, o, dm);
+        hid[o] = LeafOnlyL1Gelu(acc);
+    }
+    for (uint o = 0; o < La; o++)
+    {
+        float acc2 = leafOnlyWeights[headOffVB1 + o];
+        for (uint i = 0; i < dm; i++)
+            acc2 += hid[i] * TbW2(headOffVW1, i, o, La);
+        leafL1HeadVOff[base + o] = acc2;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_PrecondOffUVt(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint La = (uint)leafLaOff;
+    uint M = (uint)leafMOff;
+    uint per = La * La;
+    uint n = M * per;
+    if (idx >= n)
+        return;
+    uint m = idx / per;
+    uint rem = idx % per;
+    uint p = rem / La;
+    uint q = rem % La;
+    uint base = m * per;
+    float s = 0.0;
+    for (uint kk = 0; kk < La; kk++)
+        s += leafL1HeadUOff[base + p * La + kk] * leafL1HeadVOff[base + q * La + kk];
+    leafL1PrecondOff[idx] = s;
+}
+
+// node_u / node_v: Linear(d_model -> La_off) on h_diag (leafL1BufB). Matches PyTorch node_u / node_v on h_full.
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_PrecondNodeU(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint nPad = (uint)leafL1NTok;
+    uint laO = (uint)leafLaOff;
+    uint dm = (uint)leafDModel;
+    uint total = nPad * laO;
+    if (idx >= total || laO > 64u || dm > 128u)
+        return;
+    uint tok = idx / laO;
+    uint o = idx % laO;
+    float acc = leafOnlyWeights[headNodeUB + o];
+    uint x0 = tok * dm;
+    for (uint i = 0; i < dm; i++)
+        acc += leafL1BufB[x0 + i] * TbW2(headNodeUW, i, o, laO);
+    leafL1PrecondU[idx] = acc;
+}
+
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_PrecondNodeV(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint nPad = (uint)leafL1NTok;
+    uint laO = (uint)leafLaOff;
+    uint dm = (uint)leafDModel;
+    uint total = nPad * laO;
+    if (idx >= total || laO > 64u || dm > 128u)
+        return;
+    uint tok = idx / laO;
+    uint o = idx % laO;
+    float acc = leafOnlyWeights[headNodeVB + o];
+    uint x0 = tok * dm;
+    for (uint i = 0; i < dm; i++)
+        acc += leafL1BufB[x0 + i] * TbW2(headNodeVW, i, o, laO);
+    leafL1PrecondV[idx] = acc;
+}
+
+// jacobi_gate: Linear(d_model -> 1) + sigmoid, one scalar per padded node.
+[numthreads(256, 1, 1)]
+void LeafOnly_L1_PrecondJacobi(uint3 id : SV_DispatchThreadID)
+{
+    uint tok = id.x;
+    uint nPad = (uint)leafL1NTok;
+    uint dm = (uint)leafDModel;
+    if (tok >= nPad || dm > 128u)
+        return;
+    float acc = leafOnlyWeights[headJacobiB];
+    uint x0 = tok * dm;
+    for (uint i = 0; i < dm; i++)
+        acc += leafL1BufB[x0 + i] * TbW2(headJacobiW, i, 0, 1);
+    leafL1PrecondJac[tok] = 1.0 / (1.0 + exp(-acc));
 }
