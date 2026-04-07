@@ -2,15 +2,15 @@ using System.Globalization;
 using UnityEngine;
 
 /// <summary>
-/// GPU first transformer layer (diag + H-strip + off) via <c>LeafOnlyLayer1.compute</c>.
-/// When <see cref="leafOnlyLayer1Shader"/> is assigned, parity logging uses this path instead of the CPU reference.
-/// Requires same checkpoint constraints as <see cref="DispatchLeafOnlyCpuLayer1ParityAndLog"/> (highway=0, layout L×L dense, etc.).
+/// GPU first transformer layer (diag + H-strip + off) via <c>LeafOnlyLayer1.compute</c> for
+/// <c>[LeafOnlyParity]</c> logging. Needs highway=0, dense L×L layout, and compatible checkpoint shape;
+/// otherwise layer 1 parity lines are skipped (no CPU reference path).
 /// </summary>
 public partial class FluidSimulator
 {
     public const int LeafOnlyLayer1DModelMax = 128;
 
-    [Tooltip("Optional: LeafOnlyLayer1.compute — GPU layer 0 after embed. Leave null to keep CPU parity only.")]
+    [Tooltip("Optional: LeafOnlyLayer1.compute — GPU layer 0 after embed. If null, layer 1 parity logs are skipped.")]
     public ComputeShader leafOnlyLayer1Shader;
 
     private int leafL1KCopyFromEnc;
@@ -27,6 +27,13 @@ public partial class FluidSimulator
     private int leafL1KStrip;
     private int leafL1KStripPool;
     private int leafL1KPoolOffEdge;
+    private int leafL1KBuildHeadUDiag;
+    private int leafL1KPrecondDiagUUt;
+    private int leafL1KBuildHeadUVOff;
+    private int leafL1KPrecondOffUVt;
+    private int leafL1KPrecondNodeU = -1;
+    private int leafL1KPrecondNodeV = -1;
+    private int leafL1KPrecondJacobi = -1;
 
     private ComputeBuffer leafL1BufA;
     private ComputeBuffer leafL1BufB;
@@ -45,14 +52,32 @@ public partial class FluidSimulator
     private ComputeBuffer leafL1OffComb;
     private ComputeBuffer leafL1OffSkipA;
     private ComputeBuffer leafL1OffSkipB;
+    private ComputeBuffer leafL1HeadUDiag;
+    private ComputeBuffer leafL1PrecondDiag;
+    private ComputeBuffer leafL1HeadUOff;
+    private ComputeBuffer leafL1HeadVOff;
+    private ComputeBuffer leafL1PrecondOff;
+    private ComputeBuffer leafL1PrecondU;
+    private ComputeBuffer leafL1PrecondV;
+    private ComputeBuffer leafL1PrecondJac;
 
     private int leafL1CapNPad;
     private int leafL1CapDm;
     private int leafL1CapMOff;
     private int leafL1CapKMax;
     private int leafL1CapLFull;
+    private int leafL1CapLaD;
+    private int leafL1CapLaO;
     private static bool s_warnedLeafOnlyLayer1GpuMissing;
     private static bool s_warnedLeafOnlyLayer1GpuSkip;
+    private static bool s_warnedLeafOnlyLayer1GpuNoWeights;
+    private static bool s_warnedLeafOnlyLayer1GpuDim;
+    private static bool s_warnedLeafOnlyLayer1GpuPadLayout;
+    private static bool s_warnedLeafOnlyLayer1GpuEdgeBuf;
+    private static bool s_warnedLeafOnlyLayer1GpuWeightShort;
+    private static bool s_warnedLeafOnlyLayer1GpuLeafApply;
+    private static bool s_warnedLeafOnlyLayer1HeadKernelsMissing;
+    private static bool s_warnedLeafOnlyLayer1TailKernelsMissing;
 
     private void InitLeafOnlyLayer1GpuKernels()
     {
@@ -72,6 +97,13 @@ public partial class FluidSimulator
         leafL1KStrip = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_StripAccum");
         leafL1KStripPool = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_StripPoolToOff");
         leafL1KPoolOffEdge = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_PoolOffEdgeFeats");
+        leafL1KBuildHeadUDiag = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_BuildHeadUDiag");
+        leafL1KPrecondDiagUUt = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_PrecondDiagUUt");
+        leafL1KBuildHeadUVOff = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_BuildHeadUVOff");
+        leafL1KPrecondOffUVt = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_PrecondOffUVt");
+        leafL1KPrecondNodeU = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_PrecondNodeU");
+        leafL1KPrecondNodeV = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_PrecondNodeV");
+        leafL1KPrecondJacobi = leafOnlyLayer1Shader.FindKernel("LeafOnly_L1_PrecondJacobi");
     }
 
     private void ReleaseLeafOnlyLayer1GpuBuffers()
@@ -110,24 +142,46 @@ public partial class FluidSimulator
         leafL1OffSkipA = null;
         leafL1OffSkipB?.Release();
         leafL1OffSkipB = null;
+        leafL1HeadUDiag?.Release();
+        leafL1HeadUDiag = null;
+        leafL1PrecondDiag?.Release();
+        leafL1PrecondDiag = null;
+        leafL1HeadUOff?.Release();
+        leafL1HeadUOff = null;
+        leafL1HeadVOff?.Release();
+        leafL1HeadVOff = null;
+        leafL1PrecondOff?.Release();
+        leafL1PrecondOff = null;
+        leafL1PrecondU?.Release();
+        leafL1PrecondU = null;
+        leafL1PrecondV?.Release();
+        leafL1PrecondV = null;
+        leafL1PrecondJac?.Release();
+        leafL1PrecondJac = null;
         leafL1CapNPad = 0;
         leafL1CapDm = 0;
         leafL1CapMOff = 0;
         leafL1CapKMax = 0;
         leafL1CapLFull = 0;
+        leafL1CapLaD = 0;
+        leafL1CapLaO = 0;
     }
 
-    private void EnsureLeafOnlyLayer1GpuBuffers(int nPad, int d, int lFull, int kMax, int mOff, int lsOff)
+    private void EnsureLeafOnlyLayer1GpuBuffers(int nPad, int d, int lFull, int kMax, int mOff, int lsOff, int laD, int laO)
     {
         if (leafL1BufA != null && leafL1CapNPad >= nPad && leafL1CapDm >= d
-            && leafL1CapMOff >= mOff && leafL1CapKMax >= kMax && leafL1CapLFull == lFull)
+            && leafL1CapMOff >= mOff && leafL1CapKMax >= kMax && leafL1CapLFull == lFull
+            && leafL1CapLaD >= laD && leafL1CapLaO >= laO)
             return;
 
         ReleaseLeafOnlyLayer1GpuBuffers();
 
+        int kAct = nPad / lFull;
+        int nDiagHead = kAct * laD * laD;
+        int nOffSq = Mathf.Max(1, mOff * laO * laO);
+
         int nTok = nPad * d;
         int qkv = nPad * 3 * d;
-        int kAct = nPad / lFull;
         int hPadSz = kMax * lFull * d;
         int stripSz = Mathf.Max(1, mOff * lFull * d);
         int nOffTokEl = Mathf.Max(1, mOff * lsOff * d);
@@ -152,11 +206,22 @@ public partial class FluidSimulator
         leafL1OffComb = new ComputeBuffer(nOffTokEl, sizeof(float));
         leafL1OffSkipA = new ComputeBuffer(nOffTokEl, sizeof(float));
         leafL1OffSkipB = new ComputeBuffer(nOffTokEl, sizeof(float));
+        leafL1HeadUDiag = new ComputeBuffer(nDiagHead, sizeof(float));
+        leafL1PrecondDiag = new ComputeBuffer(nDiagHead, sizeof(float));
+        leafL1HeadUOff = new ComputeBuffer(nOffSq, sizeof(float));
+        leafL1HeadVOff = new ComputeBuffer(nOffSq, sizeof(float));
+        leafL1PrecondOff = new ComputeBuffer(nOffSq, sizeof(float));
+        int nUv = nPad * laO;
+        leafL1PrecondU = new ComputeBuffer(Mathf.Max(1, nUv), sizeof(float));
+        leafL1PrecondV = new ComputeBuffer(Mathf.Max(1, nUv), sizeof(float));
+        leafL1PrecondJac = new ComputeBuffer(Mathf.Max(1, nPad), sizeof(float));
         leafL1CapNPad = nPad;
         leafL1CapDm = d;
         leafL1CapMOff = mOff;
         leafL1CapKMax = kMax;
         leafL1CapLFull = lFull;
+        leafL1CapLaD = laD;
+        leafL1CapLaO = laO;
 
         var r0 = LeafOnlyHMatrixStatic.OffR0;
         var c0 = LeafOnlyHMatrixStatic.OffC0;
@@ -268,6 +333,116 @@ public partial class FluidSimulator
         }
     }
 
+    private void LeafOnlyLayer1BindHeadKernelBuildUDiag()
+    {
+        leafOnlyLayer1Shader.SetBuffer(leafL1KBuildHeadUDiag, "leafOnlyWeights", leafOnlyWeightsFloatBuffer);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KBuildHeadUDiag, "leafL1BufB", leafL1BufB);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KBuildHeadUDiag, "leafL1HeadUDiag", leafL1HeadUDiag);
+    }
+
+    private void LeafOnlyLayer1BindHeadKernelPrecondDiag()
+    {
+        leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondDiagUUt, "leafL1HeadUDiag", leafL1HeadUDiag);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondDiagUUt, "leafL1PrecondDiag", leafL1PrecondDiag);
+    }
+
+    private void LeafOnlyLayer1BindHeadKernelBuildUVOff()
+    {
+        leafOnlyLayer1Shader.SetBuffer(leafL1KBuildHeadUVOff, "leafOnlyWeights", leafOnlyWeightsFloatBuffer);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KBuildHeadUVOff, "leafL1OffBufB", leafL1OffBufB);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KBuildHeadUVOff, "leafL1HeadUOff", leafL1HeadUOff);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KBuildHeadUVOff, "leafL1HeadVOff", leafL1HeadVOff);
+    }
+
+    private void LeafOnlyLayer1BindHeadKernelPrecondOff()
+    {
+        leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondOffUVt, "leafL1HeadUOff", leafL1HeadUOff);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondOffUVt, "leafL1HeadVOff", leafL1HeadVOff);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondOffUVt, "leafL1PrecondOff", leafL1PrecondOff);
+    }
+
+    private void LeafOnlyLayer1SetHeadWeightInts(
+        int leafW0,
+        int leafB0,
+        int leafW1,
+        int leafB1,
+        int offUW0,
+        int offUB0,
+        int offUW1,
+        int offUB1,
+        int offVW0,
+        int offVB0,
+        int offVW1,
+        int offVB1)
+    {
+        leafOnlyLayer1Shader.SetInt("headLeafW0", leafW0);
+        leafOnlyLayer1Shader.SetInt("headLeafB0", leafB0);
+        leafOnlyLayer1Shader.SetInt("headLeafW1", leafW1);
+        leafOnlyLayer1Shader.SetInt("headLeafB1", leafB1);
+        leafOnlyLayer1Shader.SetInt("headOffUW0", offUW0);
+        leafOnlyLayer1Shader.SetInt("headOffUB0", offUB0);
+        leafOnlyLayer1Shader.SetInt("headOffUW1", offUW1);
+        leafOnlyLayer1Shader.SetInt("headOffUB1", offUB1);
+        leafOnlyLayer1Shader.SetInt("headOffVW0", offVW0);
+        leafOnlyLayer1Shader.SetInt("headOffVB0", offVB0);
+        leafOnlyLayer1Shader.SetInt("headOffVW1", offVW1);
+        leafOnlyLayer1Shader.SetInt("headOffVB1", offVB1);
+    }
+
+    private void LeafOnlyLayer1SetTailWeightInts(int nodeUW, int nodeUB, int nodeVW, int nodeVB, int jacW, int jacB)
+    {
+        leafOnlyLayer1Shader.SetInt("headNodeUW", nodeUW);
+        leafOnlyLayer1Shader.SetInt("headNodeUB", nodeUB);
+        leafOnlyLayer1Shader.SetInt("headNodeVW", nodeVW);
+        leafOnlyLayer1Shader.SetInt("headNodeVB", nodeVB);
+        leafOnlyLayer1Shader.SetInt("headJacobiW", jacW);
+        leafOnlyLayer1Shader.SetInt("headJacobiB", jacB);
+    }
+
+    private void LeafOnlyLayer1BindPrecondTailKernels()
+    {
+        foreach (int k in new[] { leafL1KPrecondNodeU, leafL1KPrecondNodeV, leafL1KPrecondJacobi })
+        {
+            leafOnlyLayer1Shader.SetBuffer(k, "leafOnlyWeights", leafOnlyWeightsFloatBuffer);
+            leafOnlyLayer1Shader.SetBuffer(k, "leafL1BufB", leafL1BufB);
+        }
+
+        leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondNodeU, "leafL1PrecondU", leafL1PrecondU);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondNodeV, "leafL1PrecondV", leafL1PrecondV);
+        leafOnlyLayer1Shader.SetBuffer(leafL1KPrecondJacobi, "leafL1PrecondJac", leafL1PrecondJac);
+    }
+
+    private void LeafOnlyLayer1LogPrecondNodeJacParity(string phase, int nPad, int laO)
+    {
+        int nUv = nPad * laO;
+        var u = new float[nUv];
+        leafL1PrecondU.GetData(u, 0, 0, nUv);
+        LeafOnlyParitySummarize(phase, "precondU", u, nUv);
+        LeafOnlyParityHead(phase, "precondU", u, nUv, 16);
+        if (nUv > 16)
+            LeafOnlyParityHead(phase, "precondU", u, nUv, 32);
+        if (nUv > 64)
+            LeafOnlyParityHeadAt(phase, "precondU", u, nUv, nUv / 2, 48);
+
+        var v = new float[nUv];
+        leafL1PrecondV.GetData(v, 0, 0, nUv);
+        LeafOnlyParitySummarize(phase, "precondV", v, nUv);
+        LeafOnlyParityHead(phase, "precondV", v, nUv, 16);
+        if (nUv > 16)
+            LeafOnlyParityHead(phase, "precondV", v, nUv, 32);
+        if (nUv > 64)
+            LeafOnlyParityHeadAt(phase, "precondV", v, nUv, nUv / 2, 48);
+
+        var jac = new float[nPad];
+        leafL1PrecondJac.GetData(jac, 0, 0, nPad);
+        LeafOnlyParitySummarize(phase, "precondJac", jac, nPad);
+        LeafOnlyParityHead(phase, "precondJac", jac, nPad, 16);
+        if (nPad > 16)
+            LeafOnlyParityHead(phase, "precondJac", jac, nPad, 32);
+        if (nPad > 64)
+            LeafOnlyParityHeadAt(phase, "precondJac", jac, nPad, nPad / 2, 48);
+    }
+
     /// <summary>Runs GPU layer 1 and logs <c>h_diag_after_layer0</c> / <c>off_stream_after_layer0</c> parity lines.</summary>
     private void DispatchLeafOnlyLayer1GpuForwardAndLogParity(int nPad)
     {
@@ -278,16 +453,20 @@ public partial class FluidSimulator
             {
                 s_warnedLeafOnlyLayer1GpuMissing = true;
                 Debug.Log(
-                    "[LeafOnlyParity] GPU layer1 skipped (assign FluidSimulator.leafOnlyLayer1Shader = LeafOnlyLayer1.compute). Using CPU reference if enabled.");
+                    "[LeafOnlyParity] GPU layer1 skipped (assign FluidSimulator.leafOnlyLayer1Shader = LeafOnlyLayer1.compute). No layer 1 parity logs.");
             }
 
-            DispatchLeafOnlyCpuLayer1ParityAndLog(nPad);
             return;
         }
 
         if (!LeafOnlyWeightsLoadedSuccessfully || leafOnlyWeightsFloatBuffer == null || leafOnlyTokenAfterEnc == null)
         {
-            DispatchLeafOnlyCpuLayer1ParityAndLog(nPad);
+            if (!s_warnedLeafOnlyLayer1GpuNoWeights)
+            {
+                s_warnedLeafOnlyLayer1GpuNoWeights = true;
+                Debug.Log("[LeafOnlyParity] GPU layer1 skipped (weights not loaded or embed/token buffers missing). No layer 1 parity logs.");
+            }
+
             return;
         }
 
@@ -300,14 +479,19 @@ public partial class FluidSimulator
                 Debug.Log("[LeafOnlyParity] GPU layer1 skipped (needs highway=0, route_gates=0, attn_layout=0, num_layers>=1).");
             }
 
-            DispatchLeafOnlyCpuLayer1ParityAndLog(nPad);
             return;
         }
 
         int d = arch.DModel;
         if (d > LeafOnlyLayer1DModelMax || arch.NumHeads < 1 || d % arch.NumHeads != 0)
         {
-            DispatchLeafOnlyCpuLayer1ParityAndLog(nPad);
+            if (!s_warnedLeafOnlyLayer1GpuDim)
+            {
+                s_warnedLeafOnlyLayer1GpuDim = true;
+                Debug.Log(
+                    "[LeafOnlyParity] GPU layer1 skipped (d_model / num_heads invalid or d_model > LeafOnlyLayer1DModelMax). No layer 1 parity logs.");
+            }
+
             return;
         }
 
@@ -315,7 +499,12 @@ public partial class FluidSimulator
         int lsOff = lFull / 4;
         if (nPad <= 0 || nPad % lFull != 0 || lFull != arch.LeafSize)
         {
-            DispatchLeafOnlyCpuLayer1ParityAndLog(nPad);
+            if (!s_warnedLeafOnlyLayer1GpuPadLayout)
+            {
+                s_warnedLeafOnlyLayer1GpuPadLayout = true;
+                Debug.Log("[LeafOnlyParity] GPU layer1 skipped (nPad vs LeafOnlyLeafSize / checkpoint LeafSize mismatch). No layer 1 parity logs.");
+            }
+
             return;
         }
 
@@ -326,7 +515,12 @@ public partial class FluidSimulator
         int kMax = LeafOnlyHMatrixStatic.MaxNumLeaves;
         if (LeafOnlyDiagEdgeFeatsBuffer == null || (mOff > 0 && LeafOnlyOffEdgeFeatsBuffer == null))
         {
-            DispatchLeafOnlyCpuLayer1ParityAndLog(nPad);
+            if (!s_warnedLeafOnlyLayer1GpuEdgeBuf)
+            {
+                s_warnedLeafOnlyLayer1GpuEdgeBuf = true;
+                Debug.Log("[LeafOnlyParity] GPU layer1 skipped (diag/off edge feature buffers missing). No layer 1 parity logs.");
+            }
+
             return;
         }
 
@@ -334,14 +528,90 @@ public partial class FluidSimulator
         int tbFloats = LeafOnlyTransformerBlockFloatCount(in arch);
         if (tbFloats < 0 || leafOnlyWeightsFloatBuffer.count < embedEnd + 2 * tbFloats)
         {
-            DispatchLeafOnlyCpuLayer1ParityAndLog(nPad);
+            if (!s_warnedLeafOnlyLayer1GpuWeightShort)
+            {
+                s_warnedLeafOnlyLayer1GpuWeightShort = true;
+                Debug.Log("[LeafOnlyParity] GPU layer1 skipped (weight float buffer too short for two transformer blocks). No layer 1 parity logs.");
+            }
+
             return;
         }
 
         LeafOnlyTbOffsetsFromBase(embedEnd, in arch, out LeafOnlyTbWeightOffsets oDiag);
         LeafOnlyTbOffsetsFromBase(embedEnd + tbFloats, in arch, out LeafOnlyTbWeightOffsets oOff);
 
-        EnsureLeafOnlyLayer1GpuBuffers(nPad, d, lFull, kMax, mOff, lsOff);
+        int laD = arch.LeafApplyDiag;
+        int laO = arch.LeafApplyOff;
+        if (laD * LeafOnlyCpuDiagTokenPool != lFull || laO * LeafOnlyCpuOffTokenPool != lFull)
+        {
+            if (!s_warnedLeafOnlyLayer1GpuLeafApply)
+            {
+                s_warnedLeafOnlyLayer1GpuLeafApply = true;
+                Debug.Log("[LeafOnlyParity] GPU layer1 skipped (LeafApplyDiag/Off vs leaf size inconsistent). No layer 1 parity logs.");
+            }
+
+            return;
+        }
+
+        int hLeafW0 = 0, hLeafB0 = 0, hLeafW1 = 0, hLeafB1 = 0;
+        int hOffUW0 = 0, hOffUB0 = 0, hOffUW1 = 0, hOffUB1 = 0;
+        int hOffVW0 = 0, hOffVB0 = 0, hOffVW1 = 0, hOffVB1 = 0;
+        bool canGpuHeads = arch.MlpHeads == 1
+            && leafL1KBuildHeadUDiag >= 0
+            && leafL1KPrecondDiagUUt >= 0
+            && (mOff <= 0 || (leafL1KBuildHeadUVOff >= 0 && leafL1KPrecondOffUVt >= 0))
+            && LeafOnlyTryGetPrecondHeadWeightOffsets(
+                in arch,
+                LeafOnlyGlobalFeaturesDim,
+                leafOnlyWeightsFloatBuffer.count,
+                out hLeafW0,
+                out hLeafB0,
+                out hLeafW1,
+                out hLeafB1,
+                out hOffUW0,
+                out hOffUB0,
+                out hOffUW1,
+                out hOffUB1,
+                out hOffVW0,
+                out hOffVB0,
+                out hOffVW1,
+                out hOffVB1);
+
+        int tailNodeUW = 0, tailNodeUB = 0, tailNodeVW = 0, tailNodeVB = 0, tailJacW = 0, tailJacB = 0;
+        bool tailWeightsOk = arch.MlpHeads == 1
+            && LeafOnlyTryGetNodeJacobiWeightOffsets(
+                in arch,
+                LeafOnlyGlobalFeaturesDim,
+                leafOnlyWeightsFloatBuffer.count,
+                out tailNodeUW,
+                out tailNodeUB,
+                out tailNodeVW,
+                out tailNodeVB,
+                out tailJacW,
+                out tailJacB);
+        bool tailKernelsOk = leafL1KPrecondNodeU >= 0
+            && leafL1KPrecondNodeV >= 0
+            && leafL1KPrecondJacobi >= 0;
+        bool canGpuTail = arch.MlpHeads == 1 && tailWeightsOk && tailKernelsOk;
+
+        if (arch.MlpHeads == 1 && !canGpuHeads && !s_warnedLeafOnlyLayer1HeadKernelsMissing)
+        {
+            s_warnedLeafOnlyLayer1HeadKernelsMissing = true;
+            Debug.Log(
+                "[LeafOnlyParity] Skipping GPU precondDiag/precondOff parity logs (add head kernels in LeafOnlyLayer1.compute or fix checkpoint MlpHeads/weights).");
+        }
+
+        if (arch.MlpHeads == 1 && !canGpuTail && !s_warnedLeafOnlyLayer1TailKernelsMissing)
+        {
+            s_warnedLeafOnlyLayer1TailKernelsMissing = true;
+            Debug.Log(
+                "[LeafOnlyParity] Skipping GPU precondU/precondV/precondJac parity logs: " +
+                $"tail_weights_ok={tailWeightsOk} (need room for node_u/node_v/jacobi_gate after leaf_head) " +
+                $"tail_kernels_ok={tailKernelsOk} (kernel indices U={leafL1KPrecondNodeU} V={leafL1KPrecondNodeV} Jac={leafL1KPrecondJacobi}; " +
+                "-1 means LeafOnlyLayer1.compute missing kernels or failed to compile — reimport the asset / check Console).");
+        }
+
+        EnsureLeafOnlyLayer1GpuBuffers(nPad, d, lFull, kMax, mOff, lsOff, laD, laO);
 
         leafOnlyLayer1Shader.SetInt("leafDModel", d);
         leafOnlyLayer1Shader.SetInt("leafNumHeads", nh);
@@ -380,6 +650,30 @@ public partial class FluidSimulator
         leafOnlyLayer1Shader.Dispatch(leafL1KCopyAToSkipB, LeafOnlyLayer1Groups256(nTok), 1, 1);
         leafOnlyLayer1Shader.Dispatch(leafL1KFfn, LeafOnlyLayer1Groups256(nPad), 1, 1);
 
+        if (canGpuTail)
+        {
+            leafOnlyLayer1Shader.SetInt("leafLaOff", laO);
+            LeafOnlyLayer1SetTailWeightInts(tailNodeUW, tailNodeUB, tailNodeVW, tailNodeVB, tailJacW, tailJacB);
+            LeafOnlyLayer1BindPrecondTailKernels();
+            leafOnlyLayer1Shader.Dispatch(leafL1KPrecondNodeU, LeafOnlyLayer1Groups256(nPad * laO), 1, 1);
+            leafOnlyLayer1Shader.Dispatch(leafL1KPrecondNodeV, LeafOnlyLayer1Groups256(nPad * laO), 1, 1);
+            leafOnlyLayer1Shader.Dispatch(leafL1KPrecondJacobi, LeafOnlyLayer1Groups256(nPad), 1, 1);
+        }
+
+        if (canGpuHeads)
+        {
+            leafOnlyLayer1Shader.SetInt("leafLaDiag", laD);
+            leafOnlyLayer1Shader.SetInt("leafL1DiagStridePerLeaf", lFull);
+            LeafOnlyLayer1SetHeadWeightInts(
+                hLeafW0, hLeafB0, hLeafW1, hLeafB1,
+                hOffUW0, hOffUB0, hOffUW1, hOffUB1,
+                hOffVW0, hOffVB0, hOffVW1, hOffVB1);
+            LeafOnlyLayer1BindHeadKernelBuildUDiag();
+            leafOnlyLayer1Shader.Dispatch(leafL1KBuildHeadUDiag, LeafOnlyLayer1Groups256(kAct * laD), 1, 1);
+            LeafOnlyLayer1BindHeadKernelPrecondDiag();
+            leafOnlyLayer1Shader.Dispatch(leafL1KPrecondDiagUUt, LeafOnlyLayer1Groups256(kAct * laD * laD), 1, 1);
+        }
+
         var hDiagHost = new float[nTok];
         leafL1BufB.GetData(hDiagHost, 0, 0, nTok);
         LeafOnlyParitySummarize(phase, "h_diag_after_layer0", hDiagHost, nTok);
@@ -390,6 +684,23 @@ public partial class FluidSimulator
 
         if (mOff <= 0)
         {
+            if (canGpuHeads)
+            {
+                int nPreD0 = kAct * laD * laD;
+                var preD0 = new float[nPreD0];
+                leafL1PrecondDiag.GetData(preD0, 0, 0, nPreD0);
+                LeafOnlyParitySummarize(phase, "precondDiag", preD0, nPreD0);
+                LeafOnlyParityHead(phase, "precondDiag", preD0, nPreD0, 16);
+                LeafOnlyParityHead(phase, "precondDiag", preD0, nPreD0, 32);
+                if (nPreD0 > 64)
+                    LeafOnlyParityHeadAt(phase, "precondDiag", preD0, nPreD0, nPreD0 / 2, 48);
+                Debug.Log(
+                    $"[LeafOnlyParity] phase={phase} tensor=leaf_blocks_meta path=gpu K={kAct} La_diag={laD} M_off=0 (UUt)");
+            }
+
+            if (canGpuTail)
+                LeafOnlyLayer1LogPrecondNodeJacParity(phase, nPad, laO);
+
             var invC = CultureInfo.InvariantCulture;
             Debug.Log($"[LeafOnlyParity] phase={phase} tensor=layer1_gpu_meta path=gpu K={kAct.ToString(invC)} L_diag={lFull.ToString(invC)} M_off=0");
             return;
@@ -428,6 +739,15 @@ public partial class FluidSimulator
         leafOnlyLayer1Shader.Dispatch(leafL1KCopyAToSkipB, LeafOnlyLayer1Groups256(nOffTok), 1, 1);
         leafOnlyLayer1Shader.Dispatch(leafL1KFfn, LeafOnlyLayer1Groups256(mOff * lsOff), 1, 1);
 
+        if (canGpuHeads)
+        {
+            leafOnlyLayer1Shader.SetInt("leafLaOff", laO);
+            LeafOnlyLayer1BindHeadKernelBuildUVOff();
+            leafOnlyLayer1Shader.Dispatch(leafL1KBuildHeadUVOff, LeafOnlyLayer1Groups256(mOff * laO), 1, 1);
+            LeafOnlyLayer1BindHeadKernelPrecondOff();
+            leafOnlyLayer1Shader.Dispatch(leafL1KPrecondOffUVt, LeafOnlyLayer1Groups256(mOff * laO * laO), 1, 1);
+        }
+
         var offHost = new float[nOffTok];
         leafL1OffBufB.GetData(offHost, 0, 0, nOffTok);
         LeafOnlyParitySummarize(phase, "off_stream_after_layer0", offHost, nOffTok);
@@ -435,6 +755,32 @@ public partial class FluidSimulator
         LeafOnlyParityHead(phase, "off_stream_after_layer0", offHost, nOffTok, 32);
         if (nOffTok > 64)
             LeafOnlyParityHeadAt(phase, "off_stream_after_layer0", offHost, nOffTok, nOffTok / 2, 48);
+
+        if (canGpuHeads)
+        {
+            int nPreD = kAct * laD * laD;
+            int nPreO = mOff * laO * laO;
+            var preDArr = new float[nPreD];
+            leafL1PrecondDiag.GetData(preDArr, 0, 0, nPreD);
+            LeafOnlyParitySummarize(phase, "precondDiag", preDArr, nPreD);
+            LeafOnlyParityHead(phase, "precondDiag", preDArr, nPreD, 16);
+            LeafOnlyParityHead(phase, "precondDiag", preDArr, nPreD, 32);
+            if (nPreD > 64)
+                LeafOnlyParityHeadAt(phase, "precondDiag", preDArr, nPreD, nPreD / 2, 48);
+            var preOArr = new float[nPreO];
+            leafL1PrecondOff.GetData(preOArr, 0, 0, nPreO);
+            LeafOnlyParitySummarize(phase, "precondOff", preOArr, nPreO);
+            LeafOnlyParityHead(phase, "precondOff", preOArr, nPreO, 16);
+            if (nPreO > 16)
+                LeafOnlyParityHead(phase, "precondOff", preOArr, nPreO, 32);
+            if (nPreO > 64)
+                LeafOnlyParityHeadAt(phase, "precondOff", preOArr, nPreO, nPreO / 2, 48);
+            Debug.Log(
+                $"[LeafOnlyParity] phase={phase} tensor=leaf_blocks_meta path=gpu K={kAct} La_diag={laD} La_off={laO} M_off={mOff} (UUt / UVt)");
+        }
+
+        if (canGpuTail)
+            LeafOnlyLayer1LogPrecondNodeJacParity(phase, nPad, laO);
 
         LeafOnlyLayer1RebindMainStreamToDiag();
         leafOnlyLayer1Shader.SetBuffer(leafL1KAttnRow, "leafL1EdgeFeats", LeafOnlyDiagEdgeFeatsBuffer);

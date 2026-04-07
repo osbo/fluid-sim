@@ -11,9 +11,12 @@ lexicographically first frame under --data_folder). Python lines use phase=pytor
 Embedding parity: compare tensor ``token_after_enc`` (Unity runs embed + enc_input_proj on GPU after the
 input tensors). PyTorch reference is ``model.embed`` then ``model.enc_input_proj`` (see end of main()).
 
-Layer 0 (non-highway): compare ``h_diag_after_layer0`` and ``off_stream_after_layer0`` (Unity CPU eager-softmax
-mirror in ``FluidLeafOnlyCpuLayer1Parity.cs`` vs PyTorch ``_layer0_transformer_reference_tensors`` with
-``eager_attention=True``).
+Layer 0 (non-highway): compare ``h_diag_after_layer0`` and ``off_stream_after_layer0``. Unity emits these only when
+``FluidSimulator.leafOnlyLayer1Shader`` is set to ``LeafOnlyLayer1.compute`` and GPU prerequisites pass; there is no
+CPU fallback. PyTorch reference: ``_layer0_transformer_reference_tensors`` with ``eager_attention=True``.
+
+Packed forward tails (``precondDiag``, ``precondOff``, ``precondU``, ``precondV``, ``precondJac``): Unity GPU
+kernels match ``LeafOnlyNet.forward`` / ``unpack_precond`` when ``mlp_heads=1`` and weights align.
 
 Dense diagonal attention RPE: ``diag_edge_feats`` (K×L×L×4), same as ``build_diag_dense_edge_feats_from_positions``
 (no attn_mask; channels 0–2 = position deltas, 3 = mean in-leaf matrix entry per cell). Unity builds this on GPU
