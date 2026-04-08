@@ -263,14 +263,15 @@ public class FluidRenderer : MonoBehaviour
     static bool IsNodeOrColliderVoxelView(RenderingMode mode) =>
         mode == RenderingMode.Nodes || mode == RenderingMode.ColliderVoxels;
 
-    void DispatchParticleVelocityMinMaxForRendering(Material particleMat)
+    /// <returns>False if min/max was not written (caller should keep dummy buffer + _VelocityAutoNormalize 0).</returns>
+    bool DispatchParticleVelocityMinMaxForRendering(Material particleMat)
     {
         if (particleVelocityReduceShader == null
             || particleVelocityBlockReduceKernel < 0
             || _sim.ParticlesBuffer == null
             || _sim.NumParticlesForRender <= 0
             || particleMat == null)
-            return;
+            return false;
 
         int smoothFrames = Mathf.Max(1, particleVelocityNormalizeSmoothingFrames);
         int numParticles = _sim.NumParticlesForRender;
@@ -310,7 +311,7 @@ public class FluidRenderer : MonoBehaviour
         if (smoothFrames <= 1 || particleVelocitySmoothMinMaxKernel < 0)
         {
             particleMat.SetBuffer("_ParticleVelocityMinMax", minMaxSrc);
-            return;
+            return true;
         }
 
         if (particleVelocitySmoothedMinMaxBuffer == null)
@@ -325,6 +326,7 @@ public class FluidRenderer : MonoBehaviour
         particleVelocityReduceShader.SetFloat("_VelocityMinMaxSmoothAlpha", alpha);
         particleVelocityReduceShader.Dispatch(particleVelocitySmoothMinMaxKernel, 1, 1, 1);
         particleMat.SetBuffer("_ParticleVelocityMinMax", particleVelocitySmoothedMinMaxBuffer);
+        return true;
     }
 
     void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
@@ -363,6 +365,9 @@ public class FluidRenderer : MonoBehaviour
             using (s_RenderColliderVoxelsMarker.Auto()) { RenderColliderVoxels(cam); }
         }
 
+        // Particles / ParticlesVelocity: URP has already drawn opaque scene geometry (colliders, bunny, etc.) into the
+        // camera target. DrawParticles only adds particle splats on top with depth test — no fullscreen blit, unlike
+        // Thickness, Nodes, ColliderVoxels, Depth, Normal, or Composite (those replace the framebuffer).
         if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness && !IsNodeOrColliderVoxelView(renderingMode))
         {
             using (s_DrawParticlesMarker.Auto()) { DrawParticles(cam, ctx); }
@@ -506,6 +511,9 @@ public class FluidRenderer : MonoBehaviour
                 particleVelocityMinMaxDummyBuffer = new ComputeBuffer(1, sizeof(float) * 2);
                 particleVelocityMinMaxDummyBuffer.SetData(new[] { 0f, 1f });
             }
+            // Metal requires every declared StructuredBuffer slot bound; autoNorm dispatch can early-out without setting this.
+            currentMaterial.SetBuffer("_ParticleVelocityMinMax", particleVelocityMinMaxDummyBuffer);
+
             float calculatedMinValue = Mathf.Exp(calculatedDepthMinValue);
             float calculatedScale = Mathf.Exp(calculatedDepthDisplayScale);
             currentMaterial.SetFloat("_Scale", calculatedScale);
@@ -520,13 +528,11 @@ public class FluidRenderer : MonoBehaviour
                 && particleVelocityBlockReduceKernel >= 0;
             if (autoNorm)
             {
-                DispatchParticleVelocityMinMaxForRendering(currentMaterial);
-                currentMaterial.SetFloat("_VelocityAutoNormalize", 1f);
+                bool minMaxOk = DispatchParticleVelocityMinMaxForRendering(currentMaterial);
+                currentMaterial.SetFloat("_VelocityAutoNormalize", minMaxOk ? 1f : 0f);
             }
             else
             {
-                if (particleVelocityMinMaxDummyBuffer != null)
-                    currentMaterial.SetBuffer("_ParticleVelocityMinMax", particleVelocityMinMaxDummyBuffer);
                 currentMaterial.SetFloat("_VelocityAutoNormalize", 0f);
             }
         }
