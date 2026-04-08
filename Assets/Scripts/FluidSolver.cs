@@ -70,6 +70,18 @@ public partial class FluidSimulator : MonoBehaviour
         calculateDensityGradientKernel = nodesShader.FindKernel("CalculateDensityGradient");
     }
 
+    /// <summary>CSR is required for <see cref="PressureSolveMatrixFormat.Csr"/>, neural leaf graph features, and training export.</summary>
+    private bool PressureSolveNeedsCsrThisFrame()
+    {
+        if (pressureSolveMatrixFormat == PressureSolveMatrixFormat.Csr)
+            return true;
+        if (preconditioner == PreconditionerType.Neural)
+            return true;
+        if (recorder != null && recorder.isRecording)
+            return true;
+        return false;
+    }
+
     private void SolvePressure()
     {
         if (cgSolverShader == null)
@@ -85,9 +97,19 @@ public partial class FluidSimulator : MonoBehaviour
         if (cgBetaBuffer == null) cgBetaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgRhoBuffer == null) cgRhoBuffer = new ComputeBuffer(1, sizeof(float));
 
+        bool buildCsr = PressureSolveNeedsCsrThisFrame();
+
         // SoA strides are fixed at maxNodesCapacity (both neighborsBuffer and matrixABuffer).
         cgSolverShader.SetInt("numNodesCapacity", maxNodesCapacity);
-        csrBuilderShader.SetInt("numNodesCapacity", maxNodesCapacity);
+        if (buildCsr)
+        {
+            if (csrBuilderShader == null)
+            {
+                Debug.LogError("CSR build is required (Csr matrix format, Neural preconditioner, or training recorder) but CSRBuilder compute shader is not assigned.");
+                return;
+            }
+            csrBuilderShader.SetInt("numNodesCapacity", maxNodesCapacity);
+        }
 
         // Build all GPU-driven indirect dispatch args from nodeCount in a single kernel.
         // Writes solverIndirectArgsBuffer, reductionCount256/512 buffers, and solverPrefixLenBuffer.
@@ -108,14 +130,18 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(dotProductKernel,          "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(applyJacobiKernelId,       "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(globalReduceSumKernelId,   "reductionCountBuffer", solverReductionCount256Buffer); // default; overridden below as needed
+        cgSolverShader.SetBuffer(applyMatrixAndDotKernelId, "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(spmvCsrKernelId,           "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(copyFloatKernelId,         "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(axpyAlphaKernelId,         "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(axpyNegAlphaKernelId,      "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(scaleAddBetaKernelId,      "nodeCountBuffer", nodeCount);
-        csrBuilderShader.SetBuffer(csrCountNnzKernelId,     "nodeCountBuffer", nodeCount);
-        csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId,"nodeCountBuffer", nodeCount);
-        csrBuilderShader.SetBuffer(csrFillKernelId,         "nodeCountBuffer", nodeCount);
+        if (buildCsr)
+        {
+            csrBuilderShader.SetBuffer(csrCountNnzKernelId,     "nodeCountBuffer", nodeCount);
+            csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId,"nodeCountBuffer", nodeCount);
+            csrBuilderShader.SetBuffer(csrFillKernelId,         "nodeCountBuffer", nodeCount);
+        }
 
         // --- Step 1: Calculate Divergence (RHS 'b') ---
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
@@ -131,56 +157,49 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolverShader.SetFloat("deltaTime", deltaTime);
         GpuProfileDispatchIndirect(cgSolverShader,buildMatrixAKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
 
-        // --- Step 1c: Build CSR representation ---
-        if (csrBuilderShader == null)
+        // --- Step 1c: Build CSR (only when PCG uses CSR matvec, neural leaf inputs, or training export) ---
+        if (buildCsr)
         {
-            Debug.LogError("CSRBuilder compute shader is not assigned.");
-            return;
+            // A. Count nnz per row
+            csrBuilderShader.SetBuffer(csrCountNnzKernelId, "neighborsBuffer", neighborsBuffer);
+            csrBuilderShader.SetBuffer(csrCountNnzKernelId, "nnzPerNode", nnzPerNode);
+            GpuProfileDispatchIndirect(csrBuilderShader,csrCountNnzKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+
+            // B. Exclusive prefix sum nnzPerNode -> csrRowPtr (3-pass, all GPU-driven)
+            radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "input",               nnzPerNode);
+            radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "output",              csrRowPtr);
+            radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "aux",                 aux);
+            radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
+            radixSortShader.SetInt("zeroff", 1);
+            GpuProfileDispatchIndirect(radixSortShader,radixPrefixSumSolverMainKernelId, solverIndirectArgsBuffer, SolverArgsOffsetPfx1);
+
+            radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "input",               aux);
+            radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "output",              aux2);
+            radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "aux",                 auxSmall);
+            radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
+            GpuProfileDispatchCompute(radixSortShader, radixPrefixSumSolverAuxKernelId, 1, 1, 1);
+
+            radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "input",               csrRowPtr);
+            radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "aux",                 aux2);
+            radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
+            GpuProfileDispatchIndirect(radixSortShader,radixPrefixFixupSolverKernelId, solverIndirectArgsBuffer, SolverArgsOffsetPfx1);
+
+            csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "nnzPerNode", nnzPerNode);
+            csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "rowPtrBuffer", csrRowPtr);
+            GpuProfileDispatchCompute(csrBuilderShader, csrFinalizeRowPtrKernelId, 1, 1, 1);
+
+            csrBuilderShader.SetBuffer(csrFillKernelId, "neighborsBuffer", neighborsBuffer);
+            csrBuilderShader.SetBuffer(csrFillKernelId, "matrixABuffer", matrixABuffer);
+            csrBuilderShader.SetBuffer(csrFillKernelId, "rowPtrBuffer", csrRowPtr);
+            csrBuilderShader.SetBuffer(csrFillKernelId, "colIndicesBuffer", csrColIndices);
+            csrBuilderShader.SetBuffer(csrFillKernelId, "rowIndicesBuffer", csrRowIndices);
+            csrBuilderShader.SetBuffer(csrFillKernelId, "valuesBuffer", csrValues);
+            GpuProfileDispatchIndirect(csrBuilderShader,csrFillKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+        }
         }
 
-        // A. Count nnz per row
-        csrBuilderShader.SetBuffer(csrCountNnzKernelId, "neighborsBuffer", neighborsBuffer);
-        csrBuilderShader.SetBuffer(csrCountNnzKernelId, "nnzPerNode", nnzPerNode);
-        GpuProfileDispatchIndirect(csrBuilderShader,csrCountNnzKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
-
-        // B. Exclusive prefix sum nnzPerNode -> csrRowPtr (3-pass, all GPU-driven)
-        // Pass 1: nnzPerNode -> csrRowPtr, len=numNodes
-        radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "input",               nnzPerNode);
-        radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "output",              csrRowPtr);
-        radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "aux",                 aux);
-        radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
-        radixSortShader.SetInt("zeroff", 1);
-        GpuProfileDispatchIndirect(radixSortShader,radixPrefixSumSolverMainKernelId, solverIndirectArgsBuffer, SolverArgsOffsetPfx1);
-
-        // Pass 1b: aux -> aux2, len=pfx1 (always 1 group)
-        radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "input",               aux);
-        radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "output",              aux2);
-        radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "aux",                 auxSmall);
-        radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
-        GpuProfileDispatchCompute(radixSortShader, radixPrefixSumSolverAuxKernelId, 1, 1, 1);
-
-        // Pass 2 fixup: csrRowPtr += aux2[block], len=numNodes
-        radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "input",               csrRowPtr);
-        radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "aux",                 aux2);
-        radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
-        GpuProfileDispatchIndirect(radixSortShader,radixPrefixFixupSolverKernelId, solverIndirectArgsBuffer, SolverArgsOffsetPfx1);
-
-        // C. Finalize csrRowPtr[numNodes] on GPU
-        csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "nnzPerNode", nnzPerNode);
-        csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "rowPtrBuffer", csrRowPtr);
-        GpuProfileDispatchCompute(csrBuilderShader, csrFinalizeRowPtrKernelId, 1, 1, 1);
-
-        // D. Fill CSR colIndices / values
-        csrBuilderShader.SetBuffer(csrFillKernelId, "neighborsBuffer", neighborsBuffer);
-        csrBuilderShader.SetBuffer(csrFillKernelId, "matrixABuffer", matrixABuffer);
-        csrBuilderShader.SetBuffer(csrFillKernelId, "rowPtrBuffer", csrRowPtr);
-        csrBuilderShader.SetBuffer(csrFillKernelId, "colIndicesBuffer", csrColIndices);
-        csrBuilderShader.SetBuffer(csrFillKernelId, "rowIndicesBuffer", csrRowIndices);
-        csrBuilderShader.SetBuffer(csrFillKernelId, "valuesBuffer", csrValues);
-        GpuProfileDispatchIndirect(csrBuilderShader,csrFillKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
-        }
-
-        DispatchLeafOnlyGpuInputs(numNodes, maxNnz);
+        if (buildCsr)
+            DispatchLeafOnlyGpuInputs(numNodes, maxNnz);
 
         if (preconditioner == PreconditionerType.Neural)
             LeafOnlyEnsureJacobiInvDiagFromMatrixA(LeafOnlyLastNPadded);
@@ -230,18 +249,26 @@ public partial class FluidSimulator : MonoBehaviour
         {
         for (int k = 0; k < maxCgIterations; k++)
         {
-            // 1. Ap = A*p, partial p·Ap → divergenceBuffer
+            // 1. Ap = A*p, partial p·Ap → divergenceBuffer (structured stencil or CSR)
+            int matvecKernel = pressureSolveMatrixFormat == PressureSolveMatrixFormat.Csr
+                ? spmvCsrKernelId
+                : applyMatrixAndDotKernelId;
             laplacianSw.Start();
-            cgSolverShader.SetBuffer(spmvCsrKernelId, "pBuffer", pBuffer);
-            cgSolverShader.SetBuffer(spmvCsrKernelId, "ApBuffer", ApBuffer);
-            cgSolverShader.SetBuffer(spmvCsrKernelId, "csrRowPtr", csrRowPtr);
-            cgSolverShader.SetBuffer(spmvCsrKernelId, "csrColIndices", csrColIndices);
-            cgSolverShader.SetBuffer(spmvCsrKernelId, "csrValues", csrValues);
-            cgSolverShader.SetBuffer(spmvCsrKernelId, "divergenceBuffer", divergenceBuffer);
-            if (pcgIndirectEarlyOut)
-                GpuProfileDispatchIndirect(cgSolverShader,spmvCsrKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSpmv);
+            cgSolverShader.SetBuffer(matvecKernel, "pBuffer", pBuffer);
+            cgSolverShader.SetBuffer(matvecKernel, "ApBuffer", ApBuffer);
+            cgSolverShader.SetBuffer(matvecKernel, "divergenceBuffer", divergenceBuffer);
+            if (pressureSolveMatrixFormat == PressureSolveMatrixFormat.Csr)
+            {
+                cgSolverShader.SetBuffer(matvecKernel, "csrRowPtr", csrRowPtr);
+                cgSolverShader.SetBuffer(matvecKernel, "csrColIndices", csrColIndices);
+                cgSolverShader.SetBuffer(matvecKernel, "csrValues", csrValues);
+            }
             else
-                GpuProfileDispatchIndirect(cgSolverShader,spmvCsrKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSpmv);
+            {
+                cgSolverShader.SetBuffer(matvecKernel, "matrixABuffer", matrixABuffer);
+                cgSolverShader.SetBuffer(matvecKernel, "neighborsBuffer", neighborsBuffer);
+            }
+            GpuProfileDispatchIndirect(cgSolverShader, matvecKernel, solverIndirectArgsBuffer, CgIndirectArgsOffsetSpmv);
             laplacianSw.Stop();
 
             // 2. Sum p·Ap → divergence[0]; alpha = rho / (p·Ap) on GPU

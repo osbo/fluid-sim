@@ -31,6 +31,9 @@ public partial class FluidSimulator : MonoBehaviour
     public float convergenceThreshold = 1e-05f;
     [Tooltip("How often (in PCG iterations) to evaluate ||r||² for stopping when using GPU indirect PCG. Neural preconditioner uses the same interval for CPU checks.")]
     public int cgConvergenceCheckInterval = 5;
+
+    [Tooltip("Structured = stencil SpMV (faster path, no CSR build unless Neural precond or training recorder needs CSR). Csr = build CSR every frame and use SpMV_CSR.")]
+    public PressureSolveMatrixFormat pressureSolveMatrixFormat = PressureSolveMatrixFormat.Structured;
     
     // Simulation parameters
     private float maxDetailCellSize;
