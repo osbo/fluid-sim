@@ -124,29 +124,33 @@ uint useColliders;                                // 0 = skip solid/SDF reads (n
 // Trilinear SDF sample — smooth penetration depth for proper surface projection.
 float SampleSDF(float3 simPos)
 {
-    if (useColliders == 0u) return 1e9f;
-    float R = (float)solidVoxelResolution;
-    float3 vf = simPos * (R / 1024.0) - 0.5; // fractional voxel coords (voxel centers at 0.5)
-    int3 v0 = (int3)floor(vf);
-    float3 t = vf - (float3)v0;
+    float sdf = 1e9f;
+    if (useColliders != 0u)
+    {
+        float R = (float)solidVoxelResolution;
+        float3 vf = simPos * (R / 1024.0) - 0.5; // fractional voxel coords (voxel centers at 0.5)
+        int3 v0 = (int3)floor(vf);
+        float3 t = vf - (float3)v0;
 
-    int Ri = (int)solidVoxelResolution;
-    int3 v0c = clamp(v0,        int3(0,0,0), int3(Ri-1, Ri-1, Ri-1));
-    int3 v1c = clamp(v0 + 1,   int3(0,0,0), int3(Ri-1, Ri-1, Ri-1));
+        int Ri = (int)solidVoxelResolution;
+        int3 v0c = clamp(v0,        int3(0,0,0), int3(Ri-1, Ri-1, Ri-1));
+        int3 v1c = clamp(v0 + 1,   int3(0,0,0), int3(Ri-1, Ri-1, Ri-1));
 
-    uint Ru = solidVoxelResolution;
-    #define SDF_AT(ix,iy,iz) solidSDFBuffer[(uint)(iz)*Ru*Ru + (uint)(iy)*Ru + (uint)(ix)]
-    float v000 = SDF_AT(v0c.x, v0c.y, v0c.z);
-    float v100 = SDF_AT(v1c.x, v0c.y, v0c.z);
-    float v010 = SDF_AT(v0c.x, v1c.y, v0c.z);
-    float v110 = SDF_AT(v1c.x, v1c.y, v0c.z);
-    float v001 = SDF_AT(v0c.x, v0c.y, v1c.z);
-    float v101 = SDF_AT(v1c.x, v0c.y, v1c.z);
-    float v011 = SDF_AT(v0c.x, v1c.y, v1c.z);
-    float v111 = SDF_AT(v1c.x, v1c.y, v1c.z);
-    #undef SDF_AT
-    return lerp(lerp(lerp(v000,v100,t.x), lerp(v010,v110,t.x), t.y),
-                lerp(lerp(v001,v101,t.x), lerp(v011,v111,t.x), t.y), t.z);
+        uint Ru = solidVoxelResolution;
+        #define SDF_AT(ix,iy,iz) solidSDFBuffer[(uint)(iz)*Ru*Ru + (uint)(iy)*Ru + (uint)(ix)]
+        float v000 = SDF_AT(v0c.x, v0c.y, v0c.z);
+        float v100 = SDF_AT(v1c.x, v0c.y, v0c.z);
+        float v010 = SDF_AT(v0c.x, v1c.y, v0c.z);
+        float v110 = SDF_AT(v1c.x, v1c.y, v0c.z);
+        float v001 = SDF_AT(v0c.x, v0c.y, v1c.z);
+        float v101 = SDF_AT(v1c.x, v0c.y, v1c.z);
+        float v011 = SDF_AT(v0c.x, v1c.y, v1c.z);
+        float v111 = SDF_AT(v1c.x, v1c.y, v1c.z);
+        #undef SDF_AT
+        sdf = lerp(lerp(lerp(v000,v100,t.x), lerp(v010,v110,t.x), t.y),
+                    lerp(lerp(v001,v101,t.x), lerp(v011,v111,t.x), t.y), t.z);
+    }
+    return sdf;
 }
 
 bool IsSolid(float3 simPos)
