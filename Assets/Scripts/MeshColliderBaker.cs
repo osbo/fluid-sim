@@ -7,17 +7,18 @@ using System.Text;
 using UnityEngine;
 
 // Accurate mesh voxelization: triangle–AABB tests over the simulation bounds grid, then a
-// 6-connected flood fill from the grid boundary marks exterior air. Solid = surface voxels
-// (touching geometry) or interior cells not reachable from the boundary (closed volumes).
+// 6-connected flood fill from the grid boundary marks exterior air. Solid = any cell not
+// reachable through empty space from the domain boundary (closed mesh interiors) plus
+// full volumes for Box/Sphere/Capsule colliders (flood-fill obstacles, SDF seeds on their surface).
 // Per-voxel normals: area-weighted mesh normals on geometry hits, oriented toward exterior
 // air; interior-only voxels use a sum of directions to air neighbors, then optional
 // neighbor dilation. Final normals are scaled by 1/boundsSize and normalized so they match
 // particle motion in 0–1023 simulation space (axis-aligned box).
-// Cache: Application.persistentDataPath/FluidSimSolidVoxelCache/*.vox (magic SOL2).
+// Cache: Application.persistentDataPath/FluidSimSolidVoxelCache/*.vox (magic SOL4).
 public static class MeshColliderBaker
 {
-    // File header magic bytes: 'S','O','L','3' (solid + normals + SDF)
-    static readonly byte[] FileMagicBytes = { 0x53, 0x4F, 0x4C, 0x33 };
+    // File header magic bytes: 'S','O','L','4' (solid + normals + SDF; v4 = prim volume + split SDF shell)
+    static readonly byte[] FileMagicBytes = { 0x53, 0x4F, 0x4C, 0x34 };
     const int HeaderSize = 8;
 
     public struct BakeResult
@@ -50,20 +51,23 @@ public static class MeshColliderBaker
 
         var triangles = new List<Triangle>(4096);
         CollectWorldTriangles(collidersRoot.transform, triangles);
-        if (triangles.Count == 0)
+
+        Vector3 bMin = simWorldBounds.min;
+        Vector3 bSize = simWorldBounds.size;
+        Vector3 cell = new Vector3(bSize.x / R, bSize.y / R, bSize.z / R);
+        Vector3 half = cell * 0.5f;
+
+        bool anyPrimitive = HasPrimitiveColliders(collidersRoot.transform);
+        if (triangles.Count == 0 && !anyPrimitive)
         {
-            Debug.LogWarning("[MeshColliderBaker] No mesh geometry under colliders root; grid is empty.");
+            Debug.LogWarning("[MeshColliderBaker] No mesh geometry or primitive colliders under colliders root; grid is empty.");
             if (useDiskCache)
                 SaveCache(collidersRoot, simWorldBounds, R, empty.Solid, empty.Normals, empty.SDF);
             return empty;
         }
 
-        var blocked = new BitArray(total);
+        var triHit = new BitArray(total);
         var normalAccum = new Vector3[total];
-        Vector3 bMin = simWorldBounds.min;
-        Vector3 bSize = simWorldBounds.size;
-        Vector3 cell = new Vector3(bSize.x / R, bSize.y / R, bSize.z / R);
-        Vector3 half = cell * 0.5f;
 
         foreach (var tri in triangles)
         {
@@ -102,11 +106,18 @@ public static class MeshColliderBaker
                 if (!TriangleIntersectsAABB(center, half, tri.a, tri.b, tri.c))
                     continue;
                 int idx = iz * R * R + iy * R + ix;
-                blocked.Set(idx, true);
+                triHit.Set(idx, true);
                 if (areaW > 0f)
                     normalAccum[idx] += triN * areaW;
             }
         }
+
+        // Flood-fill cannot traverse primitive volumes or mesh shell voxels; SDF seeds use triHit ∪ ∂(flood).
+        var floodObstacle = (BitArray)triHit.Clone();
+        MarkPrimitiveColliderVolumes(collidersRoot.transform, simWorldBounds, cell, R, floodObstacle);
+
+        var sdfSurface = (BitArray)triHit.Clone();
+        AddFloodObstacleBoundaryToSdfSurface(R, total, floodObstacle, sdfSurface);
 
         var outside = new BitArray(total);
         var q = new Queue<int>(Mathf.Min(total, 65536));
@@ -114,7 +125,7 @@ public static class MeshColliderBaker
         void TryEnqueueBoundary(int ix, int iy, int iz)
         {
             int idx = iz * R * R + iy * R + ix;
-            if (blocked.Get(idx) || outside.Get(idx))
+            if (floodObstacle.Get(idx) || outside.Get(idx))
                 return;
             outside.Set(idx, true);
             q.Enqueue(idx);
@@ -152,7 +163,7 @@ public static class MeshColliderBaker
                 if ((uint)nix >= (uint)R || (uint)niy >= (uint)R || (uint)niz >= (uint)R)
                     return;
                 int n = niz * R * R + niy * R + nix;
-                if (blocked.Get(n) || outside.Get(n))
+                if (floodObstacle.Get(n) || outside.Get(n))
                     return;
                 outside.Set(n, true);
                 q.Enqueue(n);
@@ -170,7 +181,7 @@ public static class MeshColliderBaker
         int solidCount = 0;
         for (int i = 0; i < total; i++)
         {
-            bool s = blocked.Get(i) || !outside.Get(i);
+            bool s = floodObstacle.Get(i) || !outside.Get(i);
             if (s)
             {
                 solid[i] = 1u;
@@ -178,9 +189,8 @@ public static class MeshColliderBaker
             }
         }
 
-        // BFS signed-distance field (L1 distance in voxels, converted to sim units).
-        // Surface voxels (blocked) = 0; outside = positive; inside = negative.
-        float[] sdf = BuildSDF(R, total, blocked, outside, 1024f / R);
+        // BFS signed distance from sdfSurface; sign from solid mask (negative = inside obstacle).
+        float[] sdf = BuildSDF(R, total, sdfSurface, solid, 1024f / R);
 
         Vector3[] normals = BuildSolidNormals(R, total, solid, normalAccum, bMin, cell);
 
@@ -209,9 +219,9 @@ public static class MeshColliderBaker
         return new BakeResult { Solid = solid, Normals = normals, SDF = sdf };
     }
 
-    // BFS distance transform: spread from surface (blocked) voxels outward in all directions.
+    // BFS distance transform: spread from sdfSurface seeds outward in all directions.
     // Returns signed distance in sim units: positive = outside solid, negative = inside solid.
-    static float[] BuildSDF(int R, int total, BitArray blocked, BitArray outside, float voxelSimSize)
+    static float[] BuildSDF(int R, int total, BitArray sdfSurface, uint[] solid, float voxelSimSize)
     {
         var dist = new int[total];
         for (int i = 0; i < total; i++) dist[i] = int.MaxValue / 2;
@@ -219,7 +229,7 @@ public static class MeshColliderBaker
         var bfsQ = new Queue<int>(total / 4 + 64);
         for (int i = 0; i < total; i++)
         {
-            if (blocked.Get(i)) { dist[i] = 0; bfsQ.Enqueue(i); }
+            if (sdfSurface.Get(i)) { dist[i] = 0; bfsQ.Enqueue(i); }
         }
 
         while (bfsQ.Count > 0)
@@ -245,8 +255,7 @@ public static class MeshColliderBaker
         for (int i = 0; i < total; i++)
         {
             float d = dist[i] * voxelSimSize;
-            // Positive outside solid, negative inside solid, zero on surface
-            sdf[i] = outside.Get(i) ? d : -d;
+            sdf[i] = solid[i] != 0u ? -d : d;
         }
         return sdf;
     }
@@ -368,6 +377,120 @@ public static class MeshColliderBaker
         public Vector3 a, b, c;
     }
 
+    static bool HasPrimitiveColliders(Transform root)
+    {
+        if (root.GetComponentsInChildren<BoxCollider>(includeInactive: false).Length > 0) return true;
+        if (root.GetComponentsInChildren<SphereCollider>(includeInactive: false).Length > 0) return true;
+        if (root.GetComponentsInChildren<CapsuleCollider>(includeInactive: false).Length > 0) return true;
+        return false;
+    }
+
+    static bool WorldPointInsideBoxCollider(BoxCollider bc, Vector3 world)
+    {
+        Vector3 local = bc.transform.InverseTransformPoint(world) - bc.center;
+        Vector3 half = bc.size * 0.5f;
+        const float eps = 1e-5f;
+        return Mathf.Abs(local.x) <= half.x + eps && Mathf.Abs(local.y) <= half.y + eps && Mathf.Abs(local.z) <= half.z + eps;
+    }
+
+    static bool WorldPointInsideSphereCollider(SphereCollider sc, Vector3 world)
+    {
+        Vector3 local = sc.transform.InverseTransformPoint(world) - sc.center;
+        float r = sc.radius;
+        return local.sqrMagnitude <= r * r + 1e-8f;
+    }
+
+    static bool WorldPointInsideCapsuleCollider(CapsuleCollider c, Vector3 world)
+    {
+        Transform t = c.transform;
+        Vector3 ctr = t.TransformPoint(c.center);
+        Vector3 ax = c.direction == 0 ? t.right : (c.direction == 1 ? t.up : t.forward);
+        float cylHalf = Mathf.Max(0f, c.height * 0.5f - c.radius);
+        Vector3 p0 = ctr - ax * cylHalf;
+        Vector3 p1 = ctr + ax * cylHalf;
+        Vector3 ab = p1 - p0;
+        float den = ab.sqrMagnitude + 1e-12f;
+        float u = Mathf.Clamp01(Vector3.Dot(world - p0, ab) / den);
+        Vector3 closest = p0 + u * ab;
+        return (world - closest).sqrMagnitude <= c.radius * c.radius + 1e-8f;
+    }
+
+    static void MarkCellsInWorldBoundsOverlap(Vector3 simMin, Vector3 cell, int R, BitArray flood,
+        Bounds objWorldBounds, Func<Vector3, bool> insideWorld)
+    {
+        Bounds wb = objWorldBounds;
+        float pad = Mathf.Max(cell.x, Mathf.Max(cell.y, cell.z)) * 0.51f;
+        wb.Expand(pad);
+
+        int ix0 = Mathf.Clamp(Mathf.FloorToInt((wb.min.x - simMin.x) / cell.x), 0, R - 1);
+        int ix1 = Mathf.Clamp(Mathf.CeilToInt((wb.max.x - simMin.x) / cell.x) - 1, 0, R - 1);
+        int iy0 = Mathf.Clamp(Mathf.FloorToInt((wb.min.y - simMin.y) / cell.y), 0, R - 1);
+        int iy1 = Mathf.Clamp(Mathf.CeilToInt((wb.max.y - simMin.y) / cell.y) - 1, 0, R - 1);
+        int iz0 = Mathf.Clamp(Mathf.FloorToInt((wb.min.z - simMin.z) / cell.z), 0, R - 1);
+        int iz1 = Mathf.Clamp(Mathf.CeilToInt((wb.max.z - simMin.z) / cell.z) - 1, 0, R - 1);
+
+        for (int iz = iz0; iz <= iz1; iz++)
+        for (int iy = iy0; iy <= iy1; iy++)
+        for (int ix = ix0; ix <= ix1; ix++)
+        {
+            Vector3 center = new Vector3(
+                simMin.x + (ix + 0.5f) * cell.x,
+                simMin.y + (iy + 0.5f) * cell.y,
+                simMin.z + (iz + 0.5f) * cell.z);
+            if (!insideWorld(center))
+                continue;
+            int idx = iz * R * R + iy * R + ix;
+            flood.Set(idx, true);
+        }
+    }
+
+    static void MarkPrimitiveColliderVolumes(Transform root, Bounds simWorldBounds, Vector3 cell, int R, BitArray flood)
+    {
+        Vector3 simMin = simWorldBounds.min;
+
+        foreach (var bc in root.GetComponentsInChildren<BoxCollider>(includeInactive: false))
+        {
+            if (!bc.enabled || !bc.gameObject.activeInHierarchy) continue;
+            MarkCellsInWorldBoundsOverlap(simMin, cell, R, flood, bc.bounds, p => WorldPointInsideBoxCollider(bc, p));
+        }
+        foreach (var sc in root.GetComponentsInChildren<SphereCollider>(includeInactive: false))
+        {
+            if (!sc.enabled || !sc.gameObject.activeInHierarchy) continue;
+            MarkCellsInWorldBoundsOverlap(simMin, cell, R, flood, sc.bounds, p => WorldPointInsideSphereCollider(sc, p));
+        }
+        foreach (var cap in root.GetComponentsInChildren<CapsuleCollider>(includeInactive: false))
+        {
+            if (!cap.enabled || !cap.gameObject.activeInHierarchy) continue;
+            MarkCellsInWorldBoundsOverlap(simMin, cell, R, flood, cap.bounds, p => WorldPointInsideCapsuleCollider(cap, p));
+        }
+    }
+
+    static void AddFloodObstacleBoundaryToSdfSurface(int R, int total, BitArray floodObstacle, BitArray sdfSurface)
+    {
+        for (int i = 0; i < total; i++)
+        {
+            if (!floodObstacle[i])
+                continue;
+            int ix = i % R;
+            int t = i / R;
+            int iy = t % R;
+            int iz = t / R;
+
+            bool NeighborIsAirOrOob(int nx, int ny, int nz)
+            {
+                if ((uint)nx >= (uint)R || (uint)ny >= (uint)R || (uint)nz >= (uint)R)
+                    return true;
+                int ni = nz * R * R + ny * R + nx;
+                return !floodObstacle[ni];
+            }
+
+            if (NeighborIsAirOrOob(ix - 1, iy, iz) || NeighborIsAirOrOob(ix + 1, iy, iz) ||
+                NeighborIsAirOrOob(ix, iy - 1, iz) || NeighborIsAirOrOob(ix, iy + 1, iz) ||
+                NeighborIsAirOrOob(ix, iy, iz - 1) || NeighborIsAirOrOob(ix, iy, iz + 1))
+                sdfSurface.Set(i, true);
+        }
+    }
+
     static void CollectWorldTriangles(Transform root, List<Triangle> outTris)
     {
         var filters = root.GetComponentsInChildren<MeshFilter>(includeInactive: false);
@@ -377,6 +500,26 @@ public static class MeshColliderBaker
             if (mesh == null)
                 continue;
             Matrix4x4 M = mf.transform.localToWorldMatrix;
+            var verts = mesh.vertices;
+            var tris = mesh.triangles;
+            for (int i = 0; i < tris.Length; i += 3)
+            {
+                outTris.Add(new Triangle
+                {
+                    a = M.MultiplyPoint3x4(verts[tris[i]]),
+                    b = M.MultiplyPoint3x4(verts[tris[i + 1]]),
+                    c = M.MultiplyPoint3x4(verts[tris[i + 2]])
+                });
+            }
+        }
+
+        var meshColliders = root.GetComponentsInChildren<MeshCollider>(includeInactive: false);
+        foreach (var mc in meshColliders)
+        {
+            if (!mc.enabled || !mc.gameObject.activeInHierarchy || mc.sharedMesh == null)
+                continue;
+            Mesh mesh = mc.sharedMesh;
+            Matrix4x4 M = mc.transform.localToWorldMatrix;
             var verts = mesh.vertices;
             var tris = mesh.triangles;
             for (int i = 0; i < tris.Length; i += 3)
@@ -495,11 +638,78 @@ public static class MeshColliderBaker
             sb.Append(';');
         }
 
+        var mcols = collidersRoot.GetComponentsInChildren<MeshCollider>(includeInactive: false);
+        Array.Sort(mcols, (a, b) => a.GetInstanceID().CompareTo(b.GetInstanceID()));
+        foreach (var mc in mcols)
+        {
+            if (mc.sharedMesh == null)
+                continue;
+            Mesh m = mc.sharedMesh;
+            sb.Append("MC|");
+            sb.Append(mc.enabled ? '1' : '0');
+            sb.Append(m.GetInstanceID());
+            sb.Append(',');
+            sb.Append(m.vertexCount);
+            sb.Append(',');
+            sb.Append(m.triangles.Length);
+            sb.Append(',');
+            Matrix4x4 M = mc.transform.localToWorldMatrix;
+            for (int k = 0; k < 16; k++)
+                sb.Append(M[k].ToString("R", inv));
+            sb.Append(';');
+        }
+
+        void AppendBox(BoxCollider bc)
+        {
+            sb.Append("Bx|");
+            sb.Append(bc.enabled ? '1' : '0');
+            Matrix4x4 M = bc.transform.localToWorldMatrix;
+            for (int k = 0; k < 16; k++)
+                sb.Append(M[k].ToString("R", inv));
+            sb.Append('|');
+            sb.Append(bc.center.x.ToString("R", inv)).Append(',').Append(bc.center.y.ToString("R", inv)).Append(',').Append(bc.center.z.ToString("R", inv)).Append('|');
+            sb.Append(bc.size.x.ToString("R", inv)).Append(',').Append(bc.size.y.ToString("R", inv)).Append(',').Append(bc.size.z.ToString("R", inv)).Append(';');
+        }
+        void AppendSphere(SphereCollider sc)
+        {
+            sb.Append("Sp|");
+            sb.Append(sc.enabled ? '1' : '0');
+            Matrix4x4 M = sc.transform.localToWorldMatrix;
+            for (int k = 0; k < 16; k++)
+                sb.Append(M[k].ToString("R", inv));
+            sb.Append('|');
+            sb.Append(sc.center.x.ToString("R", inv)).Append(',').Append(sc.center.y.ToString("R", inv)).Append(',').Append(sc.center.z.ToString("R", inv)).Append('|');
+            sb.Append(sc.radius.ToString("R", inv)).Append(';');
+        }
+        void AppendCapsule(CapsuleCollider c)
+        {
+            sb.Append("Cp|");
+            sb.Append(c.enabled ? '1' : '0');
+            Matrix4x4 M = c.transform.localToWorldMatrix;
+            for (int k = 0; k < 16; k++)
+                sb.Append(M[k].ToString("R", inv));
+            sb.Append('|');
+            sb.Append(c.center.x.ToString("R", inv)).Append(',').Append(c.center.y.ToString("R", inv)).Append(',').Append(c.center.z.ToString("R", inv)).Append('|');
+            sb.Append(c.direction.ToString(inv)).Append('|');
+            sb.Append(c.height.ToString("R", inv)).Append('|');
+            sb.Append(c.radius.ToString("R", inv)).Append(';');
+        }
+
+        var boxes = collidersRoot.GetComponentsInChildren<BoxCollider>(includeInactive: false);
+        Array.Sort(boxes, (a, b) => a.GetInstanceID().CompareTo(b.GetInstanceID()));
+        foreach (var bc in boxes) AppendBox(bc);
+        var spheres = collidersRoot.GetComponentsInChildren<SphereCollider>(includeInactive: false);
+        Array.Sort(spheres, (a, b) => a.GetInstanceID().CompareTo(b.GetInstanceID()));
+        foreach (var sc in spheres) AppendSphere(sc);
+        var caps = collidersRoot.GetComponentsInChildren<CapsuleCollider>(includeInactive: false);
+        Array.Sort(caps, (a, b) => a.GetInstanceID().CompareTo(b.GetInstanceID()));
+        foreach (var c in caps) AppendCapsule(c);
+
         sb.Append('R').Append(R).Append('|');
         Vector3 mn = simWorldBounds.min, mx = simWorldBounds.max;
         sb.Append(mn.x.ToString("R", inv)).Append(',').Append(mn.y.ToString("R", inv)).Append(',').Append(mn.z.ToString("R", inv)).Append('|');
         sb.Append(mx.x.ToString("R", inv)).Append(',').Append(mx.y.ToString("R", inv)).Append(',').Append(mx.z.ToString("R", inv));
-        sb.Append("|SOL2");
+        sb.Append("|SOL4");
 
         return Encoding.UTF8.GetBytes(sb.ToString());
     }

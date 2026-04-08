@@ -182,12 +182,8 @@ public partial class FluidSimulator : MonoBehaviour
     public bool logLayerCountsPerFrame = true;
 
     [Header("Debug: frame stats / logging")]
-    [Tooltip("Master toggle for expensive per-frame diagnostics. When off (default): no frame summary Debug.Log, no cumulative timing averages, no layer-count readback, and GPU sync for section timing is skipped. Stopwatches still run (cheap); use Unity Profiler FluidSim.* markers. Turn on only while profiling.")]
+    [Tooltip("Master toggle for expensive per-frame diagnostics. When off (default): no frame summary Debug.Log, no cumulative timing averages, no layer-count readback, and no AsyncGPUReadback fences around timed sections. When on: section Stopwatches include tiny AsyncGPUReadback waits so ms ≈ GPU work per step (very slow). Stopwatches still run when off (cheap enqueue time only); use Unity Profiler FluidSim.* markers. Turn on only while profiling.")]
     public bool enablePerFrameDebugTimingLog = false;
-
-    [Header("Debug: section timing vs GPU")]
-    [Tooltip("Only when per-frame debug timing log is enabled. Each timed simulation step runs AsyncGPUReadback (tiny slices) before and after the step so Stopwatch ms ≈ GPU work for that step. Very slow. Off = timers measure mostly CPU enqueue time.")]
-    public bool gpuSyncForSectionTimingReport = false;
 
     public PreconditionerType preconditioner = PreconditionerType.Jacobi;
 
@@ -463,10 +459,10 @@ public partial class FluidSimulator : MonoBehaviour
         particlesBuffer.SetData(particlesCPU);
     }
 
-    /// <summary>Optional: tiny async readbacks + wait so section Stopwatches approximate GPU time (see <see cref="gpuSyncForSectionTimingReport"/>).</summary>
+    /// <summary>When <see cref="enablePerFrameDebugTimingLog"/> is on: tiny AsyncGPUReadback + wait so section Stopwatches approximate GPU time for that step.</summary>
     private void GpuTimingReportFlushGpu(bool includePressureBuffer = false)
     {
-        if (!enablePerFrameDebugTimingLog || !gpuSyncForSectionTimingReport)
+        if (!enablePerFrameDebugTimingLog)
             return;
         using (s_GpuTimingSyncMarker.Auto())
         {
@@ -490,6 +486,12 @@ public partial class FluidSimulator : MonoBehaviour
 
     void Update()
     {
+        if (Keyboard.current != null && Keyboard.current.rKey.wasPressedThisFrame)
+        {
+            ResetSimulation();
+            Debug.Log("Simulation reset to initial state (R).");
+        }
+
         // Check for pause/resume toggle (space bar)
         if (Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame)
         {
@@ -523,13 +525,9 @@ public partial class FluidSimulator : MonoBehaviour
         var storeOldVelocitiesSw = new System.Diagnostics.Stopwatch();
         var applyExternalForcesSw = new System.Diagnostics.Stopwatch();
 
-        // GPU labels: one ExecuteCommandBuffer when this scope ends, *before* nodeCount readback below (nested inner scopes do not flush).
-        using (new GpuProfileSection(this, "FluidSim.PrePressure"))
-        {
         // Step 1: Sort particles
         GpuTimingReportFlushGpu(false);
         sortSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.Sort"))
         using (s_SortMarker.Auto())
             SortParticles();
         GpuTimingReportFlushGpu(false);
@@ -538,7 +536,6 @@ public partial class FluidSimulator : MonoBehaviour
         // Step 2: Find unique particles and create leaves
         GpuTimingReportFlushGpu(false);
         findUniqueSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.FindUnique"))
         using (s_FindUniqueMarker.Auto())
             findUniqueParticles();
         GpuTimingReportFlushGpu(false);
@@ -546,7 +543,6 @@ public partial class FluidSimulator : MonoBehaviour
 
         GpuTimingReportFlushGpu(false);
         createLeavesSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.CreateLeaves"))
         using (s_CreateLeavesMarker.Auto())
             CreateLeaves();
         GpuTimingReportFlushGpu(false);
@@ -555,7 +551,6 @@ public partial class FluidSimulator : MonoBehaviour
         // Step 3: Layer loop (layers 1-10)
         GpuTimingReportFlushGpu(false);
         layerLoopSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.LayerLoop"))
         using (s_LayerLoopMarker.Auto())
         {
             for (layer = layer + 1; layer <= maxLayer; layer++)
@@ -572,7 +567,6 @@ public partial class FluidSimulator : MonoBehaviour
         // Step 4: Find neighbors (GPU: WriteIndirectArgsFromCount + DispatchIndirect — no CPU count needed)
         GpuTimingReportFlushGpu(false);
         findNeighborsSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.FindNeighbors"))
         using (s_FindNeighborsMarker.Auto())
             findNeighbors();
         GpuTimingReportFlushGpu(false);
@@ -581,7 +575,6 @@ public partial class FluidSimulator : MonoBehaviour
         // Step 4.5: Calculate density gradients (indirect from GPU nodeCount)
         GpuTimingReportFlushGpu(false);
         calculateGradientsSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.CalculateGradients"))
         using (s_GradientsMarker.Auto())
             CalculateDensityGradients();
         GpuTimingReportFlushGpu(false);
@@ -597,7 +590,6 @@ public partial class FluidSimulator : MonoBehaviour
         // Step 6: Store old velocities for FLIP method
         GpuTimingReportFlushGpu(false);
         storeOldVelocitiesSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.StoreOldVelocities"))
         using (s_StoreVelocitiesMarker.Auto())
             StoreOldVelocities();
         GpuTimingReportFlushGpu(false);
@@ -606,12 +598,10 @@ public partial class FluidSimulator : MonoBehaviour
         // Step 7: Apply external forces (indirect from GPU nodeCount)
         GpuTimingReportFlushGpu(false);
         applyExternalForcesSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.ApplyExternalForces"))
         using (s_ExternalForcesMarker.Auto())
             ApplyExternalForces();
         GpuTimingReportFlushGpu(false);
         applyExternalForcesSw.Stop();
-        }
 
         // One uint sync readback: CPU must have correct numNodes this frame for SolvePressure (LeafOnly),
         // BuildLayerCountsSummaryForLog, rendering instance counts, etc. GPU indirect dispatches already use nodeCount buffer.
@@ -624,7 +614,7 @@ public partial class FluidSimulator : MonoBehaviour
         if (enablePerFrameDebugTimingLog && logLayerCountsPerFrame)
             layerCountsLine = BuildLayerCountsSummaryForLog();
 
-        // Step 9: Solve pressure (GPU labels are sub-scopes inside SolvePressure — LeafOnly/Neural use immediate dispatches)
+        // Step 9: Solve pressure
         var solvePressureSw = new System.Diagnostics.Stopwatch();
         GpuTimingReportFlushGpu(false);
         solvePressureSw.Restart();
@@ -637,7 +627,6 @@ public partial class FluidSimulator : MonoBehaviour
         var updateParticlesSw = new System.Diagnostics.Stopwatch();
         GpuTimingReportFlushGpu(false);
         updateParticlesSw.Restart();
-        using (new GpuProfileSection(this, "FluidSim.UpdateParticles"))
         using (s_UpdateParticlesMarker.Auto())
             UpdateParticles();
         GpuTimingReportFlushGpu(false);
@@ -651,13 +640,11 @@ public partial class FluidSimulator : MonoBehaviour
             cumulativeFrameTimeMs += frameSw.Elapsed.TotalMilliseconds;
             double averageFrameTimeMs = cumulativeFrameTimeMs / Math.Max(1, frameNumber);
             string averageCgIterationsText = cgSolveFrameCount > 0 ? averageCgIterations.ToString("F2") : "N/A";
-            string timingModeNote = gpuSyncForSectionTimingReport
-                ? "• Timing mode: GPU sync ON (section ms include AsyncGPUReadback waits; not a full device idle guarantee).\n"
-                : "";
+            const string timingModeNote = "• Timing mode: GPU sync ON (section ms include AsyncGPUReadback waits; not a full device idle guarantee).\n";
             Debug.Log($"Frame {frameNumber} Summary:\n" +
                      $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
                      $"• Avg Frame Time: {averageFrameTimeMs:F2} ms\n" +
-                     (timingModeNote.Length > 0 ? timingModeNote : "") +
+                     timingModeNote +
                      $"• # Nodes: {numNodes}\n" +
                      (layerCountsLine != null ? $"• {layerCountsLine}\n" : "") +
                      $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
@@ -784,7 +771,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(calculateDensityGradientKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
-        GpuProfileDispatchIndirect(nodesShader, calculateDensityGradientKernel, dispatchArgsBuffer, 0);
+        nodesShader.DispatchIndirect(calculateDensityGradientKernel, dispatchArgsBuffer, 0);
     }
 
     private void StoreOldVelocities()
@@ -798,7 +785,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetBuffer(copyNodesKernelId, "tempNodesBuffer", nodesBuffer);
         nodesPrefixSumsShader.SetBuffer(copyNodesKernelId, "nodesBuffer", nodesBufferOld);
         int copyGroups = Mathf.Max(1, (maxNodesCapacity + 511) / 512);
-        GpuProfileDispatchCompute(nodesPrefixSumsShader, copyNodesKernelId, copyGroups, 1, 1);
+        nodesPrefixSumsShader.Dispatch(copyNodesKernelId, copyGroups, 1, 1);
     }
 
     private void UpdateParticles()
@@ -835,7 +822,7 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetInt("minLayer", minLayer);
         particlesShader.SetInt("maxLayer", maxLayer);
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
-        GpuProfileDispatchCompute(particlesShader, updateParticlesKernel, threadGroups, 1, 1);
+        particlesShader.Dispatch(updateParticlesKernel, threadGroups, 1, 1);
     }
 
     private void InitializeParticleSystem()
@@ -856,6 +843,7 @@ public partial class FluidSimulator : MonoBehaviour
         initializeParticlesKernel = particlesShader.FindKernel("InitializeParticles");
         
         // Create buffers
+        particlesBuffer?.Release();
         particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint)); // 12 + 12 + 4 = 28 bytes
         particlesCPU = new Particle[numParticles];
 
@@ -1042,17 +1030,48 @@ public partial class FluidSimulator : MonoBehaviour
         solverPrefixLenBuffer = new ComputeBuffer(2, sizeof(uint));
     }
     
-    // Public method for ScenarioManager to reset the simulation
+    void ResetSimulationAccumulators()
+    {
+        frameNumber = 0;
+        cumulativeFrameTimeMs = 0.0;
+        cumulativeCgIterations = 0.0;
+        cgSolveFrameCount = 0;
+        averageCgIterations = 0.0f;
+        lastCgIterations = 0;
+        lastRenderTimeMs = 0.0;
+    }
+
+    /// <summary>Re-runs particle initialization, solid-voxel fixup, and clears timing/recording state (same as scene start).</summary>
     public void ResetSimulation()
     {
+        ResolveBoundsColliders();
+        if (simulationBounds == null || fluidInitialBounds == null)
+        {
+            Debug.LogWarning("FluidSimulator: cannot reset — assign Simulation Bounds and Fluid Initial Bounds colliders.");
+            return;
+        }
+        if (particlesShader == null)
+        {
+            Debug.LogWarning("FluidSimulator: cannot reset — particles compute shader is missing.");
+            return;
+        }
+
         InitializeParticleSystem();
+        if (particlesBuffer == null)
+            return;
+
+        BakeAndUploadSolidVoxels();
+        ResetSimulationAccumulators();
+
+        if (recorder != null)
+            recorder.StartNewRun();
     }
     
     private void SortParticles()
     {
         if (radixSort == null || radixSortShader == null)
             return;
-        radixSort.Sort(particlesBuffer, particlesBuffer, (uint)numParticles, emitGpuDebugLabels ? fluidSimGpuProfileCmd : null);
+        radixSort.Sort(particlesBuffer, particlesBuffer, (uint)numParticles);
     }
 
 
@@ -1105,6 +1124,5 @@ public partial class FluidSimulator : MonoBehaviour
         ReleasePreconditionerBuffers();
         ReleaseLeafOnlyBuffers();
         ReleaseLeafOnlyWeightsBuffers();
-        ReleaseFluidSimGpuProfileCmd();
     }
 }

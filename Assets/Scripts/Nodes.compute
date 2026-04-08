@@ -825,7 +825,7 @@ void FindReverseConnections(uint3 id : SV_DispatchThreadID)
     if (i >= NAct()) return;
 
     // For every one of my neighbor slots...
-    for (int n = 0; n < 24; n++)
+    for (uint n = 0u; n < 24u; n++)
     {
         // 1. Who is my neighbor?
         // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
@@ -840,13 +840,13 @@ void FindReverseConnections(uint3 id : SV_DispatchThreadID)
             // This loop is expensive, but we only do it ONCE.
             // We can even use the "Geometric Optimization" here to speed it up (check only 4 slots)
             
-            // Optimization: Only search the opposing face range
-            int myFace = n / 4; 
-            int oppFace = (myFace % 2 == 0) ? (myFace + 1) : (myFace - 1);
-            int startSlot = oppFace * 4;
-            int endSlot = startSlot + 4;
+            // Optimization: Only search the opposing face range (uint math avoids slow signed div/mod on Metal)
+            uint myFace = n / 4u;
+            uint oppFace = (myFace % 2u == 0u) ? (myFace + 1u) : (myFace - 1u);
+            uint startSlot = oppFace * 4u;
+            uint endSlot = startSlot + 4u;
 
-            for (int slot = startSlot; slot < endSlot; slot++)
+            for (uint slot = startSlot; slot < endSlot; slot++)
             {
                 // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
                 if (neighborsBuffer[slot * numNodesCapacity + k] == i)
