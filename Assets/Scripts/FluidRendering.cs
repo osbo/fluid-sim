@@ -1,9 +1,19 @@
 using UnityEngine;
 using UnityEngine.Rendering;
+using Unity.Profiling;
 
 // Rendering component of FluidSimulator
 public partial class FluidSimulator : MonoBehaviour
 {
+    static readonly ProfilerMarker s_RenderMarker          = new ProfilerMarker("FluidSim.Render");
+    static readonly ProfilerMarker s_RenderThicknessMarker = new ProfilerMarker("FluidSim.Render.Thickness");
+    static readonly ProfilerMarker s_ThicknessBlurMarker   = new ProfilerMarker("FluidSim.Render.ThicknessBlur");
+    static readonly ProfilerMarker s_RenderNodesMarker     = new ProfilerMarker("FluidSim.Render.Nodes");
+    static readonly ProfilerMarker s_DrawParticlesMarker   = new ProfilerMarker("FluidSim.Render.DrawParticles");
+    static readonly ProfilerMarker s_DepthBlurMarker       = new ProfilerMarker("FluidSim.Render.DepthBlur");
+    static readonly ProfilerMarker s_NormalsMarker         = new ProfilerMarker("FluidSim.Render.Normals");
+    static readonly ProfilerMarker s_CompositeMarker       = new ProfilerMarker("FluidSim.Render.Composite");
+
     void OnEnable()
     {
         RenderPipelineManager.endCameraRendering += OnEndCameraRendering;
@@ -150,13 +160,14 @@ public partial class FluidSimulator : MonoBehaviour
     {
         // Start rendering timing
         renderSw.Restart();
-        
+        using var _render = s_RenderMarker.Auto();
+
         // --- 1. Render Thickness (Raw) ---
         // Needed for: Thickness, BlurredThickness, Composite
         if (renderingMode == RenderingMode.Thickness || renderingMode == RenderingMode.BlurredThickness || renderingMode == RenderingMode.Composite)
         {
-            RenderThickness(cam);
-            
+            using (s_RenderThicknessMarker.Auto()) { RenderThickness(cam); }
+
             // If Composite or BlurredThickness, we also need to BLUR the thickness
             if (renderingMode == RenderingMode.Composite || renderingMode == RenderingMode.BlurredThickness)
             {
@@ -169,26 +180,25 @@ public partial class FluidSimulator : MonoBehaviour
                      fluidThicknessTexture = new RenderTexture(desc);
                      fluidThicknessTexture.Create();
                  }
-                 
-                 // Use thickness blur (doesn't blur with 0 thickness)
-                 RunThicknessBlur(cam, thicknessTexture, fluidThicknessTexture);
+
+                 using (s_ThicknessBlurMarker.Auto()) { RunThicknessBlur(cam, thicknessTexture, fluidThicknessTexture); }
             }
         }
-        
+
         // --- 2. Render Nodes (Wireframe) ---
         // Needed for: Nodes
         if (renderingMode == RenderingMode.Nodes)
         {
-            RenderNodes(cam);
+            using (s_RenderNodesMarker.Auto()) { RenderNodes(cam); }
         }
-        
+
         // --- 3. Render Depth (Raw) ---
         // Needed for: Depth, BlurredDepth, Normal, Composite
-        if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness && renderingMode != RenderingMode.Nodes) 
+        if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness && renderingMode != RenderingMode.Nodes)
         {
-            DrawParticles(cam, ctx); // Renders to rawDepthTexture or screen
+            using (s_DrawParticlesMarker.Auto()) { DrawParticles(cam, ctx); }
         }
-        
+
         // --- 4. Blur Depth & Gen Normals ---
         // Needed for: BlurredDepth, Normal, Composite
         if (renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
@@ -202,12 +212,9 @@ public partial class FluidSimulator : MonoBehaviour
                 fluidDepthTexture = new RenderTexture(desc);
                 fluidDepthTexture.Create();
             }
-            
-            // 1. Blur Depth (Raw -> FluidDepth)
-            RunBilateralBlur(cam, rawDepthTexture, fluidDepthTexture);
-            
-            // 2. Generate Normals (FluidDepth -> FluidNormal)
-            RenderNormals(cam);
+
+            using (s_DepthBlurMarker.Auto()) { RunBilateralBlur(cam, rawDepthTexture, fluidDepthTexture); }
+            using (s_NormalsMarker.Auto()) { RenderNormals(cam); }
         }
         
         // --- 5. Final Display / Composite ---
@@ -260,7 +267,7 @@ public partial class FluidSimulator : MonoBehaviour
         }
         else if (renderingMode == RenderingMode.Composite)
         {
-            RenderComposite(cam);
+            using (s_CompositeMarker.Auto()) { RenderComposite(cam); }
         }
         
         // Stop rendering timing and store the result

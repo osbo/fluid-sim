@@ -6,8 +6,8 @@
 //  - neighborsBuffer: SoA adjacency, 24 entries per node
 //      neighborsBuffer[k * numNodesCapacity + i] = column index of k-th neighbor of row i
 //  - matrixABuffer: SoA Laplacian weights, 25 entries per node
-//      matrixABuffer[0 * numNodes + i]     = diagonal entry A_ii
-//      matrixABuffer[(k + 1) * numNodes + i] = weight for neighbor slot k
+//      matrixABuffer[i]                                  = diagonal entry A_ii  (slot 0)
+//      matrixABuffer[(k + 1) * numNodesCapacity + i]     = weight for neighbor slot k
 //
 // Outputs:
 //  - nnzPerNode: number of nonzeros per row (1 diag + valid neighbors)
@@ -29,15 +29,16 @@
 #pragma kernel FillCSR
 
 StructuredBuffer<uint> neighborsBuffer;          // [24 * numNodesCapacity] SoA stride
-StructuredBuffer<float> matrixABuffer;          // [25 * numNodes]
+StructuredBuffer<float> matrixABuffer;          // [25 * numNodesCapacity] SoA stride (slot 0 = diagonal, slots 1-24 = neighbors)
 
-RWStructuredBuffer<uint> nnzPerNode;            // [numNodes]
-RWStructuredBuffer<uint> rowPtrBuffer;          // [numNodes + 1] (RW so we can write last element)
+RWStructuredBuffer<uint> nnzPerNode;            // [numNodesCapacity]
+RWStructuredBuffer<uint> rowPtrBuffer;          // [numNodesCapacity + 1] (RW so we can write last element)
 RWStructuredBuffer<uint> colIndicesBuffer;      // [totalNNZ]
 RWStructuredBuffer<uint> rowIndicesBuffer;      // [totalNNZ] - Explicit row indices (edge_index[0])
 RWStructuredBuffer<float> valuesBuffer;         // [totalNNZ]
 
-uint numNodes;
+// numNodes is GPU-driven — read from nodeCountBuffer[0] each kernel invocation.
+StructuredBuffer<uint> nodeCountBuffer;
 uint numNodesCapacity;
 
 // --- KERNEL: CountNNZ -------------------------------------------------------
@@ -48,64 +49,52 @@ uint numNodesCapacity;
 void CountNNZ(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
 
-    // Start with 1 for the diagonal
-    uint count = 1u;
-
-    // Check all 24 potential neighbor slots
-    // SoA layout: neighborsBuffer[slot * numNodesCapacity + i]
+    uint count = 1u; // diagonal always present
     [unroll]
     for (int k = 0; k < 24; k++)
     {
         uint neighborIdx = neighborsBuffer[k * numNodesCapacity + i];
-
-        // Valid fluid node if index is in [0, numNodes)
-        if (neighborIdx < numNodes)
-        {
-            count++;
-        }
+        if (neighborIdx < numNodes) count++;
     }
-
     nnzPerNode[i] = count;
 }
 
 // --- KERNEL: FinalizeRowPtr -------------------------------------------------
-// After an exclusive prefix sum over nnzPerNode has been written to
-// rowPtrBuffer[0..numNodes-1] on the C# side, this kernel fills
-// rowPtrBuffer[numNodes] with the total number of nonzeros:
-//      totalNNZ = rowPtr[numNodes-1] + nnzPerNode[numNodes-1]
+// After the exclusive prefix sum over nnzPerNode → rowPtrBuffer[0..N-1],
+// this kernel writes rowPtrBuffer[N] = totalNNZ.
 
 [numthreads(1, 1, 1)]
 void FinalizeRowPtr(uint3 id : SV_DispatchThreadID)
 {
+    uint numNodes = nodeCountBuffer[0];
     if (id.x != 0 || numNodes == 0) return;
 
     uint last = numNodes - 1;
-    uint total = rowPtrBuffer[last] + nnzPerNode[last];
-    rowPtrBuffer[numNodes] = total;
+    rowPtrBuffer[numNodes] = rowPtrBuffer[last] + nnzPerNode[last];
 }
 
 // --- KERNEL: FillCSR --------------------------------------------------------
-// Uses the finalized rowPtrBuffer to write CSR colIndices and values
-// from neighborsBuffer + matrixABuffer.
+// Uses the finalized rowPtrBuffer to write CSR colIndices and values.
 
 [numthreads(256, 1, 1)]
 void FillCSR(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
 
-    // Start writing at the offset defined by rowPtr
     uint writeIdx = rowPtrBuffer[i];
 
-    // 1. Write Diagonal (Slot 0 in matrixABuffer)
+    // Diagonal (slot 0: matrixABuffer[i])
     colIndicesBuffer[writeIdx] = i;
-    rowIndicesBuffer[writeIdx] = i; // Source is i
-    valuesBuffer[writeIdx] = matrixABuffer[0 * numNodes + i];
+    rowIndicesBuffer[writeIdx] = i;
+    valuesBuffer[writeIdx]     = matrixABuffer[i];
     writeIdx++;
 
-    // 2. Write Neighbors
+    // Neighbors (slots 1-24; SoA stride = numNodesCapacity)
     [unroll]
     for (int k = 0; k < 24; k++)
     {
@@ -113,9 +102,8 @@ void FillCSR(uint3 id : SV_DispatchThreadID)
         if (neighborIdx < numNodes)
         {
             colIndicesBuffer[writeIdx] = neighborIdx;
-            rowIndicesBuffer[writeIdx] = i; // Source is i
-            // Neighbor weights start at slot 1 in matrixABuffer
-            valuesBuffer[writeIdx] = matrixABuffer[(k + 1) * numNodes + i];
+            rowIndicesBuffer[writeIdx] = i;
+            valuesBuffer[writeIdx]     = matrixABuffer[(k + 1) * numNodesCapacity + i];
             writeIdx++;
         }
     }
