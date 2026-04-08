@@ -17,6 +17,10 @@ public partial class FluidSimulator : MonoBehaviour
 {
     BoxCollider simulationBounds;
     BoxCollider fluidInitialBounds;
+    [Tooltip("Optional mesh whose interior defines the fluid spawn volume. If unset, falls back to the Fluid Initial Bounds box.")]
+    public MeshFilter fluidInitialMesh;
+    [Tooltip("Initial velocity applied to all spawned particles.")]
+    public Vector3 initialVelocity = Vector3.zero;
 
     ComputeShader radixSortShader;
     ComputeShader particlesShader;
@@ -273,6 +277,7 @@ public partial class FluidSimulator : MonoBehaviour
 
     private ComputeBuffer solidSDFBuffer;
     public  ComputeBuffer SolidSDFBuffer      => solidSDFBuffer;
+    private ComputeBuffer initialPositionsBuffer;
     /// <summary>Per-voxel occupancy (0/1) for debug draw; same R³ layout as <see cref="SolidSDFBuffer"/>.</summary>
     private ComputeBuffer solidVoxelsBuffer;
     public  ComputeBuffer SolidVoxelsBuffer     => solidVoxelsBuffer;
@@ -813,126 +818,109 @@ public partial class FluidSimulator : MonoBehaviour
 
     private void InitializeParticleSystem()
     {
-        if (simulationBounds == null || fluidInitialBounds == null)
+        bool hasMesh = fluidInitialMesh != null;
+        if (simulationBounds == null || (!hasMesh && fluidInitialBounds == null))
         {
             Debug.LogError(
-                "FluidSimulator: assign simulation bounds by placing BoxColliders on GameObjects named \"Simulation Bounds\" and \"Fluid Initial Bounds\", or add them to the scene.");
+                "FluidSimulator: assign Simulation Bounds, and either a Fluid Initial Mesh or a Fluid Initial Bounds box collider.");
             return;
         }
 
-        // Get kernel index
         if (particlesShader == null)
         {
-            Debug.LogError("Particles compute shader is missing. In the Editor it loads from Assets/Scripts/Particles.compute automatically.");
+            Debug.LogError("Particles compute shader is missing.");
             return;
         }
         initializeParticlesKernel = particlesShader.FindKernel("InitializeParticles");
-        
-        // Create buffers
+
+        // Create particle buffer
         particlesBuffer?.Release();
-        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint)); // 12 + 12 + 4 = 28 bytes
+        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint));
         particlesCPU = new Particle[numParticles];
 
-        // Set buffer data to compute shader
-        particlesShader.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
-        particlesShader.SetInt("count", numParticles);
-        particlesShader.SetInt("minLayer", minLayer);
-        particlesShader.SetInt("maxLayer", maxLayer);
-        // Calculate bounds
+        // Compute sim-space transform: world → 0..1023 on each axis
         simulationBoundsMin = simulationBounds.bounds.min;
         simulationBoundsMax = simulationBounds.bounds.max;
-        
-        // Get fluid initial bounds from the GameObject's transform
-        fluidInitialBoundsMin = fluidInitialBounds.bounds.min;
-        fluidInitialBoundsMax = fluidInitialBounds.bounds.max;
-        
-        // Normalize bounds to ensure all particle positions are positive
-        // Shift all bounds to be positive by subtracting the simulation bounds minimum
-        fluidInitialBoundsMin -= simulationBoundsMin;
-        fluidInitialBoundsMax -= simulationBoundsMin;
-        simulationBoundsMin = Vector3.zero; // Now simulation bounds start at origin
-        simulationBoundsMax -= simulationBounds.bounds.min; // Shift simulation bounds max accordingly
-        
-        // Calculate morton code normalization factors on CPU
+        simulationBoundsMax -= simulationBoundsMin;  // size
+        simulationBoundsMin  = Vector3.zero;
+
         Vector3 simulationSize = simulationBoundsMax;
-        
-        // For 32-bit Morton codes: 10 bits per axis = 1024 possible values (0-1023)
-        // Normalize each axis to 0-1023 range
         mortonNormalizationFactor = new Vector3(
             1023.0f / simulationSize.x,
             1023.0f / simulationSize.y,
-            1023.0f / simulationSize.z
-        );
-        
-        // Max morton value is 1023 for each axis
+            1023.0f / simulationSize.z);
         mortonMaxValue = 1023.0f;
-        
-        // Calculate grid dimensions for even particle distribution
-        Vector3 fluidInitialSize = fluidInitialBoundsMax - fluidInitialBoundsMin;
-        
-		// Calculate optimal grid dimensions to fit numParticles as evenly as possible (3D)
-		// Start with cube root and adjust for aspect ratio
-		float cubeRoot = Mathf.Pow(numParticles, 1.0f / 3.0f);
-        
-        // Calculate aspect ratio normalized dimensions
-        float maxSize = Mathf.Max(fluidInitialSize.x, fluidInitialSize.y, fluidInitialSize.z);
-        Vector3 normalizedSize = fluidInitialSize / maxSize;
-        
-		Vector3Int gridDimensions = new Vector3Int(
-			Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.x)),
-			Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.y)),
-			Mathf.Max(1, Mathf.RoundToInt(cubeRoot * normalizedSize.z))
-		);
-        
-        // Ensure we have enough grid cells for all particles
-        // If we have too few cells, increase dimensions
-		while (gridDimensions.x * gridDimensions.y * gridDimensions.z < numParticles)
-		{
-			// Increase the smallest dimension to approach the target count
-			if (gridDimensions.x <= gridDimensions.y && gridDimensions.x <= gridDimensions.z)
-				gridDimensions.x++;
-			else if (gridDimensions.y <= gridDimensions.x && gridDimensions.y <= gridDimensions.z)
-				gridDimensions.y++;
-			else
-				gridDimensions.z++;
-		}
-        
-        // If we have too many cells, reduce dimensions
-		while (gridDimensions.x * gridDimensions.y * gridDimensions.z > numParticles)
-		{
-			// Decrease the largest dimension (but not below 1)
-			if (gridDimensions.x >= gridDimensions.y && gridDimensions.x >= gridDimensions.z)
-				gridDimensions.x = Mathf.Max(1, gridDimensions.x - 1);
-			else if (gridDimensions.y >= gridDimensions.x && gridDimensions.y >= gridDimensions.z)
-				gridDimensions.y = Mathf.Max(1, gridDimensions.y - 1);
-			else
-				gridDimensions.z = Mathf.Max(1, gridDimensions.z - 1);
-		}
-        
-        // Calculate grid spacing to fill the entire fluid bounds
-		Vector3 actualGridSpacing = new Vector3(
-			fluidInitialSize.x / Mathf.Max(1, gridDimensions.x),
-			fluidInitialSize.y / Mathf.Max(1, gridDimensions.y),
-			fluidInitialSize.z / Mathf.Max(1, gridDimensions.z)
-		);
-        
-        // Set bounds parameters to compute shader
+
+        // Also keep fluidInitialBoundsMin for RemoveSolidParticles fallback
+        fluidInitialBoundsMin = (fluidInitialBounds != null ? fluidInitialBounds.bounds.min : simulationBounds.bounds.min)
+                                - simulationBounds.bounds.min;
+        fluidInitialBoundsMax = (fluidInitialBounds != null ? fluidInitialBounds.bounds.max : simulationBounds.bounds.max)
+                                - simulationBounds.bounds.min;
+
+        // --- Generate initial positions in sim space (0–1023) ---
+        Vector3[] worldPositions;
+        if (hasMesh)
+        {
+            worldPositions = MeshColliderBaker.GenerateVolumePoints(
+                fluidInitialMesh, simulationBounds.bounds, numParticles);
+        }
+        else
+        {
+            // Box fallback: uniform grid over fluidInitialBounds
+            Bounds box = fluidInitialBounds.bounds;
+            float cubeRoot = Mathf.Pow(numParticles, 1f / 3f);
+            Vector3 size = box.size;
+            float maxSide = Mathf.Max(size.x, Mathf.Max(size.y, size.z));
+            Vector3 norm = size / maxSide;
+            int nx = Mathf.Max(1, Mathf.RoundToInt(cubeRoot * norm.x));
+            int ny = Mathf.Max(1, Mathf.RoundToInt(cubeRoot * norm.y));
+            int nz = Mathf.Max(1, Mathf.RoundToInt(cubeRoot * norm.z));
+            // Adjust so nx*ny*nz >= numParticles
+            while (nx * ny * nz < numParticles)
+            {
+                if (nx <= ny && nx <= nz) nx++;
+                else if (ny <= nx && ny <= nz) ny++;
+                else nz++;
+            }
+            Vector3 step = new Vector3(size.x / nx, size.y / ny, size.z / nz);
+            worldPositions = new Vector3[numParticles];
+            for (int i = 0; i < numParticles; i++)
+            {
+                int iz = i / (nx * ny), rem = i % (nx * ny), iy = rem / nx, ix = rem % nx;
+                worldPositions[i] = box.min + new Vector3((ix + 0.5f) * step.x, (iy + 0.5f) * step.y, (iz + 0.5f) * step.z);
+            }
+        }
+
+        // Convert world positions → sim space
+        Vector3 simOrigin = simulationBounds.bounds.min;
+        var simPositions = new Vector3[numParticles];
+        for (int i = 0; i < numParticles; i++)
+        {
+            Vector3 local = worldPositions[i % worldPositions.Length] - simOrigin;
+            simPositions[i] = new Vector3(
+                local.x * mortonNormalizationFactor.x,
+                local.y * mortonNormalizationFactor.y,
+                local.z * mortonNormalizationFactor.z);
+            simPositions[i] = Vector3.Max(simPositions[i], Vector3.one * 0.5f);
+            simPositions[i] = Vector3.Min(simPositions[i], Vector3.one * 1023.5f);
+        }
+
+        initialPositionsBuffer?.Release();
+        initialPositionsBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3);
+        initialPositionsBuffer.SetData(simPositions);
+
+        // Dispatch init kernel
+        particlesShader.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
+        particlesShader.SetBuffer(initializeParticlesKernel, "initialPositionsBuffer", initialPositionsBuffer);
+        particlesShader.SetVector("initialVelocity", initialVelocity);
+        particlesShader.SetInt("count", numParticles);
+        particlesShader.SetInt("minLayer", minLayer);
+        particlesShader.SetInt("maxLayer", maxLayer);
         particlesShader.SetVector("simulationBoundsMin", simulationBoundsMin);
         particlesShader.SetVector("simulationBoundsMax", simulationBoundsMax);
-        particlesShader.SetVector("fluidInitialBoundsMin", fluidInitialBoundsMin);
-        particlesShader.SetVector("fluidInitialBoundsMax", fluidInitialBoundsMax);
         particlesShader.SetVector("simulationSize", simulationSize);
         particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
         particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
-        particlesShader.SetInt("minLayer", minLayer);
-        
-        // Set grid parameters to compute shader
-        particlesShader.SetInts("gridDimensions", new int[] { (int)gridDimensions.x, (int)gridDimensions.y, (int)gridDimensions.z });
-        particlesShader.SetVector("gridSpacing", actualGridSpacing);
-        
-        // Dispatch the kernel
-        particlesShader.SetFloat("dispersionPower", 4.0f); // higher = stronger skew
-        particlesShader.SetFloat("boundaryThreshold", 0.01f); // near-left threshold in normalized X
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
 
@@ -1105,7 +1093,7 @@ public partial class FluidSimulator : MonoBehaviour
         dirtyFlagBuffer?.Release();
         mortonCodesBuffer?.Release();
         solidSDFBuffer?.Release();
-        solidVoxelsBuffer?.Release();
+        initialPositionsBuffer?.Release();
         ReleasePreconditionerBuffers();
         ReleaseLeafOnlyBuffers();
         ReleaseLeafOnlyWeightsBuffers();
