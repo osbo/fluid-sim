@@ -56,13 +56,49 @@ StructuredBuffer<uint> csrColIndices;     // [totalNNZ]
 StructuredBuffer<float> csrValues;        // [totalNNZ]
 
 // numNodes and reductionCount are now GPU-driven (no CPU readback).
-// nodeCountBuffer[0]          = numNodes (written by BuildSolverIndirectArgs each frame)
-// reductionCountBuffer[0]     = reductionCount (caller binds 256- or 512-variant buffer)
 StructuredBuffer<uint> nodeCountBuffer;
 StructuredBuffer<uint> reductionCountBuffer;
 uint numNodesCapacity; // fixed SoA stride for neighborsBuffer AND matrixABuffer
 float a;
 float deltaTime;
+
+// Ghost-fluid / SDF support
+StructuredBuffer<float> solidSDFBuffer; // signed dist in sim units (negative = inside solid)
+uint solidSDFResolution;                // R: grid side length (1 = stub when colliders off)
+uint useColliders;
+
+// Decode Morton code: extract (x,y,z) each 10 bits
+uint3 DeinterleaveCG(uint m)
+{
+    uint x = 0, y = 0, z = 0;
+    for (uint bi = 0; bi < 10u; bi++)
+    {
+        x |= ((m >> (3u * bi + 0u)) & 1u) << bi;
+        y |= ((m >> (3u * bi + 1u)) & 1u) << bi;
+        z |= ((m >> (3u * bi + 2u)) & 1u) << bi;
+    }
+    return uint3(x, y, z);
+}
+
+// Nearest-voxel SDF sample in sim space [0,1023].
+// Returns large positive if out-of-bounds (treat as outside).
+float SampleSDF(float3 simPos)
+{
+    if (useColliders == 0u) return 1e9f;
+    int3 vc = (int3)(simPos * ((float)solidSDFResolution / 1024.0));
+    if (any(vc < int3(0,0,0)) || any(vc >= (int3)solidSDFResolution))
+        return 1e9f; // outside grid → treat as fully outside solid
+    uint idx = (uint)vc.z * solidSDFResolution * solidSDFResolution
+             + (uint)vc.y * solidSDFResolution
+             + (uint)vc.x;
+    return solidSDFBuffer[idx];
+}
+
+static const float3 kFaceDirs[6] = {
+    float3(-1,0,0), float3(1,0,0),
+    float3(0,-1,0), float3(0,1,0),
+    float3(0,0,-1), float3(0,0,1)
+};
 
 // PCG indirect early-out (see FluidSolver.DispatchIndirect triples in cgPcgIndirectArgsBuffer):
 // [0..2] = SpMV_CSR (256 threads/group), [3..5] = 512-thread kernels, [6..8] = 1-group kernels (reduce/alpha/beta/...)
@@ -94,14 +130,38 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
         matrixABuffer[(k + 1) * numNodesCapacity + i] = 0.0;
     }
 
+    // Node center in sim space [0,1023], needed for ghost-fluid theta
+    uint nodeShift  = node.layer * 3u;
+    uint nodePrefix = node.mortonCode >> nodeShift;
+    uint3 nodeCoord = DeinterleaveCG(nodePrefix);
+    float nodeDx    = exp2((float)node.layer);
+    float3 nodeCenter = (float3(nodeCoord) + 0.5) * nodeDx;
+
     // Loop over 6 faces
     for (int d = 0; d < 6; d++)
     {
         uint faceSlotBase = d * 4;
         uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodesCapacity + i];
 
-        // Case 1: True Boundary (Neumann) - No contribution
+        // Case 1: Domain wall (Neumann) - no pressure contribution
         if (neighbor_idx == numNodes + 1u) { continue; }
+
+        // Case 1b: Solid obstacle - ghost-fluid theta-weighted Neumann contribution.
+        // theta = phi_fluid / (phi_fluid - phi_solid) clamps the effective boundary
+        // to the actual sub-cell surface position rather than the voxel face.
+        if (neighbor_idx == numNodes + 2u)
+        {
+            float phi_i = SampleSDF(nodeCenter);
+            float3 neighborCenter = nodeCenter + kFaceDirs[d] * nodeDx;
+            float phi_j = SampleSDF(neighborCenter);
+            // theta in (0,1]: fraction of face-to-face distance that is fluid
+            float denom = phi_i - phi_j;
+            float theta = (denom > 1e-4f) ? saturate(phi_i / denom) : 1.0f;
+            theta = max(theta, 0.02f); // avoid near-zero theta causing huge pressure gradients
+            float weight = (dx_i * dx_i / max(0.5f * dx_i, 1e-6f)) * deltaTime * theta;
+            diagonal += weight;
+            continue;
+        }
 
         if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
