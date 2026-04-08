@@ -117,15 +117,59 @@ uint faceOffset(int d)
     return 20u;// d == 5
 }
 
-StructuredBuffer<uint> solidVoxelsBuffer;   // solid voxel grid (R³), 1=solid
-uint solidVoxelResolution;                  // R: voxel grid side length
+StructuredBuffer<uint>   solidVoxelsBuffer;        // binary solid grid (R³), 1=solid
+StructuredBuffer<float4> solidVoxelNormalsBuffer;  // outward normals in sim space; w unused
+StructuredBuffer<float>  solidSDFBuffer;           // signed distance in sim units (negative = inside)
+uint solidVoxelResolution;                         // R: grid side length (1 = stub when colliders off)
+uint useColliders;                                // 0 = skip solid/SDF reads (no obstacle cost)
 
-bool IsSolid(float3 simPos)
+uint SolidVoxelIndex(float3 simPos)
 {
     int3 vc = (int3)(simPos * ((float)solidVoxelResolution / 1024.0));
     vc = clamp(vc, int3(0,0,0), int3((int)solidVoxelResolution-1, (int)solidVoxelResolution-1, (int)solidVoxelResolution-1));
-    uint idx = (uint)vc.z * solidVoxelResolution * solidVoxelResolution + (uint)vc.y * solidVoxelResolution + (uint)vc.x;
-    return solidVoxelsBuffer[idx] != 0u;
+    return (uint)vc.z * solidVoxelResolution * solidVoxelResolution
+         + (uint)vc.y * solidVoxelResolution
+         + (uint)vc.x;
+}
+
+bool IsSolid(float3 simPos)
+{
+    if (useColliders == 0u) return false;
+    return solidVoxelsBuffer[SolidVoxelIndex(simPos)] != 0u;
+}
+
+float3 SolidVoxelNormal(float3 simPos)
+{
+    if (useColliders == 0u) return float3(0, 0, 0);
+    return solidVoxelNormalsBuffer[SolidVoxelIndex(simPos)].xyz;
+}
+
+// Trilinear SDF sample — smooth penetration depth for proper surface projection.
+float SampleSDF(float3 simPos)
+{
+    if (useColliders == 0u) return 1e9f;
+    float R = (float)solidVoxelResolution;
+    float3 vf = simPos * (R / 1024.0) - 0.5; // fractional voxel coords (voxel centers at 0.5)
+    int3 v0 = (int3)floor(vf);
+    float3 t = vf - (float3)v0;
+
+    int Ri = (int)solidVoxelResolution;
+    int3 v0c = clamp(v0,        int3(0,0,0), int3(Ri-1, Ri-1, Ri-1));
+    int3 v1c = clamp(v0 + 1,   int3(0,0,0), int3(Ri-1, Ri-1, Ri-1));
+
+    uint Ru = solidVoxelResolution;
+    #define SDF_AT(ix,iy,iz) solidSDFBuffer[(uint)(iz)*Ru*Ru + (uint)(iy)*Ru + (uint)(ix)]
+    float v000 = SDF_AT(v0c.x, v0c.y, v0c.z);
+    float v100 = SDF_AT(v1c.x, v0c.y, v0c.z);
+    float v010 = SDF_AT(v0c.x, v1c.y, v0c.z);
+    float v110 = SDF_AT(v1c.x, v1c.y, v0c.z);
+    float v001 = SDF_AT(v0c.x, v0c.y, v1c.z);
+    float v101 = SDF_AT(v1c.x, v0c.y, v1c.z);
+    float v011 = SDF_AT(v0c.x, v1c.y, v1c.z);
+    float v111 = SDF_AT(v1c.x, v1c.y, v1c.z);
+    #undef SDF_AT
+    return lerp(lerp(lerp(v000,v100,t.x), lerp(v010,v110,t.x), t.y),
+                lerp(lerp(v001,v101,t.x), lerp(v011,v111,t.x), t.y), t.z);
 }
 
 // Buffer definitions
@@ -330,46 +374,40 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     // That 1% is enough for gravity/pressure to pull it back in.
     float eps = 0.05f;
     
-    // X Axis
-    if (newPosition.x <= 0) {
-        newPosition.x = eps; // Clamp with epsilon
-        newVelocity.x *= -1.0 * bounceDamping;
-    } 
-    else if (newPosition.x >= 1024) {
-        newPosition.x = 1024 - eps; // Clamp with epsilon
-        newVelocity.x *= -1.0 * bounceDamping;
-    }
-    
-    // Y Axis (Ceiling/Floor)
-    if (newPosition.y <= 0) {
-        newPosition.y = eps;
-        newVelocity.y *= -1.0 * bounceDamping;
-    }
-    else if (newPosition.y >= 1024) {
-        newPosition.y = 1024 - eps;
-        newVelocity.y *= -1.0 * bounceDamping;
-    }
-    
-    // Z Axis
-    if (newPosition.z <= 0) {
-        newPosition.z = eps;
-        newVelocity.z *= -1.0 * bounceDamping;
-    }
-    else if (newPosition.z >= 1024) {
-        newPosition.z = 1024 - eps;
-        newVelocity.z *= -1.0 * bounceDamping;
-    }
-    // FIX END
+    // --- Domain wall clamping + velocity depenetration ---
+    // Clamp position to [eps, 1024-eps] and remove any remaining inward velocity component
+    // (fixes particle sticking at walls caused by FLIP accumulating wall-facing velocity).
+    if (newPosition.x <= eps)          { newPosition.x = eps;        newVelocity.x = max(0.0, newVelocity.x); }
+    else if (newPosition.x >= 1024-eps){ newPosition.x = 1024 - eps; newVelocity.x = min(0.0, newVelocity.x); }
+    if (newPosition.y <= eps)          { newPosition.y = eps;        newVelocity.y = max(0.0, newVelocity.y); }
+    else if (newPosition.y >= 1024-eps){ newPosition.y = 1024 - eps; newVelocity.y = min(0.0, newVelocity.y); }
+    if (newPosition.z <= eps)          { newPosition.z = eps;        newVelocity.z = max(0.0, newVelocity.z); }
+    else if (newPosition.z >= 1024-eps){ newPosition.z = 1024 - eps; newVelocity.z = min(0.0, newVelocity.z); }
 
-    // Push particle out of solid voxels
-    if (IsSolid(newPosition))
+    // --- Solid obstacle: SDF projection ---
+    // SampleSDF gives the signed distance in sim units: negative = inside solid.
+    // Project the particle outward by exactly the penetration depth along the surface
+    // normal, then zero the inward velocity component (no bounce, prevents sticking).
+    float solidDist = SampleSDF(newPosition);
+    if (solidDist < 0.0)
     {
-        // Try reverting to pre-advection position
-        newPosition = particle.position;
-        newVelocity *= -bounceDamping;
-        // If the pre-advection position is also solid (e.g. spawned inside), zero velocity
-        if (IsSolid(newPosition))
+        float3 n = SolidVoxelNormal(newPosition);
+        float nl = length(n);
+        if (nl > 1e-4)
+        {
+            n /= nl;
+            // Move particle to the surface along the outward normal
+            newPosition -= solidDist * n;   // solidDist < 0, so this adds |solidDist|*n
+            // Remove any velocity component pointing into the solid
+            float vn = dot(newVelocity, n);
+            if (vn < 0.0) newVelocity -= vn * n;
+        }
+        else
+        {
+            // No reliable normal (deep interior or degenerate): revert to pre-advection pos
+            newPosition = particle.position;
             newVelocity = float3(0, 0, 0);
+        }
     }
 
     particle.position = newPosition;

@@ -9,23 +9,42 @@ using UnityEngine;
 // Accurate mesh voxelization: triangle–AABB tests over the simulation bounds grid, then a
 // 6-connected flood fill from the grid boundary marks exterior air. Solid = surface voxels
 // (touching geometry) or interior cells not reachable from the boundary (closed volumes).
-// Results are cached under Application.persistentDataPath when the scene collider setup matches.
+// Per-voxel normals: area-weighted mesh normals on geometry hits, oriented toward exterior
+// air; interior-only voxels use a sum of directions to air neighbors, then optional
+// neighbor dilation. Final normals are scaled by 1/boundsSize and normalized so they match
+// particle motion in 0–1023 simulation space (axis-aligned box).
+// Cache: Application.persistentDataPath/FluidSimSolidVoxelCache/*.vox (magic SOL2).
 public static class MeshColliderBaker
 {
-    // File header magic bytes: 'S','O','L','1'
-    static readonly byte[] FileMagicBytes = { 0x53, 0x4F, 0x4C, 0x31 };
+    // File header magic bytes: 'S','O','L','3' (solid + normals + SDF)
+    static readonly byte[] FileMagicBytes = { 0x53, 0x4F, 0x4C, 0x33 };
+    const int HeaderSize = 8;
 
-    /// <summary>Linear index [iz*R*R + iy*R + ix]. Values 1 = solid, 0 = free.</summary>
-    public static uint[] Bake(GameObject collidersRoot, Bounds simWorldBounds, int resolution, bool useDiskCache = true)
+    public struct BakeResult
+    {
+        public uint[]    Solid;
+        public Vector3[] Normals;
+        public float[]   SDF;   // signed distance in sim units (0-1023 space); negative = inside solid
+    }
+
+    /// <summary>Linear index [iz*R*R + iy*R + ix]. Solid 1 = obstacle; normals for air are zero.</summary>
+    public static BakeResult Bake(GameObject collidersRoot, Bounds simWorldBounds, int resolution, bool useDiskCache = true)
     {
         int R = resolution;
         int total = R * R * R;
-        if (collidersRoot == null)
-            return new uint[total];
-
-        if (useDiskCache && TryLoadCache(collidersRoot, simWorldBounds, R, total, out uint[] cached))
+        var empty = new BakeResult
         {
-            Debug.Log($"[MeshColliderBaker] Loaded cached {R}³ solid voxel grid ({total} cells).");
+            Solid   = new uint[total],
+            Normals = new Vector3[total],
+            SDF     = new float[total]   // all zeros → treated as surface everywhere (safe default)
+        };
+
+        if (collidersRoot == null)
+            return empty;
+
+        if (useDiskCache && TryLoadCache(collidersRoot, simWorldBounds, R, total, out BakeResult cached))
+        {
+            Debug.Log($"[MeshColliderBaker] Loaded cached {R}³ solid + normals ({total} cells).");
             return cached;
         }
 
@@ -34,13 +53,13 @@ public static class MeshColliderBaker
         if (triangles.Count == 0)
         {
             Debug.LogWarning("[MeshColliderBaker] No mesh geometry under colliders root; grid is empty.");
-            var empty = new uint[total];
             if (useDiskCache)
-                SaveCache(collidersRoot, simWorldBounds, R, empty);
+                SaveCache(collidersRoot, simWorldBounds, R, empty.Solid, empty.Normals, empty.SDF);
             return empty;
         }
 
         var blocked = new BitArray(total);
+        var normalAccum = new Vector3[total];
         Vector3 bMin = simWorldBounds.min;
         Vector3 bSize = simWorldBounds.size;
         Vector3 cell = new Vector3(bSize.x / R, bSize.y / R, bSize.z / R);
@@ -59,6 +78,19 @@ public static class MeshColliderBaker
             int iz0 = Mathf.Clamp(Mathf.FloorToInt((tb.min.z - bMin.z) / cell.z), 0, R - 1);
             int iz1 = Mathf.Clamp(Mathf.FloorToInt((tb.max.z - bMin.z) / cell.z), 0, R - 1);
 
+            Vector3 ab = tri.b - tri.a;
+            Vector3 ac = tri.c - tri.a;
+            Vector3 triCross = Vector3.Cross(ab, ac);
+            float len2 = triCross.sqrMagnitude;
+            Vector3 triN = Vector3.zero;
+            float areaW = 0f;
+            if (len2 > 1e-20f)
+            {
+                float len = Mathf.Sqrt(len2);
+                triN = triCross / len;
+                areaW = 0.5f * len;
+            }
+
             for (int iz = iz0; iz <= iz1; iz++)
             for (int iy = iy0; iy <= iy1; iy++)
             for (int ix = ix0; ix <= ix1; ix++)
@@ -67,8 +99,12 @@ public static class MeshColliderBaker
                     bMin.x + (ix + 0.5f) * cell.x,
                     bMin.y + (iy + 0.5f) * cell.y,
                     bMin.z + (iz + 0.5f) * cell.z);
-                if (TriangleIntersectsAABB(center, half, tri.a, tri.b, tri.c))
-                    blocked.Set(iz * R * R + iy * R + ix, true);
+                if (!TriangleIntersectsAABB(center, half, tri.a, tri.b, tri.c))
+                    continue;
+                int idx = iz * R * R + iy * R + ix;
+                blocked.Set(idx, true);
+                if (areaW > 0f)
+                    normalAccum[idx] += triN * areaW;
             }
         }
 
@@ -142,12 +178,189 @@ public static class MeshColliderBaker
             }
         }
 
+        // BFS signed-distance field (L1 distance in voxels, converted to sim units).
+        // Surface voxels (blocked) = 0; outside = positive; inside = negative.
+        float[] sdf = BuildSDF(R, total, blocked, outside, 1024f / R);
+
+        Vector3[] normals = BuildSolidNormals(R, total, solid, normalAccum, bMin, cell);
+
+        // Map world normals to simulation-space directions (uniform dot product with sim velocity).
+        Vector3 invSize = new Vector3(
+            bSize.x > 1e-8f ? 1f / bSize.x : 1f,
+            bSize.y > 1e-8f ? 1f / bSize.y : 1f,
+            bSize.z > 1e-8f ? 1f / bSize.z : 1f);
+        for (int i = 0; i < total; i++)
+        {
+            if (solid[i] == 0u)
+                continue;
+            Vector3 n = normals[i];
+            if (n.sqrMagnitude < 1e-14f)
+                continue;
+            Vector3 nSim = new Vector3(n.x * invSize.x, n.y * invSize.y, n.z * invSize.z);
+            if (nSim.sqrMagnitude > 1e-14f)
+                normals[i] = nSim.normalized;
+        }
+
         Debug.Log($"[MeshColliderBaker] Baked {R}³ grid: {solidCount} solid voxels ({100f * solidCount / total:F1}%), {triangles.Count} triangles.");
 
         if (useDiskCache)
-            SaveCache(collidersRoot, simWorldBounds, R, solid);
+            SaveCache(collidersRoot, simWorldBounds, R, solid, normals, sdf);
 
-        return solid;
+        return new BakeResult { Solid = solid, Normals = normals, SDF = sdf };
+    }
+
+    // BFS distance transform: spread from surface (blocked) voxels outward in all directions.
+    // Returns signed distance in sim units: positive = outside solid, negative = inside solid.
+    static float[] BuildSDF(int R, int total, BitArray blocked, BitArray outside, float voxelSimSize)
+    {
+        var dist = new int[total];
+        for (int i = 0; i < total; i++) dist[i] = int.MaxValue / 2;
+
+        var bfsQ = new Queue<int>(total / 4 + 64);
+        for (int i = 0; i < total; i++)
+        {
+            if (blocked.Get(i)) { dist[i] = 0; bfsQ.Enqueue(i); }
+        }
+
+        while (bfsQ.Count > 0)
+        {
+            int idx = bfsQ.Dequeue();
+            int ix = idx % R, t = idx / R, iy = t % R, iz = t / R;
+            int d1 = dist[idx] + 1;
+
+            void TryN(int nix, int niy, int niz)
+            {
+                if ((uint)nix >= (uint)R || (uint)niy >= (uint)R || (uint)niz >= (uint)R) return;
+                int n = niz * R * R + niy * R + nix;
+                if (dist[n] <= d1) return;
+                dist[n] = d1;
+                bfsQ.Enqueue(n);
+            }
+            TryN(ix - 1, iy, iz); TryN(ix + 1, iy, iz);
+            TryN(ix, iy - 1, iz); TryN(ix, iy + 1, iz);
+            TryN(ix, iy, iz - 1); TryN(ix, iy, iz + 1);
+        }
+
+        var sdf = new float[total];
+        for (int i = 0; i < total; i++)
+        {
+            float d = dist[i] * voxelSimSize;
+            // Positive outside solid, negative inside solid, zero on surface
+            sdf[i] = outside.Get(i) ? d : -d;
+        }
+        return sdf;
+    }
+
+    static Vector3 EgressWorld(int idx, int R, uint[] solid, Vector3 bMin, Vector3 cell)
+    {
+        IdxToIJK(idx, R, out int ix, out int iy, out int iz);
+        Vector3 c = CellCenter(ix, iy, iz, bMin, cell);
+        Vector3 sum = Vector3.zero;
+
+        void AddAirNeighbor(int nix, int niy, int niz)
+        {
+            if ((uint)nix >= (uint)R || (uint)niy >= (uint)R || (uint)niz >= (uint)R)
+                return;
+            int n = niz * R * R + niy * R + nix;
+            if (solid[n] != 0u)
+                return;
+            sum += CellCenter(nix, niy, niz, bMin, cell) - c;
+        }
+
+        AddAirNeighbor(ix - 1, iy, iz);
+        AddAirNeighbor(ix + 1, iy, iz);
+        AddAirNeighbor(ix, iy - 1, iz);
+        AddAirNeighbor(ix, iy + 1, iz);
+        AddAirNeighbor(ix, iy, iz - 1);
+        AddAirNeighbor(ix, iy, iz + 1);
+
+        return sum;
+    }
+
+    static Vector3[] BuildSolidNormals(int R, int total, uint[] solid, Vector3[] normalAccum, Vector3 bMin, Vector3 cell)
+    {
+        var normals = new Vector3[total];
+        const float eps2 = 1e-12f;
+
+        for (int i = 0; i < total; i++)
+        {
+            if (solid[i] == 0u)
+                continue;
+            Vector3 egress = EgressWorld(i, R, solid, bMin, cell);
+            if (normalAccum[i].sqrMagnitude > eps2)
+            {
+                Vector3 n = normalAccum[i].normalized;
+                if (egress.sqrMagnitude > eps2 && Vector3.Dot(n, egress) < 0f)
+                    n = -n;
+                normals[i] = n;
+            }
+            else if (egress.sqrMagnitude > eps2)
+                normals[i] = egress.normalized;
+        }
+
+        // Dilate from labeled surface into any remaining solid voxels (deep interior).
+        bool changed = true;
+        int guard = 0;
+        while (changed && guard < R + 2)
+        {
+            guard++;
+            changed = false;
+            for (int i = 0; i < total; i++)
+            {
+                if (solid[i] == 0u || normals[i].sqrMagnitude > eps2)
+                    continue;
+                Vector3 avg = Vector3.zero;
+                int count = 0;
+                IdxToIJK(i, R, out int ix, out int iy, out int iz);
+                void TryNbor(int nix, int niy, int niz)
+                {
+                    if ((uint)nix >= (uint)R || (uint)niy >= (uint)R || (uint)niz >= (uint)R)
+                        return;
+                    int j = niz * R * R + niy * R + nix;
+                    if (solid[j] == 0u || normals[j].sqrMagnitude < eps2)
+                        return;
+                    avg += normals[j];
+                    count++;
+                }
+                TryNbor(ix - 1, iy, iz);
+                TryNbor(ix + 1, iy, iz);
+                TryNbor(ix, iy - 1, iz);
+                TryNbor(ix, iy + 1, iz);
+                TryNbor(ix, iy, iz - 1);
+                TryNbor(ix, iy, iz + 1);
+                if (count > 0)
+                {
+                    normals[i] = (avg / count).normalized;
+                    changed = true;
+                }
+            }
+        }
+
+        for (int i = 0; i < total; i++)
+        {
+            if (solid[i] == 0u)
+                continue;
+            if (normals[i].sqrMagnitude < eps2)
+                normals[i] = Vector3.up;
+        }
+
+        return normals;
+    }
+
+    static void IdxToIJK(int idx, int R, out int ix, out int iy, out int iz)
+    {
+        ix = idx % R;
+        int t = idx / R;
+        iy = t % R;
+        iz = t / R;
+    }
+
+    static Vector3 CellCenter(int ix, int iy, int iz, Vector3 bMin, Vector3 cell)
+    {
+        return new Vector3(
+            bMin.x + (ix + 0.5f) * cell.x,
+            bMin.y + (iy + 0.5f) * cell.y,
+            bMin.z + (iz + 0.5f) * cell.z);
     }
 
     struct Triangle
@@ -178,7 +391,6 @@ public static class MeshColliderBaker
         }
     }
 
-    /// <summary>SAT triangle vs axis-aligned box (box center, half extents; triangle in same space).</summary>
     static bool TriangleIntersectsAABB(Vector3 boxCenter, Vector3 boxHalf, Vector3 v0, Vector3 v1, Vector3 v2)
     {
         if (boxHalf.x <= 0f || boxHalf.y <= 0f || boxHalf.z <= 0f)
@@ -287,6 +499,7 @@ public static class MeshColliderBaker
         Vector3 mn = simWorldBounds.min, mx = simWorldBounds.max;
         sb.Append(mn.x.ToString("R", inv)).Append(',').Append(mn.y.ToString("R", inv)).Append(',').Append(mn.z.ToString("R", inv)).Append('|');
         sb.Append(mx.x.ToString("R", inv)).Append(',').Append(mx.y.ToString("R", inv)).Append(',').Append(mx.z.ToString("R", inv));
+        sb.Append("|SOL2");
 
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
@@ -304,44 +517,79 @@ public static class MeshColliderBaker
         }
     }
 
-    static bool TryLoadCache(GameObject collidersRoot, Bounds simWorldBounds, int R, int total, out uint[] data)
+    // Layout: header(8) + solid(total*4) + normals(total*12) + sdf(total*4)
+    static int ExpectedFileLength(int total) => HeaderSize + total * 4 + total * 12 + total * 4;
+
+    /// <summary>Buffer.BlockCopy only accepts primitive arrays; pack Vector3 as float3.</summary>
+    static void PackNormalsForCache(Vector3[] normals, float[] dstFloat3)
     {
-        data = null;
-        string path = CachePath(collidersRoot, simWorldBounds, R);
-        if (!File.Exists(path))
-            return false;
-        try
+        int n = normals.Length;
+        for (int i = 0; i < n; i++)
         {
-            byte[] raw = File.ReadAllBytes(path);
-            if (raw.Length < 8 + total * 4)
-                return false;
-            if (raw.Length < 8 || raw[0] != FileMagicBytes[0] || raw[1] != FileMagicBytes[1] ||
-                raw[2] != FileMagicBytes[2] || raw[3] != FileMagicBytes[3])
-                return false;
-            int fileR = BitConverter.ToInt32(raw, 4);
-            if (fileR != R)
-                return false;
-            var arr = new uint[total];
-            Buffer.BlockCopy(raw, 8, arr, 0, total * 4);
-            data = arr;
-            return true;
-        }
-        catch
-        {
-            return false;
+            int b = i * 3;
+            dstFloat3[b]     = normals[i].x;
+            dstFloat3[b + 1] = normals[i].y;
+            dstFloat3[b + 2] = normals[i].z;
         }
     }
 
-    static void SaveCache(GameObject collidersRoot, Bounds simWorldBounds, int R, uint[] solid)
+    static void UnpackNormalsFromCache(float[] srcFloat3, Vector3[] normals)
+    {
+        int n = normals.Length;
+        for (int i = 0; i < n; i++)
+        {
+            int b = i * 3;
+            normals[i] = new Vector3(srcFloat3[b], srcFloat3[b + 1], srcFloat3[b + 2]);
+        }
+    }
+
+    static bool TryLoadCache(GameObject collidersRoot, Bounds simWorldBounds, int R, int total, out BakeResult result)
+    {
+        result = default;
+        string path = CachePath(collidersRoot, simWorldBounds, R);
+        if (!File.Exists(path)) return false;
+        try
+        {
+            byte[] raw = File.ReadAllBytes(path);
+            if (raw.Length < ExpectedFileLength(total)) return false;
+            if (raw[0] != FileMagicBytes[0] || raw[1] != FileMagicBytes[1] ||
+                raw[2] != FileMagicBytes[2] || raw[3] != FileMagicBytes[3])
+                return false;
+            if (BitConverter.ToInt32(raw, 4) != R) return false;
+
+            var solid = new uint[total];
+            Buffer.BlockCopy(raw, HeaderSize, solid, 0, total * 4);
+
+            var normFlat = new float[total * 3];
+            Buffer.BlockCopy(raw, HeaderSize + total * 4, normFlat, 0, total * 12);
+            var normals = new Vector3[total];
+            UnpackNormalsFromCache(normFlat, normals);
+
+            var sdf = new float[total];
+            Buffer.BlockCopy(raw, HeaderSize + total * 4 + total * 12, sdf, 0, total * 4);
+            result = new BakeResult { Solid = solid, Normals = normals, SDF = sdf };
+            return true;
+        }
+        catch { return false; }
+    }
+
+    static void SaveCache(GameObject collidersRoot, Bounds simWorldBounds, int R,
+                          uint[] solid, Vector3[] normals, float[] sdf)
     {
         try
         {
             string path = CachePath(collidersRoot, simWorldBounds, R);
             int total = solid.Length;
-            var raw = new byte[8 + total * 4];
+            var raw = new byte[ExpectedFileLength(total)];
             FileMagicBytes.CopyTo(raw, 0);
             BitConverter.GetBytes(R).CopyTo(raw, 4);
-            Buffer.BlockCopy(solid, 0, raw, 8, total * 4);
+            Buffer.BlockCopy(solid, 0, raw, HeaderSize, total * 4);
+
+            var normFlat = new float[total * 3];
+            PackNormalsForCache(normals, normFlat);
+            Buffer.BlockCopy(normFlat, 0, raw, HeaderSize + total * 4, total * 12);
+
+            Buffer.BlockCopy(sdf, 0, raw, HeaderSize + total * 4 + total * 12, total * 4);
             File.WriteAllBytes(path, raw);
         }
         catch (Exception e)

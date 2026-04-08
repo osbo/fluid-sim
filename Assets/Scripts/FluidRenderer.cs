@@ -723,7 +723,7 @@ public class FluidRenderer : MonoBehaviour
 
     void RenderColliderVoxels(Camera cam)
     {
-        if (cam == null || _sim == null) return;
+        if (cam == null || _sim == null || !_sim.useColliders) return;
 
         if (quadMesh == null)
             CreateQuadMesh();

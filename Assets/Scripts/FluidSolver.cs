@@ -137,6 +137,9 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(buildMatrixAKernelId, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(buildMatrixAKernelId, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.SetBuffer(buildMatrixAKernelId, "matrixABuffer", matrixABuffer);
+        cgSolverShader.SetBuffer(buildMatrixAKernelId, "solidSDFBuffer", solidSDFBuffer);
+        cgSolverShader.SetInt("useColliders", useColliders ? 1 : 0);
+        cgSolverShader.SetInt("solidSDFResolution", ColliderGridResolution);
         cgSolverShader.SetFloat("deltaTime", deltaTime);
         GpuProfileDispatchIndirect(cgSolverShader,buildMatrixAKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
 
@@ -471,7 +474,8 @@ public partial class FluidSimulator : MonoBehaviour
         WriteIndirectArgsFromCountBuffer(nodeCount);
         nodesShader.SetBuffer(applyExternalForcesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(applyExternalForcesKernel, "solidVoxelsBuffer", solidVoxelsBuffer);
-        nodesShader.SetInt("solidVoxelResolution", SolidVoxelResolution);
+        nodesShader.SetInt("useColliders", useColliders ? 1 : 0);
+        nodesShader.SetInt("solidVoxelResolution", ColliderGridResolution);
         nodesShader.SetFloat("gravity", gravity);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);

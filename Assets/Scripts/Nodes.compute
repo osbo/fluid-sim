@@ -68,10 +68,12 @@ uint numNodesCapacity;                                  // SoA stride (prealloca
 uint numParticles;                                      // total number of particles
 
 StructuredBuffer<uint> solidVoxelsBuffer;               // solid voxel grid (R³), 1=solid
-uint solidVoxelResolution;                              // R: voxel grid side length
+uint solidVoxelResolution;                              // R: voxel grid side length (1 = stub when colliders off)
+uint useColliders;
 
 bool IsSolid(float3 simPos)
 {
+    if (useColliders == 0u) return false;
     int3 vc = (int3)(simPos * ((float)solidVoxelResolution / 1024.0));
     vc = clamp(vc, int3(0,0,0), int3((int)solidVoxelResolution-1, (int)solidVoxelResolution-1, (int)solidVoxelResolution-1));
     uint idx = (uint)vc.z * solidVoxelResolution * solidVoxelResolution + (uint)vc.y * solidVoxelResolution + (uint)vc.x;
@@ -704,12 +706,14 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
         
         uint3 ncoord = uint3((uint)nx, (uint)ny, (uint)nz);
 
-        // Check if the neighbor cell center falls inside a solid voxel
+        // Check if the neighbor cell center falls inside a solid voxel.
+        // Use sentinel NAct()+2 to distinguish solid-obstacle faces from domain-wall faces (NAct()+1),
+        // so BuildMatrixA can apply ghost-fluid theta only at obstacle boundaries.
         float cellSize = (float)(1u << node.layer);
         float3 neighborCenter = (float3(ncoord) + 0.5) * cellSize;
         if (IsSolid(neighborCenter))
         {
-            neighborsBuffer[faceOffset(d) * numNodesCapacity + threadIndex] = NAct() + 1u;
+            neighborsBuffer[faceOffset(d) * numNodesCapacity + threadIndex] = NAct() + 2u;
             continue;
         }
 
@@ -876,8 +880,9 @@ void interpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
         // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
         uint n0_idx = neighborsBuffer[faceSlotBase * numNodesCapacity + threadIndex]; 
 
-        // --- 1. Wall Boundary (Neumann) ---
-        if (n0_idx == NAct() + 1) {
+        // --- 1. Wall Boundary (Neumann) or Solid Obstacle ---
+        // NAct()+1 = domain wall, NAct()+2 = solid obstacle; both enforce zero normal velocity.
+        if (n0_idx >= NAct() + 1u) {
              if (d == 0) outNode.velocities.left = 0;
              else if (d == 1) outNode.velocities.right = 0;
              else if (d == 2) outNode.velocities.bottom = 0;
@@ -1050,7 +1055,7 @@ void ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID
         // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
         uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodesCapacity + threadIndex];
         float pressure_gradient = 0.0;
-        bool isBoundary = (neighbor_idx == NAct() + 1);
+        bool isBoundary = (neighbor_idx >= NAct() + 1u); // domain wall (+1) or solid obstacle (+2)
 
         if (isBoundary) // Neumann BC: zero flux
         {
@@ -1212,7 +1217,7 @@ void InitializePhi(uint3 id : SV_DispatchThreadID)
             // SoA layout: neighborsBuffer[slot * numNodesCapacity + nodeIndex]
             uint neighbor_idx = neighborsBuffer[(faceSlotBase + k) * numNodesCapacity + threadIndex];
 
-            if (neighbor_idx < NAct() || neighbor_idx == NAct() + 1)
+            if (neighbor_idx < NAct() || neighbor_idx >= NAct() + 1u) // fluid, wall, or solid obstacle
             {
                 hasFluidNeighborOnFace = true;
             }
