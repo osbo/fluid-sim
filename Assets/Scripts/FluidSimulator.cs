@@ -29,7 +29,7 @@ public partial class FluidSimulator : MonoBehaviour
     // CG Solver parameters
     public int maxCgIterations = 400;
     public float convergenceThreshold = 1e-05f;
-    [Tooltip("How often (in PCG iterations) to evaluate ||r||² for stopping when using GPU indirect PCG. Neural preconditioner uses the same interval for CPU checks.")]
+    [Tooltip("Unused: PCG always runs maxCgIterations with no mid-loop convergence check. Enable per-frame debug timing log to print final ||r||² after the solve.")]
     public int cgConvergenceCheckInterval = 5;
 
     [Tooltip("Structured = stencil SpMV (faster path, no CSR build unless Neural precond or training recorder needs CSR). Csr = build CSR every frame and use SpMV_CSR.")]
@@ -84,7 +84,6 @@ public partial class FluidSimulator : MonoBehaviour
     private int axpyAlphaKernelId;
     private int axpyNegAlphaKernelId;
     private int scaleAddBetaKernelId;
-    private int checkConvergenceKernelId;
     // Cached CSR builder kernel IDs
     private int csrCountNnzKernelId;
     private int csrFinalizeRowPtrKernelId;
@@ -140,8 +139,6 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer solverReductionCount256Buffer; // ceil(n/256) for GlobalReduceSum after SpMV
     private ComputeBuffer solverReductionCount512Buffer; // ceil(n/512) for GlobalReduceSum after DotProduct
     private ComputeBuffer solverPrefixLenBuffer;         // [0]=numNodes [1]=pfx1, for CSR prefix sum kernels
-    private ComputeBuffer cgPcgIterationStatBuffer;
-    private readonly uint[] cgPcgIterationStatScratch = new uint[1];
     private ComputeBuffer diffusionGradientBuffer; // Precomputed normalized density gradient per node
     private ComputeBuffer dispatchArgsBuffer;       // 3-uint indirect dispatch args for DispatchIndirect
     private ComputeBuffer particlePrefixElementCountBuffer; // [0] = numParticles for find-unique prefix scans
@@ -1077,7 +1074,6 @@ public partial class FluidSimulator : MonoBehaviour
         solverReductionCount256Buffer?.Release();
         solverReductionCount512Buffer?.Release();
         solverPrefixLenBuffer?.Release();
-        cgPcgIterationStatBuffer?.Release();
         pBuffer?.Release();
         ApBuffer?.Release();
         pressureBuffer?.Release();

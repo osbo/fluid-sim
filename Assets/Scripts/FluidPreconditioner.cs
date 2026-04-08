@@ -52,7 +52,7 @@ public partial class FluidSimulator : MonoBehaviour
         GpuDotProductReduceNoReadback(r, z_out);
     }
 
-    /// <summary>Same as <see cref="ApplyPreconditionerPcgIterationGpu"/> but uses <see cref="cgPcgIndirectArgsBuffer"/> for 512-thread and copy paths (PCG indirect early-out).</summary>
+    /// <summary>Same as <see cref="ApplyPreconditionerPcgIterationGpu"/> but uses indirect dispatch args for 512-thread and copy paths.</summary>
     private void ApplyPreconditionerPcgIterationGpuIndirect(ComputeBuffer r, ComputeBuffer z_out, int kJacobi, int groups512Uniform)
     {
         if (preconditioner == PreconditionerType.None)
