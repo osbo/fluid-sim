@@ -1,6 +1,7 @@
 // Each #kernel tells which function to compile;you can have many kernels
 #pragma kernel InitializeParticles
 #pragma kernel UpdateParticles
+#pragma kernel RemoveSolidParticles
 
 
 // Particle struct definition
@@ -114,6 +115,17 @@ uint faceOffset(int d)
     if (d == 3) return 12u;
     if (d == 4) return 16u;
     return 20u;// d == 5
+}
+
+StructuredBuffer<uint> solidVoxelsBuffer;   // solid voxel grid (R³), 1=solid
+uint solidVoxelResolution;                  // R: voxel grid side length
+
+bool IsSolid(float3 simPos)
+{
+    int3 vc = (int3)(simPos * ((float)solidVoxelResolution / 1024.0));
+    vc = clamp(vc, int3(0,0,0), int3((int)solidVoxelResolution-1, (int)solidVoxelResolution-1, (int)solidVoxelResolution-1));
+    uint idx = (uint)vc.z * solidVoxelResolution * solidVoxelResolution + (uint)vc.y * solidVoxelResolution + (uint)vc.x;
+    return solidVoxelsBuffer[idx] != 0u;
 }
 
 // Buffer definitions
@@ -349,15 +361,52 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     }
     // FIX END
 
+    // Push particle out of solid voxels
+    if (IsSolid(newPosition))
+    {
+        // Try reverting to pre-advection position
+        newPosition = particle.position;
+        newVelocity *= -bounceDamping;
+        // If the pre-advection position is also solid (e.g. spawned inside), zero velocity
+        if (IsSolid(newPosition))
+            newVelocity = float3(0, 0, 0);
+    }
+
     particle.position = newPosition;
 
-    // newVelocity.y -= gravity * deltaTime; 
+    // newVelocity.y -= gravity * deltaTime;
 
     particle.velocity = newVelocity;
 
-    
-    
     particle.mortonCode = EncodeMorton3D(newPosition);
 
+    particlesBuffer[index] = particle;
+}
+
+// One-time startup pass: teleport any particle that initialized inside a solid voxel
+// to just above the fluid initial bounds min so it re-enters fluid normally.
+[numthreads(512,1,1)]
+void RemoveSolidParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= numParticles) return;
+
+    Particle particle = particlesBuffer[index];
+    if (!IsSolid(particle.position)) return;
+
+    // Place the particle just inside the fluid initial bounds with a small per-particle offset
+    // so they don't all stack at the exact same point.
+    float spread = 4.0;
+    float3 safePos = fluidInitialBoundsMin + float3(
+        spread * (float)(index % 64u),
+        spread * (float)((index / 64u) % 64u),
+        spread * (float)(index / 4096u)
+    );
+    // Clamp into simulation bounds
+    safePos = clamp(safePos, float3(1,1,1), float3(1022,1022,1022));
+
+    particle.position = safePos;
+    particle.velocity = float3(0, 0, 0);
+    particle.mortonCode = EncodeMorton3D(safePos);
     particlesBuffer[index] = particle;
 }

@@ -67,6 +67,17 @@ StructuredBuffer<uint> nodeCountBuffer;                 // [0] = active node cou
 uint numNodesCapacity;                                  // SoA stride (preallocated width); >= nodeCountBuffer[0]
 uint numParticles;                                      // total number of particles
 
+StructuredBuffer<uint> solidVoxelsBuffer;               // solid voxel grid (R³), 1=solid
+uint solidVoxelResolution;                              // R: voxel grid side length
+
+bool IsSolid(float3 simPos)
+{
+    int3 vc = (int3)(simPos * ((float)solidVoxelResolution / 1024.0));
+    vc = clamp(vc, int3(0,0,0), int3((int)solidVoxelResolution-1, (int)solidVoxelResolution-1, (int)solidVoxelResolution-1));
+    uint idx = (uint)vc.z * solidVoxelResolution * solidVoxelResolution + (uint)vc.y * solidVoxelResolution + (uint)vc.x;
+    return solidVoxelsBuffer[idx] != 0u;
+}
+
 uint NAct() { return nodeCountBuffer[0]; }
 uint layer;                                             // current hierarchical layer
 float deltaTime;                                        // time step for pressure gradient application
@@ -692,6 +703,16 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
         }
         
         uint3 ncoord = uint3((uint)nx, (uint)ny, (uint)nz);
+
+        // Check if the neighbor cell center falls inside a solid voxel
+        float cellSize = (float)(1u << node.layer);
+        float3 neighborCenter = (float3(ncoord) + 0.5) * cellSize;
+        if (IsSolid(neighborCenter))
+        {
+            neighborsBuffer[faceOffset(d) * numNodesCapacity + threadIndex] = NAct() + 1u;
+            continue;
+        }
+
         uint nPrefix = interleave(ncoord);
 
         // same-layer neighbor: leq prefix will fall under eq. Layer will be eq.
@@ -1156,6 +1177,16 @@ void ApplyExternalForces(uint3 id : SV_DispatchThreadID)
     if (coord.y == gridDim - 1) node.velocities.top = 0;
     if (coord.z == 0) node.velocities.front = 0;
     if (coord.z == gridDim - 1) node.velocities.back = 0;
+
+    // 3. Solid collider boundaries: zero any face whose neighbor cell is solid
+    float cellSize = exp2((float)node.layer);
+    float3 selfCenter = (float3(coord) + 0.5) * cellSize;
+    if (IsSolid(selfCenter + float3(-cellSize, 0, 0))) node.velocities.left   = 0;
+    if (IsSolid(selfCenter + float3( cellSize, 0, 0))) node.velocities.right  = 0;
+    if (IsSolid(selfCenter + float3(0, -cellSize, 0))) node.velocities.bottom = 0;
+    if (IsSolid(selfCenter + float3(0,  cellSize, 0))) node.velocities.top    = 0;
+    if (IsSolid(selfCenter + float3(0, 0, -cellSize))) node.velocities.front  = 0;
+    if (IsSolid(selfCenter + float3(0, 0,  cellSize))) node.velocities.back   = 0;
 
     nodesBuffer[i] = node;
 }

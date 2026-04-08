@@ -169,8 +169,15 @@ public partial class FluidSimulator : MonoBehaviour
     public float gravity = 100.0f;
     public bool useRealTime = false; // When true, uses Time.deltaTime instead of fixed frameRate
     public float frameRate = 30.0f;
+    [Tooltip("Finest octree layer for the sim; collider voxel grid uses R = 2^(10 - minLayer) along each axis (same as Nodes.compute kMortonAxisBits).")]
     [Range(0, 10)] public int minLayer = 4;
     [Range(0, 10)] public int maxLayer = 10;
+
+    /// <summary>Must match kMortonAxisBits in Nodes.compute.</summary>
+    public const int MortonAxisBits = 10;
+
+    /// <summary>Collider voxel resolution per axis: 2^(MortonAxisBits - minLayer).</summary>
+    public int SolidVoxelResolution => 1 << (MortonAxisBits - Mathf.Clamp(minLayer, 0, MortonAxisBits));
     [Tooltip("When per-frame debug timing log is enabled: each frame, GPU readback of nodesBuffer and layer histogram text for the summary. No effect when that master toggle is off.")]
     public bool logLayerCountsPerFrame = true;
 
@@ -258,6 +265,13 @@ public partial class FluidSimulator : MonoBehaviour
     private Particle[] particlesCPU;
     private string str;
 
+    // Solid colliders (static mesh obstacles)
+    [Header("Static Colliders")]
+    [Tooltip("Parent GameObject whose MeshFilter children define static solid obstacles.")]
+    public GameObject collidersRoot;
+    private ComputeBuffer solidVoxelsBuffer;
+    public ComputeBuffer SolidVoxelsBuffer => solidVoxelsBuffer;
+
     // Training data recorder
     public TrainingDataRecorder recorder;
 
@@ -310,6 +324,12 @@ public partial class FluidSimulator : MonoBehaviour
             if (go != null)
                 fluidInitialBounds = go.GetComponent<BoxCollider>();
         }
+        if (collidersRoot == null)
+        {
+            var go = GameObject.Find("Collider");
+            if (go != null)
+                collidersRoot = go;
+        }
     }
 
     void Start()
@@ -317,6 +337,8 @@ public partial class FluidSimulator : MonoBehaviour
         ValidateOctreeLayers();
         InitializeParticleSystem();
         // InitializeInitialParticles();
+
+        BakeAndUploadSolidVoxels();
 
         // Cache all kernel IDs once so hot paths never call FindKernel
         InitSolverKernels();
@@ -337,6 +359,33 @@ public partial class FluidSimulator : MonoBehaviour
         if (recorder != null)
         {
             recorder.StartNewRun();
+        }
+    }
+
+    private void BakeAndUploadSolidVoxels()
+    {
+        int R = SolidVoxelResolution;
+        int total = R * R * R;
+
+        uint[] voxels = (collidersRoot != null)
+            ? MeshColliderBaker.Bake(collidersRoot, simulationBounds.bounds, R)
+            : new uint[total];
+
+        solidVoxelsBuffer?.Release();
+        solidVoxelsBuffer = new ComputeBuffer(total, sizeof(uint));
+        solidVoxelsBuffer.SetData(voxels);
+
+        // Teleport any particles that initialized inside solid voxels
+        if (particlesShader != null)
+        {
+            int kernel = particlesShader.FindKernel("RemoveSolidParticles");
+            particlesShader.SetBuffer(kernel, "particlesBuffer", particlesBuffer);
+            particlesShader.SetBuffer(kernel, "solidVoxelsBuffer", solidVoxelsBuffer);
+            particlesShader.SetInt("solidVoxelResolution", R);
+            particlesShader.SetInt("numParticles", numParticles);
+            particlesShader.SetVector("fluidInitialBoundsMin", fluidInitialBoundsMin);
+            int groups = Mathf.CeilToInt(numParticles / 512.0f);
+            particlesShader.Dispatch(kernel, groups, 1, 1);
         }
     }
 
@@ -723,6 +772,8 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetBuffer(updateParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetBuffer(updateParticlesKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
         particlesShader.SetBuffer(updateParticlesKernel, "nodeCountBuffer", nodeCount);
+        particlesShader.SetBuffer(updateParticlesKernel, "solidVoxelsBuffer", solidVoxelsBuffer);
+            particlesShader.SetInt("solidVoxelResolution", SolidVoxelResolution);
         particlesShader.SetInt("numParticles", numParticles);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         particlesShader.SetFloat("deltaTime", deltaTime);
@@ -999,6 +1050,7 @@ public partial class FluidSimulator : MonoBehaviour
         phiBuffer_Read?.Release();
         dirtyFlagBuffer?.Release();
         mortonCodesBuffer?.Release();
+        solidVoxelsBuffer?.Release();
         ReleasePreconditionerBuffers();
         ReleaseLeafOnlyBuffers();
         ReleaseLeafOnlyWeightsBuffers();
