@@ -26,10 +26,21 @@ public static class MeshColliderBaker
         public uint[]    Solid;
         public Vector3[] Normals;
         public float[]   SDF;   // signed distance in sim units (0-1023 space); negative = inside solid
+        /// <summary>1 = sealed empty cell (true fluid cavity), not mesh shell / primitive fill; null when loaded from disk cache (SOL4).</summary>
+        public byte[]    InClosedVolume;
     }
 
     /// <summary>Linear index [iz*R*R + iy*R + ix]. Solid 1 = obstacle; normals for air are zero.</summary>
-    public static BakeResult Bake(GameObject collidersRoot, Bounds simWorldBounds, int resolution, bool useDiskCache = true)
+    /// <param name="padFloodGridForDomainBoundary">If true, flood-fill uses (R+2)³ with one air layer outside
+    /// <paramref name="simWorldBounds"/> so clipping/flush meshes don’t leak to the domain box; result is still R³.</param>
+    /// <param name="bakeContextLabel">Prefix for <see cref="LogBakeDiagnostics"/> (e.g. "GenerateVolumePoints").</param>
+    public static BakeResult Bake(
+        GameObject collidersRoot,
+        Bounds simWorldBounds,
+        int resolution,
+        bool useDiskCache = true,
+        bool padFloodGridForDomainBoundary = false,
+        string bakeContextLabel = "Bake")
     {
         int R = resolution;
         int total = R * R * R;
@@ -37,13 +48,14 @@ public static class MeshColliderBaker
         {
             Solid   = new uint[total],
             Normals = new Vector3[total],
-            SDF     = new float[total]   // all zeros → treated as surface everywhere (safe default)
+            SDF     = new float[total],   // all zeros → treated as surface everywhere (safe default)
+            InClosedVolume = new byte[total]
         };
 
         if (collidersRoot == null)
             return empty;
 
-        if (useDiskCache && TryLoadCache(collidersRoot, simWorldBounds, R, total, out BakeResult cached))
+        if (useDiskCache && TryLoadCache(collidersRoot, simWorldBounds, R, total, padFloodGridForDomainBoundary, out BakeResult cached))
         {
             Debug.Log($"[MeshColliderBaker] Loaded cached {R}³ solid + normals ({total} cells).");
             return cached;
@@ -62,12 +74,25 @@ public static class MeshColliderBaker
         {
             Debug.LogWarning("[MeshColliderBaker] No mesh geometry or primitive colliders under colliders root; grid is empty.");
             if (useDiskCache)
-                SaveCache(collidersRoot, simWorldBounds, R, empty.Solid, empty.Normals, empty.SDF);
+                SaveCache(collidersRoot, simWorldBounds, R, empty.Solid, empty.Normals, empty.SDF, padFloodGridForDomainBoundary);
             return empty;
         }
 
-        var triHit = new BitArray(total);
-        var normalAccum = new Vector3[total];
+        LogBakeDiagnostics(bakeContextLabel, collidersRoot, simWorldBounds, R, triangles.Count, anyPrimitive);
+
+        bool pad = padFloodGridForDomainBoundary;
+        int Rgrid = pad ? R + 2 : R;
+        int totalGrid = Rgrid * Rgrid * Rgrid;
+        Vector3 bMinGrid = pad ? bMin - cell : bMin;
+        Bounds boundsForPrimitives = simWorldBounds;
+        if (pad)
+        {
+            boundsForPrimitives = new Bounds();
+            boundsForPrimitives.SetMinMax(bMin - cell, simWorldBounds.max + cell);
+        }
+
+        var triHit = new BitArray(totalGrid);
+        var normalAccum = new Vector3[totalGrid];
 
         foreach (var tri in triangles)
         {
@@ -75,12 +100,12 @@ public static class MeshColliderBaker
             tb.Encapsulate(tri.b);
             tb.Encapsulate(tri.c);
 
-            int ix0 = Mathf.Clamp(Mathf.FloorToInt((tb.min.x - bMin.x) / cell.x), 0, R - 1);
-            int ix1 = Mathf.Clamp(Mathf.FloorToInt((tb.max.x - bMin.x) / cell.x), 0, R - 1);
-            int iy0 = Mathf.Clamp(Mathf.FloorToInt((tb.min.y - bMin.y) / cell.y), 0, R - 1);
-            int iy1 = Mathf.Clamp(Mathf.FloorToInt((tb.max.y - bMin.y) / cell.y), 0, R - 1);
-            int iz0 = Mathf.Clamp(Mathf.FloorToInt((tb.min.z - bMin.z) / cell.z), 0, R - 1);
-            int iz1 = Mathf.Clamp(Mathf.FloorToInt((tb.max.z - bMin.z) / cell.z), 0, R - 1);
+            int ix0 = Mathf.Clamp(Mathf.FloorToInt((tb.min.x - bMinGrid.x) / cell.x), 0, Rgrid - 1);
+            int ix1 = Mathf.Clamp(Mathf.FloorToInt((tb.max.x - bMinGrid.x) / cell.x), 0, Rgrid - 1);
+            int iy0 = Mathf.Clamp(Mathf.FloorToInt((tb.min.y - bMinGrid.y) / cell.y), 0, Rgrid - 1);
+            int iy1 = Mathf.Clamp(Mathf.FloorToInt((tb.max.y - bMinGrid.y) / cell.y), 0, Rgrid - 1);
+            int iz0 = Mathf.Clamp(Mathf.FloorToInt((tb.min.z - bMinGrid.z) / cell.z), 0, Rgrid - 1);
+            int iz1 = Mathf.Clamp(Mathf.FloorToInt((tb.max.z - bMinGrid.z) / cell.z), 0, Rgrid - 1);
 
             Vector3 ab = tri.b - tri.a;
             Vector3 ac = tri.c - tri.a;
@@ -100,12 +125,12 @@ public static class MeshColliderBaker
             for (int ix = ix0; ix <= ix1; ix++)
             {
                 Vector3 center = new Vector3(
-                    bMin.x + (ix + 0.5f) * cell.x,
-                    bMin.y + (iy + 0.5f) * cell.y,
-                    bMin.z + (iz + 0.5f) * cell.z);
+                    bMinGrid.x + (ix + 0.5f) * cell.x,
+                    bMinGrid.y + (iy + 0.5f) * cell.y,
+                    bMinGrid.z + (iz + 0.5f) * cell.z);
                 if (!TriangleIntersectsAABB(center, half, tri.a, tri.b, tri.c))
                     continue;
-                int idx = iz * R * R + iy * R + ix;
+                int idx = iz * Rgrid * Rgrid + iy * Rgrid + ix;
                 triHit.Set(idx, true);
                 if (areaW > 0f)
                     normalAccum[idx] += triN * areaW;
@@ -114,55 +139,55 @@ public static class MeshColliderBaker
 
         // Flood-fill cannot traverse primitive volumes or mesh shell voxels; SDF seeds use triHit ∪ ∂(flood).
         var floodObstacle = (BitArray)triHit.Clone();
-        MarkPrimitiveColliderVolumes(collidersRoot.transform, simWorldBounds, cell, R, floodObstacle);
+        MarkPrimitiveColliderVolumes(collidersRoot.transform, boundsForPrimitives, cell, Rgrid, floodObstacle);
 
         var sdfSurface = (BitArray)triHit.Clone();
-        AddFloodObstacleBoundaryToSdfSurface(R, total, floodObstacle, sdfSurface);
+        AddFloodObstacleBoundaryToSdfSurface(Rgrid, totalGrid, floodObstacle, sdfSurface);
 
-        var outside = new BitArray(total);
-        var q = new Queue<int>(Mathf.Min(total, 65536));
+        var outside = new BitArray(totalGrid);
+        var q = new Queue<int>(Mathf.Min(totalGrid, 65536));
 
         void TryEnqueueBoundary(int ix, int iy, int iz)
         {
-            int idx = iz * R * R + iy * R + ix;
+            int idx = iz * Rgrid * Rgrid + iy * Rgrid + ix;
             if (floodObstacle.Get(idx) || outside.Get(idx))
                 return;
             outside.Set(idx, true);
             q.Enqueue(idx);
         }
 
-        for (int iy = 0; iy < R; iy++)
-        for (int ix = 0; ix < R; ix++)
+        for (int iy = 0; iy < Rgrid; iy++)
+        for (int ix = 0; ix < Rgrid; ix++)
         {
             TryEnqueueBoundary(ix, iy, 0);
-            TryEnqueueBoundary(ix, iy, R - 1);
+            TryEnqueueBoundary(ix, iy, Rgrid - 1);
         }
-        for (int iz = 0; iz < R; iz++)
-        for (int ix = 0; ix < R; ix++)
+        for (int iz = 0; iz < Rgrid; iz++)
+        for (int ix = 0; ix < Rgrid; ix++)
         {
             TryEnqueueBoundary(ix, 0, iz);
-            TryEnqueueBoundary(ix, R - 1, iz);
+            TryEnqueueBoundary(ix, Rgrid - 1, iz);
         }
-        for (int iz = 0; iz < R; iz++)
-        for (int iy = 0; iy < R; iy++)
+        for (int iz = 0; iz < Rgrid; iz++)
+        for (int iy = 0; iy < Rgrid; iy++)
         {
             TryEnqueueBoundary(0, iy, iz);
-            TryEnqueueBoundary(R - 1, iy, iz);
+            TryEnqueueBoundary(Rgrid - 1, iy, iz);
         }
 
         while (q.Count > 0)
         {
             int idx = q.Dequeue();
-            int ix = idx % R;
-            int t = idx / R;
-            int iy = t % R;
-            int iz = t / R;
+            int ix = idx % Rgrid;
+            int t = idx / Rgrid;
+            int iy = t % Rgrid;
+            int iz = t / Rgrid;
 
             void TryN(int nix, int niy, int niz)
             {
-                if ((uint)nix >= (uint)R || (uint)niy >= (uint)R || (uint)niz >= (uint)R)
+                if ((uint)nix >= (uint)Rgrid || (uint)niy >= (uint)Rgrid || (uint)niz >= (uint)Rgrid)
                     return;
-                int n = niz * R * R + niy * R + nix;
+                int n = niz * Rgrid * Rgrid + niy * Rgrid + nix;
                 if (floodObstacle.Get(n) || outside.Get(n))
                     return;
                 outside.Set(n, true);
@@ -177,22 +202,50 @@ public static class MeshColliderBaker
             TryN(ix, iy, iz + 1);
         }
 
+        byte[] inClosedVolume = new byte[total];
         var solid = new uint[total];
+        BitArray sdfSurfaceForBuild;
+        Vector3[] normalAccumForBuild;
+
+        if (pad)
+        {
+            sdfSurfaceForBuild = new BitArray(total);
+            normalAccumForBuild = new Vector3[total];
+            for (int iz = 0; iz < R; iz++)
+            for (int iy = 0; iy < R; iy++)
+            for (int ix = 0; ix < R; ix++)
+            {
+                int pidx = (iz + 1) * Rgrid * Rgrid + (iy + 1) * Rgrid + (ix + 1);
+                int i = iz * R * R + iy * R + ix;
+                bool fo = floodObstacle.Get(pidx);
+                bool o = outside.Get(pidx);
+                inClosedVolume[i] = (byte)((o || fo) ? 0 : 1);
+                solid[i] = (fo || !o) ? 1u : 0u;
+                sdfSurfaceForBuild.Set(i, sdfSurface.Get(pidx));
+                normalAccumForBuild[i] = normalAccum[pidx];
+            }
+        }
+        else
+        {
+            for (int i = 0; i < total; i++)
+                inClosedVolume[i] = (byte)(outside.Get(i) || floodObstacle.Get(i) ? 0 : 1);
+            for (int i = 0; i < total; i++)
+                solid[i] = (floodObstacle.Get(i) || !outside.Get(i)) ? 1u : 0u;
+            sdfSurfaceForBuild = sdfSurface;
+            normalAccumForBuild = normalAccum;
+        }
+
         int solidCount = 0;
         for (int i = 0; i < total; i++)
         {
-            bool s = floodObstacle.Get(i) || !outside.Get(i);
-            if (s)
-            {
-                solid[i] = 1u;
+            if (solid[i] != 0u)
                 solidCount++;
-            }
         }
 
         // BFS signed distance from sdfSurface; sign from solid mask (negative = inside obstacle).
-        float[] sdf = BuildSDF(R, total, sdfSurface, solid, 1024f / R);
+        float[] sdf = BuildSDF(R, total, sdfSurfaceForBuild, solid, 1024f / R);
 
-        Vector3[] normals = BuildSolidNormals(R, total, solid, normalAccum, bMin, cell);
+        Vector3[] normals = BuildSolidNormals(R, total, solid, normalAccumForBuild, bMin, cell);
 
         // Map world normals to simulation-space directions (uniform dot product with sim velocity).
         Vector3 invSize = new Vector3(
@@ -214,9 +267,9 @@ public static class MeshColliderBaker
         Debug.Log($"[MeshColliderBaker] Baked {R}³ grid: {solidCount} solid voxels ({100f * solidCount / total:F1}%), {triangles.Count} triangles.");
 
         if (useDiskCache)
-            SaveCache(collidersRoot, simWorldBounds, R, solid, normals, sdf);
+            SaveCache(collidersRoot, simWorldBounds, R, solid, normals, sdf, padFloodGridForDomainBoundary);
 
-        return new BakeResult { Solid = solid, Normals = normals, SDF = sdf };
+        return new BakeResult { Solid = solid, Normals = normals, SDF = sdf, InClosedVolume = inClosedVolume };
     }
 
     // BFS distance transform: spread from sdfSurface seeds outward in all directions.
@@ -375,6 +428,133 @@ public static class MeshColliderBaker
     struct Triangle
     {
         public Vector3 a, b, c;
+    }
+
+    static string HierarchyPath(Transform t)
+    {
+        var parts = new List<string>(8);
+        for (Transform c = t; c != null; c = c.parent)
+            parts.Add(c.name);
+        parts.Reverse();
+        return string.Join("/", parts);
+    }
+
+    /// <summary>
+    /// Explains what Bake() is voxelizing: full <paramref name="simWorldBounds"/> grid, all MeshFilters
+    /// under root (triangle shell), and all primitive colliders as solid volumes (Box = filled AABB, etc.).
+    /// </summary>
+    static void LogBakeDiagnostics(string tag, GameObject collidersRoot, Bounds simWorldBounds, int R, int triangleCount, bool anyPrimitive)
+    {
+        Vector3 bSize = simWorldBounds.size;
+        Vector3 cell = new Vector3(
+            bSize.x > 1e-8f ? bSize.x / R : 0f,
+            bSize.y > 1e-8f ? bSize.y / R : 0f,
+            bSize.z > 1e-8f ? bSize.z / R : 0f);
+
+        var sb = new StringBuilder(1536);
+        sb.Append("[MeshColliderBaker] ").Append(tag).Append(" diagnostics:\n");
+        sb.Append("  simWorldBounds center=").Append(simWorldBounds.center.ToString("F3"))
+            .Append(" size=").Append(simWorldBounds.size.ToString("F3"))
+            .Append(" min=").Append(simWorldBounds.min.ToString("F3"))
+            .Append(" max=").Append(simWorldBounds.max.ToString("F3")).Append('\n');
+        sb.Append("  voxel grid R=").Append(R).Append(" cell=").Append(cell.ToString("F4")).Append('\n');
+        sb.Append("  triangle list size (all MeshFilters + MeshColliders under root): ").Append(triangleCount).Append('\n');
+        sb.Append("  anyPrimitiveColliders: ").Append(anyPrimitive).Append('\n');
+
+        MeshFilter[] mfs = collidersRoot.GetComponentsInChildren<MeshFilter>(includeInactive: false);
+        sb.Append("  MeshFilters (").Append(mfs.Length).Append("):\n");
+        foreach (var mf in mfs)
+        {
+            Mesh m = mf.sharedMesh;
+            if (m == null)
+            {
+                sb.Append("    - ").Append(HierarchyPath(mf.transform)).Append(" (sharedMesh null)\n");
+                continue;
+            }
+            int nTri = m.triangles.Length / 3;
+            Renderer rd = mf.GetComponent<Renderer>();
+            string wb = rd != null
+                ? ("Renderer.bounds " + rd.bounds.center.ToString("F3") + " size " + rd.bounds.size.ToString("F3"))
+                : ("local mesh.bounds center " + m.bounds.center.ToString("F3") + " ext " + m.bounds.extents.ToString("F3") + " (not world — add Renderer for world AABB)");
+            sb.Append("    - ").Append(HierarchyPath(mf.transform)).Append('\n');
+            sb.Append("      mesh.name=\"").Append(m.name).Append("\" vertexCount=").Append(m.vertexCount)
+                .Append(" triangles=").Append(nTri).Append('\n');
+            sb.Append("      ").Append(wb).Append('\n');
+        }
+
+        BoxCollider[] boxes = collidersRoot.GetComponentsInChildren<BoxCollider>(includeInactive: false);
+        if (boxes.Length > 0)
+        {
+            sb.Append("  BoxColliders (").Append(boxes.Length).Append(") — interior voxels are SOLID (axis-aligned box), not just mesh surface:\n");
+            foreach (var bc in boxes)
+            {
+                bool on = bc.enabled && bc.gameObject.activeInHierarchy;
+                sb.Append("    - ").Append(HierarchyPath(bc.transform));
+                if (!on) sb.Append(" [disabled or inactive — skipped in bake]");
+                sb.Append('\n');
+                sb.Append("      bounds center=").Append(bc.bounds.center.ToString("F3"))
+                    .Append(" size=").Append(bc.bounds.size.ToString("F3")).Append('\n');
+            }
+        }
+
+        SphereCollider[] spheres = collidersRoot.GetComponentsInChildren<SphereCollider>(includeInactive: false);
+        if (spheres.Length > 0)
+        {
+            sb.Append("  SphereColliders (").Append(spheres.Length).Append(") — interior voxels are SOLID (ellipsoid if scaled non-uniformly):\n");
+            foreach (var sc in spheres)
+            {
+                bool on = sc.enabled && sc.gameObject.activeInHierarchy;
+                sb.Append("    - ").Append(HierarchyPath(sc.transform));
+                if (!on) sb.Append(" [disabled or inactive — skipped in bake]");
+                sb.Append('\n');
+                sb.Append("      bounds center=").Append(sc.bounds.center.ToString("F3"))
+                    .Append(" size=").Append(sc.bounds.size.ToString("F3"))
+                    .Append(" radius=").Append(sc.radius.ToString("F3")).Append('\n');
+            }
+        }
+
+        CapsuleCollider[] caps = collidersRoot.GetComponentsInChildren<CapsuleCollider>(includeInactive: false);
+        if (caps.Length > 0)
+        {
+            sb.Append("  CapsuleColliders (").Append(caps.Length).Append(") — capsule interior is SOLID:\n");
+            foreach (var cap in caps)
+            {
+                bool on = cap.enabled && cap.gameObject.activeInHierarchy;
+                sb.Append("    - ").Append(HierarchyPath(cap.transform));
+                if (!on) sb.Append(" [disabled or inactive — skipped in bake]");
+                sb.Append('\n');
+                sb.Append("      bounds center=").Append(cap.bounds.center.ToString("F3"))
+                    .Append(" size=").Append(cap.bounds.size.ToString("F3")).Append('\n');
+            }
+        }
+
+        MeshCollider[] meshCols = collidersRoot.GetComponentsInChildren<MeshCollider>(includeInactive: false);
+        if (meshCols.Length > 0)
+        {
+            sb.Append("  MeshColliders (").Append(meshCols.Length).Append(") — triangles also added to shell:\n");
+            foreach (var mc in meshCols)
+            {
+                Mesh m = mc.sharedMesh;
+                bool on = mc.enabled && mc.gameObject.activeInHierarchy;
+                sb.Append("    - ").Append(HierarchyPath(mc.transform));
+                if (!on) sb.Append(" [disabled or inactive]");
+                sb.Append(" mesh=").Append(m != null ? m.name : "null").Append('\n');
+            }
+        }
+
+        Debug.Log(sb.ToString());
+
+        int enabledActiveBoxes = 0;
+        foreach (var bc in boxes)
+        {
+            if (bc.enabled && bc.gameObject.activeInHierarchy)
+                enabledActiveBoxes++;
+        }
+        if (enabledActiveBoxes > 0 && triangleCount > 0)
+        {
+            Debug.LogWarning("[MeshColliderBaker] Enabled BoxCollider(s) under the bake root add a full rectangular solid. " +
+                "If you expected only the mesh shape (e.g. a sphere), remove or disable the BoxCollider on that object.");
+        }
     }
 
     static bool HasPrimitiveColliders(Transform root)
@@ -614,7 +794,7 @@ public static class MeshColliderBaker
         return dir;
     }
 
-    static byte[] BuildKeyBytes(GameObject collidersRoot, Bounds simWorldBounds, int R)
+    static byte[] BuildKeyBytes(GameObject collidersRoot, Bounds simWorldBounds, int R, bool padFloodGridForDomainBoundary)
     {
         var mfs = collidersRoot.GetComponentsInChildren<MeshFilter>(includeInactive: false);
         Array.Sort(mfs, (a, b) => a.GetInstanceID().CompareTo(b.GetInstanceID()));
@@ -710,13 +890,80 @@ public static class MeshColliderBaker
         sb.Append(mn.x.ToString("R", inv)).Append(',').Append(mn.y.ToString("R", inv)).Append(',').Append(mn.z.ToString("R", inv)).Append('|');
         sb.Append(mx.x.ToString("R", inv)).Append(',').Append(mx.y.ToString("R", inv)).Append(',').Append(mx.z.ToString("R", inv));
         sb.Append("|SOL4");
+        if (padFloodGridForDomainBoundary)
+            sb.Append("|PAD1");
 
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 
-    static string CachePath(GameObject collidersRoot, Bounds simWorldBounds, int R)
+    /// <summary>
+    /// Returns up to <paramref name="targetCount"/> world-space positions uniformly distributed
+    /// inside <paramref name="meshFilter"/>'s volume. Same <see cref="Bake"/> pipeline and SDF as colliders,
+    /// with padded flood-fill so domain clipping matches collider semantics; samples voxels with SDF &lt; 0 (strict interior, not shell).
+    /// </summary>
+    public static Vector3[] GenerateVolumePoints(MeshFilter meshFilter, Bounds simWorldBounds, int targetCount)
     {
-        byte[] key = BuildKeyBytes(collidersRoot, simWorldBounds, R);
+        if (meshFilter == null || meshFilter.sharedMesh == null)
+            return new Vector3[0];
+
+        int R = Mathf.Clamp(Mathf.CeilToInt(Mathf.Pow(targetCount * 8f, 1f / 3f)), 32, 256);
+        Debug.Log($"[MeshColliderBaker] GenerateVolumePoints: root '{meshFilter.gameObject.name}', mesh \"{meshFilter.sharedMesh.name}\", " +
+                  $"targetCount={targetCount}, R={R}, simBounds size={simWorldBounds.size.ToString("F3")} " +
+                  $"(Bake + padded flood, interior = SDF < 0).");
+
+        BakeResult bake = Bake(
+            meshFilter.gameObject,
+            simWorldBounds,
+            R,
+            useDiskCache: false,
+            padFloodGridForDomainBoundary: true,
+            bakeContextLabel: "GenerateVolumePoints");
+
+        Vector3 bMin  = simWorldBounds.min;
+        Vector3 bSize = simWorldBounds.size;
+        Vector3 cell  = new Vector3(bSize.x / R, bSize.y / R, bSize.z / R);
+        int total = R * R * R;
+
+        var inside = new List<Vector3>(targetCount * 2);
+        for (int idx = 0; idx < total; idx++)
+        {
+            if (bake.SDF[idx] >= 0f)
+                continue;
+
+            int ix = idx % R, tmp = idx / R, iy = tmp % R, iz = tmp / R;
+            inside.Add(new Vector3(
+                bMin.x + (ix + 0.5f) * cell.x,
+                bMin.y + (iy + 0.5f) * cell.y,
+                bMin.z + (iz + 0.5f) * cell.z));
+        }
+
+        if (inside.Count == 0)
+        {
+            Debug.LogWarning("[MeshColliderBaker] GenerateVolumePoints: no voxels with SDF<0 (open mesh, or no enclosed interior after bake).");
+            return new Vector3[0];
+        }
+
+        // Shuffle so any truncated subset is spatially uniform.
+        var rng = new System.Random(42);
+        for (int i = inside.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (inside[i], inside[j]) = (inside[j], inside[i]);
+        }
+
+        // Return exactly targetCount points, repeating if we have fewer.
+        var result = new Vector3[targetCount];
+        for (int i = 0; i < targetCount; i++)
+            result[i] = inside[i % inside.Count];
+
+        Debug.Log($"[MeshColliderBaker] GenerateVolumePoints: {inside.Count} voxels with SDF<0 at R={R}, returning {targetCount} positions " +
+                  $"(indices repeat if {inside.Count} < {targetCount}).");
+        return result;
+    }
+
+    static string CachePath(GameObject collidersRoot, Bounds simWorldBounds, int R, bool padFloodGridForDomainBoundary)
+    {
+        byte[] key = BuildKeyBytes(collidersRoot, simWorldBounds, R, padFloodGridForDomainBoundary);
         using (var sha = SHA256.Create())
         {
             byte[] hash = sha.ComputeHash(key);
@@ -753,10 +1000,16 @@ public static class MeshColliderBaker
         }
     }
 
-    static bool TryLoadCache(GameObject collidersRoot, Bounds simWorldBounds, int R, int total, out BakeResult result)
+    static bool TryLoadCache(
+        GameObject collidersRoot,
+        Bounds simWorldBounds,
+        int R,
+        int total,
+        bool padFloodGridForDomainBoundary,
+        out BakeResult result)
     {
         result = default;
-        string path = CachePath(collidersRoot, simWorldBounds, R);
+        string path = CachePath(collidersRoot, simWorldBounds, R, padFloodGridForDomainBoundary);
         if (!File.Exists(path)) return false;
         try
         {
@@ -777,18 +1030,24 @@ public static class MeshColliderBaker
 
             var sdf = new float[total];
             Buffer.BlockCopy(raw, HeaderSize + total * 4 + total * 12, sdf, 0, total * 4);
-            result = new BakeResult { Solid = solid, Normals = normals, SDF = sdf };
+            result = new BakeResult { Solid = solid, Normals = normals, SDF = sdf, InClosedVolume = null };
             return true;
         }
         catch { return false; }
     }
 
-    static void SaveCache(GameObject collidersRoot, Bounds simWorldBounds, int R,
-                          uint[] solid, Vector3[] normals, float[] sdf)
+    static void SaveCache(
+        GameObject collidersRoot,
+        Bounds simWorldBounds,
+        int R,
+        uint[] solid,
+        Vector3[] normals,
+        float[] sdf,
+        bool padFloodGridForDomainBoundary)
     {
         try
         {
-            string path = CachePath(collidersRoot, simWorldBounds, R);
+            string path = CachePath(collidersRoot, simWorldBounds, R, padFloodGridForDomainBoundary);
             int total = solid.Length;
             var raw = new byte[ExpectedFileLength(total)];
             FileMagicBytes.CopyTo(raw, 0);
