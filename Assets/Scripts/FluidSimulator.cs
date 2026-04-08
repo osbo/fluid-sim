@@ -271,11 +271,11 @@ public partial class FluidSimulator : MonoBehaviour
     /// <summary>Resolution passed to solid/SDF shaders: full R when <see cref="useColliders"/> is on, else 1 (stub buffer).</summary>
     internal int ColliderGridResolution => useColliders ? SolidVoxelResolution : 1;
 
-    private ComputeBuffer solidVoxelsBuffer;
-    public  ComputeBuffer SolidVoxelsBuffer   => solidVoxelsBuffer;
-    private ComputeBuffer solidVoxelNormalsBuffer;
     private ComputeBuffer solidSDFBuffer;
     public  ComputeBuffer SolidSDFBuffer      => solidSDFBuffer;
+    /// <summary>Per-voxel occupancy (0/1) for debug draw; same R³ layout as <see cref="SolidSDFBuffer"/>.</summary>
+    private ComputeBuffer solidVoxelsBuffer;
+    public  ComputeBuffer SolidVoxelsBuffer     => solidVoxelsBuffer;
 
     // Training data recorder
     public TrainingDataRecorder recorder;
@@ -375,17 +375,12 @@ public partial class FluidSimulator : MonoBehaviour
 
         if (!useColliders)
         {
-            solidVoxelsBuffer?.Release();
-            solidVoxelsBuffer = new ComputeBuffer(stubElements, sizeof(uint));
-            solidVoxelsBuffer.SetData(new uint[] { 0u });
-
-            solidVoxelNormalsBuffer?.Release();
-            solidVoxelNormalsBuffer = new ComputeBuffer(stubElements, sizeof(float) * 4);
-            solidVoxelNormalsBuffer.SetData(new Vector4[] { Vector4.zero });
-
             solidSDFBuffer?.Release();
             solidSDFBuffer = new ComputeBuffer(stubElements, sizeof(float));
             solidSDFBuffer.SetData(new float[] { 1e9f });
+            solidVoxelsBuffer?.Release();
+            solidVoxelsBuffer = new ComputeBuffer(stubElements, sizeof(uint));
+            solidVoxelsBuffer.SetData(new uint[] { 0u });
             return;
         }
 
@@ -401,27 +396,20 @@ public partial class FluidSimulator : MonoBehaviour
                 SDF = new float[total]
             };
 
-        solidVoxelsBuffer?.Release();
-        solidVoxelsBuffer = new ComputeBuffer(total, sizeof(uint));
-        solidVoxelsBuffer.SetData(bake.Solid);
-
-        solidVoxelNormalsBuffer?.Release();
-        solidVoxelNormalsBuffer = new ComputeBuffer(total, sizeof(float) * 4);
-        var normalsUpload = new Vector4[total];
-        for (int i = 0; i < total; i++)
-            normalsUpload[i] = new Vector4(bake.Normals[i].x, bake.Normals[i].y, bake.Normals[i].z, 0f);
-        solidVoxelNormalsBuffer.SetData(normalsUpload);
-
         solidSDFBuffer?.Release();
         solidSDFBuffer = new ComputeBuffer(total, sizeof(float));
         solidSDFBuffer.SetData(bake.SDF);
+
+        solidVoxelsBuffer?.Release();
+        solidVoxelsBuffer = new ComputeBuffer(total, sizeof(uint));
+        solidVoxelsBuffer.SetData(bake.Solid);
 
         // Teleport any particles that initialized inside solid voxels
         if (particlesShader != null)
         {
             int kernel = particlesShader.FindKernel("RemoveSolidParticles");
             particlesShader.SetBuffer(kernel, "particlesBuffer", particlesBuffer);
-            particlesShader.SetBuffer(kernel, "solidVoxelsBuffer", solidVoxelsBuffer);
+            particlesShader.SetBuffer(kernel, "solidSDFBuffer", solidSDFBuffer);
             particlesShader.SetInt("useColliders", 1);
             particlesShader.SetInt("solidVoxelResolution", R);
             particlesShader.SetInt("numParticles", numParticles);
@@ -805,8 +793,6 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetBuffer(updateParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetBuffer(updateParticlesKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
         particlesShader.SetBuffer(updateParticlesKernel, "nodeCountBuffer", nodeCount);
-        particlesShader.SetBuffer(updateParticlesKernel, "solidVoxelsBuffer", solidVoxelsBuffer);
-        particlesShader.SetBuffer(updateParticlesKernel, "solidVoxelNormalsBuffer", solidVoxelNormalsBuffer);
         particlesShader.SetBuffer(updateParticlesKernel, "solidSDFBuffer", solidSDFBuffer);
         particlesShader.SetInt("useColliders", useColliders ? 1 : 0);
         particlesShader.SetInt("solidVoxelResolution", ColliderGridResolution);
@@ -1118,9 +1104,8 @@ public partial class FluidSimulator : MonoBehaviour
         phiBuffer_Read?.Release();
         dirtyFlagBuffer?.Release();
         mortonCodesBuffer?.Release();
-        solidVoxelsBuffer?.Release();
-        solidVoxelNormalsBuffer?.Release();
         solidSDFBuffer?.Release();
+        solidVoxelsBuffer?.Release();
         ReleasePreconditionerBuffers();
         ReleaseLeafOnlyBuffers();
         ReleaseLeafOnlyWeightsBuffers();

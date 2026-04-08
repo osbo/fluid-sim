@@ -460,7 +460,7 @@ public partial class FluidSimulator : MonoBehaviour
         BindNodesOctreeCounts();
         WriteIndirectArgsFromCountBuffer(nodeCount);
         nodesShader.SetBuffer(applyExternalForcesKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetBuffer(applyExternalForcesKernel, "solidVoxelsBuffer", solidVoxelsBuffer);
+        nodesShader.SetBuffer(applyExternalForcesKernel, "solidSDFBuffer", solidSDFBuffer);
         nodesShader.SetInt("useColliders", useColliders ? 1 : 0);
         nodesShader.SetInt("solidVoxelResolution", ColliderGridResolution);
         nodesShader.SetFloat("gravity", gravity);
