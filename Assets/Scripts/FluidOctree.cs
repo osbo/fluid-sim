@@ -57,14 +57,14 @@ public partial class FluidSimulator : MonoBehaviour
     {
         nodesPrefixSumsShader.SetBuffer(writeDispatchArgsFromCountKernelId, "dispatchArgsFromCountSrc", countBuffer);
         nodesPrefixSumsShader.SetBuffer(writeDispatchArgsFromCountKernelId, "dispatchArgsBuffer", dispatchArgsBuffer);
-        nodesPrefixSumsShader.Dispatch(writeDispatchArgsFromCountKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, writeDispatchArgsFromCountKernelId, 1, 1, 1);
     }
 
     private void GpuCopyUint1(ComputeBuffer dst, ComputeBuffer src)
     {
         nodesPrefixSumsShader.SetBuffer(copyUintBufferKernelId, "copyUintSrc", src);
         nodesPrefixSumsShader.SetBuffer(copyUintBufferKernelId, "copyUintDst", dst);
-        nodesPrefixSumsShader.Dispatch(copyUintBufferKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, copyUintBufferKernelId, 1, 1, 1);
     }
 
     private void BindNodesOctreeCounts()
@@ -102,7 +102,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetBuffer(markUniqueParticlesKernel, "sortedParticles", particlesBuffer);
         nodesPrefixSumsShader.SetBuffer(markUniqueParticlesKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
-        nodesPrefixSumsShader.Dispatch(markUniqueParticlesKernel, groupsLinear, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, markUniqueParticlesKernel, groupsLinear, 1, 1);
 
         RunPrefixScan(indicators, prefixSums, particlePrefixElementCountBuffer);
 
@@ -110,16 +110,16 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "sortedParticles", particlesBuffer);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "uniqueIndices", uniqueIndices);
-        nodesPrefixSumsShader.Dispatch(scatterUniquesKernel, groupsLinear, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, scatterUniquesKernel, groupsLinear, 1, 1);
 
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "uniqueCount", uniqueCount);
-        nodesPrefixSumsShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, writeUniqueCountKernel, 1, 1, 1);
 
         nodesPrefixSumsShader.SetBuffer(writeDispatchArgsKernelId, "uniqueCount", uniqueCount);
         nodesPrefixSumsShader.SetBuffer(writeDispatchArgsKernelId, "dispatchArgsBuffer", dispatchArgsBuffer);
-        nodesPrefixSumsShader.Dispatch(writeDispatchArgsKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, writeDispatchArgsKernelId, 1, 1, 1);
 
         GpuCopyUint1(nodeCount, uniqueCount);
     }
@@ -142,7 +142,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("numParticles", numParticles);
         nodesShader.SetInt("minLayer", minLayer);
         nodesShader.SetInt("maxLayer", maxLayer);
-        nodesShader.DispatchIndirect(createLeavesKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesShader, createLeavesKernel, dispatchArgsBuffer, 0);
     }
 
     private void findUniqueNodes()
@@ -161,23 +161,23 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetBuffer(markUniquesPrefixKernel, "mortonCodesBuffer", mortonCodesBuffer);
         nodesPrefixSumsShader.SetBuffer(markUniquesPrefixKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
-        nodesPrefixSumsShader.DispatchIndirect(markUniquesPrefixKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesPrefixSumsShader, markUniquesPrefixKernel, dispatchArgsBuffer, 0);
 
         RunPrefixScan(indicators, prefixSums, nodeCount);
 
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "uniqueIndices", uniqueIndices);
-        nodesPrefixSumsShader.DispatchIndirect(scatterUniquesKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesPrefixSumsShader, scatterUniquesKernel, dispatchArgsBuffer, 0);
 
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(writeUniqueCountKernel, "uniqueCount", uniqueCount);
-        nodesPrefixSumsShader.Dispatch(writeUniqueCountKernel, 1, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, writeUniqueCountKernel, 1, 1, 1);
 
         nodesPrefixSumsShader.SetBuffer(writeDispatchArgsKernelId, "uniqueCount", uniqueCount);
         nodesPrefixSumsShader.SetBuffer(writeDispatchArgsKernelId, "dispatchArgsBuffer", dispatchArgsBuffer);
-        nodesPrefixSumsShader.Dispatch(writeDispatchArgsKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, writeDispatchArgsKernelId, 1, 1, 1);
     }
 
     private void ProcessNodes()
@@ -190,7 +190,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetInt("layer", layer);
         nodesShader.SetInt("minLayer", minLayer);
         nodesShader.SetInt("maxLayer", maxLayer);
-        nodesShader.DispatchIndirect(processNodesKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesShader, processNodesKernel, dispatchArgsBuffer, 0);
     }
 
     private void compactNodes()
@@ -206,7 +206,7 @@ public partial class FluidSimulator : MonoBehaviour
 
         nodesPrefixSumsShader.SetBuffer(markActiveNodesKernelId, "nodesBuffer", nodesBuffer);
         nodesPrefixSumsShader.SetBuffer(markActiveNodesKernelId, "indicators", indicators);
-        nodesPrefixSumsShader.DispatchIndirect(markActiveNodesKernelId, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesPrefixSumsShader, markActiveNodesKernelId, dispatchArgsBuffer, 0);
 
         RunPrefixScan(indicators, prefixSums, nodeCount);
 
@@ -215,12 +215,12 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "nodesBuffer", nodesBuffer);
         nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "tempNodesBuffer", tempNodesBuffer);
         nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "mortonCodesBuffer", mortonCodesBuffer);
-        nodesPrefixSumsShader.DispatchIndirect(scatterActivesKernelId, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesPrefixSumsShader, scatterActivesKernelId, dispatchArgsBuffer, 0);
 
         nodesPrefixSumsShader.SetBuffer(writeNodeCountKernelId, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(writeNodeCountKernelId, "prefixSums", prefixSums);
         nodesPrefixSumsShader.SetBuffer(writeNodeCountKernelId, "nodeCount", nodeCount);
-        nodesPrefixSumsShader.Dispatch(writeNodeCountKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, writeNodeCountKernelId, 1, 1, 1);
 
         (nodesBuffer, tempNodesBuffer) = (tempNodesBuffer, nodesBuffer);
     }
@@ -240,20 +240,20 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(findNeighborsKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "mortonCodesBuffer", mortonCodesBuffer);
-        nodesShader.DispatchIndirect(findNeighborsKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesShader, findNeighborsKernel, dispatchArgsBuffer, 0);
 
         nodesShader.SetBuffer(findReverseKernel, "reverseNeighborsBuffer", reverseNeighborsBuffer);
         nodesShader.SetBuffer(findReverseKernel, "neighborsBuffer", neighborsBuffer);
-        nodesShader.DispatchIndirect(findReverseKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesShader, findReverseKernel, dispatchArgsBuffer, 0);
 
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetBuffer(interpolateFaceVelocitiesKernel, "neighborsBuffer", neighborsBuffer);
-        nodesShader.DispatchIndirect(interpolateFaceVelocitiesKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesShader, interpolateFaceVelocitiesKernel, dispatchArgsBuffer, 0);
 
         nodesShader.SetBuffer(copyFaceVelocitiesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(copyFaceVelocitiesKernel, "tempNodesBuffer", tempNodesBuffer);
-        nodesShader.DispatchIndirect(copyFaceVelocitiesKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesShader, copyFaceVelocitiesKernel, dispatchArgsBuffer, 0);
     }
 
     private void ComputeLevelSet()
@@ -277,7 +277,7 @@ public partial class FluidSimulator : MonoBehaviour
         BindNodesOctreeCounts();
         nodesShader.SetBuffer(initializePhiKernel, "phiBuffer", phiBuffer);
         nodesShader.SetBuffer(initializePhiKernel, "neighborsBuffer", neighborsBuffer);
-        nodesShader.Dispatch(initializePhiKernel, dispatchSize, 1, 1);
+        GpuProfileDispatchCompute(nodesShader, initializePhiKernel, dispatchSize, 1, 1);
 
         GpuCopyBuffer(phiBuffer, phiBuffer_Read);
 
@@ -298,7 +298,7 @@ public partial class FluidSimulator : MonoBehaviour
             nodesShader.SetBuffer(propagatePhiKernel, "dirtyFlagBuffer", dirtyFlagBuffer);
             nodesShader.SetBuffer(propagatePhiKernel, "nodesBuffer", nodesBuffer);
             nodesShader.SetBuffer(propagatePhiKernel, "neighborsBuffer", neighborsBuffer);
-            nodesShader.Dispatch(propagatePhiKernel, dispatchSize, 1, 1);
+            GpuProfileDispatchCompute(nodesShader, propagatePhiKernel, dispatchSize, 1, 1);
 
             dirtyFlagBuffer.GetData(dirtyData);
             if (dirtyData[0] == 0) break;
@@ -315,7 +315,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetBuffer(npsPrefixSumKernelId, "indicators", input);
         nodesPrefixSumsShader.SetBuffer(npsPrefixSumKernelId, "prefixSums", output);
         nodesPrefixSumsShader.SetBuffer(npsPrefixSumKernelId, "aux", aux);
-        nodesPrefixSumsShader.Dispatch(npsPrefixSumKernelId, maxPrefixThreadGroups, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, npsPrefixSumKernelId, maxPrefixThreadGroups, 1, 1);
 
         if (maxPrefixThreadGroups > 1)
         {
@@ -324,11 +324,11 @@ public partial class FluidSimulator : MonoBehaviour
             radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
             radixSortShader.SetInt("len", maxAuxBlocks);
             radixSortShader.SetInt("zeroff", 1);
-            radixSortShader.Dispatch(radixPrefixSumKernelId, 1, 1, 1);
+            GpuProfileDispatchCompute(radixSortShader, radixPrefixSumKernelId, 1, 1, 1);
 
             nodesPrefixSumsShader.SetBuffer(npsPrefixFixupKernelId, "prefixSums", output);
             nodesPrefixSumsShader.SetBuffer(npsPrefixFixupKernelId, "aux2", aux2);
-            nodesPrefixSumsShader.Dispatch(npsPrefixFixupKernelId, maxPrefixThreadGroups, 1, 1);
+            GpuProfileDispatchCompute(nodesPrefixSumsShader, npsPrefixFixupKernelId, maxPrefixThreadGroups, 1, 1);
         }
     }
 

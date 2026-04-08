@@ -5,10 +5,15 @@ using System;
 // CG Solver component of FluidSimulator
 public partial class FluidSimulator : MonoBehaviour
 {
-    // cgPcgIndirectArgsBuffer layout (uint triples): SpMV (256 th/g), 512-th/g kernels, 1-group kernels.
-    private const int CgIndirectArgsOffsetSpmv = 0;
-    private const int CgIndirectArgsOffsetVec512 = 12;
-    private const int CgIndirectArgsOffsetSingleGroup = 24;
+    // solverIndirectArgsBuffer byte offsets (each triple = 3 uints = 12 bytes):
+    private const int SolverArgsOffset256         = 0;   // ceil(n/256) groups — BuildMatrixA, Divergence, CSR, ApplyPressure
+    private const int SolverArgsOffset512         = 12;  // ceil(n/512) groups — Scale, Axpy, Dot, Copy, Jacobi, AxpyAlpha/NegAlpha, ScaleAddBeta
+    private const int SolverArgsOffsetSingleGroup = 24;  // 1 group — GlobalReduceSum, ComputeAlpha/Beta, StoreRho
+    private const int SolverArgsOffsetPfx1        = 36;  // ceil(n/1024) groups — CSR prefix sum passes 1 & fixup
+    // Aliases matching old CgIndirectArgs names so CG loop code is unchanged:
+    private const int CgIndirectArgsOffsetSpmv        = SolverArgsOffset256;
+    private const int CgIndirectArgsOffsetVec512       = SolverArgsOffset512;
+    private const int CgIndirectArgsOffsetSingleGroup  = SolverArgsOffsetSingleGroup;
 
     // Timing variables for CG loop
     private System.Diagnostics.Stopwatch laplacianSw = new System.Diagnostics.Stopwatch();
@@ -46,8 +51,12 @@ public partial class FluidSimulator : MonoBehaviour
         csrFinalizeRowPtrKernelId   = csrBuilderShader.FindKernel("FinalizeRowPtr");
         csrFillKernelId             = csrBuilderShader.FindKernel("FillCSR");
 
-        radixPrefixSumKernelId      = radixSortShader.FindKernel("prefixSum");
-        radixPrefixFixupKernelId    = radixSortShader.FindKernel("prefixFixup");
+        radixPrefixSumKernelId           = radixSortShader.FindKernel("prefixSum");
+        radixPrefixFixupKernelId         = radixSortShader.FindKernel("prefixFixup");
+        radixPrefixSumSolverMainKernelId = radixSortShader.FindKernel("prefixSumSolverMain");
+        radixPrefixSumSolverAuxKernelId  = radixSortShader.FindKernel("prefixSumSolverAux");
+        radixPrefixFixupSolverKernelId   = radixSortShader.FindKernel("prefixFixupSolver");
+        buildSolverIndirectArgsKernelId  = nodesPrefixSumsShader.FindKernel("BuildSolverIndirectArgs");
 
         InitLeafOnlyInputKernels();
         InitLeafOnlyEmbedKernels();
@@ -69,80 +78,58 @@ public partial class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // --- Buffer Init (Grow-only) ---
-        int requiredSize = Mathf.NextPowerOfTwo(Mathf.Max(numNodes, 512));
-
-        if (divergenceBuffer == null || divergenceBuffer.count < requiredSize) {
-            divergenceBuffer?.Release(); divergenceBuffer = new ComputeBuffer(requiredSize, sizeof(float));
-        }
-        if (residualBuffer == null || residualBuffer.count < requiredSize) {
-            residualBuffer?.Release(); residualBuffer = new ComputeBuffer(requiredSize, sizeof(float));
-        }
-        if (pBuffer == null || pBuffer.count < requiredSize) {
-            pBuffer?.Release(); pBuffer = new ComputeBuffer(requiredSize, sizeof(float));
-        }
-        if (ApBuffer == null || ApBuffer.count < requiredSize) {
-            ApBuffer?.Release(); ApBuffer = new ComputeBuffer(requiredSize, sizeof(float));
-        }
-        if (pressureBuffer == null || pressureBuffer.count < requiredSize) {
-            pressureBuffer?.Release(); pressureBuffer = new ComputeBuffer(requiredSize, sizeof(float));
-        }
-        if (zVectorBuffer == null || zVectorBuffer.count < requiredSize) {
-            zVectorBuffer?.Release(); zVectorBuffer = new ComputeBuffer(requiredSize, sizeof(float));
-        }
-        if (matrixABuffer == null || matrixABuffer.count < requiredSize * 25) {
-            matrixABuffer?.Release();
-            matrixABuffer = new ComputeBuffer(requiredSize * 25, sizeof(float));
-        }
-
-        // CSR helper buffers — pre-allocated to max stencil width (25 entries per node).
-        // This avoids the per-frame GPU→CPU readback of totalNNZ.
-        int maxNnz = requiredSize * 25;
-        if (nnzPerNode == null || nnzPerNode.count < requiredSize) {
-            nnzPerNode?.Release();
-            nnzPerNode = new ComputeBuffer(requiredSize, sizeof(uint));
-        }
-        if (csrRowPtr == null || csrRowPtr.count < requiredSize + 1) {
-            csrRowPtr?.Release();
-            csrRowPtr = new ComputeBuffer(requiredSize + 1, sizeof(uint));
-        }
-        if (csrColIndices == null || csrColIndices.count < maxNnz) {
-            csrColIndices?.Release();
-            csrColIndices = new ComputeBuffer(maxNnz, sizeof(uint));
-        }
-        if (csrRowIndices == null || csrRowIndices.count < maxNnz) {
-            csrRowIndices?.Release();
-            csrRowIndices = new ComputeBuffer(maxNnz, sizeof(uint));
-        }
-        if (csrValues == null || csrValues.count < maxNnz) {
-            csrValues?.Release();
-            csrValues = new ComputeBuffer(maxNnz, sizeof(float));
-        }
+        // All solver buffers are pre-allocated to maxNodesCapacity in AllocateOctreeBuffersToCapacity.
+        // Build all GPU-driven indirect dispatch args and scalar counts in one kernel.
+        int maxNnz = matrixABuffer.count; // = maxNodesCapacity * 25
         if (cgAlphaBuffer == null) cgAlphaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgBetaBuffer == null) cgBetaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgRhoBuffer == null) cgRhoBuffer = new ComputeBuffer(1, sizeof(float));
 
-        // neighborsBuffer uses SoA stride maxNodesCapacity (see Nodes.compute); matrixABuffer still uses numNodes stride.
+        // SoA strides are fixed at maxNodesCapacity (both neighborsBuffer and matrixABuffer).
         cgSolverShader.SetInt("numNodesCapacity", maxNodesCapacity);
         csrBuilderShader.SetInt("numNodesCapacity", maxNodesCapacity);
+
+        // Build all GPU-driven indirect dispatch args from nodeCount in a single kernel.
+        // Writes solverIndirectArgsBuffer, reductionCount256/512 buffers, and solverPrefixLenBuffer.
+        using (new GpuProfileSection(this, "FluidSim.SolvePressure.Build"))
+        {
+        nodesPrefixSumsShader.SetBuffer(buildSolverIndirectArgsKernelId, "nodeCount", nodeCount);
+        nodesPrefixSumsShader.SetBuffer(buildSolverIndirectArgsKernelId, "solverIndirectArgsBuffer", solverIndirectArgsBuffer);
+        nodesPrefixSumsShader.SetBuffer(buildSolverIndirectArgsKernelId, "solverReductionCount256Buffer", solverReductionCount256Buffer);
+        nodesPrefixSumsShader.SetBuffer(buildSolverIndirectArgsKernelId, "solverReductionCount512Buffer", solverReductionCount512Buffer);
+        nodesPrefixSumsShader.SetBuffer(buildSolverIndirectArgsKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, buildSolverIndirectArgsKernelId, 1, 1, 1);
+
+        // Bind nodeCountBuffer to all shaders that replaced the numNodes uniform.
+        cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(buildMatrixAKernelId,      "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(scaleKernelId,             "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(axpyKernel,                "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(dotProductKernel,          "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(applyJacobiKernelId,       "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(globalReduceSumKernelId,   "reductionCountBuffer", solverReductionCount256Buffer); // default; overridden below as needed
+        cgSolverShader.SetBuffer(spmvCsrKernelId,           "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(copyFloatKernelId,         "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(axpyAlphaKernelId,         "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(axpyNegAlphaKernelId,      "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(scaleAddBetaKernelId,      "nodeCountBuffer", nodeCount);
+        csrBuilderShader.SetBuffer(csrCountNnzKernelId,     "nodeCountBuffer", nodeCount);
+        csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId,"nodeCountBuffer", nodeCount);
+        csrBuilderShader.SetBuffer(csrFillKernelId,         "nodeCountBuffer", nodeCount);
 
         // --- Step 1: Calculate Divergence (RHS 'b') ---
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "neighborsBuffer", neighborsBuffer);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(calculateDivergenceKernel, numNodes);
+        GpuProfileDispatchIndirect(cgSolverShader,calculateDivergenceKernel, solverIndirectArgsBuffer, SolverArgsOffset512);
 
         // --- Step 1b: Build Matrix A ---
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         cgSolverShader.SetBuffer(buildMatrixAKernelId, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(buildMatrixAKernelId, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.SetBuffer(buildMatrixAKernelId, "matrixABuffer", matrixABuffer);
-        cgSolverShader.SetInt("numNodes", numNodes);
         cgSolverShader.SetFloat("deltaTime", deltaTime);
-        int groupsA = Mathf.CeilToInt(numNodes / 256.0f);
-        int groups512 = Mathf.CeilToInt(numNodes / 512.0f);
-        cgSolverShader.Dispatch(buildMatrixAKernelId, groupsA, 1, 1);
+        GpuProfileDispatchIndirect(cgSolverShader,buildMatrixAKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
 
         // --- Step 1c: Build CSR representation ---
         if (csrBuilderShader == null)
@@ -151,75 +138,59 @@ public partial class FluidSimulator : MonoBehaviour
             return;
         }
 
-        int csrGroups = Mathf.CeilToInt(numNodes / 256.0f);
-
         // A. Count nnz per row
         csrBuilderShader.SetBuffer(csrCountNnzKernelId, "neighborsBuffer", neighborsBuffer);
         csrBuilderShader.SetBuffer(csrCountNnzKernelId, "nnzPerNode", nnzPerNode);
-        csrBuilderShader.SetInt("numNodes", numNodes);
-        csrBuilderShader.Dispatch(csrCountNnzKernelId, csrGroups, 1, 1);
+        GpuProfileDispatchIndirect(csrBuilderShader,csrCountNnzKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
 
-        // B. Exclusive prefix sum nnzPerNode -> csrRowPtr
-        uint tgSize = 512u;
-        uint numThreadgroups = (uint)((numNodes + (tgSize * 2) - 1) / (tgSize * 2));
-        uint auxSize = (uint)Mathf.Max(1, (int)numThreadgroups);
-
-        if (aux == null || aux.count < auxSize) {
-            aux?.Release(); aux = new ComputeBuffer((int)auxSize, sizeof(uint));
-        }
-        if (aux2 == null || aux2.count < auxSize) {
-            aux2?.Release(); aux2 = new ComputeBuffer((int)auxSize, sizeof(uint));
-        }
-        if (auxSmall == null) auxSmall = new ComputeBuffer(1, sizeof(uint));
-
-        radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", nnzPerNode);
-        radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", csrRowPtr);
-        radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", aux);
-        radixSortShader.SetInt("len", numNodes);
+        // B. Exclusive prefix sum nnzPerNode -> csrRowPtr (3-pass, all GPU-driven)
+        // Pass 1: nnzPerNode -> csrRowPtr, len=numNodes
+        radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "input",               nnzPerNode);
+        radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "output",              csrRowPtr);
+        radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "aux",                 aux);
+        radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
         radixSortShader.SetInt("zeroff", 1);
-        radixSortShader.Dispatch(radixPrefixSumKernelId, (int)numThreadgroups, 1, 1);
+        GpuProfileDispatchIndirect(radixSortShader,radixPrefixSumSolverMainKernelId, solverIndirectArgsBuffer, SolverArgsOffsetPfx1);
 
-        if (numThreadgroups > 1)
-        {
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", aux);
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", aux2);
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
-            radixSortShader.SetInt("len", (int)auxSize);
-            radixSortShader.SetInt("zeroff", 1);
-            radixSortShader.Dispatch(radixPrefixSumKernelId, 1, 1, 1);
+        // Pass 1b: aux -> aux2, len=pfx1 (always 1 group)
+        radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "input",               aux);
+        radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "output",              aux2);
+        radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "aux",                 auxSmall);
+        radixSortShader.SetBuffer(radixPrefixSumSolverAuxKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
+        GpuProfileDispatchCompute(radixSortShader, radixPrefixSumSolverAuxKernelId, 1, 1, 1);
 
-            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "input", csrRowPtr);
-            radixSortShader.SetBuffer(radixPrefixFixupKernelId, "aux", aux2);
-            radixSortShader.SetInt("len", numNodes);
-            radixSortShader.Dispatch(radixPrefixFixupKernelId, (int)numThreadgroups, 1, 1);
-        }
+        // Pass 2 fixup: csrRowPtr += aux2[block], len=numNodes
+        radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "input",               csrRowPtr);
+        radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "aux",                 aux2);
+        radixSortShader.SetBuffer(radixPrefixFixupSolverKernelId, "solverPrefixLenBuffer", solverPrefixLenBuffer);
+        GpuProfileDispatchIndirect(radixSortShader,radixPrefixFixupSolverKernelId, solverIndirectArgsBuffer, SolverArgsOffsetPfx1);
 
         // C. Finalize csrRowPtr[numNodes] on GPU
         csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "nnzPerNode", nnzPerNode);
         csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "rowPtrBuffer", csrRowPtr);
-        csrBuilderShader.SetInt("numNodes", numNodes);
-        csrBuilderShader.Dispatch(csrFinalizeRowPtrKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(csrBuilderShader, csrFinalizeRowPtrKernelId, 1, 1, 1);
 
-        // D. Fill CSR colIndices / values (buffers pre-allocated — no readback needed)
+        // D. Fill CSR colIndices / values
         csrBuilderShader.SetBuffer(csrFillKernelId, "neighborsBuffer", neighborsBuffer);
         csrBuilderShader.SetBuffer(csrFillKernelId, "matrixABuffer", matrixABuffer);
         csrBuilderShader.SetBuffer(csrFillKernelId, "rowPtrBuffer", csrRowPtr);
         csrBuilderShader.SetBuffer(csrFillKernelId, "colIndicesBuffer", csrColIndices);
         csrBuilderShader.SetBuffer(csrFillKernelId, "rowIndicesBuffer", csrRowIndices);
         csrBuilderShader.SetBuffer(csrFillKernelId, "valuesBuffer", csrValues);
-        csrBuilderShader.SetInt("numNodes", numNodes);
-        csrBuilderShader.Dispatch(csrFillKernelId, csrGroups, 1, 1);
+        GpuProfileDispatchIndirect(csrBuilderShader,csrFillKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+        }
 
         DispatchLeafOnlyGpuInputs(numNodes, maxNnz);
 
         if (preconditioner == PreconditionerType.Neural)
             LeafOnlyEnsureJacobiInvDiagFromMatrixA(LeafOnlyLastNPadded);
 
-        // Init Pressure x=0 via GPU Scale(0) — no CPU allocation
+        using (new GpuProfileSection(this, "FluidSim.SolvePressure.Init"))
+        {
+        // Init Pressure x=0 via GPU Scale(0)
         cgSolverShader.SetBuffer(scaleKernelId, "yBuffer", pressureBuffer);
         cgSolverShader.SetFloat("a", 0.0f);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(scaleKernelId, numNodes);
+        GpuProfileDispatchIndirect(cgSolverShader,scaleKernelId, solverIndirectArgsBuffer, SolverArgsOffset512);
 
         // r = b (GPU copy, no CPU round-trip)
         GpuCopyBuffer(divergenceBuffer, residualBuffer);
@@ -229,6 +200,7 @@ public partial class FluidSimulator : MonoBehaviour
 
         // p = z (GPU copy)
         GpuCopyBuffer(zVectorBuffer, pBuffer);
+        }
 
         float initialResidual = GpuDotProduct(residualBuffer, residualBuffer);
         if (initialResidual < convergenceThreshold) return;
@@ -244,20 +216,18 @@ public partial class FluidSimulator : MonoBehaviour
         bool pcgIndirectEarlyOut = preconditioner != PreconditionerType.Neural;
         if (pcgIndirectEarlyOut)
         {
-            if (cgPcgIndirectArgsBuffer == null || cgPcgIndirectArgsBuffer.count != 9)
-            {
-                cgPcgIndirectArgsBuffer?.Release();
-                cgPcgIndirectArgsBuffer = new ComputeBuffer(9, sizeof(uint), ComputeBufferType.IndirectArguments);
-            }
+            // solverIndirectArgsBuffer already holds correct dispatch args (written by BuildSolverIndirectArgs above).
+            // CheckConvergence will zero args [0],[3],[6] to stop the loop early; they are rebuilt next frame.
             if (cgPcgIterationStatBuffer == null)
                 cgPcgIterationStatBuffer = new ComputeBuffer(1, sizeof(uint));
-            InitCgPcgIndirectArgs(groupsA, groups512);
             cgPcgIterationStatScratch[0] = 0u;
             cgPcgIterationStatBuffer.SetData(cgPcgIterationStatScratch);
         }
 
         int totalIterations = maxCgIterations;
 
+        void RunPcgLoop()
+        {
         for (int k = 0; k < maxCgIterations; k++)
         {
             // 1. Ap = A*p, partial p·Ap → divergenceBuffer
@@ -268,31 +238,28 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(spmvCsrKernelId, "csrColIndices", csrColIndices);
             cgSolverShader.SetBuffer(spmvCsrKernelId, "csrValues", csrValues);
             cgSolverShader.SetBuffer(spmvCsrKernelId, "divergenceBuffer", divergenceBuffer);
-            cgSolverShader.SetInt("numNodes", numNodes);
             if (pcgIndirectEarlyOut)
-                cgSolverShader.DispatchIndirect(spmvCsrKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetSpmv);
+                GpuProfileDispatchIndirect(cgSolverShader,spmvCsrKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSpmv);
             else
-                cgSolverShader.Dispatch(spmvCsrKernelId, groupsA, 1, 1);
+                GpuProfileDispatchIndirect(cgSolverShader,spmvCsrKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSpmv);
             laplacianSw.Stop();
 
             // 2. Sum p·Ap → divergence[0]; alpha = rho / (p·Ap) on GPU
             dotProductSw.Start();
             cgSolverShader.SetBuffer(globalReduceSumKernelId, "divergenceBuffer", divergenceBuffer);
-            cgSolverShader.SetInt("reductionCount", groupsA);
+            cgSolverShader.SetBuffer(globalReduceSumKernelId, "reductionCountBuffer", solverReductionCount256Buffer);
             if (pcgIndirectEarlyOut)
-                cgSolverShader.DispatchIndirect(globalReduceSumKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
+                GpuProfileDispatchIndirect(cgSolverShader,globalReduceSumKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
             else
-                GpuFinalizeReduction(groupsA);
+                GpuProfileDispatchIndirect(cgSolverShader,globalReduceSumKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
 
+            cgSolverShader.SetBuffer(computeAlphaKernelId, "divergenceBuffer", divergenceBuffer);
+            cgSolverShader.SetBuffer(computeAlphaKernelId, "rhoBuffer", cgRhoBuffer);
+            cgSolverShader.SetBuffer(computeAlphaKernelId, "alphaBuffer", cgAlphaBuffer);
             if (pcgIndirectEarlyOut)
-            {
-                cgSolverShader.SetBuffer(computeAlphaKernelId, "divergenceBuffer", divergenceBuffer);
-                cgSolverShader.SetBuffer(computeAlphaKernelId, "rhoBuffer", cgRhoBuffer);
-                cgSolverShader.SetBuffer(computeAlphaKernelId, "alphaBuffer", cgAlphaBuffer);
-                cgSolverShader.DispatchIndirect(computeAlphaKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
-            }
+                GpuProfileDispatchIndirect(cgSolverShader,computeAlphaKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
             else
-                DispatchComputeAlpha();
+                GpuProfileDispatchCompute(cgSolverShader,computeAlphaKernelId, 1, 1, 1);
             dotProductSw.Stop();
 
             // 3. x += alpha * p ; r -= alpha * Ap
@@ -300,20 +267,12 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(axpyAlphaKernelId, "xBuffer", pBuffer);
             cgSolverShader.SetBuffer(axpyAlphaKernelId, "yBuffer", pressureBuffer);
             cgSolverShader.SetBuffer(axpyAlphaKernelId, "alphaBuffer", cgAlphaBuffer);
-            cgSolverShader.SetInt("numNodes", numNodes);
-            if (pcgIndirectEarlyOut)
-                cgSolverShader.DispatchIndirect(axpyAlphaKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
-            else
-                Dispatch(axpyAlphaKernelId, numNodes);
+            GpuProfileDispatchIndirect(cgSolverShader,axpyAlphaKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
 
             cgSolverShader.SetBuffer(axpyNegAlphaKernelId, "xBuffer", ApBuffer);
             cgSolverShader.SetBuffer(axpyNegAlphaKernelId, "yBuffer", residualBuffer);
             cgSolverShader.SetBuffer(axpyNegAlphaKernelId, "alphaBuffer", cgAlphaBuffer);
-            cgSolverShader.SetInt("numNodes", numNodes);
-            if (pcgIndirectEarlyOut)
-                cgSolverShader.DispatchIndirect(axpyNegAlphaKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
-            else
-                Dispatch(axpyNegAlphaKernelId, numNodes);
+            GpuProfileDispatchIndirect(cgSolverShader,axpyNegAlphaKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
             updateVectorSw.Stop();
 
             if (k % cgCheckInterval == 0)
@@ -324,18 +283,16 @@ public partial class FluidSimulator : MonoBehaviour
                     cgSolverShader.SetBuffer(dotProductKernel, "xBuffer", residualBuffer);
                     cgSolverShader.SetBuffer(dotProductKernel, "yBuffer", residualBuffer);
                     cgSolverShader.SetBuffer(dotProductKernel, "divergenceBuffer", divergenceBuffer);
-                    cgSolverShader.SetInt("numNodes", numNodes);
-                    cgSolverShader.DispatchIndirect(dotProductKernel, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
-                    cgSolverShader.SetBuffer(globalReduceSumKernelId, "divergenceBuffer", divergenceBuffer);
-                    cgSolverShader.SetInt("reductionCount", groups512);
-                    cgSolverShader.DispatchIndirect(globalReduceSumKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
+                    GpuProfileDispatchIndirect(cgSolverShader,dotProductKernel, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
+                    cgSolverShader.SetBuffer(globalReduceSumKernelId, "reductionCountBuffer", solverReductionCount512Buffer);
+                    GpuProfileDispatchIndirect(cgSolverShader,globalReduceSumKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
                     cgSolverShader.SetFloat("convergenceThreshold", convergenceThreshold);
                     cgSolverShader.SetFloat("initialResidualSq", initialResidual);
                     cgSolverShader.SetInt("pcgLoopK", k);
                     cgSolverShader.SetBuffer(checkConvergenceKernelId, "divergenceBuffer", divergenceBuffer);
-                    cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgIndirectDispatchArgs", cgPcgIndirectArgsBuffer);
+                    cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgIndirectDispatchArgs", solverIndirectArgsBuffer);
                     cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgPcgIterationStat", cgPcgIterationStatBuffer);
-                    cgSolverShader.Dispatch(checkConvergenceKernelId, 1, 1, 1);
+                    GpuProfileDispatchCompute(cgSolverShader,checkConvergenceKernelId, 1, 1, 1);
                 }
                 else
                 {
@@ -352,7 +309,7 @@ public partial class FluidSimulator : MonoBehaviour
             // 4. z = M^-1 r, rho_new = r·z → divergence[0]; beta and rho on GPU
             dotProductSw.Start();
             if (pcgIndirectEarlyOut)
-                ApplyPreconditionerPcgIterationGpuIndirect(residualBuffer, zVectorBuffer, applyJacobiKernelId, groups512);
+                ApplyPreconditionerPcgIterationGpuIndirect(residualBuffer, zVectorBuffer, applyJacobiKernelId, 0);
             else
                 ApplyPreconditionerPcgIterationGpu(residualBuffer, zVectorBuffer, applyJacobiKernelId);
 
@@ -360,9 +317,9 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(computeBetaKernelId, "rhoBuffer", cgRhoBuffer);
             cgSolverShader.SetBuffer(computeBetaKernelId, "betaBuffer", cgBetaBuffer);
             if (pcgIndirectEarlyOut)
-                cgSolverShader.DispatchIndirect(computeBetaKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
+                GpuProfileDispatchIndirect(cgSolverShader,computeBetaKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
             else
-                cgSolverShader.Dispatch(computeBetaKernelId, 1, 1, 1);
+                GpuProfileDispatchCompute(cgSolverShader,computeBetaKernelId, 1, 1, 1);
             dotProductSw.Stop();
 
             // 5. p = beta * p + z
@@ -370,16 +327,21 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(scaleAddBetaKernelId, "pBuffer", pBuffer);
             cgSolverShader.SetBuffer(scaleAddBetaKernelId, "yBuffer", zVectorBuffer);
             cgSolverShader.SetBuffer(scaleAddBetaKernelId, "betaBuffer", cgBetaBuffer);
-            cgSolverShader.SetInt("numNodes", numNodes);
-            if (pcgIndirectEarlyOut)
-                cgSolverShader.DispatchIndirect(scaleAddBetaKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
-            else
-                Dispatch(scaleAddBetaKernelId, numNodes);
+            GpuProfileDispatchIndirect(cgSolverShader,scaleAddBetaKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
             updateVectorSw.Stop();
 
             if (!pcgIndirectEarlyOut)
                 totalIterations = k + 1;
         }
+        }
+
+        if (pcgIndirectEarlyOut && emitGpuDebugLabels)
+        {
+            using (new GpuProfileSection(this, "FluidSim.SolvePressure.PCG"))
+                RunPcgLoop();
+        }
+        else
+            RunPcgLoop();
 
         if (pcgIndirectEarlyOut)
         {
@@ -432,7 +394,8 @@ public partial class FluidSimulator : MonoBehaviour
         }
 
         // --- Step 4: Apply pressure to velocities ---
-        ApplyPressureGradient();
+        using (new GpuProfileSection(this, "FluidSim.SolvePressure.ApplyPressure"))
+            ApplyPressureGradient();
     }
 
     private void ApplyPressureGradient()
@@ -452,80 +415,40 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetFloat("deltaTime", deltaTime);
         nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         nodesShader.SetInt("minLayer", minLayer);
-
-        int threadGroups = Mathf.CeilToInt(numNodes / 256.0f);
-        nodesShader.Dispatch(applyPressureGradientKernel, threadGroups, 1, 1);
+        GpuProfileDispatchIndirect(nodesShader,applyPressureGradientKernel, solverIndirectArgsBuffer, SolverArgsOffset256);
 
         ComputeBuffer swap = nodesBuffer;
         nodesBuffer = tempNodesBuffer;
         tempNodesBuffer = swap;
     }
 
-    private void InitCgPcgIndirectArgs(int groupsA256, int groups512Ct)
-    {
-        cgPcgIndirectArgsScratch[0] = (uint)groupsA256;
-        cgPcgIndirectArgsScratch[1] = 1u;
-        cgPcgIndirectArgsScratch[2] = 1u;
-        cgPcgIndirectArgsScratch[3] = (uint)groups512Ct;
-        cgPcgIndirectArgsScratch[4] = 1u;
-        cgPcgIndirectArgsScratch[5] = 1u;
-        cgPcgIndirectArgsScratch[6] = 1u;
-        cgPcgIndirectArgsScratch[7] = 1u;
-        cgPcgIndirectArgsScratch[8] = 1u;
-        cgPcgIndirectArgsBuffer.SetData(cgPcgIndirectArgsScratch);
-    }
-
     private void GpuCopyBufferIndirect(ComputeBuffer source, ComputeBuffer destination)
     {
         cgSolverShader.SetBuffer(copyFloatKernelId, "xBuffer", source);
         cgSolverShader.SetBuffer(copyFloatKernelId, "yBuffer", destination);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        cgSolverShader.DispatchIndirect(copyFloatKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
+        GpuProfileDispatchIndirect(cgSolverShader,copyFloatKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
     }
 
-    private void GpuDotProductReduceNoReadbackIndirect(ComputeBuffer bufferA, ComputeBuffer bufferB, int groups512Ct)
+    private void GpuDotProductReduceNoReadbackIndirect(ComputeBuffer bufferA, ComputeBuffer bufferB, int _unused)
     {
         cgSolverShader.SetBuffer(dotProductKernel, "xBuffer", bufferA);
         cgSolverShader.SetBuffer(dotProductKernel, "yBuffer", bufferB);
         cgSolverShader.SetBuffer(dotProductKernel, "divergenceBuffer", divergenceBuffer);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        cgSolverShader.DispatchIndirect(dotProductKernel, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
+        GpuProfileDispatchIndirect(cgSolverShader,dotProductKernel, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
         cgSolverShader.SetBuffer(globalReduceSumKernelId, "divergenceBuffer", divergenceBuffer);
-        cgSolverShader.SetInt("reductionCount", groups512Ct);
-        cgSolverShader.DispatchIndirect(globalReduceSumKernelId, cgPcgIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
-    }
-
-    private void Dispatch(int kernel, int count)
-    {
-        int threadGroups = Mathf.CeilToInt(count / 512.0f);
-        cgSolverShader.Dispatch(kernel, threadGroups, 1, 1);
+        cgSolverShader.SetBuffer(globalReduceSumKernelId, "reductionCountBuffer", solverReductionCount512Buffer);
+        GpuProfileDispatchIndirect(cgSolverShader,globalReduceSumKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
     }
 
     // Legacy name kept for FluidPreconditioner.cs callers.
     private void CopyBuffer(ComputeBuffer source, ComputeBuffer destination) => GpuCopyBuffer(source, destination);
 
-    // GPU-only buffer copy: no CPU round-trip.
+    // GPU-only buffer copy: fully indirect, no CPU round-trip.
     private void GpuCopyBuffer(ComputeBuffer source, ComputeBuffer destination)
     {
         cgSolverShader.SetBuffer(copyFloatKernelId, "xBuffer", source);
         cgSolverShader.SetBuffer(copyFloatKernelId, "yBuffer", destination);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(copyFloatKernelId, numNodes);
-    }
-
-    private void GpuFinalizeReduction(int groupCount)
-    {
-        cgSolverShader.SetBuffer(globalReduceSumKernelId, "divergenceBuffer", divergenceBuffer);
-        cgSolverShader.SetInt("reductionCount", groupCount);
-        cgSolverShader.Dispatch(globalReduceSumKernelId, 1, 1, 1);
-    }
-
-    // Finishes the reduction already started by SpMV (partial sums in divergenceBuffer[0..groupCount-1]).
-    private float GpuReduceSum(int groupCount)
-    {
-        GpuFinalizeReduction(groupCount);
-        divergenceBuffer.GetData(reductionResult, 0, 0, 1);
-        return reductionResult[0];
+        GpuProfileDispatchIndirect(cgSolverShader,copyFloatKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
     }
 
     private void GpuDotProductReduceNoReadback(ComputeBuffer bufferA, ComputeBuffer bufferB)
@@ -533,17 +456,17 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(dotProductKernel, "xBuffer", bufferA);
         cgSolverShader.SetBuffer(dotProductKernel, "yBuffer", bufferB);
         cgSolverShader.SetBuffer(dotProductKernel, "divergenceBuffer", divergenceBuffer);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        cgSolverShader.Dispatch(dotProductKernel, threadGroups, 1, 1);
-        GpuFinalizeReduction(threadGroups);
+        GpuProfileDispatchIndirect(cgSolverShader,dotProductKernel, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
+        cgSolverShader.SetBuffer(globalReduceSumKernelId, "divergenceBuffer", divergenceBuffer);
+        cgSolverShader.SetBuffer(globalReduceSumKernelId, "reductionCountBuffer", solverReductionCount512Buffer);
+        GpuProfileDispatchIndirect(cgSolverShader,globalReduceSumKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
     }
 
     private void DispatchStoreRhoFromDot()
     {
         cgSolverShader.SetBuffer(storeRhoFromDotKernelId, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetBuffer(storeRhoFromDotKernelId, "rhoBuffer", cgRhoBuffer);
-        cgSolverShader.Dispatch(storeRhoFromDotKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(cgSolverShader,storeRhoFromDotKernelId, 1, 1, 1);
     }
 
     private void DispatchComputeAlpha()
@@ -551,7 +474,7 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(computeAlphaKernelId, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetBuffer(computeAlphaKernelId, "rhoBuffer", cgRhoBuffer);
         cgSolverShader.SetBuffer(computeAlphaKernelId, "alphaBuffer", cgAlphaBuffer);
-        cgSolverShader.Dispatch(computeAlphaKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(cgSolverShader,computeAlphaKernelId, 1, 1, 1);
     }
 
     private void DispatchComputeBeta()
@@ -559,7 +482,7 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(computeBetaKernelId, "divergenceBuffer", divergenceBuffer);
         cgSolverShader.SetBuffer(computeBetaKernelId, "rhoBuffer", cgRhoBuffer);
         cgSolverShader.SetBuffer(computeBetaKernelId, "betaBuffer", cgBetaBuffer);
-        cgSolverShader.Dispatch(computeBetaKernelId, 1, 1, 1);
+        GpuProfileDispatchCompute(cgSolverShader,computeBetaKernelId, 1, 1, 1);
     }
 
     private float GpuDotProduct(ComputeBuffer bufferA, ComputeBuffer bufferB)
@@ -569,41 +492,36 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(dotProductKernel, "xBuffer", bufferA);
         cgSolverShader.SetBuffer(dotProductKernel, "yBuffer", bufferB);
         cgSolverShader.SetBuffer(dotProductKernel, "divergenceBuffer", divergenceBuffer);
-        cgSolverShader.SetInt("numNodes", numNodes);
+        GpuProfileDispatchIndirect(cgSolverShader,dotProductKernel, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
 
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        cgSolverShader.Dispatch(dotProductKernel, threadGroups, 1, 1);
+        cgSolverShader.SetBuffer(globalReduceSumKernelId, "divergenceBuffer", divergenceBuffer);
+        cgSolverShader.SetBuffer(globalReduceSumKernelId, "reductionCountBuffer", solverReductionCount512Buffer);
+        GpuProfileDispatchIndirect(cgSolverShader,globalReduceSumKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetSingleGroup);
 
-        return GpuReduceSum(threadGroups);
+        divergenceBuffer.GetData(reductionResult, 0, 0, 1);
+        return reductionResult[0];
     }
 
     private void UpdateVector(ComputeBuffer yBuffer, ComputeBuffer xBuffer, float a)
     {
         if (cgSolverShader == null) return;
-
         cgSolverShader.SetBuffer(axpyKernel, "xBuffer", xBuffer);
         cgSolverShader.SetBuffer(axpyKernel, "yBuffer", yBuffer);
         cgSolverShader.SetFloat("a", a);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(axpyKernel, numNodes);
+        GpuProfileDispatchIndirect(cgSolverShader,axpyKernel, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
     }
 
     private void UpdateVector(ComputeBuffer pBuf, ComputeBuffer rBuffer, float rCoeff, float pCoeff)
     {
         if (cgSolverShader == null) return;
-
-        // p = beta * p
         cgSolverShader.SetBuffer(scaleKernelId, "yBuffer", pBuf);
         cgSolverShader.SetFloat("a", pCoeff);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(scaleKernelId, numNodes);
+        GpuProfileDispatchIndirect(cgSolverShader,scaleKernelId, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
 
-        // p = r + p  (rCoeff is always 1.0)
         cgSolverShader.SetBuffer(axpyKernel, "xBuffer", rBuffer);
         cgSolverShader.SetBuffer(axpyKernel, "yBuffer", pBuf);
         cgSolverShader.SetFloat("a", rCoeff);
-        cgSolverShader.SetInt("numNodes", numNodes);
-        Dispatch(axpyKernel, numNodes);
+        GpuProfileDispatchIndirect(cgSolverShader,axpyKernel, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
     }
 
     /// <summary>Finishes after the GPU has written <see cref="cgPcgIterationStatBuffer"/>; updates CG profiling (typically next frame).</summary>
@@ -632,6 +550,6 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetFloat("gravity", gravity);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);
-        nodesShader.DispatchIndirect(applyExternalForcesKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesShader,applyExternalForcesKernel, dispatchArgsBuffer, 0);
     }
 }

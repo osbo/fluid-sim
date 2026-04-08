@@ -492,7 +492,7 @@ public struct LeafOnlyCheckpointHeader
         }
 
         int e = exp - 15 + 127;
-        uint ubits = (uint)((sign << 16) | ((uint)e << 23) | ((uint)mant << 13));
+        uint ubits = (((uint)sign << 16) | ((uint)e << 23) | ((uint)mant << 13));
         return BitConverter.ToSingle(BitConverter.GetBytes(ubits), 0);
     }
 }

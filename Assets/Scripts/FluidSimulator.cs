@@ -5,8 +5,8 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
-using UnityEngine.Rendering;
 using System.IO;
+using Unity.Profiling;
 
 // Main FluidSimulator class - split into partial classes for better organization
 // Core simulation logic: particle management, main loop, initialization
@@ -48,6 +48,10 @@ public partial class FluidSimulator : MonoBehaviour
     private int writeNodeCountKernel;
     private int radixPrefixSumKernelId;
     private int radixPrefixFixupKernelId;
+    private int radixPrefixSumSolverMainKernelId;
+    private int radixPrefixSumSolverAuxKernelId;
+    private int radixPrefixFixupSolverKernelId;
+    private int buildSolverIndirectArgsKernelId;
     private int findNeighborsKernel;
     private int findReverseKernel;
     private int interpolateFaceVelocitiesKernel;
@@ -127,10 +131,13 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer cgAlphaBuffer;
     private ComputeBuffer cgBetaBuffer;
     private ComputeBuffer cgRhoBuffer;
-    /// <summary>9 uints: 3× DispatchIndirect triples — SpMV (256), 512-thread ops, 1-group ops. Zeros stop PCG work.</summary>
-    private ComputeBuffer cgPcgIndirectArgsBuffer;
+    /// <summary>12 uints: 4× DispatchIndirect triples — [0] SpMV/256-thread, [1] 512-thread, [2] 1-group, [3] prefix-pass1.
+    /// Replaces cgPcgIndirectArgsBuffer; first 9 uints are written by BuildSolverIndirectArgs each frame.</summary>
+    private ComputeBuffer solverIndirectArgsBuffer;
+    private ComputeBuffer solverReductionCount256Buffer; // ceil(n/256) for GlobalReduceSum after SpMV
+    private ComputeBuffer solverReductionCount512Buffer; // ceil(n/512) for GlobalReduceSum after DotProduct
+    private ComputeBuffer solverPrefixLenBuffer;         // [0]=numNodes [1]=pfx1, for CSR prefix sum kernels
     private ComputeBuffer cgPcgIterationStatBuffer;
-    private readonly uint[] cgPcgIndirectArgsScratch = new uint[9];
     private readonly uint[] cgPcgIterationStatScratch = new uint[1];
     private ComputeBuffer diffusionGradientBuffer; // Precomputed normalized density gradient per node
     private ComputeBuffer dispatchArgsBuffer;       // 3-uint indirect dispatch args for DispatchIndirect
@@ -164,11 +171,19 @@ public partial class FluidSimulator : MonoBehaviour
     public float frameRate = 30.0f;
     [Range(0, 10)] public int minLayer = 4;
     [Range(0, 10)] public int maxLayer = 10;
-    [Tooltip("Each frame: GPU readback of nodesBuffer and Debug.Log of how many nodes sit at each layer index (after findNeighbors).")]
+    [Tooltip("When per-frame debug timing log is enabled: each frame, GPU readback of nodesBuffer and layer histogram text for the summary. No effect when that master toggle is off.")]
     public bool logLayerCountsPerFrame = true;
+
+    [Header("Debug: frame stats / logging")]
+    [Tooltip("Master toggle for expensive per-frame diagnostics. When off (default): no frame summary Debug.Log, no cumulative timing averages, no layer-count readback, and GPU sync for section timing is skipped. Stopwatches still run (cheap); use Unity Profiler FluidSim.* markers. Turn on only while profiling.")]
+    public bool enablePerFrameDebugTimingLog = false;
+
+    [Header("Debug: section timing vs GPU")]
+    [Tooltip("Only when per-frame debug timing log is enabled. Each timed simulation step runs AsyncGPUReadback (tiny slices) before and after the step so Stopwatch ms ≈ GPU work for that step. Very slow. Off = timers measure mostly CPU enqueue time.")]
+    public bool gpuSyncForSectionTimingReport = false;
+
     public PreconditionerType preconditioner = PreconditionerType.Jacobi;
 
-    private bool hasShownWaitMessage = false;
     private int frameNumber = 0;
     private double cumulativeFrameTimeMs = 0.0;
     private double cumulativeCgIterations = 0.0;
@@ -182,6 +197,21 @@ public partial class FluidSimulator : MonoBehaviour
     private System.Diagnostics.Stopwatch totalOctreeSw;
     private System.Diagnostics.Stopwatch renderSw = new System.Diagnostics.Stopwatch();
     private double lastRenderTimeMs = 0.0;
+
+    // Profiler markers for Unity Profiler GPU timeline
+    static readonly ProfilerMarker s_FrameMarker            = new ProfilerMarker("FluidSim.Frame");
+    static readonly ProfilerMarker s_SortMarker             = new ProfilerMarker("FluidSim.Sort");
+    static readonly ProfilerMarker s_FindUniqueMarker       = new ProfilerMarker("FluidSim.FindUnique");
+    static readonly ProfilerMarker s_CreateLeavesMarker     = new ProfilerMarker("FluidSim.CreateLeaves");
+    static readonly ProfilerMarker s_LayerLoopMarker        = new ProfilerMarker("FluidSim.LayerLoop");
+    static readonly ProfilerMarker s_FindNeighborsMarker    = new ProfilerMarker("FluidSim.FindNeighbors");
+    static readonly ProfilerMarker s_GradientsMarker        = new ProfilerMarker("FluidSim.CalculateGradients");
+    static readonly ProfilerMarker s_StoreVelocitiesMarker  = new ProfilerMarker("FluidSim.StoreOldVelocities");
+    static readonly ProfilerMarker s_ExternalForcesMarker   = new ProfilerMarker("FluidSim.ApplyExternalForces");
+    static readonly ProfilerMarker s_NodeCountReadbackMarker= new ProfilerMarker("FluidSim.NodeCountReadback");
+    static readonly ProfilerMarker s_SolvePressureMarker    = new ProfilerMarker("FluidSim.SolvePressure");
+    static readonly ProfilerMarker s_UpdateParticlesMarker  = new ProfilerMarker("FluidSim.UpdateParticles");
+    static readonly ProfilerMarker s_GpuTimingSyncMarker    = new ProfilerMarker("FluidSim.GpuTimingSync");
     
     // Simulation parameters (calculated in InitializeParticleSystem)
     private Vector3 mortonNormalizationFactor;
@@ -433,6 +463,31 @@ public partial class FluidSimulator : MonoBehaviour
         particlesBuffer.SetData(particlesCPU);
     }
 
+    /// <summary>Optional: tiny async readbacks + wait so section Stopwatches approximate GPU time (see <see cref="gpuSyncForSectionTimingReport"/>).</summary>
+    private void GpuTimingReportFlushGpu(bool includePressureBuffer = false)
+    {
+        if (!enablePerFrameDebugTimingLog || !gpuSyncForSectionTimingReport)
+            return;
+        using (s_GpuTimingSyncMarker.Auto())
+        {
+            if (particlesBuffer != null)
+            {
+                var r = AsyncGPUReadback.Request(particlesBuffer, 4, 0);
+                r.WaitForCompletion();
+            }
+            if (nodeCount != null)
+            {
+                var r = AsyncGPUReadback.Request(nodeCount, sizeof(uint), 0);
+                r.WaitForCompletion();
+            }
+            if (includePressureBuffer && pressureBuffer != null)
+            {
+                var r = AsyncGPUReadback.Request(pressureBuffer, sizeof(float), 0);
+                r.WaitForCompletion();
+            }
+        }
+    }
+
     void Update()
     {
         // Check for pause/resume toggle (space bar)
@@ -451,106 +506,178 @@ public partial class FluidSimulator : MonoBehaviour
         layer = minLayer;
         
         var frameSw = System.Diagnostics.Stopwatch.StartNew();
-        
+        using var _ = s_FrameMarker.Auto();
+
         // Calculate maxDetailCellSize for volume calculations
         // Use the normalized simulation bounds (simulationBoundsMin is now Vector3.zero)
         Vector3 simulationSize = simulationBoundsMax;
         maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
 
+        var sortSw = new System.Diagnostics.Stopwatch();
+        var findUniqueSw = new System.Diagnostics.Stopwatch();
+        var createLeavesSw = new System.Diagnostics.Stopwatch();
+        var layerLoopSw = new System.Diagnostics.Stopwatch();
+        var findNeighborsSw = new System.Diagnostics.Stopwatch();
+        var calculateGradientsSw = new System.Diagnostics.Stopwatch();
+        var computeLevelSetSw = new System.Diagnostics.Stopwatch();
+        var storeOldVelocitiesSw = new System.Diagnostics.Stopwatch();
+        var applyExternalForcesSw = new System.Diagnostics.Stopwatch();
+
+        // GPU labels: one ExecuteCommandBuffer when this scope ends, *before* nodeCount readback below (nested inner scopes do not flush).
+        using (new GpuProfileSection(this, "FluidSim.PrePressure"))
+        {
         // Step 1: Sort particles
-        var sortSw = System.Diagnostics.Stopwatch.StartNew();
-        SortParticles();
+        GpuTimingReportFlushGpu(false);
+        sortSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.Sort"))
+        using (s_SortMarker.Auto())
+            SortParticles();
+        GpuTimingReportFlushGpu(false);
         sortSw.Stop();
 
         // Step 2: Find unique particles and create leaves
-        var findUniqueSw = System.Diagnostics.Stopwatch.StartNew();
-        findUniqueParticles();
+        GpuTimingReportFlushGpu(false);
+        findUniqueSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.FindUnique"))
+        using (s_FindUniqueMarker.Auto())
+            findUniqueParticles();
+        GpuTimingReportFlushGpu(false);
         findUniqueSw.Stop();
 
-        var createLeavesSw = System.Diagnostics.Stopwatch.StartNew();
-        CreateLeaves();
+        GpuTimingReportFlushGpu(false);
+        createLeavesSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.CreateLeaves"))
+        using (s_CreateLeavesMarker.Auto())
+            CreateLeaves();
+        GpuTimingReportFlushGpu(false);
         createLeavesSw.Stop();
 
         // Step 3: Layer loop (layers 1-10)
-        var layerLoopSw = System.Diagnostics.Stopwatch.StartNew();
-        for (layer = layer + 1; layer <= maxLayer; layer++)
+        GpuTimingReportFlushGpu(false);
+        layerLoopSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.LayerLoop"))
+        using (s_LayerLoopMarker.Auto())
         {
-            
-            findUniqueNodes();
-            ProcessNodes();
-            compactNodes();
-            // mortonCodesBuffer is refreshed inside scatterActives (fused with compaction).
+            for (layer = layer + 1; layer <= maxLayer; layer++)
+            {
+                findUniqueNodes();
+                ProcessNodes();
+                compactNodes();
+                // mortonCodesBuffer is refreshed inside scatterActives (fused with compaction).
+            }
         }
+        GpuTimingReportFlushGpu(false);
         layerLoopSw.Stop();
 
         // Step 4: Find neighbors (GPU: WriteIndirectArgsFromCount + DispatchIndirect — no CPU count needed)
-        var findNeighborsSw = System.Diagnostics.Stopwatch.StartNew();
-        findNeighbors();
+        GpuTimingReportFlushGpu(false);
+        findNeighborsSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.FindNeighbors"))
+        using (s_FindNeighborsMarker.Auto())
+            findNeighbors();
+        GpuTimingReportFlushGpu(false);
         findNeighborsSw.Stop();
 
         // Step 4.5: Calculate density gradients (indirect from GPU nodeCount)
-        var calculateGradientsSw = System.Diagnostics.Stopwatch.StartNew();
-        CalculateDensityGradients();
+        GpuTimingReportFlushGpu(false);
+        calculateGradientsSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.CalculateGradients"))
+        using (s_GradientsMarker.Auto())
+            CalculateDensityGradients();
+        GpuTimingReportFlushGpu(false);
         calculateGradientsSw.Stop();
 
         // Step 5: Compute level set (distance field)
-        var computeLevelSetSw = System.Diagnostics.Stopwatch.StartNew();
+        GpuTimingReportFlushGpu(false);
+        computeLevelSetSw.Restart();
         // ComputeLevelSet();
+        GpuTimingReportFlushGpu(false);
         computeLevelSetSw.Stop();
 
         // Step 6: Store old velocities for FLIP method
-        var storeOldVelocitiesSw = System.Diagnostics.Stopwatch.StartNew();
-        StoreOldVelocities();
+        GpuTimingReportFlushGpu(false);
+        storeOldVelocitiesSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.StoreOldVelocities"))
+        using (s_StoreVelocitiesMarker.Auto())
+            StoreOldVelocities();
+        GpuTimingReportFlushGpu(false);
         storeOldVelocitiesSw.Stop();
 
         // Step 7: Apply external forces (indirect from GPU nodeCount)
-        var applyExternalForcesSw = System.Diagnostics.Stopwatch.StartNew();
-        ApplyExternalForces();
+        GpuTimingReportFlushGpu(false);
+        applyExternalForcesSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.ApplyExternalForces"))
+        using (s_ExternalForcesMarker.Auto())
+            ApplyExternalForces();
+        GpuTimingReportFlushGpu(false);
         applyExternalForcesSw.Stop();
+        }
 
-        // Single sync readback: CPU needs numNodes for SolvePressure, UpdateParticles, rendering, and optional layer log.
-        nodeCount.GetData(gpuNodeCountReadback);
-        numNodes = (int)gpuNodeCountReadback[0];
-        string layerCountsLine = BuildLayerCountsSummaryForLog();
+        // One uint sync readback: CPU must have correct numNodes this frame for SolvePressure (LeafOnly),
+        // BuildLayerCountsSummaryForLog, rendering instance counts, etc. GPU indirect dispatches already use nodeCount buffer.
+        using (s_NodeCountReadbackMarker.Auto())
+        {
+            nodeCount.GetData(gpuNodeCountReadback);
+            numNodes = (int)gpuNodeCountReadback[0];
+        }
+        string layerCountsLine = null;
+        if (enablePerFrameDebugTimingLog && logLayerCountsPerFrame)
+            layerCountsLine = BuildLayerCountsSummaryForLog();
 
-        // Step 9: Solve pressure
-        var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
-        SolvePressure();
+        // Step 9: Solve pressure (GPU labels are sub-scopes inside SolvePressure — LeafOnly/Neural use immediate dispatches)
+        var solvePressureSw = new System.Diagnostics.Stopwatch();
+        GpuTimingReportFlushGpu(false);
+        solvePressureSw.Restart();
+        using (s_SolvePressureMarker.Auto())
+            SolvePressure();
+        GpuTimingReportFlushGpu(true);
         solvePressureSw.Stop();
 
         // Step 10: Update particles
-        var updateParticlesSw = System.Diagnostics.Stopwatch.StartNew();
-        UpdateParticles();
+        var updateParticlesSw = new System.Diagnostics.Stopwatch();
+        GpuTimingReportFlushGpu(false);
+        updateParticlesSw.Restart();
+        using (new GpuProfileSection(this, "FluidSim.UpdateParticles"))
+        using (s_UpdateParticlesMarker.Auto())
+            UpdateParticles();
+        GpuTimingReportFlushGpu(false);
         updateParticlesSw.Stop();
 
-        // Frame timing summary
+        // Frame timing summary (optional; Console + string build are costly on the main thread)
         frameSw.Stop();
-        frameNumber++;
-        cumulativeFrameTimeMs += frameSw.Elapsed.TotalMilliseconds;
-        double averageFrameTimeMs = cumulativeFrameTimeMs / Math.Max(1, frameNumber);
-        string averageCgIterationsText = cgSolveFrameCount > 0 ? averageCgIterations.ToString("F2") : "N/A";
-        Debug.Log($"Frame {frameNumber} Summary:\n" +
-                 $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Avg Frame Time: {averageFrameTimeMs:F2} ms\n" +
-                 $"• # Nodes: {numNodes}\n" +
-                 (layerCountsLine != null ? $"• {layerCountsLine}\n" : "") +
-                 $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Find Neighbors: {findNeighborsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Calculate Gradients: {calculateGradientsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Compute Level Set: {computeLevelSetSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Apply External Forces: {applyExternalForcesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                 $"• Rendering: {lastRenderTimeMs:F2} ms\n" +
-                 $"• CG Iterations: {lastCgIterations}\n" +
-                 $"• Avg CG Iterations: {averageCgIterationsText}");
+        if (enablePerFrameDebugTimingLog)
+        {
+            frameNumber++;
+            cumulativeFrameTimeMs += frameSw.Elapsed.TotalMilliseconds;
+            double averageFrameTimeMs = cumulativeFrameTimeMs / Math.Max(1, frameNumber);
+            string averageCgIterationsText = cgSolveFrameCount > 0 ? averageCgIterations.ToString("F2") : "N/A";
+            string timingModeNote = gpuSyncForSectionTimingReport
+                ? "• Timing mode: GPU sync ON (section ms include AsyncGPUReadback waits; not a full device idle guarantee).\n"
+                : "";
+            Debug.Log($"Frame {frameNumber} Summary:\n" +
+                     $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Avg Frame Time: {averageFrameTimeMs:F2} ms\n" +
+                     (timingModeNote.Length > 0 ? timingModeNote : "") +
+                     $"• # Nodes: {numNodes}\n" +
+                     (layerCountsLine != null ? $"• {layerCountsLine}\n" : "") +
+                     $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Find Neighbors: {findNeighborsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Calculate Gradients: {calculateGradientsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Compute Level Set: {computeLevelSetSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Apply External Forces: {applyExternalForcesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
+                     $"• Rendering: {lastRenderTimeMs:F2} ms\n" +
+                     $"• CG Iterations: {lastCgIterations}\n" +
+                     $"• Avg CG Iterations: {averageCgIterationsText}");
+        }
     }
 
-    /// <summary>Non-null when <see cref="logLayerCountsPerFrame"/> is true: histogram after <see cref="numNodes"/> readback.</summary>
+    /// <summary>Layer histogram after <see cref="numNodes"/> readback; caller must gate with <see cref="enablePerFrameDebugTimingLog"/> and <see cref="logLayerCountsPerFrame"/>.</summary>
     private string BuildLayerCountsSummaryForLog()
     {
         if (!logLayerCountsPerFrame)
@@ -657,7 +784,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(calculateDensityGradientKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
-        nodesShader.DispatchIndirect(calculateDensityGradientKernel, dispatchArgsBuffer, 0);
+        GpuProfileDispatchIndirect(nodesShader, calculateDensityGradientKernel, dispatchArgsBuffer, 0);
     }
 
     private void StoreOldVelocities()
@@ -671,7 +798,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetBuffer(copyNodesKernelId, "tempNodesBuffer", nodesBuffer);
         nodesPrefixSumsShader.SetBuffer(copyNodesKernelId, "nodesBuffer", nodesBufferOld);
         int copyGroups = Mathf.Max(1, (maxNodesCapacity + 511) / 512);
-        nodesPrefixSumsShader.Dispatch(copyNodesKernelId, copyGroups, 1, 1);
+        GpuProfileDispatchCompute(nodesPrefixSumsShader, copyNodesKernelId, copyGroups, 1, 1);
     }
 
     private void UpdateParticles()
@@ -690,7 +817,7 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetBuffer(updateParticlesKernel, "nodesBufferOld", nodesBufferOld);
         particlesShader.SetBuffer(updateParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetBuffer(updateParticlesKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
-        particlesShader.SetInt("numNodes", numNodes);
+        particlesShader.SetBuffer(updateParticlesKernel, "nodeCountBuffer", nodeCount);
         particlesShader.SetInt("numParticles", numParticles);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         particlesShader.SetFloat("deltaTime", deltaTime);
@@ -703,7 +830,7 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetInt("minLayer", minLayer);
         particlesShader.SetInt("maxLayer", maxLayer);
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
-        particlesShader.Dispatch(updateParticlesKernel, threadGroups, 1, 1);
+        GpuProfileDispatchCompute(particlesShader, updateParticlesKernel, threadGroups, 1, 1);
     }
 
     private void InitializeParticleSystem()
@@ -824,6 +951,11 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
 
         AllocateOctreeBuffersToCapacity();
+
+        radixSort?.ReleaseBuffers();
+        radixSort = null;
+        if (radixSortShader != null)
+            radixSort = new RadixSort(radixSortShader, (uint)numParticles);
     }
 
     /// <summary>Preallocate octree/prefix buffers so the update loop never resizes or stalls on GPU count readbacks mid-pipeline.</summary>
@@ -866,6 +998,36 @@ public partial class FluidSimulator : MonoBehaviour
         reverseNeighborsBuffer = new ComputeBuffer(maxNodesCapacity * 24, sizeof(uint));
         diffusionGradientBuffer = new ComputeBuffer(maxNodesCapacity, sizeof(float) * 3);
         particlePrefixElementCountBuffer = new ComputeBuffer(1, sizeof(uint));
+
+        // Pre-allocate solver buffers to max capacity so SolvePressure never resizes mid-frame.
+        int solverCap = Mathf.NextPowerOfTwo(Mathf.Max(maxNodesCapacity, 512));
+        int maxNnz    = solverCap * 25;
+        divergenceBuffer?.Release(); divergenceBuffer = new ComputeBuffer(solverCap, sizeof(float));
+        residualBuffer?.Release();   residualBuffer   = new ComputeBuffer(solverCap, sizeof(float));
+        pBuffer?.Release();          pBuffer          = new ComputeBuffer(solverCap, sizeof(float));
+        ApBuffer?.Release();         ApBuffer         = new ComputeBuffer(solverCap, sizeof(float));
+        pressureBuffer?.Release();   pressureBuffer   = new ComputeBuffer(solverCap, sizeof(float));
+        zVectorBuffer?.Release();    zVectorBuffer    = new ComputeBuffer(solverCap, sizeof(float));
+        matrixABuffer?.Release();    matrixABuffer    = new ComputeBuffer(maxNodesCapacity * 25, sizeof(float));
+        nnzPerNode?.Release();       nnzPerNode       = new ComputeBuffer(solverCap, sizeof(uint));
+        csrRowPtr?.Release();        csrRowPtr        = new ComputeBuffer(solverCap + 1, sizeof(uint));
+        csrColIndices?.Release();    csrColIndices    = new ComputeBuffer(maxNnz, sizeof(uint));
+        csrRowIndices?.Release();    csrRowIndices    = new ComputeBuffer(maxNnz, sizeof(uint));
+        csrValues?.Release();        csrValues        = new ComputeBuffer(maxNnz, sizeof(float));
+
+        // Solver indirect dispatch args (4 triples = 12 uints):
+        //   [0-2]  256-thread (BuildMatrixA, divergence, CSR, ApplyPressure)
+        //   [3-5]  512-thread (vector ops: axpy, scale, dot, copy, jacobi)
+        //   [6-8]  1-group    (GlobalReduceSum, ComputeAlpha/Beta, StoreRho)
+        //   [9-11] pfx1-groups (CSR exclusive prefix sum passes 1 & 2)
+        solverIndirectArgsBuffer?.Release();
+        solverIndirectArgsBuffer = new ComputeBuffer(12, sizeof(uint), ComputeBufferType.IndirectArguments);
+        solverReductionCount256Buffer?.Release();
+        solverReductionCount256Buffer = new ComputeBuffer(1, sizeof(uint));
+        solverReductionCount512Buffer?.Release();
+        solverReductionCount512Buffer = new ComputeBuffer(1, sizeof(uint));
+        solverPrefixLenBuffer?.Release();
+        solverPrefixLenBuffer = new ComputeBuffer(2, sizeof(uint));
     }
     
     // Public method for ScenarioManager to reset the simulation
@@ -876,12 +1038,9 @@ public partial class FluidSimulator : MonoBehaviour
     
     private void SortParticles()
     {
-        // Release and recreate radix sort each frame since numParticles changes
-        radixSort?.ReleaseBuffers();
-        radixSort = new RadixSort(radixSortShader, (uint)numParticles);
-        
-        // Sort the particles directly by their morton codes
-        radixSort.Sort(particlesBuffer, particlesBuffer, (uint)numParticles);
+        if (radixSort == null || radixSortShader == null)
+            return;
+        radixSort.Sort(particlesBuffer, particlesBuffer, (uint)numParticles, emitGpuDebugLabels ? fluidSimGpuProfileCmd : null);
     }
 
 
@@ -911,7 +1070,10 @@ public partial class FluidSimulator : MonoBehaviour
         cgAlphaBuffer?.Release();
         cgBetaBuffer?.Release();
         cgRhoBuffer?.Release();
-        cgPcgIndirectArgsBuffer?.Release();
+        solverIndirectArgsBuffer?.Release();
+        solverReductionCount256Buffer?.Release();
+        solverReductionCount512Buffer?.Release();
+        solverPrefixLenBuffer?.Release();
         cgPcgIterationStatBuffer?.Release();
         pBuffer?.Release();
         ApBuffer?.Release();
@@ -929,6 +1091,7 @@ public partial class FluidSimulator : MonoBehaviour
         ReleasePreconditionerBuffers();
         ReleaseLeafOnlyBuffers();
         ReleaseLeafOnlyWeightsBuffers();
+        ReleaseFluidSimGpuProfileCmd();
 
         // Clean up render textures
         if (fluidDepthTexture != null) fluidDepthTexture.Release();

@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.Rendering;
 
 public class RadixSort
 {
@@ -7,7 +8,6 @@ public class RadixSort
     private int prefixFixupKernel;
     private int splitPrepKernel;
     private int splitScatterKernel;
-    private int clearBuffer32Kernel;
     private int extractKeysKernel;
     private int applySortKernel;
     private int copyParticlesKernel;
@@ -26,22 +26,20 @@ public class RadixSort
     public RadixSort(ComputeShader shader, uint maxLength)
     {
         this.maxLength = maxLength;
-        this.sortShader = shader;
+        sortShader = shader;
 
         prefixSumKernel = sortShader.FindKernel("prefixSum");
         prefixFixupKernel = sortShader.FindKernel("prefixFixup");
         splitPrepKernel = sortShader.FindKernel("split_prep");
         splitScatterKernel = sortShader.FindKernel("split_scatter");
-        clearBuffer32Kernel = sortShader.FindKernel("clearBuffer32");
         extractKeysKernel = sortShader.FindKernel("ExtractKeys");
         applySortKernel = sortShader.FindKernel("ApplySort");
         copyParticlesKernel = sortShader.FindKernel("CopyParticles");
 
-        // KEY FIX: Only allocating 8 bytes (uint2) for the ping-pong sort buffers!
         int keySize = sizeof(uint) * 2;
         keysBufferA = new ComputeBuffer((int)maxLength, keySize, ComputeBufferType.Default);
         keysBufferB = new ComputeBuffer((int)maxLength, keySize, ComputeBufferType.Default);
-        
+
         eBuffer = new ComputeBuffer((int)maxLength, sizeof(uint), ComputeBufferType.Default);
         fBuffer = new ComputeBuffer((int)maxLength, sizeof(uint), ComputeBufferType.Default);
 
@@ -51,7 +49,7 @@ public class RadixSort
         uint threadgroupSize = 512;
         uint numThreadgroups = (maxLength + (threadgroupSize * 2) - 1) / (threadgroupSize * 2);
         uint requiredAuxSize = System.Math.Max(1, numThreadgroups);
-        
+
         auxBuffer = new ComputeBuffer((int)requiredAuxSize, sizeof(uint), ComputeBufferType.Default);
         aux2Buffer = new ComputeBuffer((int)requiredAuxSize, sizeof(uint), ComputeBufferType.Default);
         auxSmallBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Default);
@@ -69,7 +67,8 @@ public class RadixSort
         particleSortScratch?.Release();
     }
 
-    public void Sort(ComputeBuffer inputParticles, ComputeBuffer outputParticles, uint actualCount)
+    /// <summary>Morton-code radix sort: 32 single-bit passes (stable on <c>uint2(morton, index)</c>).</summary>
+    public void Sort(ComputeBuffer inputParticles, ComputeBuffer outputParticles, uint actualCount, CommandBuffer gpuCmd = null)
     {
         if (actualCount == 0) return;
 
@@ -79,50 +78,58 @@ public class RadixSort
         bool inPlace = ReferenceEquals(inputParticles, outputParticles);
         ComputeBuffer sortedParticlesOut = inPlace ? particleSortScratch : outputParticles;
 
-        // 1. Extract Keys (MortonCode, OriginalIndex)
         sortShader.SetBuffer(extractKeysKernel, "originalParticles", inputParticles);
         sortShader.SetBuffer(extractKeysKernel, "inputKeys", keysBufferA);
         sortShader.SetInt("count", (int)actualCount);
-        sortShader.Dispatch(extractKeysKernel, threadGroups, 1, 1);
+        if (gpuCmd != null)
+            gpuCmd.DispatchCompute(sortShader, extractKeysKernel, threadGroups, 1, 1);
+        else
+            sortShader.Dispatch(extractKeysKernel, threadGroups, 1, 1);
 
         ComputeBuffer keysIn = keysBufferA;
         ComputeBuffer keysOut = keysBufferB;
 
-        // 2. Sort the tiny keys 32 times
         for (int i = 0; i < 32; i++)
         {
-            EncodeSplit(keysIn, keysOut, (uint)i, actualCount);
+            EncodeSplit(keysIn, keysOut, (uint)i, actualCount, gpuCmd);
             (keysIn, keysOut) = (keysOut, keysIn);
         }
 
-        // 3. Apply Sort (Move the heavy particles ONCE based on the final sorted keys)
-        // keysIn holds the final sorted array because of the swap at the end of the loop
         sortShader.SetBuffer(applySortKernel, "originalParticles", inputParticles);
         sortShader.SetBuffer(applySortKernel, "inputKeys", keysIn);
         sortShader.SetBuffer(applySortKernel, "sortedParticlesOut", sortedParticlesOut);
         sortShader.SetInt("count", (int)actualCount);
-        sortShader.Dispatch(applySortKernel, threadGroups, 1, 1);
+        if (gpuCmd != null)
+            gpuCmd.DispatchCompute(sortShader, applySortKernel, threadGroups, 1, 1);
+        else
+            sortShader.Dispatch(applySortKernel, threadGroups, 1, 1);
 
         if (inPlace)
         {
             sortShader.SetBuffer(copyParticlesKernel, "copySrcParticles", particleSortScratch);
             sortShader.SetBuffer(copyParticlesKernel, "copyDstParticles", outputParticles);
             sortShader.SetInt("count", (int)actualCount);
-            sortShader.Dispatch(copyParticlesKernel, threadGroups, 1, 1);
+            if (gpuCmd != null)
+                gpuCmd.DispatchCompute(sortShader, copyParticlesKernel, threadGroups, 1, 1);
+            else
+                sortShader.Dispatch(copyParticlesKernel, threadGroups, 1, 1);
         }
     }
 
-    private void EncodeSplit(ComputeBuffer inputKeys, ComputeBuffer outputKeys, uint bit, uint count)
+    private void EncodeSplit(ComputeBuffer inputKeys, ComputeBuffer outputKeys, uint bit, uint count, CommandBuffer gpuCmd)
     {
         int threadGroups = (int)((count + 512 - 1) / 512);
-        
+
         sortShader.SetBuffer(splitPrepKernel, "inputKeys", inputKeys);
         sortShader.SetInt("bit", (int)bit);
         sortShader.SetBuffer(splitPrepKernel, "e", eBuffer);
         sortShader.SetInt("count", (int)count);
-        sortShader.Dispatch(splitPrepKernel, threadGroups, 1, 1);
+        if (gpuCmd != null)
+            gpuCmd.DispatchCompute(sortShader, splitPrepKernel, threadGroups, 1, 1);
+        else
+            sortShader.Dispatch(splitPrepKernel, threadGroups, 1, 1);
 
-        EncodeScan(eBuffer, fBuffer, count);
+        EncodeScan(eBuffer, fBuffer, count, gpuCmd);
 
         sortShader.SetBuffer(splitScatterKernel, "inputKeys", inputKeys);
         sortShader.SetBuffer(splitScatterKernel, "outputKeys", outputKeys);
@@ -130,10 +137,13 @@ public class RadixSort
         sortShader.SetBuffer(splitScatterKernel, "e", eBuffer);
         sortShader.SetBuffer(splitScatterKernel, "f", fBuffer);
         sortShader.SetInt("count", (int)count);
-        sortShader.Dispatch(splitScatterKernel, threadGroups, 1, 1);
+        if (gpuCmd != null)
+            gpuCmd.DispatchCompute(sortShader, splitScatterKernel, threadGroups, 1, 1);
+        else
+            sortShader.Dispatch(splitScatterKernel, threadGroups, 1, 1);
     }
 
-    private void EncodeScan(ComputeBuffer input, ComputeBuffer output, uint length)
+    private void EncodeScan(ComputeBuffer input, ComputeBuffer output, uint length, CommandBuffer gpuCmd)
     {
         if (length == 0) return;
 
@@ -148,7 +158,10 @@ public class RadixSort
             sortShader.SetBuffer(prefixSumKernel, "aux", auxBuffer);
             sortShader.SetInt("len", (int)length);
             sortShader.SetInt("zeroff", (int)zeroff);
-            sortShader.Dispatch(prefixSumKernel, 1, 1, 1);
+            if (gpuCmd != null)
+                gpuCmd.DispatchCompute(sortShader, prefixSumKernel, 1, 1, 1);
+            else
+                sortShader.Dispatch(prefixSumKernel, 1, 1, 1);
         }
         else
         {
@@ -157,7 +170,10 @@ public class RadixSort
             sortShader.SetBuffer(prefixSumKernel, "aux", auxBuffer);
             sortShader.SetInt("len", (int)length);
             sortShader.SetInt("zeroff", (int)zeroff);
-            sortShader.Dispatch(prefixSumKernel, (int)numThreadgroups, 1, 1);
+            if (gpuCmd != null)
+                gpuCmd.DispatchCompute(sortShader, prefixSumKernel, (int)numThreadgroups, 1, 1);
+            else
+                sortShader.Dispatch(prefixSumKernel, (int)numThreadgroups, 1, 1);
 
             uint auxLength = numThreadgroups;
             sortShader.SetBuffer(prefixSumKernel, "input", auxBuffer);
@@ -165,12 +181,18 @@ public class RadixSort
             sortShader.SetBuffer(prefixSumKernel, "aux", auxSmallBuffer);
             sortShader.SetInt("len", (int)auxLength);
             sortShader.SetInt("zeroff", (int)zeroff);
-            sortShader.Dispatch(prefixSumKernel, 1, 1, 1);
+            if (gpuCmd != null)
+                gpuCmd.DispatchCompute(sortShader, prefixSumKernel, 1, 1, 1);
+            else
+                sortShader.Dispatch(prefixSumKernel, 1, 1, 1);
 
             sortShader.SetBuffer(prefixFixupKernel, "input", output);
             sortShader.SetBuffer(prefixFixupKernel, "aux", aux2Buffer);
             sortShader.SetInt("len", (int)length);
-            sortShader.Dispatch(prefixFixupKernel, (int)numThreadgroups, 1, 1);
+            if (gpuCmd != null)
+                gpuCmd.DispatchCompute(sortShader, prefixFixupKernel, (int)numThreadgroups, 1, 1);
+            else
+                sortShader.Dispatch(prefixFixupKernel, (int)numThreadgroups, 1, 1);
         }
     }
 }

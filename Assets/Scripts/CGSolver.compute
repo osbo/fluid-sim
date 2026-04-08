@@ -55,11 +55,14 @@ StructuredBuffer<uint> csrRowPtr;         // [numNodes + 1]
 StructuredBuffer<uint> csrColIndices;     // [totalNNZ]
 StructuredBuffer<float> csrValues;        // [totalNNZ]
 
-uint numNodes;
-uint numNodesCapacity; // SoA stride for neighborsBuffer (matches Nodes.compute); logical count is numNodes
-float a; 
+// numNodes and reductionCount are now GPU-driven (no CPU readback).
+// nodeCountBuffer[0]          = numNodes (written by BuildSolverIndirectArgs each frame)
+// reductionCountBuffer[0]     = reductionCount (caller binds 256- or 512-variant buffer)
+StructuredBuffer<uint> nodeCountBuffer;
+StructuredBuffer<uint> reductionCountBuffer;
+uint numNodesCapacity; // fixed SoA stride for neighborsBuffer AND matrixABuffer
+float a;
 float deltaTime;
-uint reductionCount;
 
 // PCG indirect early-out (see FluidSolver.DispatchIndirect triples in cgPcgIndirectArgsBuffer):
 // [0..2] = SpMV_CSR (256 threads/group), [3..5] = 512-thread kernels, [6..8] = 1-group kernels (reduce/alpha/beta/...)
@@ -78,6 +81,7 @@ groupshared float s_data[512];
 void BuildMatrixA(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
 
     Node node = nodesBuffer[i];
@@ -85,9 +89,9 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
     float diagonal = 0.0;
     
     // Initialize off-diagonals to 0
-    // SoA layout: matrixABuffer[slot * numNodes + index]
+    // SoA layout: matrixABuffer[slot * numNodesCapacity + index]
     for(int k=0; k<24; k++) {
-        matrixABuffer[(k + 1) * numNodes + i] = 0.0;
+        matrixABuffer[(k + 1) * numNodesCapacity + i] = 0.0;
     }
 
     // Loop over 6 faces
@@ -97,7 +101,7 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
         uint neighbor_idx = neighborsBuffer[faceSlotBase * numNodesCapacity + i];
 
         // Case 1: True Boundary (Neumann) - No contribution
-        if (neighbor_idx == numNodes + 1) { continue; }
+        if (neighbor_idx == numNodes + 1u) { continue; }
 
         if (neighbor_idx < numNodes && nodesBuffer[neighbor_idx].layer >= node.layer)
         {
@@ -121,14 +125,14 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
             diagonal += weight;
             
             // Find which slot this neighbor occupies (it's the first slot of the face)
-            matrixABuffer[(faceSlotBase + 1) * numNodes + i] = -weight;
+            matrixABuffer[(faceSlotBase + 1) * numNodesCapacity + i] = -weight;
         }
         else
         {
             // Case 3/4: Child neighbors or Dirichlet
             float faceArea = dx_i * dx_i;
             float childFaceArea = faceArea / 4.0;
-            
+
             for (int k = 0; k < 4; k++)
             {
                 uint child_idx = neighborsBuffer[(faceSlotBase + k) * numNodesCapacity + i];
@@ -142,26 +146,21 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
                     float weight = (childFaceArea / distance) * deltaTime;
 
                     diagonal += weight;
-                    matrixABuffer[(slot + 1) * numNodes + i] = -weight;
+                    matrixABuffer[(slot + 1) * numNodesCapacity + i] = -weight;
                 }
                 else if (child_idx == numNodes) // Case 4: Dirichlet (Air)
                 {
-                    // Ghost value is 0.0. 
-                    // Term is w * (p_i - p_ghost) = w * p_i
-                    // Contributes to diagonal only.
                     float dx_k = dx_i * 0.5;
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
                     float weight = (childFaceArea / distance) * deltaTime;
-                    
                     diagonal += weight;
-                    // Off-diagonal is 0 because p_ghost is 0
                 }
             }
         }
     }
 
     if (!isfinite(diagonal)) diagonal = 0.0;
-    matrixABuffer[0 * numNodes + i] = diagonal; // Slot 0 is Diagonal
+    matrixABuffer[i] = diagonal; // Slot 0 is Diagonal (0 * numNodesCapacity + i = i)
 }
 
 // --- KERNEL: APPLY MATRIX A + DOT ---
@@ -176,6 +175,7 @@ void ApplyMatrixAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, ui
     uint i = id.x;
     uint li = Gtid.x;
     uint group_start_idx = Gid.x * 256;
+    uint numNodes = nodeCountBuffer[0];
 
     // --- Phase 1: Collaborative Load p into LDS ---
     if (i < numNodes) {
@@ -207,7 +207,7 @@ void ApplyMatrixAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, ui
             // Better Optimization: Check neighbor validity first
             if (neighbor_idx < numNodes)
             {
-                float weight = matrixABuffer[(k + 1) * numNodes + i];
+                float weight = matrixABuffer[(k + 1) * numNodesCapacity + i];
                 float p_neighbor;
 
                 // LDS Cache Check
@@ -261,6 +261,7 @@ void SpMV_CSR(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : 
 {
     uint i = id.x;
     uint li = Gtid.x;
+    uint numNodes = nodeCountBuffer[0];
 
     float Ap_val = 0.0;
     float p_i = 0.0;
@@ -316,6 +317,7 @@ void SpMV_CSR(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : 
 void CalculateDivergence(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
     Node node = nodesBuffer[i];
     faceVelocities v = node.velocities;
@@ -335,6 +337,7 @@ void CalculateDivergence(uint3 id : SV_DispatchThreadID)
 [numthreads(512, 1, 1)]
 void Scale(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
     float y_val = yBuffer[i];
     yBuffer[i] = a * y_val;
@@ -343,6 +346,7 @@ void Scale(uint3 id : SV_DispatchThreadID) {
 [numthreads(512, 1, 1)]
 void Axpy(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
     float x_val = xBuffer[i];
     float y_val = yBuffer[i];
@@ -353,6 +357,7 @@ void Axpy(uint3 id : SV_DispatchThreadID) {
 void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
     uint li = Gtid.x;
+    uint numNodes = nodeCountBuffer[0];
     float x_val = (i < numNodes) ? xBuffer[i] : 0.0;
     float y_val = (i < numNodes) ? yBuffer[i] : 0.0;
     if (!isfinite(x_val)) x_val = 0.0;
@@ -373,13 +378,14 @@ void DotProduct(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id 
 [numthreads(512, 1, 1)]
 void ApplyJacobi(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
 
-    float r_val = xBuffer[i]; 
+    float r_val = xBuffer[i];
     if (!isfinite(r_val)) r_val = 0.0;
 
-    // READ FROM MATRIX A (Slot 0 is Diagonal)
-    float diag_val = matrixABuffer[0 * numNodes + i]; 
+    // READ FROM MATRIX A (Slot 0 is Diagonal; 0 * numNodesCapacity + i = i)
+    float diag_val = matrixABuffer[i];
     
     // Safety check for zero / NaN diagonal
     if (!isfinite(diag_val)) diag_val = 0.0;
@@ -394,7 +400,7 @@ void ApplyJacobi(uint3 id : SV_DispatchThreadID) {
 [numthreads(64, 1, 1)]
 void GlobalReduceSum(uint3 id : SV_DispatchThreadID) {
     if (id.x != 0) return;
-    uint count = min(reductionCount, 2048);
+    uint count = min(reductionCountBuffer[0], 2048u);
     float total = 0.0;
     for(uint i = 0; i < count; i++) total += divergenceBuffer[i];
     divergenceBuffer[0] = total;
@@ -428,6 +434,7 @@ void StoreRhoFromDot(uint3 id : SV_DispatchThreadID)
 void AxpyAlpha(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
     yBuffer[i] += alphaBuffer[0] * xBuffer[i];
 }
@@ -436,6 +443,7 @@ void AxpyAlpha(uint3 id : SV_DispatchThreadID)
 void AxpyNegAlpha(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
     yBuffer[i] -= alphaBuffer[0] * xBuffer[i];
 }
@@ -445,6 +453,7 @@ void AxpyNegAlpha(uint3 id : SV_DispatchThreadID)
 void ScaleAddBeta(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
     pBuffer[i] = betaBuffer[0] * pBuffer[i] + yBuffer[i];
 }
@@ -453,6 +462,7 @@ void ScaleAddBeta(uint3 id : SV_DispatchThreadID)
 [numthreads(512, 1, 1)]
 void CopyFloat(uint3 id : SV_DispatchThreadID) {
     uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
     if (i >= numNodes) return;
     yBuffer[i] = xBuffer[i];
 }

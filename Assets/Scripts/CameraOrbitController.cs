@@ -20,7 +20,7 @@ public class CameraOrbitController : MonoBehaviour
     [SerializeField] private float orbitDistance = 10f;
     [SerializeField] private float minDistance = 1f;
     [SerializeField] private float maxDistance = 50f;
-    [SerializeField] private float orbitSpeed = 2f;
+    [SerializeField] private float orbitSpeed = 1f;
     
     [Header("Mouse Settings")]
     [SerializeField] private bool invertY = false;
@@ -169,8 +169,9 @@ public class CameraOrbitController : MonoBehaviour
         if (mouseDelta.magnitude > 0.01f) // Only update if mouse moved
         {
             // Update target rotation (mouse delta is already frame-independent)
-            targetRotation.x += mouseDelta.x * mouseSensitivity * 0.1f;
-            targetRotation.y -= mouseDelta.y * mouseSensitivity * 0.1f * (invertY ? -1f : 1f);
+            float orbitMul = mouseSensitivity * 0.1f * orbitSpeed;
+            targetRotation.x += mouseDelta.x * orbitMul;
+            targetRotation.y -= mouseDelta.y * orbitMul * (invertY ? -1f : 1f);
             
             // Clamp vertical rotation
             targetRotation.y = Mathf.Clamp(targetRotation.y, -90f, 90f);
@@ -192,8 +193,9 @@ public class CameraOrbitController : MonoBehaviour
         if (mouseDelta.magnitude > 0.01f)
         {
             // Update target rotation for free look
-            targetRotation.x += mouseDelta.x * mouseSensitivity * 0.1f;
-            targetRotation.y -= mouseDelta.y * mouseSensitivity * 0.1f * (invertY ? -1f : 1f);
+            float orbitMul = mouseSensitivity * 0.1f * orbitSpeed;
+            targetRotation.x += mouseDelta.x * orbitMul;
+            targetRotation.y -= mouseDelta.y * orbitMul * (invertY ? -1f : 1f);
             
             // Clamp vertical rotation
             targetRotation.y = Mathf.Clamp(targetRotation.y, -90f, 90f);

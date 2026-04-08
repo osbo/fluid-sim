@@ -138,7 +138,7 @@ float deltaTime;
 float dispersionPower; // >1 concentrates near left, <1 concentrates near right
 float boundaryThreshold; // normalized u threshold near left edge considered boundary
 uint minLayer;
-uint numNodes;
+StructuredBuffer<uint> nodeCountBuffer; // [0] = numNodes (GPU-driven, no CPU readback)
 uint numParticles;
 uint maxLayer;
 
@@ -225,7 +225,7 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     uint target = particle.mortonCode;
     uint left = 0;
-    uint right = numNodes;
+    uint right = nodeCountBuffer[0];
     
     // Binary search to find the first node with a Morton code >= particle's code
     while (left < right) {

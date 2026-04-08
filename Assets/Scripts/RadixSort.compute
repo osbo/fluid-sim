@@ -1,5 +1,8 @@
 #pragma kernel prefixSum
 #pragma kernel prefixFixup
+#pragma kernel prefixSumSolverMain
+#pragma kernel prefixSumSolverAux
+#pragma kernel prefixFixupSolver
 #pragma kernel split_prep
 #pragma kernel split_scatter
 #pragma kernel clearBuffer32
@@ -22,6 +25,10 @@ RWStructuredBuffer<uint> output;
 RWStructuredBuffer<uint> aux;
 uint len;
 uint zeroff;
+
+// Indirect variants for solver CSR prefix sum (len from GPU buffer, no CPU readback).
+// solverPrefixLenBuffer[0] = numNodes, [1] = pfx1 (pass-1 group count, for aux prefix).
+StructuredBuffer<uint> solverPrefixLenBuffer;
 
 // NEW: Key-Value buffers (x = morton, y = index)
 RWStructuredBuffer<uint2> inputKeys;
@@ -60,7 +67,6 @@ void ExtractKeys(uint3 id : SV_DispatchThreadID)
 void ApplySort(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= count) return;
-    // Move the heavy 28-byte struct exactly ONCE based on the sorted indices
     sortedParticlesOut[id.x] = originalParticles[inputKeys[id.x].y];
 }
 
@@ -119,6 +125,77 @@ void prefixSum(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
         if (zeroff) output[0] = 0;
         aux[blockIdx] = scan_array[2 * THREADS - 1];
     }
+}
+
+// --- Indirect solver prefix-sum variants (GPU-driven len, no CPU readback) ---
+
+[numthreads(THREADS, 1, 1)]
+void prefixSumSolverMain(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
+{
+    uint threadIdx = Gtid.x;
+    uint blockIdx  = Gid.x;
+    uint len_      = solverPrefixLenBuffer[0]; // numNodes
+    uint t1 = threadIdx + 2 * blockIdx * THREADS;
+    uint t2 = t1 + THREADS;
+
+    scan_array[threadIdx]         = (t1 < len_) ? input[t1] : 0;
+    scan_array[threadIdx + THREADS] = (t2 < len_) ? input[t2] : 0;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s1 = 1; s1 <= THREADS; s1 <<= 1) {
+        uint idx = (threadIdx + 1) * s1 * 2 - 1;
+        if (idx < 2 * THREADS) scan_array[idx] += scan_array[idx - s1];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    [unroll] for (uint s2 = THREADS >> 1; s2 > 0; s2 >>= 1) {
+        uint idx = (threadIdx + 1) * s2 * 2 - 1;
+        if (idx + s2 < 2 * THREADS) scan_array[idx + s2] += scan_array[idx];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (t1 + zeroff < len_) output[t1 + zeroff] = scan_array[threadIdx];
+    if (t2 + zeroff < len_) output[t2 + zeroff] = (threadIdx == THREADS - 1 && zeroff) ? 0 : scan_array[threadIdx + THREADS];
+    if (threadIdx == 0) { if (zeroff) output[0] = 0; aux[blockIdx] = scan_array[2 * THREADS - 1]; }
+}
+
+[numthreads(THREADS, 1, 1)]
+void prefixSumSolverAux(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
+{
+    // Always dispatched as (1,1,1); len = pfx1 (number of aux entries from pass 1).
+    uint threadIdx = Gtid.x;
+    uint blockIdx  = Gid.x;
+    uint len_      = solverPrefixLenBuffer[1]; // pfx1
+    uint t1 = threadIdx + 2 * blockIdx * THREADS;
+    uint t2 = t1 + THREADS;
+
+    scan_array[threadIdx]           = (t1 < len_) ? input[t1] : 0;
+    scan_array[threadIdx + THREADS] = (t2 < len_) ? input[t2] : 0;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s1 = 1; s1 <= THREADS; s1 <<= 1) {
+        uint idx = (threadIdx + 1) * s1 * 2 - 1;
+        if (idx < 2 * THREADS) scan_array[idx] += scan_array[idx - s1];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    [unroll] for (uint s2 = THREADS >> 1; s2 > 0; s2 >>= 1) {
+        uint idx = (threadIdx + 1) * s2 * 2 - 1;
+        if (idx + s2 < 2 * THREADS) scan_array[idx + s2] += scan_array[idx];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (t1 + zeroff < len_) output[t1 + zeroff] = scan_array[threadIdx];
+    if (t2 + zeroff < len_) output[t2 + zeroff] = (threadIdx == THREADS - 1 && zeroff) ? 0 : scan_array[threadIdx + THREADS];
+    if (threadIdx == 0) { if (zeroff) output[0] = 0; aux[blockIdx] = scan_array[2 * THREADS - 1]; }
+}
+
+[numthreads(THREADS, 1, 1)]
+void prefixFixupSolver(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
+{
+    uint threadIdx = Gtid.x;
+    uint blockIdx  = Gid.x;
+    uint len_      = solverPrefixLenBuffer[0]; // numNodes
+    uint start = threadIdx + 2 * blockIdx * THREADS;
+    uint block_sum = aux[blockIdx];
+    if (start < len_)          input[start]          += block_sum;
+    if (start + THREADS < len_) input[start + THREADS] += block_sum;
 }
 
 [numthreads(THREADS, 1, 1)]
