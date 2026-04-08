@@ -896,20 +896,85 @@ public static class MeshColliderBaker
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 
+    /// <summary>World AABB for spawn fallback: <see cref="Renderer.bounds"/> if present, else mesh vertices in world space.</summary>
+    public static Bounds MeshFilterWorldBounds(MeshFilter mf)
+    {
+        if (mf == null)
+            return new Bounds();
+        Renderer rd = mf.GetComponent<Renderer>();
+        if (rd != null)
+            return rd.bounds;
+        Mesh m = mf.sharedMesh;
+        if (m == null || m.vertexCount == 0)
+            return new Bounds(mf.transform.position, Vector3.zero);
+        var verts = m.vertices;
+        Matrix4x4 M = mf.transform.localToWorldMatrix;
+        var wb = new Bounds(M.MultiplyPoint3x4(verts[0]), Vector3.zero);
+        for (int i = 1; i < verts.Length; i++)
+            wb.Encapsulate(M.MultiplyPoint3x4(verts[i]));
+        return wb;
+    }
+
+    static bool BoundsVolumePositive(Bounds b)
+    {
+        return b.size.x > 1e-6f && b.size.y > 1e-6f && b.size.z > 1e-6f;
+    }
+
+    /// <summary>Uniform grid of <paramref name="count"/> points inside <paramref name="box"/> (world space).</summary>
+    public static Vector3[] UniformGridWorldPositions(Bounds box, int count)
+    {
+        if (count <= 0)
+            return Array.Empty<Vector3>();
+
+        if (!BoundsVolumePositive(box))
+        {
+            var flat = new Vector3[count];
+            Vector3 c = box.min + box.max; // 2*center if degenerate min==max
+            c *= 0.5f;
+            for (int i = 0; i < count; i++)
+                flat[i] = c;
+            return flat;
+        }
+
+        float cubeRoot = Mathf.Pow(count, 1f / 3f);
+        Vector3 size = box.size;
+        float maxSide = Mathf.Max(size.x, Mathf.Max(size.y, size.z));
+        Vector3 norm = size / maxSide;
+        int nx = Mathf.Max(1, Mathf.RoundToInt(cubeRoot * norm.x));
+        int ny = Mathf.Max(1, Mathf.RoundToInt(cubeRoot * norm.y));
+        int nz = Mathf.Max(1, Mathf.RoundToInt(cubeRoot * norm.z));
+        while (nx * ny * nz < count)
+        {
+            if (nx <= ny && nx <= nz) nx++;
+            else if (ny <= nx && ny <= nz) ny++;
+            else nz++;
+        }
+
+        Vector3 step = new Vector3(size.x / nx, size.y / ny, size.z / nz);
+        var result = new Vector3[count];
+        for (int i = 0; i < count; i++)
+        {
+            int iz = i / (nx * ny), rem = i % (nx * ny), iy = rem / nx, ix = rem % nx;
+            result[i] = box.min + new Vector3((ix + 0.5f) * step.x, (iy + 0.5f) * step.y, (iz + 0.5f) * step.z);
+        }
+
+        return result;
+    }
+
     /// <summary>
-    /// Returns up to <paramref name="targetCount"/> world-space positions uniformly distributed
-    /// inside <paramref name="meshFilter"/>'s volume. Same <see cref="Bake"/> pipeline and SDF as colliders,
-    /// with padded flood-fill so domain clipping matches collider semantics; samples voxels with SDF &lt; 0 (strict interior, not shell).
+    /// Returns <paramref name="targetCount"/> world-space positions. Uses the same <see cref="Bake"/> + padded flood + SDF as colliders;
+    /// prefers voxels with SDF &lt; 0, then sealed cavity (<see cref="BakeResult.InClosedVolume"/>), then a uniform grid in the mesh world AABB
+    /// clipped to <paramref name="simWorldBounds"/> (handles thin shells / leaky voxel shells where SDF is never negative).
     /// </summary>
     public static Vector3[] GenerateVolumePoints(MeshFilter meshFilter, Bounds simWorldBounds, int targetCount)
     {
         if (meshFilter == null || meshFilter.sharedMesh == null)
-            return new Vector3[0];
+            return UniformGridWorldPositions(simWorldBounds, targetCount);
 
         int R = Mathf.Clamp(Mathf.CeilToInt(Mathf.Pow(targetCount * 8f, 1f / 3f)), 32, 256);
         Debug.Log($"[MeshColliderBaker] GenerateVolumePoints: root '{meshFilter.gameObject.name}', mesh \"{meshFilter.sharedMesh.name}\", " +
                   $"targetCount={targetCount}, R={R}, simBounds size={simWorldBounds.size.ToString("F3")} " +
-                  $"(Bake + padded flood, interior = SDF < 0).");
+                  $"(Bake + padded flood; interior prefers SDF < 0).");
 
         BakeResult bake = Bake(
             meshFilter.gameObject,
@@ -925,22 +990,40 @@ public static class MeshColliderBaker
         int total = R * R * R;
 
         var inside = new List<Vector3>(targetCount * 2);
-        for (int idx = 0; idx < total; idx++)
+        void CollectFromMask(Func<int, bool> include)
         {
-            if (bake.SDF[idx] >= 0f)
-                continue;
+            inside.Clear();
+            for (int idx = 0; idx < total; idx++)
+            {
+                if (!include(idx))
+                    continue;
+                int ix = idx % R, tmp = idx / R, iy = tmp % R, iz = tmp / R;
+                inside.Add(new Vector3(
+                    bMin.x + (ix + 0.5f) * cell.x,
+                    bMin.y + (iy + 0.5f) * cell.y,
+                    bMin.z + (iz + 0.5f) * cell.z));
+            }
+        }
 
-            int ix = idx % R, tmp = idx / R, iy = tmp % R, iz = tmp / R;
-            inside.Add(new Vector3(
-                bMin.x + (ix + 0.5f) * cell.x,
-                bMin.y + (iy + 0.5f) * cell.y,
-                bMin.z + (iz + 0.5f) * cell.z));
+        CollectFromMask(i => bake.SDF[i] < 0f);
+        string source = "SDF<0";
+
+        if (inside.Count == 0 && bake.InClosedVolume != null)
+        {
+            CollectFromMask(i => bake.InClosedVolume[i] != 0);
+            source = "InClosedVolume (sealed cavity)";
         }
 
         if (inside.Count == 0)
         {
-            Debug.LogWarning("[MeshColliderBaker] GenerateVolumePoints: no voxels with SDF<0 (open mesh, or no enclosed interior after bake).");
-            return new Vector3[0];
+            Bounds wb = MeshFilterWorldBounds(meshFilter);
+            wb.min = Vector3.Max(wb.min, simWorldBounds.min);
+            wb.max = Vector3.Min(wb.max, simWorldBounds.max);
+            if (!BoundsVolumePositive(wb))
+                wb = simWorldBounds;
+            Debug.LogWarning("[MeshColliderBaker] GenerateVolumePoints: no interior voxels from bake (thin shell / leaky flood / open mesh). " +
+                $"Using uniform grid fallback in bounds center={wb.center.ToString("F2")} size={wb.size.ToString("F2")}.");
+            return UniformGridWorldPositions(wb, targetCount);
         }
 
         // Shuffle so any truncated subset is spatially uniform.
@@ -951,12 +1034,11 @@ public static class MeshColliderBaker
             (inside[i], inside[j]) = (inside[j], inside[i]);
         }
 
-        // Return exactly targetCount points, repeating if we have fewer.
         var result = new Vector3[targetCount];
         for (int i = 0; i < targetCount; i++)
             result[i] = inside[i % inside.Count];
 
-        Debug.Log($"[MeshColliderBaker] GenerateVolumePoints: {inside.Count} voxels with SDF<0 at R={R}, returning {targetCount} positions " +
+        Debug.Log($"[MeshColliderBaker] GenerateVolumePoints: {inside.Count} source voxels ({source}) at R={R}, returning {targetCount} positions " +
                   $"(indices repeat if {inside.Count} < {targetCount}).");
         return result;
     }

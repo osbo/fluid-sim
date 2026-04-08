@@ -66,6 +66,7 @@ public partial class FluidSimulator : MonoBehaviour
     private int applyPressureGradientKernel;
     private int updateParticlesKernel;
     private int applyExternalForcesKernel;
+    private int applyViscosityKernelId;
     private int solvePressureIterationKernel;
     private int initializePressureBuffersKernel;
     private int initializePhiKernel;
@@ -171,6 +172,13 @@ public partial class FluidSimulator : MonoBehaviour
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
     public float gravity = 100.0f;
+
+    [Header("Viscosity")]
+    [Tooltip("Kinematic viscosity ν in sim-units²/s. 0 = inviscid. Use small values for water-like fluids; larger for honey/glycerol.\nExplicit stability limit: ν·dt/dx_min² < 1/6.")]
+    public float kinematicViscosity = 0.0f;
+    [Tooltip("FLIP/PIC blend. 1.0 = pure FLIP (recommended when kinematicViscosity > 0). 0.95 = slight PIC damping (legacy).")]
+    [Range(0f, 1f)] public float flipRatio = 1.0f;
+
     public bool useRealTime = false; // When true, uses Time.deltaTime instead of fixed frameRate
     public float frameRate = 30.0f;
     [Tooltip("Finest octree layer for the sim; collider voxel grid uses R = 2^(10 - minLayer) along each axis (same as Nodes.compute kMortonAxisBits).")]
@@ -596,6 +604,10 @@ public partial class FluidSimulator : MonoBehaviour
         GpuTimingReportFlushGpu(false);
         applyExternalForcesSw.Stop();
 
+        // Step 7b: Apply physical viscosity (ν∇²u) if enabled
+        if (kinematicViscosity > 0f)
+            ApplyViscosity();
+
         // One uint sync readback: CPU must have correct numNodes this frame for SolvePressure (LeafOnly),
         // BuildLayerCountsSummaryForLog, rendering instance counts, etc. GPU indirect dispatches already use nodeCount buffer.
         using (s_NodeCountReadbackMarker.Auto())
@@ -805,6 +817,7 @@ public partial class FluidSimulator : MonoBehaviour
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         particlesShader.SetFloat("deltaTime", deltaTime);
         particlesShader.SetFloat("gravity", gravity);
+        particlesShader.SetFloat("flip_ratio", flipRatio);
         particlesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
         particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
@@ -845,6 +858,10 @@ public partial class FluidSimulator : MonoBehaviour
         simulationBoundsMin  = Vector3.zero;
 
         Vector3 simulationSize = simulationBoundsMax;
+        const float minSimExtent = 1e-4f;
+        simulationSize.x = Mathf.Max(simulationSize.x, minSimExtent);
+        simulationSize.y = Mathf.Max(simulationSize.y, minSimExtent);
+        simulationSize.z = Mathf.Max(simulationSize.z, minSimExtent);
         mortonNormalizationFactor = new Vector3(
             1023.0f / simulationSize.x,
             1023.0f / simulationSize.y,
@@ -891,12 +908,23 @@ public partial class FluidSimulator : MonoBehaviour
             }
         }
 
+        if (worldPositions == null || worldPositions.Length == 0)
+        {
+            Debug.LogWarning(
+                "FluidSimulator: no initial world positions (empty mesh volume). Using uniform grid in Fluid Initial Bounds or simulation bounds.");
+            Bounds fb = simulationBounds.bounds;
+            if (fluidInitialBounds != null)
+                fb = fluidInitialBounds.bounds;
+            worldPositions = MeshColliderBaker.UniformGridWorldPositions(fb, numParticles);
+        }
+
         // Convert world positions → sim space
         Vector3 simOrigin = simulationBounds.bounds.min;
         var simPositions = new Vector3[numParticles];
+        int wpLen = worldPositions.Length;
         for (int i = 0; i < numParticles; i++)
         {
-            Vector3 local = worldPositions[i % worldPositions.Length] - simOrigin;
+            Vector3 local = worldPositions[i % wpLen] - simOrigin;
             simPositions[i] = new Vector3(
                 local.x * mortonNormalizationFactor.x,
                 local.y * mortonNormalizationFactor.y,
