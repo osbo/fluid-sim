@@ -1,0 +1,95 @@
+// Per-frame min/max |velocity| over particles for velocity coloring (GPU-only; no CPU readback).
+#pragma kernel BlockReduce
+#pragma kernel ReduceLevel
+#pragma kernel SmoothVelocityMinMax
+
+struct Particle
+{
+    float3 position;
+    float3 velocity;
+    uint mortonCode;
+};
+
+StructuredBuffer<Particle> _Particles;
+uint _ParticleCount;
+
+RWStructuredBuffer<float2> _BlockMinMaxOut;
+
+// Metal: groupshared must be at global scope, not inside the kernel body.
+groupshared float blockReduce_sMin[256];
+groupshared float blockReduce_sMax[256];
+
+[numthreads(256, 1, 1)]
+void BlockReduce(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint i = gid.x * 256u + gi;
+    float v = (i < _ParticleCount) ? length(_Particles[i].velocity) : 0.0;
+
+    const float fmax = 3.402823466e+38;
+    blockReduce_sMin[gi] = (i < _ParticleCount) ? v : fmax;
+    blockReduce_sMax[gi] = (i < _ParticleCount) ? v : -fmax;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 128u; s > 0u; s >>= 1)
+    {
+        if (gi < s)
+        {
+            blockReduce_sMin[gi] = min(blockReduce_sMin[gi], blockReduce_sMin[gi + s]);
+            blockReduce_sMax[gi] = max(blockReduce_sMax[gi], blockReduce_sMax[gi + s]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0u)
+        _BlockMinMaxOut[gid.x] = float2(blockReduce_sMin[0], blockReduce_sMax[0]);
+}
+
+StructuredBuffer<float2> _LevelIn;
+RWStructuredBuffer<float2> _LevelOut;
+uint _LevelCount;
+
+groupshared float2 reduceLevel_s[256];
+
+[numthreads(256, 1, 1)]
+void ReduceLevel(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint idx = gid.x * 256u + gi;
+    const float fmax = 3.402823466e+38;
+    float2 mm = (idx < _LevelCount) ? _LevelIn[idx] : float2(fmax, -fmax);
+
+    reduceLevel_s[gi] = mm;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1)
+    {
+        if (gi < stride)
+        {
+            float2 a = reduceLevel_s[gi];
+            float2 b = reduceLevel_s[gi + stride];
+            reduceLevel_s[gi] = float2(min(a.x, b.x), max(a.y, b.y));
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0u)
+        _LevelOut[gid.x] = reduceLevel_s[0];
+}
+
+// Raw this frame at [0]; persistent smoothed (min,max) in _SmoothedMinMax[0].
+StructuredBuffer<float2> _RawMinMax;
+RWStructuredBuffer<float2> _SmoothedMinMax;
+float _VelocityMinMaxSmoothAlpha;
+
+[numthreads(1, 1, 1)]
+void SmoothVelocityMinMax(uint3 id : SV_DispatchThreadID)
+{
+    float2 raw = _RawMinMax[0];
+    float2 prev = _SmoothedMinMax[0];
+    const float huge = 1e37;
+    // Uninitialized sentinel (min > max) or cleared state → snap to raw.
+    bool uninitialized = (prev.x > prev.y) || (prev.x > huge * 0.5) || (prev.y < -huge * 0.5);
+    float a = saturate(_VelocityMinMaxSmoothAlpha);
+    float2 outv = uninitialized ? raw : lerp(prev, raw, a);
+    _SmoothedMinMax[0] = outv;
+}
