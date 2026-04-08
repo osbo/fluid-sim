@@ -10,8 +10,8 @@ public partial class FluidSimulator
 {
     public const int LeafOnlyLayer1DModelMax = 128;
 
-    [Tooltip("Optional: LeafOnlyLayer1.compute — GPU layer 0 after embed. If null, layer 1 parity logs are skipped.")]
-    public ComputeShader leafOnlyLayer1Shader;
+    [Tooltip("LeafOnlyLayer1.compute — GPU layer 0 after embed. Editor loads from Assets/Scripts if unset.")]
+    ComputeShader leafOnlyLayer1Shader;
 
     private int leafL1KCopyFromEnc;
     private int leafL1KCopyAToSkipA;

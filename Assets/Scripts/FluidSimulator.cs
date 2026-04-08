@@ -10,30 +10,27 @@ using Unity.Profiling;
 
 // Main FluidSimulator class - split into partial classes for better organization
 // Core simulation logic: particle management, main loop, initialization
-// See: FluidEnums.cs, FluidRendering.cs, FluidPreconditioner.cs,
+// See: FluidEnums.cs, FluidRenderer.cs, FluidPreconditioner.cs,
 //      FluidOctree.cs, FluidSolver.cs, FluidLeafOnlyInputs.cs, FluidLeafOnlyWeights.cs,
-//      FluidLeafOnlyPrecondApply.cs, RadixSort.cs
+//      FluidLeafOnlyPrecondApply.cs, FluidSimulator.LoadEditorAssets.cs, RadixSort.cs
 public partial class FluidSimulator : MonoBehaviour
 {
-    public BoxCollider simulationBounds;
-    public BoxCollider fluidInitialBounds;
-    
-    public ComputeShader radixSortShader;
-    public ComputeShader particlesShader;
-    public ComputeShader nodesPrefixSumsShader;
-    public ComputeShader nodesShader;
-    public ComputeShader cgSolverShader;
-    public ComputeShader csrBuilderShader; // NEW: CSR construction shader
+    BoxCollider simulationBounds;
+    BoxCollider fluidInitialBounds;
+
+    ComputeShader radixSortShader;
+    ComputeShader particlesShader;
+    ComputeShader nodesPrefixSumsShader;
+    ComputeShader nodesShader;
+    ComputeShader cgSolverShader;
+    ComputeShader csrBuilderShader;
     public int numParticles = 1048576;
-    
+
     // CG Solver parameters
     public int maxCgIterations = 400;
     public float convergenceThreshold = 1e-05f;
     [Tooltip("Unused: PCG always runs maxCgIterations with no mid-loop convergence check. Enable per-frame debug timing log to print final ||r||² after the solve.")]
     public int cgConvergenceCheckInterval = 5;
-
-    [Tooltip("Structured = stencil SpMV (faster path, no CSR build unless Neural precond or training recorder needs CSR). Csr = build CSR every frame and use SpMV_CSR.")]
-    public PressureSolveMatrixFormat pressureSolveMatrixFormat = PressureSolveMatrixFormat.Structured;
     
     // Simulation parameters
     private float maxDetailCellSize;
@@ -72,7 +69,6 @@ public partial class FluidSimulator : MonoBehaviour
     private int calculateDensityGradientKernel;
     // Cached solver kernel IDs (set once in InitSolverKernels)
     private int buildMatrixAKernelId;
-    private int applyMatrixAndDotKernelId;
     private int spmvCsrKernelId;
     private int applyJacobiKernelId;
     private int globalReduceSumKernelId;
@@ -162,8 +158,12 @@ public partial class FluidSimulator : MonoBehaviour
     
     // Public accessors for external scripts (e.g., FluidMeshRenderer)
     public ComputeBuffer NodesBuffer => nodesBuffer;
+    public ComputeBuffer ParticlesBuffer => particlesBuffer;
     public ComputeBuffer PhiBuffer => phiBuffer;
     public int NumNodes => numNodes;
+    public int NumParticlesForRender => numParticles;
+    public Bounds WorldSimulationBounds => simulationBounds != null ? simulationBounds.bounds : new Bounds(Vector3.zero, Vector3.one);
+    public float MaxDetailCellSize => maxDetailCellSize;
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
     public float gravity = 100.0f;
@@ -195,8 +195,7 @@ public partial class FluidSimulator : MonoBehaviour
     private bool isPaused = false;
     
     private System.Diagnostics.Stopwatch totalOctreeSw;
-    private System.Diagnostics.Stopwatch renderSw = new System.Diagnostics.Stopwatch();
-    private double lastRenderTimeMs = 0.0;
+    private double lastRenderTimeMs;
 
     // Profiler markers for Unity Profiler GPU timeline
     static readonly ProfilerMarker s_FrameMarker            = new ProfilerMarker("FluidSim.Frame");
@@ -261,85 +260,9 @@ public partial class FluidSimulator : MonoBehaviour
 
     // Training data recorder
     public TrainingDataRecorder recorder;
-    
-    [Header("Rendering")]
 
-    // Rendering mode enum
-    public RenderingMode renderingMode = RenderingMode.Thickness;
-    
-    // Thickness source selection
-    public ThicknessSource thicknessSource = ThicknessSource.Nodes;
+    internal void SetLastRenderTimeMs(double ms) => lastRenderTimeMs = ms;
 
-    public Light mainLight; // Assign your Directional Light
-    
-    public ComputeShader blurCompute; // Assign BilateralBlur.compute here
-    
-    // Material to render particles as points (assign a shader like Custom/ParticlesPoints)
-    public Material particlesMaterial;
-    
-    // Material to render particles with depth shader (assign a shader like Fluid/ParticleDepth)
-    public Material particleDepthMaterial;
-    
-    // Material to render nodes with thickness shader (assign a shader like Custom/NodeThickness)
-    public Material nodeThicknessMaterial;
-    
-    // Material to render nodes with wireframe shader (assign a shader like Custom/NodeWireframe)
-    public Material nodeWireframeMaterial;
-    
-    // Material to render particles with thickness shader (assign a shader like Custom/ParticleThickness)
-    public Material particleThicknessMaterial;
-    
-    // Material to generate normals from depth (assign a shader like Fluid/NormalsFromDepth)
-    public Material normalMaterial; // Assign "Fluid/NormalsFromDepth" in Inspector
-
-    public Material compositeMaterial; // Assign "Fluid/FluidRender" here
-    
-    
-    // Debug display material for visualizing textures
-    public Material debugDisplayMaterial; // Assign "Custom/DebugTextureDisplay" in Inspector
-
-    public Color fluidColor = new Color(0.2f, 0.6f, 1.0f); // Input for extinction
-    public bool useSkybox = true; // Toggle between cubemap and gradient sky
-    public Cubemap skyboxTexture; // Skybox cubemap for environment sampling
-    public Color skyHorizonColor = new Color(0.0f, 0.0f, 0.0f); // Dark color at horizon (looking down)
-    public Color skyTopColor = new Color(1.0f, 1.0f, 1.0f); // Light color at top (looking up)
-    [Range(-20.0f, 20.0f)] public float sunIntensity = -2.3f; // Exponent: actual intensity = exp(value)
-    [Range(0.0f, 500.0f)] public float sunSharpness = 53.0f; // Sun highlight sharpness (power exponent)
-    // Calculated depth values (updated each frame based on camera position)
-    private float calculatedDepthDisplayScale = 0.0f;  // Exponent for depth scale
-    private float calculatedDepthMinValue = 0.0f;     // Exponent for depth min
-    private float calculatedMinDepth = 0.0f;          // Actual min depth value
-    private float calculatedMaxDepth = 0.0f;          // Actual max depth value
-    [Range(-20.0f, 20.0f)] public float thicknessScaleNodes = -8.9f; // Exponent: actual scale = exp(value) for nodes
-    [Range(-20.0f, 20.0f)] public float thicknessScaleParticles = -9.6f; // Exponent: actual scale = exp(value) for particles
-
-    [Range(0, 100)] public int depthBlurRadius = 6;
-    [Range(0.0001f, 10.0f)] public float depthBlurThreshold = 1.24f;
-    [Range(0, 100)] public int thicknessBlurRadius = 22;
-    [Range(0.0001f, 1.0f)] public float particleRadius = 0.066f; // Radius for particle points (world space)
-    [Tooltip("Particles / Particles Velocity: bounds-normalized camera distance. Exponent on nearness (1 = linear). >1 pulls brightness toward closer particles; <1 lifts mids.")]
-    [Range(0.25f, 4f)]
-    public float particleDepthShadeGamma = 1.2f;
-    [Tooltip("Particles / Particles Velocity: minimum HSV value scale when far (within bounds range), so velocity color stays readable instead of going to black.")]
-    [Range(0f, 0.6f)]
-    public float particleDepthLumaFloor = 0.15f;
-    [Tooltip("Particles Velocity mode: speed magnitudes at or above this value map to the fastest hue (red); slower maps toward blue. Units match simulation velocity.")]
-    public float particleVelocityColorReference = 10f;
-    [Tooltip("Particles Velocity mode: map colors using min–max |v| for the current frame (GPU reduction only; no CPU particle readback). Ignored when off; reference speed above is used instead.")]
-    public bool particleVelocityNormalizePerFrame;
-    [Tooltip("When per-frame normalize is on: blend smoothed min/max toward this frame’s values each frame (lerp weight 1/N). Larger N = less jitter, slower tracking.")]
-    [Range(1, 120)]
-    public int particleVelocityNormalizeSmoothingFrames = 10;
-    public ComputeShader particleVelocityReduceShader;
-    [Range(0.0001f, 1.0f)] public float depthRadius = 0.279f; // Radius for depth quads (world space)
-    [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.776f; // Radius for particle thickness quads (world space)
-    [Range(0, 20)] public float absorptionStrength = 5.8f;
-    [Range(0.0f, 1.0f)] public float depthOfFieldStrength = 0.076f;
-    [Range(0.0f, 1.0f)] public float reflectionStrength = 0.633f; // Multiplier for reflection intensity
-    [Range(0.0f, 1.0f)] public float reflectionTint = 0.418f; // Amount to mix refraction color into reflection
-    [Range(0.0f, 1.0f)] public float fresnelClamp = 0.8f; // Maximum fresnel weight to keep water visible
-    [Range(0, 2)] public float refractionScale = 0.57f; // Scales normal map intensity (0.0 = flat mirror, 1.0 = normal, 2.0 = super distorted)
-    
     // Helper method for resizing buffers
     private void ResizeBuffer(ref ComputeBuffer buffer, int count, int stride)
     {
@@ -350,26 +273,6 @@ public partial class FluidSimulator : MonoBehaviour
         int newSize = Mathf.NextPowerOfTwo(Mathf.Max(count, 512));
         buffer = new ComputeBuffer(newSize, stride);
     }
-    
-    // Mesh for instanced node rendering (quad for billboard-style rendering)
-    private Mesh quadMesh;
-    private ComputeBuffer argsBuffer;
-    private ComputeBuffer particleArgsBuffer;
-    private int particleVelocityBlockReduceKernel = -1;
-    private int particleVelocityReduceLevelKernel = -1;
-    private int particleVelocitySmoothMinMaxKernel = -1;
-    private ComputeBuffer particleVelocityReduceBufferA;
-    private ComputeBuffer particleVelocityReduceBufferB;
-    private ComputeBuffer particleVelocitySmoothedMinMaxBuffer;
-    private ComputeBuffer particleVelocityMinMaxDummyBuffer;
-    private CommandBuffer thicknessCmd;
-    private CommandBuffer depthCmd;
-    private RenderTexture thicknessTexture;
-    private RenderTexture fluidDepthTexture; // Stores the final smooth depth for normals
-    private RenderTexture rawDepthTexture; // Stores unblurred depth for visualization
-    private RenderTexture fluidNormalTexture; // Stores the surface normals (RGB = slope vectors)
-    private RenderTexture fluidThicknessTexture; // Smoothed thickness
-    private RenderTexture nodesTexture; // Stores wireframe nodes rendering
     
     private void ValidateOctreeLayers()
     {
@@ -387,6 +290,28 @@ public partial class FluidSimulator : MonoBehaviour
         ValidateOctreeLayers();
     }
 
+    void Awake()
+    {
+        LoadEditorDefaultComputeShaders();
+        ResolveBoundsColliders();
+    }
+
+    void ResolveBoundsColliders()
+    {
+        if (simulationBounds == null)
+        {
+            var go = GameObject.Find("Simulation Bounds");
+            if (go != null)
+                simulationBounds = go.GetComponent<BoxCollider>();
+        }
+        if (fluidInitialBounds == null)
+        {
+            var go = GameObject.Find("Fluid Initial Bounds");
+            if (go != null)
+                fluidInitialBounds = go.GetComponent<BoxCollider>();
+        }
+    }
+
     void Start()
     {
         ValidateOctreeLayers();
@@ -398,26 +323,6 @@ public partial class FluidSimulator : MonoBehaviour
         InitOctreeKernels();
         TryLoadLeafOnlyWeightsFromDisk();
 
-        // Create quad mesh and args buffers for node and particle rendering
-        CreateQuadMesh();
-        CreateArgsBuffer();
-        CreateParticleArgsBuffer();
-
-        if (particleVelocityReduceShader != null)
-        {
-            particleVelocityBlockReduceKernel = particleVelocityReduceShader.FindKernel("BlockReduce");
-            particleVelocityReduceLevelKernel = particleVelocityReduceShader.FindKernel("ReduceLevel");
-            particleVelocitySmoothMinMaxKernel = particleVelocityReduceShader.FindKernel("SmoothVelocityMinMax");
-        }
-        
-        // Create thickness render texture
-        if (thicknessTexture == null)
-        {
-            thicknessTexture = new RenderTexture(Screen.width, Screen.height, 0, RenderTextureFormat.RFloat);
-            thicknessTexture.enableRandomWrite = true;
-            thicknessTexture.Create();
-        }
-        
         // Auto-find recorder if not assigned
         if (recorder == null)
         {
@@ -805,7 +710,7 @@ public partial class FluidSimulator : MonoBehaviour
     {
         if (particlesShader == null)
         {
-            Debug.LogError("Particles compute shader is not assigned. Please assign `particlesShader` in the inspector.");
+            Debug.LogError("Particles compute shader is missing.");
             return;
         }
 
@@ -835,10 +740,17 @@ public partial class FluidSimulator : MonoBehaviour
 
     private void InitializeParticleSystem()
     {
+        if (simulationBounds == null || fluidInitialBounds == null)
+        {
+            Debug.LogError(
+                "FluidSimulator: assign simulation bounds by placing BoxColliders on GameObjects named \"Simulation Bounds\" and \"Fluid Initial Bounds\", or add them to the scene.");
+            return;
+        }
+
         // Get kernel index
         if (particlesShader == null)
         {
-            Debug.LogError("Particles compute shader is not assigned. Please assign `particlesShader` in the inspector.");
+            Debug.LogError("Particles compute shader is missing. In the Editor it loads from Assets/Scripts/Particles.compute automatically.");
             return;
         }
         initializeParticlesKernel = particlesShader.FindKernel("InitializeParticles");
@@ -1091,10 +1003,5 @@ public partial class FluidSimulator : MonoBehaviour
         ReleaseLeafOnlyBuffers();
         ReleaseLeafOnlyWeightsBuffers();
         ReleaseFluidSimGpuProfileCmd();
-
-        // Clean up render textures
-        if (fluidDepthTexture != null) fluidDepthTexture.Release();
-        if (fluidNormalTexture != null) fluidNormalTexture.Release();
-        if (nodesTexture != null) nodesTexture.Release();
     }
 }

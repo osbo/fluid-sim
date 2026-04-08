@@ -8,8 +8,8 @@ using UnityEngine;
 /// </summary>
 public partial class FluidSimulator : MonoBehaviour
 {
-    [Tooltip("LeafOnlyOffEdgeFeats.compute — dense off H-tile grid; leave null to skip.")]
-    public ComputeShader leafOnlyOffEdgeFeatsShader;
+    [Tooltip("LeafOnlyOffEdgeFeats.compute. Editor loads from Assets/Scripts if unset.")]
+    ComputeShader leafOnlyOffEdgeFeatsShader;
 
     private int leafOnlyOffGeomKernel;
     private int leafOnlyOffClearScratchKernel;

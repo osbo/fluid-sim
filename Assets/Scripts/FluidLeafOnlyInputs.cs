@@ -10,8 +10,8 @@ public partial class FluidSimulator : MonoBehaviour
     public const int LeafOnlyMaxMixedSize = 8192;
     public const int LeafOnlyLeafSize = 128;
 
-    [Tooltip("If assigned, rebuilds LeafOnly GPU inputs after each pressure CSR build (no .bin I/O).")]
-    public ComputeShader leafOnlyInputsShader;
+    [Tooltip("Rebuilds LeafOnly GPU inputs after each pressure CSR build. Editor loads Assets/Scripts/LeafOnlyInputs.compute if unset.")]
+    ComputeShader leafOnlyInputsShader;
 
     [Tooltip("Disable to skip LeafOnly input dispatches (saves GPU time while debugging other paths).")]
     public bool buildLeafOnlyInputsEachPressureSolve = true;

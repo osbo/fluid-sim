@@ -9,8 +9,8 @@ public partial class FluidSimulator : MonoBehaviour
     public const int LeafOnlyGlobalFeaturesDim = 12;
     public const int LeafOnlyEmbedDModelMax = 128;
 
-    [Tooltip("Compute shader with LeafOnly_Embed* kernels. Assign LeafOnlyEmbed.compute; leave null to skip embed parity.")]
-    public ComputeShader leafOnlyEmbedShader;
+    [Tooltip("LeafOnly_Embed* kernels. Editor loads Assets/Scripts/LeafOnlyEmbed.compute if unset.")]
+    ComputeShader leafOnlyEmbedShader;
 
     private int leafOnlyEmbedLiftKernel;
     private int leafOnlyEmbedClearAggrKernel;
