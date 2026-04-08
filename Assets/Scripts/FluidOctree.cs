@@ -240,6 +240,8 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(findNeighborsKernel, "tempNodesBuffer", tempNodesBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetBuffer(findNeighborsKernel, "mortonCodesBuffer", mortonCodesBuffer);
+        nodesShader.SetBuffer(findNeighborsKernel, "solidVoxelsBuffer", solidVoxelsBuffer);
+        nodesShader.SetInt("solidVoxelResolution", SolidVoxelResolution);
         GpuProfileDispatchIndirect(nodesShader, findNeighborsKernel, dispatchArgsBuffer, 0);
 
         nodesShader.SetBuffer(findReverseKernel, "reverseNeighborsBuffer", reverseNeighborsBuffer);

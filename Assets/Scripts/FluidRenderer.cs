@@ -21,6 +21,7 @@ public class FluidRenderer : MonoBehaviour
     public Material particleDepthMaterial;
     public Material nodeThicknessMaterial;
     public Material nodeWireframeMaterial;
+    public Material voxelWireframeMaterial;
     public Material particleThicknessMaterial;
     public Material normalMaterial;
     public Material compositeMaterial;
@@ -65,6 +66,7 @@ public class FluidRenderer : MonoBehaviour
     static readonly ProfilerMarker s_RenderThicknessMarker = new ProfilerMarker("FluidSim.Render.Thickness");
     static readonly ProfilerMarker s_ThicknessBlurMarker = new ProfilerMarker("FluidSim.Render.ThicknessBlur");
     static readonly ProfilerMarker s_RenderNodesMarker = new ProfilerMarker("FluidSim.Render.Nodes");
+    static readonly ProfilerMarker s_RenderColliderVoxelsMarker = new ProfilerMarker("FluidSim.Render.ColliderVoxels");
     static readonly ProfilerMarker s_DrawParticlesMarker = new ProfilerMarker("FluidSim.Render.DrawParticles");
     static readonly ProfilerMarker s_DepthBlurMarker = new ProfilerMarker("FluidSim.Render.DepthBlur");
     static readonly ProfilerMarker s_NormalsMarker = new ProfilerMarker("FluidSim.Render.Normals");
@@ -73,6 +75,10 @@ public class FluidRenderer : MonoBehaviour
     Mesh quadMesh;
     ComputeBuffer argsBuffer;
     ComputeBuffer particleArgsBuffer;
+    ComputeBuffer voxelArgsBuffer;
+    int cachedVoxelArgsResolution = -1;
+    static bool s_warnedVoxelInstanceBudget;
+    static bool s_warnedVoxelBufferMissing;
     int particleVelocityBlockReduceKernel = -1;
     int particleVelocityReduceLevelKernel = -1;
     int particleVelocitySmoothMinMaxKernel = -1;
@@ -142,6 +148,7 @@ public class FluidRenderer : MonoBehaviour
         EnsureMaterial(ref particleDepthMaterial, "Custom/ParticleDepth");
         EnsureMaterial(ref nodeThicknessMaterial, "Custom/NodeThickness");
         EnsureMaterial(ref nodeWireframeMaterial, "Custom/NodeWireframe");
+        EnsureMaterial(ref voxelWireframeMaterial, "Custom/VoxelWireframe");
         EnsureMaterial(ref particleThicknessMaterial, "Custom/ParticleThickness");
         EnsureMaterial(ref normalMaterial, "Custom/NormalsFromDepth");
         EnsureMaterial(ref compositeMaterial, "Custom/FluidRender");
@@ -187,6 +194,12 @@ public class FluidRenderer : MonoBehaviour
             particleArgsBuffer.Release();
             particleArgsBuffer = null;
         }
+        if (voxelArgsBuffer != null)
+        {
+            voxelArgsBuffer.Release();
+            voxelArgsBuffer = null;
+        }
+        cachedVoxelArgsResolution = -1;
         if (thicknessCmd != null)
         {
             thicknessCmd.Release();
@@ -246,6 +259,9 @@ public class FluidRenderer : MonoBehaviour
             return _sim.WorldSimulationBounds;
         }
     }
+
+    static bool IsNodeOrColliderVoxelView(RenderingMode mode) =>
+        mode == RenderingMode.Nodes || mode == RenderingMode.ColliderVoxels;
 
     void DispatchParticleVelocityMinMaxForRendering(Material particleMat)
     {
@@ -342,8 +358,12 @@ public class FluidRenderer : MonoBehaviour
         {
             using (s_RenderNodesMarker.Auto()) { RenderNodes(cam); }
         }
+        if (renderingMode == RenderingMode.ColliderVoxels)
+        {
+            using (s_RenderColliderVoxelsMarker.Auto()) { RenderColliderVoxels(cam); }
+        }
 
-        if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness && renderingMode != RenderingMode.Nodes)
+        if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness && !IsNodeOrColliderVoxelView(renderingMode))
         {
             using (s_DrawParticlesMarker.Auto()) { DrawParticles(cam, ctx); }
         }
@@ -363,7 +383,7 @@ public class FluidRenderer : MonoBehaviour
             using (s_NormalsMarker.Auto()) { RenderNormals(cam); }
         }
 
-        if (renderingMode == RenderingMode.Nodes)
+        if (renderingMode == RenderingMode.Nodes || renderingMode == RenderingMode.ColliderVoxels)
         {
             Graphics.Blit(nodesTexture, (RenderTexture)null);
         }
@@ -699,6 +719,95 @@ public class FluidRenderer : MonoBehaviour
 
         thicknessCmd.DrawMeshInstancedIndirect(quadMesh, 0, nodeWireframeMaterial, 0, argsBuffer);
         Graphics.ExecuteCommandBuffer(thicknessCmd);
+    }
+
+    void RenderColliderVoxels(Camera cam)
+    {
+        if (cam == null || _sim == null) return;
+
+        if (quadMesh == null)
+            CreateQuadMesh();
+
+        int R = _sim.SolidVoxelResolution;
+        long voxelCountLong = (long)R * R * R;
+        const long maxInstances = 6_000_000;
+        if (voxelCountLong > maxInstances)
+        {
+            if (!s_warnedVoxelInstanceBudget)
+            {
+                s_warnedVoxelInstanceBudget = true;
+                Debug.LogWarning(
+                    $"FluidRenderer: ColliderVoxels view skipped — R³={voxelCountLong} exceeds budget ({maxInstances}). Raise minLayer on Fluid Simulator to reduce R (current R={R}).");
+            }
+            return;
+        }
+
+        uint voxelInstances = (uint)voxelCountLong;
+        if (_sim.SolidVoxelsBuffer == null || _sim.SolidVoxelsBuffer.count != voxelInstances)
+        {
+            if (!s_warnedVoxelBufferMissing)
+            {
+                s_warnedVoxelBufferMissing = true;
+                Debug.LogWarning("FluidRenderer: ColliderVoxels needs a baked solid voxel grid (Fluid Simulator → colliders / resolution).");
+            }
+            return;
+        }
+
+        if (voxelWireframeMaterial == null) return;
+
+        if (nodesTexture == null || nodesTexture.width != cam.pixelWidth || nodesTexture.height != cam.pixelHeight)
+        {
+            if (nodesTexture != null)
+                nodesTexture.Release();
+            nodesTexture = new RenderTexture(cam.pixelWidth, cam.pixelHeight, 24, RenderTextureFormat.ARGBFloat);
+            nodesTexture.enableRandomWrite = true;
+            nodesTexture.Create();
+        }
+
+        EnsureVoxelIndirectArgs(R, voxelInstances);
+
+        thicknessCmd.Clear();
+        thicknessCmd.SetRenderTarget(nodesTexture);
+        thicknessCmd.ClearRenderTarget(true, true, Color.clear);
+
+        voxelWireframeMaterial.SetBuffer("_SolidVoxels", _sim.SolidVoxelsBuffer);
+        voxelWireframeMaterial.SetInt("_SolidVoxelResolution", R);
+        voxelWireframeMaterial.SetVector("_SimulationBoundsMin", SimBounds.min);
+        voxelWireframeMaterial.SetVector("_SimulationBoundsMax", SimBounds.max);
+
+        if (SimBounds.size.sqrMagnitude > 1e-6f)
+        {
+            Vector3 cameraPos = cam.transform.position;
+            Bounds bounds = SimBounds;
+            float boundsDiagonal = bounds.size.magnitude;
+            CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
+            voxelWireframeMaterial.SetFloat("_Scale", Mathf.Exp(calculatedDepthDisplayScale));
+            voxelWireframeMaterial.SetFloat("_MinValue", Mathf.Exp(calculatedDepthMinValue));
+        }
+
+        thicknessCmd.DrawMeshInstancedIndirect(quadMesh, 0, voxelWireframeMaterial, 0, voxelArgsBuffer);
+        Graphics.ExecuteCommandBuffer(thicknessCmd);
+    }
+
+    void EnsureVoxelIndirectArgs(int R, uint instanceCount)
+    {
+        if (quadMesh == null)
+            CreateQuadMesh();
+        if (voxelArgsBuffer != null && cachedVoxelArgsResolution == R)
+            return;
+
+        const int subMeshIndex = 0;
+        uint[] args = new uint[5];
+        args[0] = (uint)quadMesh.GetIndexCount(subMeshIndex);
+        args[1] = instanceCount;
+        args[2] = (uint)quadMesh.GetIndexStart(subMeshIndex);
+        args[3] = (uint)quadMesh.GetBaseVertex(subMeshIndex);
+        args[4] = 0;
+
+        voxelArgsBuffer?.Release();
+        voxelArgsBuffer = new ComputeBuffer(5, sizeof(uint), ComputeBufferType.IndirectArguments);
+        voxelArgsBuffer.SetData(args);
+        cachedVoxelArgsResolution = R;
     }
 
     void RenderNormals(Camera cam)

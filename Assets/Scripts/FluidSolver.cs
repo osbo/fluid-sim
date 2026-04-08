@@ -470,6 +470,8 @@ public partial class FluidSimulator : MonoBehaviour
         BindNodesOctreeCounts();
         WriteIndirectArgsFromCountBuffer(nodeCount);
         nodesShader.SetBuffer(applyExternalForcesKernel, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(applyExternalForcesKernel, "solidVoxelsBuffer", solidVoxelsBuffer);
+        nodesShader.SetInt("solidVoxelResolution", SolidVoxelResolution);
         nodesShader.SetFloat("gravity", gravity);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);

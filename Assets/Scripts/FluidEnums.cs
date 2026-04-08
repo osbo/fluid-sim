@@ -5,6 +5,8 @@ public enum RenderingMode
     Particles,
     ParticlesVelocity,
     Nodes,
+    /// <summary>Solid collider voxels (baked static mesh obstacles) as wireframe cubes where voxel is solid.</summary>
+    ColliderVoxels,
     Depth,
     Thickness,
     BlurredDepth,
