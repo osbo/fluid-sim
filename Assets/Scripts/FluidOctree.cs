@@ -3,6 +3,8 @@ using UnityEngine;
 // Octree/Node component of FluidSimulator
 public partial class FluidSimulator : MonoBehaviour
 {
+    bool _loggedMissingOctreeBuffers;
+
     // Cache all octree/prefix-sum kernel IDs once in Start() so the layer loop never calls FindKernel.
     private void InitOctreeKernels()
     {
@@ -80,11 +82,24 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(calculateDensityGradientKernel, "nodeCountBuffer", nodeCount);
         nodesShader.SetBuffer(applyPressureGradientKernel, "nodeCountBuffer", nodeCount);
         nodesShader.SetBuffer(applyExternalForcesKernel, "nodeCountBuffer", nodeCount);
+        nodesShader.SetBuffer(applyViscosityKernelId, "nodeCountBuffer", nodeCount);
     }
 
     private void findUniqueParticles()
     {
         if (numParticles == 0) return;
+
+        if (particlePrefixElementCountBuffer == null || particlesBuffer == null ||
+            indicators == null || prefixSums == null || uniqueIndices == null ||
+            uniqueCount == null || dispatchArgsBuffer == null || nodeCount == null)
+        {
+            if (!_loggedMissingOctreeBuffers)
+            {
+                _loggedMissingOctreeBuffers = true;
+                Debug.LogError("FluidSimulator: octree/prefix buffers are not allocated (did particle init fail?). Skipping findUniqueParticles.");
+            }
+            return;
+        }
 
         if (nodesPrefixSumsShader == null)
         {

@@ -177,6 +177,7 @@ float3 mortonNormalizationFactor;
 float mortonMaxValue;
 float gravity;
 float deltaTime;
+float flip_ratio; // 1.0 = pure FLIP (use with physical viscosity), 0.0 = pure PIC
 float dispersionPower; // >1 concentrates near left, <1 concentrates near right
 float boundaryThreshold; // normalized u threshold near left edge considered boundary
 uint minLayer;
@@ -267,10 +268,10 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
     oldGridVelocity.y = lerp(nodeOld.velocities.bottom, nodeOld.velocities.top, t.y);
     oldGridVelocity.z = lerp(nodeOld.velocities.front, nodeOld.velocities.back, t.z);
 
-    // FLIP method: Calculate velocity delta and blend
+    // FLIP method: Calculate velocity delta and blend.
+    // flip_ratio=1.0 → pure FLIP (no numerical dissipation); set from C# alongside physical viscosity.
     float3 grid_velocity_delta = newGridVelocity - oldGridVelocity;
     float3 flip_velocity = particle.velocity + grid_velocity_delta;
-    float flip_ratio = 0.95f;
     float3 newVelocity = lerp(newGridVelocity, flip_velocity, flip_ratio);
 
     // float3 newVelocity = newGridVelocity;

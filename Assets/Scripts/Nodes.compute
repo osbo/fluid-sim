@@ -10,6 +10,7 @@
 #pragma kernel InitializePhi
 #pragma kernel PropagatePhi
 #pragma kernel CalculateDensityGradient
+#pragma kernel ApplyViscosity
 
 struct faceVelocities
 {
@@ -1416,4 +1417,78 @@ void CalculateDensityGradient(uint3 id : SV_DispatchThreadID)
     }
 
     diffusionGradientBuffer[i] = gradient;
+}
+
+// ---------------------------------------------------------------------------
+// Explicit viscosity: u += ν·dt·∇²u
+//
+// Approximates the Laplacian of the cell-center velocity as the sum of
+// (v_neighbor - v_self) / distance² over all valid face neighbors, then
+// applies the result to the face velocities.  Unconditionally zero-fluxes
+// at domain / solid walls (those faces already carry 0 velocity).
+//
+// Stability limit (explicit): ν·dt / dx_min² < 1/6.
+// For water (ν ≈ 1e-6 in SI) converted to sim-units this is never violated
+// in practice; for high-ν fluids use a small dt or switch to implicit.
+// ---------------------------------------------------------------------------
+float kinematicViscosity; // ν [sim-units²/s]  (set to 0 to disable)
+
+[numthreads(512, 1, 1)]
+void ApplyViscosity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= NAct()) return;
+
+    Node node = nodesBuffer[i];
+    float dx_i = exp2((float)node.layer);
+
+    // Cell-center velocity of self (average of opposing face pairs)
+    float3 v_self = float3(
+        (node.velocities.left  + node.velocities.right) * 0.5,
+        (node.velocities.bottom + node.velocities.top)  * 0.5,
+        (node.velocities.front + node.velocities.back)  * 0.5
+    );
+
+    // Accumulate finite-difference Laplacian: Σ (v_j - v_i) / dist²
+    // Uses only the primary neighbor (slot 0 of each face group).
+    // For finer-child neighbors, slot 0 gives one of the children — close
+    // enough for the diffusion approximation at tree-cell granularity.
+    float3 laplacian = float3(0, 0, 0);
+
+    [unroll]
+    for (int d = 0; d < 6; d++)
+    {
+        uint slot      = (uint)d * 4u; // slot 0 of each face group
+        uint nb_idx    = neighborsBuffer[slot * numNodesCapacity + i];
+
+        // NAct() = invalid/wall, NAct()+1 = domain wall, NAct()+2 = solid
+        if (nb_idx >= NAct()) continue;
+
+        Node nb    = nodesBuffer[nb_idx];
+        float dx_j = exp2((float)nb.layer);
+
+        // Face-to-face distance between cell centers
+        float dist = max(0.5 * (dx_i + dx_j), 1e-6);
+
+        float3 v_nb = float3(
+            (nb.velocities.left  + nb.velocities.right) * 0.5,
+            (nb.velocities.bottom + nb.velocities.top)  * 0.5,
+            (nb.velocities.front + nb.velocities.back)  * 0.5
+        );
+
+        laplacian += (v_nb - v_self) / (dist * dist);
+    }
+
+    float3 delta = kinematicViscosity * deltaTime * laplacian;
+
+    // Apply the velocity correction uniformly to all faces.
+    // Both faces of an axis share the same center-velocity change.
+    node.velocities.left   += delta.x;
+    node.velocities.right  += delta.x;
+    node.velocities.bottom += delta.y;
+    node.velocities.top    += delta.y;
+    node.velocities.front  += delta.z;
+    node.velocities.back   += delta.z;
+
+    nodesBuffer[i] = node;
 }

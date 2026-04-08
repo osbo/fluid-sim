@@ -61,9 +61,10 @@ public partial class FluidSimulator : MonoBehaviour
         InitLeafOnlyLayer1GpuKernels();
         InitLeafOnlyPrecondApplyKernels();
 
-        applyPressureGradientKernel = nodesShader.FindKernel("ApplyPressureGradient");
-        applyExternalForcesKernel   = nodesShader.FindKernel("ApplyExternalForces");
+        applyPressureGradientKernel    = nodesShader.FindKernel("ApplyPressureGradient");
+        applyExternalForcesKernel      = nodesShader.FindKernel("ApplyExternalForces");
         calculateDensityGradientKernel = nodesShader.FindKernel("CalculateDensityGradient");
+        applyViscosityKernelId         = nodesShader.FindKernel("ApplyViscosity");
     }
 
     private void SolvePressure()
@@ -467,5 +468,19 @@ public partial class FluidSimulator : MonoBehaviour
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);
         nodesShader.DispatchIndirect(applyExternalForcesKernel, dispatchArgsBuffer, 0);
+    }
+
+    private void ApplyViscosity()
+    {
+        if (nodesShader == null) return;
+
+        // dispatchArgsBuffer is already set to ceil(numNodes/512) by the preceding
+        // ApplyExternalForces call (WriteIndirectArgsFromCountBuffer).  Reuse it here.
+        float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
+        nodesShader.SetFloat("kinematicViscosity", kinematicViscosity);
+        nodesShader.SetFloat("deltaTime", deltaTime);
+        nodesShader.SetBuffer(applyViscosityKernelId, "nodesBuffer", nodesBuffer);
+        nodesShader.SetBuffer(applyViscosityKernelId, "neighborsBuffer", neighborsBuffer);
+        nodesShader.DispatchIndirect(applyViscosityKernelId, dispatchArgsBuffer, 0);
     }
 }
