@@ -627,11 +627,11 @@ public partial class FluidSimulator : MonoBehaviour
         if (nodesShader == null) return;
 
         BindNodesOctreeCounts();
+        WriteIndirectArgsFromCountBuffer(nodeCount);
         nodesShader.SetBuffer(applyExternalForcesKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetFloat("gravity", gravity);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);
-        int threadGroups = Mathf.CeilToInt(numNodes / 512.0f);
-        nodesShader.Dispatch(applyExternalForcesKernel, threadGroups, 1, 1);
+        nodesShader.DispatchIndirect(applyExternalForcesKernel, dispatchArgsBuffer, 0);
     }
 }

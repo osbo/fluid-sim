@@ -104,6 +104,8 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer uniqueCount;
     private ComputeBuffer nodeCount;
     private ComputeBuffer auxSmall;
+    // AoS Node struct in GPU memory; morton-heavy searches also use mortonCodesBuffer (see Nodes.compute). A full SoA split
+    // (positions, layers, masses, …) would further cut bandwidth in kernels that only need a subset of fields.
     private ComputeBuffer nodesBuffer;
     private ComputeBuffer nodesBufferOld;
     private ComputeBuffer tempNodesBuffer;
@@ -285,8 +287,20 @@ public partial class FluidSimulator : MonoBehaviour
     [Range(0.0001f, 10.0f)] public float depthBlurThreshold = 1.24f;
     [Range(0, 100)] public int thicknessBlurRadius = 22;
     [Range(0.0001f, 1.0f)] public float particleRadius = 0.066f; // Radius for particle points (world space)
+    [Tooltip("Particles / Particles Velocity: bounds-normalized camera distance. Exponent on nearness (1 = linear). >1 pulls brightness toward closer particles; <1 lifts mids.")]
+    [Range(0.25f, 4f)]
+    public float particleDepthShadeGamma = 1.2f;
+    [Tooltip("Particles / Particles Velocity: minimum HSV value scale when far (within bounds range), so velocity color stays readable instead of going to black.")]
+    [Range(0f, 0.6f)]
+    public float particleDepthLumaFloor = 0.15f;
     [Tooltip("Particles Velocity mode: speed magnitudes at or above this value map to the fastest hue (red); slower maps toward blue. Units match simulation velocity.")]
     public float particleVelocityColorReference = 10f;
+    [Tooltip("Particles Velocity mode: map colors using min–max |v| for the current frame (GPU reduction only; no CPU particle readback). Ignored when off; reference speed above is used instead.")]
+    public bool particleVelocityNormalizePerFrame;
+    [Tooltip("When per-frame normalize is on: blend smoothed min/max toward this frame’s values each frame (lerp weight 1/N). Larger N = less jitter, slower tracking.")]
+    [Range(1, 120)]
+    public int particleVelocityNormalizeSmoothingFrames = 10;
+    public ComputeShader particleVelocityReduceShader;
     [Range(0.0001f, 1.0f)] public float depthRadius = 0.279f; // Radius for depth quads (world space)
     [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.776f; // Radius for particle thickness quads (world space)
     [Range(0, 20)] public float absorptionStrength = 5.8f;
@@ -311,6 +325,13 @@ public partial class FluidSimulator : MonoBehaviour
     private Mesh quadMesh;
     private ComputeBuffer argsBuffer;
     private ComputeBuffer particleArgsBuffer;
+    private int particleVelocityBlockReduceKernel = -1;
+    private int particleVelocityReduceLevelKernel = -1;
+    private int particleVelocitySmoothMinMaxKernel = -1;
+    private ComputeBuffer particleVelocityReduceBufferA;
+    private ComputeBuffer particleVelocityReduceBufferB;
+    private ComputeBuffer particleVelocitySmoothedMinMaxBuffer;
+    private ComputeBuffer particleVelocityMinMaxDummyBuffer;
     private CommandBuffer thicknessCmd;
     private CommandBuffer depthCmd;
     private RenderTexture thicknessTexture;
@@ -351,6 +372,13 @@ public partial class FluidSimulator : MonoBehaviour
         CreateQuadMesh();
         CreateArgsBuffer();
         CreateParticleArgsBuffer();
+
+        if (particleVelocityReduceShader != null)
+        {
+            particleVelocityBlockReduceKernel = particleVelocityReduceShader.FindKernel("BlockReduce");
+            particleVelocityReduceLevelKernel = particleVelocityReduceShader.FindKernel("ReduceLevel");
+            particleVelocitySmoothMinMaxKernel = particleVelocityReduceShader.FindKernel("SmoothVelocityMinMax");
+        }
         
         // Create thickness render texture
         if (thicknessTexture == null)
@@ -455,18 +483,12 @@ public partial class FluidSimulator : MonoBehaviour
         }
         layerLoopSw.Stop();
 
-        // Single readback: final active node count for CPU-side solver, rendering, and diagnostics.
-        nodeCount.GetData(gpuNodeCountReadback);
-        numNodes = (int)gpuNodeCountReadback[0];
-
-        // Step 4: Find neighbors
+        // Step 4: Find neighbors (GPU: WriteIndirectArgsFromCount + DispatchIndirect — no CPU count needed)
         var findNeighborsSw = System.Diagnostics.Stopwatch.StartNew();
         findNeighbors();
         findNeighborsSw.Stop();
 
-        string layerCountsLine = BuildLayerCountsSummaryForLog();
-
-        // Step 4.5: Calculate density gradients
+        // Step 4.5: Calculate density gradients (indirect from GPU nodeCount)
         var calculateGradientsSw = System.Diagnostics.Stopwatch.StartNew();
         CalculateDensityGradients();
         calculateGradientsSw.Stop();
@@ -481,10 +503,15 @@ public partial class FluidSimulator : MonoBehaviour
         StoreOldVelocities();
         storeOldVelocitiesSw.Stop();
 
-        // Step 7: Apply external forces on the grid
+        // Step 7: Apply external forces (indirect from GPU nodeCount)
         var applyExternalForcesSw = System.Diagnostics.Stopwatch.StartNew();
         ApplyExternalForces();
         applyExternalForcesSw.Stop();
+
+        // Single sync readback: CPU needs numNodes for SolvePressure, UpdateParticles, rendering, and optional layer log.
+        nodeCount.GetData(gpuNodeCountReadback);
+        numNodes = (int)gpuNodeCountReadback[0];
+        string layerCountsLine = BuildLayerCountsSummaryForLog();
 
         // Step 9: Solve pressure
         var solvePressureSw = System.Diagnostics.Stopwatch.StartNew();
@@ -523,7 +550,7 @@ public partial class FluidSimulator : MonoBehaviour
                  $"• Avg CG Iterations: {averageCgIterationsText}");
     }
 
-    /// <summary>Non-null when <see cref="logLayerCountsPerFrame"/> is true: nodes-per-layer after findNeighbors (GPU readback).</summary>
+    /// <summary>Non-null when <see cref="logLayerCountsPerFrame"/> is true: histogram after <see cref="numNodes"/> readback.</summary>
     private string BuildLayerCountsSummaryForLog()
     {
         if (!logLayerCountsPerFrame)
@@ -626,12 +653,11 @@ public partial class FluidSimulator : MonoBehaviour
         }
 
         BindNodesOctreeCounts();
+        WriteIndirectArgsFromCountBuffer(nodeCount);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "nodesBuffer", nodesBuffer);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "neighborsBuffer", neighborsBuffer);
         nodesShader.SetBuffer(calculateDensityGradientKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
-
-        int groups = Mathf.CeilToInt(numNodes / 512.0f);
-        nodesShader.Dispatch(calculateDensityGradientKernel, groups, 1, 1);
+        nodesShader.DispatchIndirect(calculateDensityGradientKernel, dispatchArgsBuffer, 0);
     }
 
     private void StoreOldVelocities()
