@@ -20,15 +20,6 @@ public enum PreconditionerType
     Jacobi
 }
 
-/// <summary>How PCG applies the pressure Laplacian each iteration. CSR is still built when <see cref="PreconditionerType.Neural"/> or the training recorder is capturing frames (needs edge lists).</summary>
-public enum PressureSolveMatrixFormat
-{
-    /// <summary><c>ApplyMatrixAndDot</c> on SoA stencil; skips CSR build if nothing else needs it.</summary>
-    Structured,
-    /// <summary><c>SpMV_CSR</c>; builds CSR every solve.</summary>
-    Csr
-}
-
 public enum ThicknessSource
 {
     Nodes,

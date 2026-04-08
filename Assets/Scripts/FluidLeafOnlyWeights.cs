@@ -11,13 +11,10 @@ public partial class FluidSimulator : MonoBehaviour
 {
     public const int LeafOnlyEdgeGateHiddenDim = 16;
 
-    [Tooltip("Fallback only: raw binary TextAsset. Prefer StreamingAssets — Unity may alter binary TextAssets.")]
-    public TextAsset leafOnlyWeightsAsset;
-
-    [Tooltip("File name only (not a path): read from Assets/StreamingAssets/<this name>. Example: model_weights_sim_8192.bytes")]
+    [Tooltip("File name only (not a path): read from Assets/StreamingAssets/<this name>.")]
     public string leafOnlyWeightsStreamingAssetsName = "leaf_only_weights.bytes";
 
-    [Tooltip("If true, also load when the StreamingAssets file exists (even if preconditioner is not Neural).")]
+    [Tooltip("If true, load when the StreamingAssets file exists (even if preconditioner is not Neural).")]
     public bool tryLoadLeafOnlyWeightsFromStreamingAssets = true;
 
     private ComputeBuffer leafOnlyWeightsFloatBuffer;
@@ -38,7 +35,7 @@ public partial class FluidSimulator : MonoBehaviour
         LeafOnlyWeightsLoadedSuccessfully = false;
         leafOnlyWeightsLoadError = null;
 
-        bool wantLoad = preconditioner == PreconditionerType.Neural || leafOnlyWeightsAsset != null;
+        bool wantLoad = preconditioner == PreconditionerType.Neural;
         if (!wantLoad && tryLoadLeafOnlyWeightsFromStreamingAssets && !string.IsNullOrEmpty(leafOnlyWeightsStreamingAssetsName))
         {
             string streamingPath = Path.Combine(Application.streamingAssetsPath, leafOnlyWeightsStreamingAssetsName);
@@ -49,7 +46,7 @@ public partial class FluidSimulator : MonoBehaviour
         if (!wantLoad)
             return;
 
-        // Try StreamingAssets first (raw File.ReadAllBytes, same as Python open(path,"rb")), then TextAsset.
+        // StreamingAssets only (raw File.ReadAllBytes, same as Python open(path,"rb")).
         byte[] bytes = null;
         string bytesSource = null;
         if (!string.IsNullOrEmpty(leafOnlyWeightsStreamingAssetsName))
@@ -72,7 +69,6 @@ public partial class FluidSimulator : MonoBehaviour
         }
 
         string parseErr = null;
-        string firstErr = null;
 
         if (bytes != null)
         {
@@ -81,35 +77,17 @@ public partial class FluidSimulator : MonoBehaviour
                 FinalizeLeafOnlyWeightUpload(bytes, bytesSource, weightsByteOffset);
                 return;
             }
-
-            firstErr = parseErr;
         }
 
-        if (leafOnlyWeightsAsset != null && leafOnlyWeightsAsset.bytes != null && leafOnlyWeightsAsset.bytes.Length > 0)
-        {
-            byte[] ab = leafOnlyWeightsAsset.bytes;
-            string an = leafOnlyWeightsAsset.name;
-            if (LeafOnlyCheckpointHeader.TryParse(ab, out leafOnlyCheckpointHeader, out int weightsByteOffset, out parseErr))
-            {
-                Debug.LogWarning(
-                    "[LeafOnly] Loaded weights from TextAsset '" + an + "' (StreamingAssets parse failed or missing). Prefer a raw .bytes file under StreamingAssets.");
-                FinalizeLeafOnlyWeightUpload(ab, "TextAsset:" + an, weightsByteOffset);
-                return;
-            }
-
-            if (bytes == null)
-                firstErr = parseErr;
-        }
-
-        if (bytes == null && (leafOnlyWeightsAsset == null || leafOnlyWeightsAsset.bytes == null || leafOnlyWeightsAsset.bytes.Length == 0))
+        if (bytes == null)
         {
             leafOnlyWeightsLoadError = "missing or too small";
             if (preconditioner == PreconditionerType.Neural)
-                Debug.LogWarning("[LeafOnly] Neural preconditioner selected but no weights found (assign TextAsset or place file under StreamingAssets).");
+                Debug.LogWarning("[LeafOnly] Neural preconditioner selected but no weights found (place a raw .bytes file under StreamingAssets).");
             return;
         }
 
-        leafOnlyWeightsLoadError = firstErr ?? parseErr ?? "checkpoint parse failed";
+        leafOnlyWeightsLoadError = parseErr ?? "checkpoint parse failed";
         Debug.LogError($"[LeafOnly] Checkpoint parse failed: {leafOnlyWeightsLoadError}");
     }
 

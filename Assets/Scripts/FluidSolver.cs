@@ -30,7 +30,6 @@ public partial class FluidSimulator : MonoBehaviour
 
         calculateDivergenceKernel   = cgSolverShader.FindKernel("CalculateDivergence");
         buildMatrixAKernelId        = cgSolverShader.FindKernel("BuildMatrixA");
-        applyMatrixAndDotKernelId   = cgSolverShader.FindKernel("ApplyMatrixAndDot");
         spmvCsrKernelId             = cgSolverShader.FindKernel("SpMV_CSR");
         axpyKernel                  = cgSolverShader.FindKernel("Axpy");
         scaleKernelId               = cgSolverShader.FindKernel("Scale");
@@ -67,18 +66,6 @@ public partial class FluidSimulator : MonoBehaviour
         calculateDensityGradientKernel = nodesShader.FindKernel("CalculateDensityGradient");
     }
 
-    /// <summary>CSR is required for <see cref="PressureSolveMatrixFormat.Csr"/>, neural leaf graph features, and training export.</summary>
-    private bool PressureSolveNeedsCsrThisFrame()
-    {
-        if (pressureSolveMatrixFormat == PressureSolveMatrixFormat.Csr)
-            return true;
-        if (preconditioner == PreconditionerType.Neural)
-            return true;
-        if (recorder != null && recorder.isRecording)
-            return true;
-        return false;
-    }
-
     private void SolvePressure()
     {
         if (cgSolverShader == null)
@@ -94,7 +81,7 @@ public partial class FluidSimulator : MonoBehaviour
         if (cgBetaBuffer == null) cgBetaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgRhoBuffer == null) cgRhoBuffer = new ComputeBuffer(1, sizeof(float));
 
-        bool buildCsr = PressureSolveNeedsCsrThisFrame();
+        const bool buildCsr = true;
 
         // SoA strides are fixed at maxNodesCapacity (both neighborsBuffer and matrixABuffer).
         cgSolverShader.SetInt("numNodesCapacity", maxNodesCapacity);
@@ -102,7 +89,7 @@ public partial class FluidSimulator : MonoBehaviour
         {
             if (csrBuilderShader == null)
             {
-                Debug.LogError("CSR build is required (Csr matrix format, Neural preconditioner, or training recorder) but CSRBuilder compute shader is not assigned.");
+                Debug.LogError("CSR build requires CSRBuilder compute shader (assign or use Editor default path Assets/Scripts/CSRBuilder.compute).");
                 return;
             }
             csrBuilderShader.SetInt("numNodesCapacity", maxNodesCapacity);
@@ -127,7 +114,6 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolverShader.SetBuffer(dotProductKernel,          "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(applyJacobiKernelId,       "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(globalReduceSumKernelId,   "reductionCountBuffer", solverReductionCount256Buffer); // default; overridden below as needed
-        cgSolverShader.SetBuffer(applyMatrixAndDotKernelId, "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(spmvCsrKernelId,           "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(copyFloatKernelId,         "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(axpyAlphaKernelId,         "nodeCountBuffer", nodeCount);
@@ -231,25 +217,15 @@ public partial class FluidSimulator : MonoBehaviour
         {
         for (int k = 0; k < maxCgIterations; k++)
         {
-            // 1. Ap = A*p, partial p·Ap → divergenceBuffer (structured stencil or CSR)
-            int matvecKernel = pressureSolveMatrixFormat == PressureSolveMatrixFormat.Csr
-                ? spmvCsrKernelId
-                : applyMatrixAndDotKernelId;
+            // 1. Ap = A*p, partial p·Ap → divergenceBuffer (CSR SpMV)
+            int matvecKernel = spmvCsrKernelId;
             laplacianSw.Start();
             cgSolverShader.SetBuffer(matvecKernel, "pBuffer", pBuffer);
             cgSolverShader.SetBuffer(matvecKernel, "ApBuffer", ApBuffer);
             cgSolverShader.SetBuffer(matvecKernel, "divergenceBuffer", divergenceBuffer);
-            if (pressureSolveMatrixFormat == PressureSolveMatrixFormat.Csr)
-            {
-                cgSolverShader.SetBuffer(matvecKernel, "csrRowPtr", csrRowPtr);
-                cgSolverShader.SetBuffer(matvecKernel, "csrColIndices", csrColIndices);
-                cgSolverShader.SetBuffer(matvecKernel, "csrValues", csrValues);
-            }
-            else
-            {
-                cgSolverShader.SetBuffer(matvecKernel, "matrixABuffer", matrixABuffer);
-                cgSolverShader.SetBuffer(matvecKernel, "neighborsBuffer", neighborsBuffer);
-            }
+            cgSolverShader.SetBuffer(matvecKernel, "csrRowPtr", csrRowPtr);
+            cgSolverShader.SetBuffer(matvecKernel, "csrColIndices", csrColIndices);
+            cgSolverShader.SetBuffer(matvecKernel, "csrValues", csrValues);
             GpuProfileDispatchIndirect(cgSolverShader, matvecKernel, solverIndirectArgsBuffer, CgIndirectArgsOffsetSpmv);
             laplacianSw.Stop();
 

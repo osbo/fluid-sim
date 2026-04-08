@@ -9,8 +9,8 @@ using UnityEngine;
 /// </summary>
 public partial class FluidSimulator : MonoBehaviour
 {
-    [Tooltip("LeafOnlyPrecondApply.compute — packed precond apply z += M r. Optional in Editor (auto-loaded from Assets/Scripts).")]
-    public ComputeShader leafOnlyPrecondApplyShader;
+    [Tooltip("LeafOnlyPrecondApply.compute — packed precond apply z += M r. Editor loads from Assets/Scripts if unset.")]
+    ComputeShader leafOnlyPrecondApplyShader;
 
     [Tooltip("Optional packed preconditioner buffer (diag | off | U | V | optional jacobi). If null or wrong length, an internal buffer is used for GPU apply.")]
     public ComputeBuffer leafOnlyPrecondPackedBuffer;
@@ -106,13 +106,6 @@ public partial class FluidSimulator : MonoBehaviour
 
     private void InitLeafOnlyPrecondApplyKernels()
     {
-#if UNITY_EDITOR
-        if (leafOnlyPrecondApplyShader == null)
-        {
-            leafOnlyPrecondApplyShader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>(
-                "Assets/Scripts/LeafOnlyPrecondApply.compute");
-        }
-#endif
         if (leafOnlyPrecondApplyShader == null)
             return;
         kPrecondClearZ = leafOnlyPrecondApplyShader.FindKernel("LeafOnly_PrecondClearZ");

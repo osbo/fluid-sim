@@ -7,8 +7,8 @@ using UnityEngine;
 /// </summary>
 public partial class FluidSimulator : MonoBehaviour
 {
-    [Tooltip("LeafOnlyDiagEdgeFeats.compute — dense diag edge grid for attention; leave null to skip.")]
-    public ComputeShader leafOnlyDiagEdgeFeatsShader;
+    [Tooltip("LeafOnlyDiagEdgeFeats.compute. Editor loads from Assets/Scripts if unset.")]
+    ComputeShader leafOnlyDiagEdgeFeatsShader;
 
     private int leafOnlyDiagGeomKernel;
     private int leafOnlyDiagClearScratchKernel;
