@@ -117,32 +117,9 @@ uint faceOffset(int d)
     return 20u;// d == 5
 }
 
-StructuredBuffer<uint>   solidVoxelsBuffer;        // binary solid grid (R³), 1=solid
-StructuredBuffer<float4> solidVoxelNormalsBuffer;  // outward normals in sim space; w unused
 StructuredBuffer<float>  solidSDFBuffer;           // signed distance in sim units (negative = inside)
 uint solidVoxelResolution;                         // R: grid side length (1 = stub when colliders off)
 uint useColliders;                                // 0 = skip solid/SDF reads (no obstacle cost)
-
-uint SolidVoxelIndex(float3 simPos)
-{
-    int3 vc = (int3)(simPos * ((float)solidVoxelResolution / 1024.0));
-    vc = clamp(vc, int3(0,0,0), int3((int)solidVoxelResolution-1, (int)solidVoxelResolution-1, (int)solidVoxelResolution-1));
-    return (uint)vc.z * solidVoxelResolution * solidVoxelResolution
-         + (uint)vc.y * solidVoxelResolution
-         + (uint)vc.x;
-}
-
-bool IsSolid(float3 simPos)
-{
-    if (useColliders == 0u) return false;
-    return solidVoxelsBuffer[SolidVoxelIndex(simPos)] != 0u;
-}
-
-float3 SolidVoxelNormal(float3 simPos)
-{
-    if (useColliders == 0u) return float3(0, 0, 0);
-    return solidVoxelNormalsBuffer[SolidVoxelIndex(simPos)].xyz;
-}
 
 // Trilinear SDF sample — smooth penetration depth for proper surface projection.
 float SampleSDF(float3 simPos)
@@ -170,6 +147,11 @@ float SampleSDF(float3 simPos)
     #undef SDF_AT
     return lerp(lerp(lerp(v000,v100,t.x), lerp(v010,v110,t.x), t.y),
                 lerp(lerp(v001,v101,t.x), lerp(v011,v111,t.x), t.y), t.z);
+}
+
+bool IsSolid(float3 simPos)
+{
+    return SampleSDF(simPos) < 0.0;
 }
 
 // Buffer definitions
@@ -386,27 +368,38 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     // --- Solid obstacle: SDF projection ---
     // SampleSDF gives the signed distance in sim units: negative = inside solid.
-    // Project the particle outward by exactly the penetration depth along the surface
-    // normal, then zero the inward velocity component (no bounce, prevents sticking).
+    // Normal is computed as the gradient of the trilinear SDF (finite differences),
+    // giving a smooth surface normal that matches the interpolated distance field.
     float solidDist = SampleSDF(newPosition);
-    if (solidDist < 0.0)
+    if (solidDist < 1.0) // probe slightly outside surface to get gradient early
     {
-        float3 n = SolidVoxelNormal(newPosition);
-        float nl = length(n);
-        if (nl > 1e-4)
+        // Central-difference gradient of the trilinear SDF in sim-space units.
+        float h = 1024.0 / (float)solidVoxelResolution; // one voxel width in sim units
+        float3 grad = float3(
+            SampleSDF(newPosition + float3(h, 0, 0)) - SampleSDF(newPosition - float3(h, 0, 0)),
+            SampleSDF(newPosition + float3(0, h, 0)) - SampleSDF(newPosition - float3(0, h, 0)),
+            SampleSDF(newPosition + float3(0, 0, h)) - SampleSDF(newPosition - float3(0, 0, h))
+        );
+        float gl = length(grad);
+
+        if (solidDist < 0.0)
         {
-            n /= nl;
-            // Move particle to the surface along the outward normal
-            newPosition -= solidDist * n;   // solidDist < 0, so this adds |solidDist|*n
-            // Remove any velocity component pointing into the solid
-            float vn = dot(newVelocity, n);
-            if (vn < 0.0) newVelocity -= vn * n;
-        }
-        else
-        {
-            // No reliable normal (deep interior or degenerate): revert to pre-advection pos
-            newPosition = particle.position;
-            newVelocity = float3(0, 0, 0);
+            if (gl > 1e-4)
+            {
+                float3 n = grad / gl;
+                // Push particle to surface + small safety margin (0.5 sim units)
+                newPosition -= (solidDist - 0.5) * n;
+                // Remove inward velocity; add small outward kick to prevent sticking
+                float vn = dot(newVelocity, n);
+                if (vn < 0.0) newVelocity -= vn * n;
+                newVelocity += n * 0.5; // small outward nudge so pressure doesn't have to do it alone
+            }
+            else
+            {
+                // Deep interior with no gradient: revert to pre-advection pos
+                newPosition = particle.position;
+                newVelocity = float3(0, 0, 0);
+            }
         }
     }
 

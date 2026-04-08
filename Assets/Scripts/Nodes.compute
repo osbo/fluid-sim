@@ -67,17 +67,33 @@ StructuredBuffer<uint> nodeCountBuffer;                 // [0] = active node cou
 uint numNodesCapacity;                                  // SoA stride (preallocated width); >= nodeCountBuffer[0]
 uint numParticles;                                      // total number of particles
 
-StructuredBuffer<uint> solidVoxelsBuffer;               // solid voxel grid (R³), 1=solid
-uint solidVoxelResolution;                              // R: voxel grid side length (1 = stub when colliders off)
+StructuredBuffer<float> solidSDFBuffer;                 // signed distance in sim units (negative = inside solid)
+uint solidVoxelResolution;                              // R: SDF grid side length (1 = stub when colliders off)
 uint useColliders;
+
+float SampleSDF_Nodes(float3 simPos)
+{
+    if (useColliders == 0u) return 1e9f;
+    float R = (float)solidVoxelResolution;
+    float3 vf = simPos * (R / 1024.0) - 0.5;
+    int3 v0 = (int3)floor(vf);
+    float3 t = vf - (float3)v0;
+    int Ri = (int)solidVoxelResolution;
+    int3 v0c = clamp(v0,      int3(0,0,0), int3(Ri-1,Ri-1,Ri-1));
+    int3 v1c = clamp(v0 + 1, int3(0,0,0), int3(Ri-1,Ri-1,Ri-1));
+    uint Ru = solidVoxelResolution;
+    #define NSDF(ix,iy,iz) solidSDFBuffer[(uint)(iz)*Ru*Ru + (uint)(iy)*Ru + (uint)(ix)]
+    float d = lerp(lerp(lerp(NSDF(v0c.x,v0c.y,v0c.z), NSDF(v1c.x,v0c.y,v0c.z), t.x),
+                        lerp(NSDF(v0c.x,v1c.y,v0c.z), NSDF(v1c.x,v1c.y,v0c.z), t.x), t.y),
+                   lerp(lerp(NSDF(v0c.x,v0c.y,v1c.z), NSDF(v1c.x,v0c.y,v1c.z), t.x),
+                        lerp(NSDF(v0c.x,v1c.y,v1c.z), NSDF(v1c.x,v1c.y,v1c.z), t.x), t.y), t.z);
+    #undef NSDF
+    return d;
+}
 
 bool IsSolid(float3 simPos)
 {
-    if (useColliders == 0u) return false;
-    int3 vc = (int3)(simPos * ((float)solidVoxelResolution / 1024.0));
-    vc = clamp(vc, int3(0,0,0), int3((int)solidVoxelResolution-1, (int)solidVoxelResolution-1, (int)solidVoxelResolution-1));
-    uint idx = (uint)vc.z * solidVoxelResolution * solidVoxelResolution + (uint)vc.y * solidVoxelResolution + (uint)vc.x;
-    return solidVoxelsBuffer[idx] != 0u;
+    return SampleSDF_Nodes(simPos) < 0.0;
 }
 
 uint NAct() { return nodeCountBuffer[0]; }
@@ -143,40 +159,44 @@ uint EncodeMorton3D(float3 pos)
 uint faceOffset(int d)
 {
     // left=0..3, right=4..7, bottom=8..11, top=12..15, front=16..19, back=20..23
-    if (d == 0) return 0u;
-    if (d == 1) return 4u;
-    if (d == 2) return 8u;
-    if (d == 3) return 12u;
-    if (d == 4) return 16u;
-    return 20u; // d == 5
+    uint o = 20u;
+    if (d == 0) o = 0u;
+    else if (d == 1) o = 4u;
+    else if (d == 2) o = 8u;
+    else if (d == 3) o = 12u;
+    else if (d == 4) o = 16u;
+    return o;
 }
 
 float selectFace(faceVelocities v, int d)
 {
-    if (d == 0) return v.left;
-    if (d == 1) return v.right;
-    if (d == 2) return v.bottom;
-    if (d == 3) return v.top;
-    if (d == 4) return v.front;
-    return v.back;
+    float f = v.back;
+    if (d == 0) f = v.left;
+    else if (d == 1) f = v.right;
+    else if (d == 2) f = v.bottom;
+    else if (d == 3) f = v.top;
+    else if (d == 4) f = v.front;
+    return f;
 }
 
 float selectOpposingFace(faceVelocities v, int d)
 {
-    if (d == 0) return v.right;
-    if (d == 1) return v.left;
-    if (d == 2) return v.top;
-    if (d == 3) return v.bottom;
-    if (d == 4) return v.back;
-    return v.front;
+    float f = v.front;
+    if (d == 0) f = v.right;
+    else if (d == 1) f = v.left;
+    else if (d == 2) f = v.top;
+    else if (d == 3) f = v.bottom;
+    else if (d == 4) f = v.back;
+    return f;
 }
 
 float calculateMassWeight(float selfMass, float neighborMass)
 {
     float total = selfMass + neighborMass;
-    // If both are near zero (air-to-air), fallback to 0.5
-    if (total < 1e-6) return 0.5; 
-    return selfMass / total;
+    float w = 0.5;
+    if (total >= 1e-6)
+        w = selfMass / total;
+    return w;
 }
 
 // --- NEW: Extraction Kernel ---
@@ -566,9 +586,9 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
         uint childShift = (layer - 1) * 3;  // Children's prefix starts here
         uint parentPrefix = baseCode >> parentShift;
         
-        for (uint i = uniqueStart; i < uniqueEnd; i++)
+        for (uint childNi = uniqueStart; childNi < uniqueEnd; childNi++)
         {
-            Node childNode = nodesBuffer[i];
+            Node childNode = nodesBuffer[childNi];
             
             // Extract the child prefix and check if it belongs to this parent
             uint childMortonCode = childNode.mortonCode;

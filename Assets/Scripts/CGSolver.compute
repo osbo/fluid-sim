@@ -84,14 +84,19 @@ uint3 DeinterleaveCG(uint m)
 // Returns large positive if out-of-bounds (treat as outside).
 float SampleSDF(float3 simPos)
 {
-    if (useColliders == 0u) return 1e9f;
-    int3 vc = (int3)(simPos * ((float)solidSDFResolution / 1024.0));
-    if (any(vc < int3(0,0,0)) || any(vc >= (int3)solidSDFResolution))
-        return 1e9f; // outside grid → treat as fully outside solid
-    uint idx = (uint)vc.z * solidSDFResolution * solidSDFResolution
-             + (uint)vc.y * solidSDFResolution
-             + (uint)vc.x;
-    return solidSDFBuffer[idx];
+    float sdf = 1e9f;
+    if (useColliders != 0u)
+    {
+        int3 vc = (int3)(simPos * ((float)solidSDFResolution / 1024.0));
+        if (!(any(vc < int3(0,0,0)) || any(vc >= (int3)solidSDFResolution)))
+        {
+            uint idx = (uint)vc.z * solidSDFResolution * solidSDFResolution
+                     + (uint)vc.y * solidSDFResolution
+                     + (uint)vc.x;
+            sdf = solidSDFBuffer[idx];
+        }
+    }
+    return sdf;
 }
 
 static const float3 kFaceDirs[6] = {
