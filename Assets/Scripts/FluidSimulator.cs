@@ -205,9 +205,16 @@ public partial class FluidSimulator : MonoBehaviour
     private int cgSolveFrameCount = 0;
     private float averageCgIterations = 0.0f;
     private int lastCgIterations = 0;
+
+    /// <summary>Running averages for <c>[PCG]</c> line: sample count and sums (only while <see cref="enablePerFrameDebugTimingLog"/> is on).</summary>
+    private int pcgResidualLogSampleCount = 0;
+    private double cumulativePcgResidualSqLogSum = 0.0;
+    private double cumulativePcgRelResidualLogSum = 0.0;
+    private double cumulativePcgItersLogSum = 0.0;
     
     // Pause/resume functionality
     private bool isPaused = false;
+
     
     private System.Diagnostics.Stopwatch totalOctreeSw;
     private double lastRenderTimeMs;
@@ -1040,6 +1047,10 @@ public partial class FluidSimulator : MonoBehaviour
         cgSolveFrameCount = 0;
         averageCgIterations = 0.0f;
         lastCgIterations = 0;
+        pcgResidualLogSampleCount = 0;
+        cumulativePcgResidualSqLogSum = 0.0;
+        cumulativePcgRelResidualLogSum = 0.0;
+        cumulativePcgItersLogSum = 0.0;
         lastRenderTimeMs = 0.0;
     }
 

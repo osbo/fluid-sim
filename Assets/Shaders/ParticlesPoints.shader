@@ -3,12 +3,15 @@ Shader "Custom/ParticlesPoints"
     Properties
     {
         _Radius ("Particle Radius", Float) = 0.01
-        _DepthFadeStart ("Depth Fade Start", Float) = 0.0
-        _DepthFadeEnd ("Depth Fade End", Float) = 100.0
+        _DepthShadeGamma ("Depth Shade Gamma (bounds)", Float) = 1.2
+        _DepthLumaFloor ("Depth Luma Floor (HSV V)", Float) = 0.15
+        _UseVelocityColor ("Use Velocity Color", Float) = 0
+        _VelocityReferenceSpeed ("Velocity Reference Speed", Float) = 10
+        _VelocityAutoNormalize ("Velocity Auto Normalize", Float) = 0
     }
     SubShader
     {
-        Tags { "RenderType"="Opaque" "Queue"="Geometry" "RenderPipeline"="UniversalRenderPipeline" }
+        Tags { "RenderType"="Opaque" "Queue"="Geometry" "RenderPipeline"="UniversalPipeline" }
         Pass
         {
             Tags { "LightMode" = "SRPDefaultUnlit" }
@@ -29,13 +32,41 @@ Shader "Custom/ParticlesPoints"
             };
 
             StructuredBuffer<Particle> _Particles;
+            StructuredBuffer<float2> _ParticleVelocityMinMax; // [0] = (minSpeed, maxSpeed) for this frame (GPU)
             float _Radius;
             float3 _SimulationBoundsMin;
             float3 _SimulationBoundsMax;
-            float _DepthFadeStart;
-            float _DepthFadeEnd;
             float _Scale;
             float _MinValue;
+            float _DepthShadeGamma;
+            float _DepthLumaFloor;
+            float _UseVelocityColor;
+            float _VelocityReferenceSpeed;
+            float _VelocityAutoNormalize;
+
+            float3 RgbToHsv(float3 rgb)
+            {
+                float maxc = max(rgb.r, max(rgb.g, rgb.b));
+                float minc = min(rgb.r, min(rgb.g, rgb.b));
+                float d = maxc - minc;
+                float h = 0.0;
+                if (d > 1e-6)
+                {
+                    if (maxc == rgb.r) h = (rgb.g - rgb.b) / d + (rgb.g < rgb.b ? 6.0 : 0.0);
+                    else if (maxc == rgb.g) h = (rgb.b - rgb.r) / d + 2.0;
+                    else h = (rgb.r - rgb.g) / d + 4.0;
+                    h /= 6.0;
+                }
+                float s = (maxc > 1e-6) ? (d / maxc) : 0.0;
+                return float3(h, s, maxc);
+            }
+
+            float3 HsvToRgb(float3 c)
+            {
+                float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+                float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+                return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+            }
 
             struct Attributes
             {
@@ -76,7 +107,29 @@ Shader "Custom/ParticlesPoints"
                                   + (cameraUp * input.positionOS.y * _Radius * 2.0);
                 
                 o.pos = TransformWorldToHClip(positionWS);
-                o.col = float4(0.0, 0.5, 1.0, 1.0);
+
+                float3 rgb = float3(0.0, 0.5, 1.0);
+                if (_UseVelocityColor > 0.5)
+                {
+                    float speed = length(p.velocity);
+                    float t;
+                    if (_VelocityAutoNormalize > 0.5)
+                    {
+                        float2 mm = _ParticleVelocityMinMax[0];
+                        float lo = mm.x;
+                        float hi = mm.y;
+                        float range = max(hi - lo, 1e-6);
+                        t = saturate((speed - lo) / range);
+                    }
+                    else
+                    {
+                        float denom = max(_VelocityReferenceSpeed, 1e-5);
+                        t = saturate(speed / denom);
+                    }
+                    float hue = (2.0 / 3.0) * (1.0 - t);
+                    rgb = HsvToRgb(float3(hue, 0.92, 1.0));
+                }
+                o.col = float4(rgb, 1.0);
                 o.uv = input.uv;
                 
                 // Calculate distance from camera to particle
@@ -92,27 +145,20 @@ Shader "Custom/ParticlesPoints"
                 float distSq = dot(uv, uv);
                 if (distSq > 1.0) discard;
                 
-                // Use the same depth scaling as DebugTextureDisplay
                 float val = i.depth;
+                if (!isfinite(val)) return float4(0, 0, 0, 1);
                 
-                // Early return: if depth is truly 0 or very large, output black
-                if (val == 0.0 || val >= 10000.0) return float4(0, 0, 0, 1);
-                
-                // Subtract min value before scaling (same as DebugTextureDisplay)
-                float adjustedVal = val - _MinValue;
-                
-                // Scale the adjusted value (same as DebugTextureDisplay)
-                float displayVal = adjustedVal * _Scale;
-                
-                // Clamp to 0-1 range for color intensity
-                displayVal = saturate(displayVal);
-                
-                // Use the scaled depth value to modulate the particle color
-                // Near particles (low depth, high displayVal) are brighter
-                // Far particles (high depth, low displayVal) are darker
-                float4 finalColor = i.col * displayVal;
-                
-                return finalColor;
+                // Bounds-normalized depth: 0 = near (closest in range), 1 = far
+                float tFar = saturate((val - _MinValue) * _Scale);
+                float wNear = 1.0 - tFar;
+                wNear = pow(max(wNear, 1e-5), max(_DepthShadeGamma, 0.01));
+                float floorV = saturate(_DepthLumaFloor);
+                float vScale = floorV + (1.0 - floorV) * wNear;
+                float3 rgb = i.col.rgb;
+                float3 hsv = RgbToHsv(rgb);
+                hsv.z *= vScale;
+                float3 outRgb = HsvToRgb(hsv);
+                return float4(outRgb, i.col.a);
             }
             ENDHLSL
 
