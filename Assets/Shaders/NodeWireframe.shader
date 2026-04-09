@@ -9,7 +9,7 @@ Shader "Custom/NodeWireframe"
     }
     SubShader
     {
-        Tags { "RenderType"="Transparent" "Queue"="Transparent" "RenderPipeline"="UniversalRenderPipeline" }
+        Tags { "RenderType"="Transparent" "Queue"="Transparent" "RenderPipeline"="UniversalPipeline" }
         Pass
         {
             Tags { "LightMode" = "SRPDefaultUnlit" }
@@ -52,7 +52,7 @@ Shader "Custom/NodeWireframe"
             {
                 float4 pos : SV_POSITION;
                 float3 centerWS : TEXCOORD0;
-                float nodeSize : TEXCOORD1;
+                float3 nodeSize : TEXCOORD1;
                 float3 worldPos : TEXCOORD2;
                 uint layer : TEXCOORD3;
                 float2 screenPos : TEXCOORD4; // Screen position for pixel-space calculations
@@ -141,27 +141,29 @@ Shader "Custom/NodeWireframe"
                 Node node = _Nodes[input.instanceID];
                 
                 float3 centerWS = DecodeMorton3D(node);
-                float nodeSize = max(_PointSize * exp2((float)node.layer), 0.01);
-                
+                float3 simulationSize = _SimulationBoundsMax - _SimulationBoundsMin;
+                float cellSideLength = exp2((float)node.layer);
+                float3 nodeSize = max(cellSideLength / 1024.0 * simulationSize, 0.01);
+
                 // --- Calculate Density (same as NodeThickness) ---
-                // Volume of a cube = size^3
-                float volume = nodeSize * nodeSize * nodeSize;
+                // Volume of a rectangular cell
+                float volume = nodeSize.x * nodeSize.y * nodeSize.z;
                 // Density = Mass / Volume
                 float density = (node.mass / max(volume, 0.0001));
 
                 // --- Billboard Calculation ---
-                // Scale up canvas by 2.0 to ensure the rotated cube fits inside the quad
+                // Scale up canvas by 2.0 to ensure the rotated box fits inside the quad
                 float3 cameraRight = unity_CameraToWorld._m00_m10_m20;
                 float3 cameraUp = unity_CameraToWorld._m01_m11_m21;
-                float drawSize = nodeSize * 2.0;
-                
-                float3 positionWS = centerWS 
-                                  + (cameraRight * input.positionOS.x * drawSize) 
+                float drawSize = max(nodeSize.x, max(nodeSize.y, nodeSize.z)) * 2.0;
+
+                float3 positionWS = centerWS
+                                  + (cameraRight * input.positionOS.x * drawSize)
                                   + (cameraUp * input.positionOS.y * drawSize);
-                
+
                 o.pos = TransformWorldToHClip(positionWS);
                 o.centerWS = centerWS;
-                o.nodeSize = nodeSize; 
+                o.nodeSize = nodeSize;
                 o.worldPos = positionWS;
                 o.layer = node.layer;
                 
@@ -223,8 +225,8 @@ Shader "Custom/NodeWireframe"
                 float pixelsPerWorldUnit = 1.0 / max(worldUnitsPerPixel, 0.0001);
                 
                 // Convert to pixels per local unit
-                // 1 local unit = nodeSize world units
-                float pixelsPerLocalUnit = pixelsPerWorldUnit * i.nodeSize;
+                // 1 local unit = max(nodeSize) world units (use largest axis for wireframe width)
+                float pixelsPerLocalUnit = pixelsPerWorldUnit * max(i.nodeSize.x, max(i.nodeSize.y, i.nodeSize.z));
                 
                 // Convert pixel width to local space units
                 // _WireframeWidth is in pixels, pixelsPerLocalUnit is pixels per local unit

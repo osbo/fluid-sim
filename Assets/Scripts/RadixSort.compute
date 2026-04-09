@@ -127,6 +127,7 @@ void prefixSum(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID)
     }
 }
 
+
 // --- Indirect solver prefix-sum variants (GPU-driven len, no CPU readback) ---
 
 [numthreads(THREADS, 1, 1)]

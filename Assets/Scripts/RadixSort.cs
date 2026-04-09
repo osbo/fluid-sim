@@ -45,6 +45,7 @@ public class RadixSort
         int particleStride = 3 * 4 + 3 * 4 + 4;
         particleSortScratch = new ComputeBuffer((int)maxLength, particleStride, ComputeBufferType.Default);
 
+
         uint threadgroupSize = 512;
         uint numThreadgroups = (maxLength + (threadgroupSize * 2) - 1) / (threadgroupSize * 2);
         uint requiredAuxSize = System.Math.Max(1, numThreadgroups);

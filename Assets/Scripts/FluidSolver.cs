@@ -283,7 +283,15 @@ public partial class FluidSimulator : MonoBehaviour
         {
             float rFinSq = GpuDotProduct(residualBuffer, residualBuffer);
             float rel = rFinSq / Mathf.Max(initialResidual, 1e-30f);
-            Debug.Log($"[PCG] ||r||²={rFinSq:E6}  rel(||r||²/||r0||²)={rel:E6}  iters={maxCgIterations}");
+            pcgResidualLogSampleCount++;
+            cumulativePcgResidualSqLogSum += rFinSq;
+            cumulativePcgRelResidualLogSum += rel;
+            cumulativePcgItersLogSum += maxCgIterations;
+            int n = pcgResidualLogSampleCount;
+            double avgRsq = cumulativePcgResidualSqLogSum / n;
+            double avgRel = cumulativePcgRelResidualLogSum / n;
+            double avgIters = cumulativePcgItersLogSum / n;
+            Debug.Log($"[PCG] ||r||²={rFinSq:E6}  rel(||r||²/||r0||²)={rel:E6}  iters={maxCgIterations}  ||  avg ||r||²={avgRsq:E6}  avg rel={avgRel:E6}  avg iters={avgIters:F2}");
         }
 
         // Save training data (totalNNZ read back only when recording)

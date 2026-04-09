@@ -6,7 +6,7 @@ Shader "Custom/ParticleThickness"
     }
     SubShader
     {
-        Tags { "RenderType"="Transparent" "Queue"="Transparent" "RenderPipeline"="UniversalRenderPipeline" }
+        Tags { "RenderType"="Transparent" "Queue"="Transparent" "RenderPipeline"="UniversalPipeline" }
         Pass
         {
             Tags { "LightMode" = "SRPDefaultUnlit" }
