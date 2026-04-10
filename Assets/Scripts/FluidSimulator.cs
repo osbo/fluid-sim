@@ -1275,7 +1275,10 @@ public partial class FluidSimulator : MonoBehaviour
     /// <summary>Preallocate octree/prefix buffers so the update loop never resizes or stalls on GPU count readbacks mid-pipeline.</summary>
     private void AllocateOctreeBuffersToCapacity()
     {
-        maxNodesCapacity = Mathf.Max(512, Mathf.CeilToInt(numParticles * 1.5f));
+        int newCapacity = Mathf.Max(512, Mathf.CeilToInt(numParticles * 1.5f));
+        if (newCapacity <= maxNodesCapacity && nodesBuffer != null)
+            return;
+        maxNodesCapacity = newCapacity;
         GetUniformGridDims(out _, out _, out int uniformCellCount);
         int prefixCapacity = Mathf.Max(maxNodesCapacity, uniformCellCount);
         maxPrefixThreadGroups = Mathf.Max(1, (prefixCapacity + 1023) / 1024);

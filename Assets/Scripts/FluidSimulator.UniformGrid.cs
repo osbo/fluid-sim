@@ -4,6 +4,10 @@ using UnityEngine;
 
 public partial class FluidSimulator
 {
+    /// <summary>D3D11 (and Unity) cap on dispatch thread-group count per dimension.</summary>
+    private const int MaxComputeThreadGroupsPerDimension = 65535;
+    private const int UniformGridClearDenseThreadsPerGroup = 256;
+
     private int uniformGridClearNodeAccumKernel;
     private int uniformGridSplatParticlesKernel;
     private int uniformGridNormalizeNodesKernel;
@@ -55,13 +59,11 @@ public partial class FluidSimulator
         if (expectedCellCount <= 0)
             return;
 
-        if (uniformDenseIndexMapBuffer == null
-            || uniformCellCountsBuffer.count != expectedCellCount
-            || uniformDenseIndexMapBuffer.count != expectedCellCount
-            || UniformGridCellCount != expectedCellCount)
-        {
+        // N³ depends on uniformGridCellLayer; AllocateOctreeBuffersToCapacity() often skips realloc when only the layer changes.
+        if (uniformCellCountsBuffer == null || uniformDenseIndexMapBuffer == null)
             AllocateOctreeBuffersToCapacity();
-        }
+        else if (uniformCellCountsBuffer.count != expectedCellCount || uniformDenseIndexMapBuffer.count != expectedCellCount)
+            AllocateUniformGridBuffers();
 
         int cellCount = UniformGridCellCount;
         if (cellCount <= 0)
@@ -77,12 +79,20 @@ public partial class FluidSimulator
         uniformGridShader.SetInt("maxUniformActiveCells", maxNodesCapacity);
         uniformGridShader.SetInt("numNodesCapacity", maxNodesCapacity);
 
-        // 1. Clear dense maps
+        // 1. Clear dense maps (chunk if N³ needs more than MaxComputeThreadGroupsPerDimension groups)
         uniformGridShader.SetBuffer(uniformGridClearDenseKernel, "cellCounts", uniformCellCountsBuffer);
         uniformGridShader.SetBuffer(uniformGridClearDenseKernel, "denseIndexMap", uniformDenseIndexMapBuffer);
         uniformGridShader.SetBuffer(uniformGridClearDenseKernel, "activeNodeCount", uniformActiveNodeCountBuffer);
-        int clearGroups = Mathf.Max(1, (cellCount + 255) / 256);
-        uniformGridShader.Dispatch(uniformGridClearDenseKernel, clearGroups, 1, 1);
+        int maxCellsPerClearPass = MaxComputeThreadGroupsPerDimension * UniformGridClearDenseThreadsPerGroup;
+        int clearBase = 0;
+        while (clearBase < cellCount)
+        {
+            int cellsThisPass = Mathf.Min(cellCount - clearBase, maxCellsPerClearPass);
+            int clearGroups = Mathf.Max(1, (cellsThisPass + UniformGridClearDenseThreadsPerGroup - 1) / UniformGridClearDenseThreadsPerGroup);
+            uniformGridShader.SetInt("uniformGridClearCellBase", clearBase);
+            uniformGridShader.Dispatch(uniformGridClearDenseKernel, clearGroups, 1, 1);
+            clearBase += cellsThisPass;
+        }
 
         // 2. Bin particles: assign node IDs, populate denseIndexMap and activeMortonList
         uniformGridShader.SetBuffer(uniformGridBinParticlesKernel, "particlesBuffer", particlesBuffer);

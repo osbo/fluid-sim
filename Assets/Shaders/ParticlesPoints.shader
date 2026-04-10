@@ -2,7 +2,7 @@ Shader "Custom/ParticlesPoints"
 {
     Properties
     {
-        _Radius ("Particle Radius", Float) = 0.01
+        _Radius ("Particle Radius", Float) = 0.0001
         _DepthShadeGamma ("Depth Shade Gamma (bounds)", Float) = 1.2
         _DepthLumaFloor ("Depth Luma Floor (HSV V)", Float) = 0.15
         _UseVelocityColor ("Use Velocity Color", Float) = 0

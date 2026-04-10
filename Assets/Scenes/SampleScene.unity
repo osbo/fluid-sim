@@ -733,7 +733,7 @@ MonoBehaviour:
   numParticles: 1048576
   maxCgIterations: 30
   convergenceThreshold: 0.00001
-  cgConvergenceCheckInterval: 10
+  cgConvergenceCheckInterval: 5
   gravity: 100
   kinematicViscosity: 5
   flipRatio: 0.9
@@ -791,7 +791,7 @@ MonoBehaviour:
   depthBlurRadius: 6
   depthBlurThreshold: 1.24
   thicknessBlurRadius: 56
-  particleRadius: 0.066
+  particleRadius: 0.049
   particleDepthShadeGamma: 1.2
   particleDepthLumaFloor: 0.15
   particleVelocityColorReference: 200
