@@ -533,7 +533,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &444293661
 Transform:
   m_ObjectHideFlags: 0
@@ -737,21 +737,20 @@ MonoBehaviour:
   gravity: 100
   kinematicViscosity: 5
   flipRatio: 0.9
-  useRealTime: 0
+  useRealTime: 1
   frameRate: 60
   minLayer: 3
   maxLayer: 5
   uniformGridCellLayer: 3
   logLayerCountsPerFrame: 0
   enablePerFrameDebugTimingLog: 0
-  debugValidateUniformParticleSort: 0
   debugValidateUniformNeighbors: 0
   debugUniformNeighborsMaxNodes: 2097152
   debugUniformNeighborsMaxDenseCells: 2097152
   debugUniformNeighborsMaxExamples: 16
   preconditioner: 2
   gridMode: 1
-  useColliders: 1
+  useColliders: 0
   collidersRoot: {fileID: 444293660}
   recorder: {fileID: 944897176}
 --- !u!114 &757290356
@@ -766,7 +765,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c7e8f9a0b1d24e5f6a70819293a4b5c6, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  renderingMode: 0
+  renderingMode: 1
   thicknessSource: 0
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
@@ -1246,7 +1245,7 @@ MeshFilter:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1326165318}
-  m_Mesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
+  m_Mesh: {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
 --- !u!4 &1326165322
 Transform:
   m_ObjectHideFlags: 0
@@ -1256,8 +1255,8 @@ Transform:
   m_GameObject: {fileID: 1326165318}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -10, y: 25, z: -10}
-  m_LocalScale: {x: 19, y: 30, z: 19}
+  m_LocalPosition: {x: 0, y: 20, z: 0}
+  m_LocalScale: {x: 40, y: 40, z: 40}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}

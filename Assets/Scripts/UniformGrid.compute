@@ -60,21 +60,15 @@ StructuredBuffer<Particle> particlesBuffer;
 
 RWStructuredBuffer<uint> activeMortonList;
 
-// Node accumulation buffer: 16 floats per node (as uint for atomic CAS).
-// Slots: [0]=posX [1]=posY [2]=posZ [3]=velX [4]=velY [5]=velZ
-//        [6]=vLeft [7]=vRight [8]=vBottom [9]=vTop [10]=vFront [11]=vBack
-//        [12..14]=face weight sums (left,right,bottom,top stored packed: [12]=left [13]=right [14]=bottom)
-//        [15]=count (integer, incremented with InterlockedAdd)
-// Weights for face velocities use the same trilinear weights as the old kernel.
-// We store 6 face velocity accumulators and 7 weight accumulators (left,right,bottom,top,front,back,count).
+// Node accumulation buffer: 7 slots per node (as uint for atomic CAS).
 // Layout (per node, stride = numNodesCapacity):
-//   slot 0..2  : position sum (float-as-uint CAS)
-//   slot 3..5  : velocity sum (float-as-uint CAS)
-//   slot 6..11 : face velocity sums: left,right,bottom,top,front,back (float-as-uint CAS)
-//   slot 12..17: face weight sums:  left,right,bottom,top,front,back (float-as-uint CAS)
-//   slot 18    : particle count (InterlockedAdd uint)
-// Total: 19 slots × numNodesCapacity uints.
-RWStructuredBuffer<uint> nodeAccumBuffer; // [19 * numNodesCapacity]
+//   slot 0..2 : position sum (float-as-uint CAS)
+//   slot 3..5 : velocity sum (float-as-uint CAS)
+//   slot 6    : particle count (InterlockedAdd uint)
+// Face velocities are derived from center velocity in NormalizeNodes; InterpolateFaceVelocities
+// then averages across neighbors, making within-cell face weighting a negligible correction.
+// Total: 7 slots × numNodesCapacity uints.
+RWStructuredBuffer<uint> nodeAccumBuffer; // [7 * numNodesCapacity]
 
 uint uniformGridLog2K;
 uint uniformGridCellCount;
@@ -201,7 +195,7 @@ void AtomicAddFloat(RWStructuredBuffer<uint> buf, uint idx, float val)
     }
 }
 
-// One thread per active node: zero all 19 accumulator slots.
+// One thread per active node: zero all 7 accumulator slots.
 [numthreads(512, 1, 1)]
 void UniformGrid_ClearNodeAccum(uint3 id : SV_DispatchThreadID)
 {
@@ -211,12 +205,12 @@ void UniformGrid_ClearNodeAccum(uint3 id : SV_DispatchThreadID)
 
     uint stride = numNodesCapacity;
     [unroll]
-    for (uint s = 0; s < 19u; s++)
+    for (uint s = 0; s < 7u; s++)
         nodeAccumBuffer[s * stride + nodeID] = 0u;
 }
 
 // One thread per particle: look up its node via denseIndexMap, then CAS-accumulate position,
-// velocity, 6 face velocities with trilinear weights, and a particle count.
+// velocity, and particle count. Face velocities are derived from center velocity in NormalizeNodes.
 [numthreads(256, 1, 1)]
 void UniformGrid_SplatParticles(uint3 id : SV_DispatchThreadID)
 {
@@ -231,13 +225,6 @@ void UniformGrid_SplatParticles(uint3 id : SV_DispatchThreadID)
     uint nodeID = denseIndexMap[cellIdx];
     if (nodeID == kEmptyCell) return;
 
-    uint s = kMaxAxisBits - k;
-    uint3 pFine = deinterleave10(pt.mortonCode);
-    uint3 c = uint3(pFine.x >> s, pFine.y >> s, pFine.z >> s);
-    float cellSideLength = exp2((float)uniformGridCellLayer);
-    float3 nodeMin = float3(c.x << s, c.y << s, c.z << s);
-    float3 t = saturate((pt.position - nodeMin) / cellSideLength);
-
     uint stride = numNodesCapacity;
 
     // Position / velocity (equal-weight average; divide by count in normalize pass)
@@ -248,31 +235,13 @@ void UniformGrid_SplatParticles(uint3 id : SV_DispatchThreadID)
     AtomicAddFloat(nodeAccumBuffer, 4u * stride + nodeID, pt.velocity.y);
     AtomicAddFloat(nodeAccumBuffer, 5u * stride + nodeID, pt.velocity.z);
 
-    // Face velocity accumulators (weighted)
-    float wLeft   = 1.0 - t.x;  float wRight  = t.x;
-    float wBottom = 1.0 - t.y;  float wTop    = t.y;
-    float wFront  = 1.0 - t.z;  float wBack   = t.z;
-
-    AtomicAddFloat(nodeAccumBuffer,  6u * stride + nodeID, pt.velocity.x * wLeft);
-    AtomicAddFloat(nodeAccumBuffer,  7u * stride + nodeID, pt.velocity.x * wRight);
-    AtomicAddFloat(nodeAccumBuffer,  8u * stride + nodeID, pt.velocity.y * wBottom);
-    AtomicAddFloat(nodeAccumBuffer,  9u * stride + nodeID, pt.velocity.y * wTop);
-    AtomicAddFloat(nodeAccumBuffer, 10u * stride + nodeID, pt.velocity.z * wFront);
-    AtomicAddFloat(nodeAccumBuffer, 11u * stride + nodeID, pt.velocity.z * wBack);
-
-    // Face weight accumulators
-    AtomicAddFloat(nodeAccumBuffer, 12u * stride + nodeID, wLeft);
-    AtomicAddFloat(nodeAccumBuffer, 13u * stride + nodeID, wRight);
-    AtomicAddFloat(nodeAccumBuffer, 14u * stride + nodeID, wBottom);
-    AtomicAddFloat(nodeAccumBuffer, 15u * stride + nodeID, wTop);
-    AtomicAddFloat(nodeAccumBuffer, 16u * stride + nodeID, wFront);
-    AtomicAddFloat(nodeAccumBuffer, 17u * stride + nodeID, wBack);
-
     // Particle count (integer)
-    InterlockedAdd(nodeAccumBuffer[18u * stride + nodeID], 1u);
+    InterlockedAdd(nodeAccumBuffer[6u * stride + nodeID], 1u);
 }
 
 // One thread per active node: read accumulators, normalize, write final Node struct.
+// Face velocities are initialized to center velocity; InterpolateFaceVelocities averages
+// with neighbors afterward, making within-cell face weighting a negligible correction.
 [numthreads(512, 1, 1)]
 void UniformGrid_NormalizeNodes(uint3 id : SV_DispatchThreadID)
 {
@@ -282,9 +251,8 @@ void UniformGrid_NormalizeNodes(uint3 id : SV_DispatchThreadID)
 
     uint stride = numNodesCapacity;
 
-    uint countU = nodeAccumBuffer[18u * stride + nodeID];
+    uint countU = nodeAccumBuffer[6u * stride + nodeID];
     float count = max(1.0, (float)countU);
-    float eps   = 1e-9;
 
     // Recover morton from activeMortonList (set during BinParticles)
     uint mortonCode = activeMortonList[nodeID];
@@ -296,20 +264,13 @@ void UniformGrid_NormalizeNodes(uint3 id : SV_DispatchThreadID)
                         asfloat(nodeAccumBuffer[4u * stride + nodeID]),
                         asfloat(nodeAccumBuffer[5u * stride + nodeID])) / count;
 
-    float wL = max(eps, asfloat(nodeAccumBuffer[12u * stride + nodeID]));
-    float wR = max(eps, asfloat(nodeAccumBuffer[13u * stride + nodeID]));
-    float wB = max(eps, asfloat(nodeAccumBuffer[14u * stride + nodeID]));
-    float wT = max(eps, asfloat(nodeAccumBuffer[15u * stride + nodeID]));
-    float wF = max(eps, asfloat(nodeAccumBuffer[16u * stride + nodeID]));
-    float wK = max(eps, asfloat(nodeAccumBuffer[17u * stride + nodeID]));
-
     faceVelocities fv;
-    fv.left   = asfloat(nodeAccumBuffer[ 6u * stride + nodeID]) / wL;
-    fv.right  = asfloat(nodeAccumBuffer[ 7u * stride + nodeID]) / wR;
-    fv.bottom = asfloat(nodeAccumBuffer[ 8u * stride + nodeID]) / wB;
-    fv.top    = asfloat(nodeAccumBuffer[ 9u * stride + nodeID]) / wT;
-    fv.front  = asfloat(nodeAccumBuffer[10u * stride + nodeID]) / wF;
-    fv.back   = asfloat(nodeAccumBuffer[11u * stride + nodeID]) / wK;
+    fv.left   = vel.x;
+    fv.right  = vel.x;
+    fv.bottom = vel.y;
+    fv.top    = vel.y;
+    fv.front  = vel.z;
+    fv.back   = vel.z;
 
     Node node;
     node.position   = pos;
