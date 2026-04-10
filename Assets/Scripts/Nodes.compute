@@ -475,36 +475,38 @@ void ProcessNodes(uint3 id : SV_DispatchThreadID)
                     {
                         uint nPrefixShifted = nPrefix << 3;
                         int subNodesLower[4];
-                        if (d == 0) { // right face
-                            subNodesLower[0] = 1;
-                            subNodesLower[1] = 3;
-                            subNodesLower[2] = 5;
-                            subNodesLower[3] = 7;
-                        } else if (d == 1) { // left face
+                        // Child index bits: 0=x, 1=y, 2=z (see interleave). Neighbor deltas match findNeighbors:
+                        // d=0 (-x) → min-x face → x-child-bit 0 → {0,2,4,6}; d=1 (+x) → {1,3,5,7}; etc.
+                        if (d == 0) {
                             subNodesLower[0] = 0;
                             subNodesLower[1] = 2;
                             subNodesLower[2] = 4;
                             subNodesLower[3] = 6;
-                        } else if (d == 2) { // top face
-                            subNodesLower[0] = 2;
+                        } else if (d == 1) {
+                            subNodesLower[0] = 1;
                             subNodesLower[1] = 3;
-                            subNodesLower[2] = 6;
+                            subNodesLower[2] = 5;
                             subNodesLower[3] = 7;
-                        } else if (d == 3) { // bottom face
+                        } else if (d == 2) {
                             subNodesLower[0] = 0;
                             subNodesLower[1] = 1;
                             subNodesLower[2] = 4;
                             subNodesLower[3] = 5;
-                        } else if (d == 4) { // back face
-                            subNodesLower[0] = 4;
-                            subNodesLower[1] = 5;
+                        } else if (d == 3) {
+                            subNodesLower[0] = 2;
+                            subNodesLower[1] = 3;
                             subNodesLower[2] = 6;
                             subNodesLower[3] = 7;
-                        } else if (d == 5) { // front face
+                        } else if (d == 4) {
                             subNodesLower[0] = 0;
                             subNodesLower[1] = 1;
                             subNodesLower[2] = 2;
                             subNodesLower[3] = 3;
+                        } else if (d == 5) {
+                            subNodesLower[0] = 4;
+                            subNodesLower[1] = 5;
+                            subNodesLower[2] = 6;
+                            subNodesLower[3] = 7;
                         }
                         
                         uint validChildCount = 0;
@@ -785,36 +787,37 @@ void findNeighbors(uint3 id : SV_DispatchThreadID)
                 {
                     uint nPrefixShifted = nPrefix << 3;
                     int subNodesLower[4];
-                    if (d == 0) { // right face
-                        subNodesLower[0] = 1;
-                        subNodesLower[1] = 3;
-                        subNodesLower[2] = 5;
-                        subNodesLower[3] = 7;
-                    } else if (d == 1) { // left face
+                    // Same child-corner tables as ProcessNodes (deltas d=0..5 = -x,+x,-y,+y,-z,+z).
+                    if (d == 0) {
                         subNodesLower[0] = 0;
                         subNodesLower[1] = 2;
                         subNodesLower[2] = 4;
                         subNodesLower[3] = 6;
-                    } else if (d == 2) { // top face
-                        subNodesLower[0] = 2;
+                    } else if (d == 1) {
+                        subNodesLower[0] = 1;
                         subNodesLower[1] = 3;
-                        subNodesLower[2] = 6;
+                        subNodesLower[2] = 5;
                         subNodesLower[3] = 7;
-                    } else if (d == 3) { // bottom face
+                    } else if (d == 2) {
                         subNodesLower[0] = 0;
                         subNodesLower[1] = 1;
                         subNodesLower[2] = 4;
                         subNodesLower[3] = 5;
-                    } else if (d == 4) { // back face
-                        subNodesLower[0] = 4;
-                        subNodesLower[1] = 5;
+                    } else if (d == 3) {
+                        subNodesLower[0] = 2;
+                        subNodesLower[1] = 3;
                         subNodesLower[2] = 6;
                         subNodesLower[3] = 7;
-                    } else if (d == 5) { // front face
+                    } else if (d == 4) {
                         subNodesLower[0] = 0;
                         subNodesLower[1] = 1;
                         subNodesLower[2] = 2;
                         subNodesLower[3] = 3;
+                    } else if (d == 5) {
+                        subNodesLower[0] = 4;
+                        subNodesLower[1] = 5;
+                        subNodesLower[2] = 6;
+                        subNodesLower[3] = 7;
                     }
                     
                     for (int i = 0; i < 4; i++)

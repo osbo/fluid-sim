@@ -2,6 +2,10 @@
 // Builds a standard CSR matrix representation from the existing
 // 27-point stencil stored in neighborsBuffer + matrixABuffer.
 //
+// GridMode.Uniform: CountNNZUniform / FillCSRUniform use ≤7 nonzeros per row (diag + 6 faces).
+// PCG matvec (SpMV_CSR), dot products, and axpy are unchanged — fewer NNZ and Morton-ordered
+// columns make the CSR build and SpMV memory traffic much cheaper than the 25-slot octree stencil.
+//
 // Inputs:
 //  - neighborsBuffer: SoA adjacency, 24 entries per node
 //      neighborsBuffer[k * numNodesCapacity + i] = column index of k-th neighbor of row i
@@ -27,9 +31,14 @@
 #pragma kernel CountNNZ
 #pragma kernel FinalizeRowPtr
 #pragma kernel FillCSR
+#pragma kernel CountNNZUniform
+#pragma kernel FillCSRUniform
 
 StructuredBuffer<uint> neighborsBuffer;          // [24 * numNodesCapacity] SoA stride
 StructuredBuffer<float> matrixABuffer;          // [25 * numNodesCapacity] SoA stride (slot 0 = diagonal, slots 1-24 = neighbors)
+
+StructuredBuffer<uint> uniformNeighborsBuffer;   // [6 * numNodesCapacity]
+StructuredBuffer<float> uniformMatrixABuffer;   // [7 * numNodesCapacity] (diag + 6)
 
 RWStructuredBuffer<uint> nnzPerNode;            // [numNodesCapacity]
 RWStructuredBuffer<uint> rowPtrBuffer;          // [numNodesCapacity + 1] (RW so we can write last element)
@@ -104,6 +113,53 @@ void FillCSR(uint3 id : SV_DispatchThreadID)
             colIndicesBuffer[writeIdx] = neighborIdx;
             rowIndicesBuffer[writeIdx] = i;
             valuesBuffer[writeIdx]     = matrixABuffer[(k + 1) * numNodesCapacity + i];
+            writeIdx++;
+        }
+    }
+}
+
+// --- Uniform 6-neighbor stencil (diag + up to 6 off-diagonals) ---
+
+[numthreads(256, 1, 1)]
+void CountNNZUniform(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
+    if (i >= numNodes) return;
+
+    uint count = 1u;
+    [unroll]
+    for (int k = 0; k < 6; k++)
+    {
+        uint neighborIdx = uniformNeighborsBuffer[k * numNodesCapacity + i];
+        if (neighborIdx < numNodes) count++;
+    }
+    nnzPerNode[i] = count;
+}
+
+[numthreads(256, 1, 1)]
+void FillCSRUniform(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
+    if (i >= numNodes) return;
+
+    uint writeIdx = rowPtrBuffer[i];
+
+    colIndicesBuffer[writeIdx] = i;
+    rowIndicesBuffer[writeIdx] = i;
+    valuesBuffer[writeIdx]     = uniformMatrixABuffer[i];
+    writeIdx++;
+
+    [unroll]
+    for (int k = 0; k < 6; k++)
+    {
+        uint neighborIdx = uniformNeighborsBuffer[k * numNodesCapacity + i];
+        if (neighborIdx < numNodes)
+        {
+            colIndicesBuffer[writeIdx] = neighborIdx;
+            rowIndicesBuffer[writeIdx] = i;
+            valuesBuffer[writeIdx]     = uniformMatrixABuffer[(k + 1) * numNodesCapacity + i];
             writeIdx++;
         }
     }

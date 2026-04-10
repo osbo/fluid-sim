@@ -21,6 +21,7 @@ public class FluidRenderer : MonoBehaviour
     public Material particleDepthMaterial;
     public Material nodeThicknessMaterial;
     public Material nodeWireframeMaterial;
+    public Material uniformGridWireframeMaterial;
     public Material voxelWireframeMaterial;
     public Material particleThicknessMaterial;
     public Material normalMaterial;
@@ -66,6 +67,7 @@ public class FluidRenderer : MonoBehaviour
     static readonly ProfilerMarker s_RenderThicknessMarker = new ProfilerMarker("FluidSim.Render.Thickness");
     static readonly ProfilerMarker s_ThicknessBlurMarker = new ProfilerMarker("FluidSim.Render.ThicknessBlur");
     static readonly ProfilerMarker s_RenderNodesMarker = new ProfilerMarker("FluidSim.Render.Nodes");
+    static readonly ProfilerMarker s_RenderUniformGridNodesMarker = new ProfilerMarker("FluidSim.Render.UniformGridNodes");
     static readonly ProfilerMarker s_RenderColliderVoxelsMarker = new ProfilerMarker("FluidSim.Render.ColliderVoxels");
     static readonly ProfilerMarker s_DrawParticlesMarker = new ProfilerMarker("FluidSim.Render.DrawParticles");
     static readonly ProfilerMarker s_DepthBlurMarker = new ProfilerMarker("FluidSim.Render.DepthBlur");
@@ -79,6 +81,9 @@ public class FluidRenderer : MonoBehaviour
     int cachedVoxelArgsResolution = -1;
     static bool s_warnedVoxelInstanceBudget;
     static bool s_warnedVoxelBufferMissing;
+    /// <summary>Thickness blit scale: node-based vs particle-based thickness pass.</summary>
+    float ThicknessBlitDisplayScale =>
+        thicknessSource == ThicknessSource.Nodes ? thicknessScaleNodes : thicknessScaleParticles;
     int particleVelocityBlockReduceKernel = -1;
     int particleVelocityReduceLevelKernel = -1;
     int particleVelocitySmoothMinMaxKernel = -1;
@@ -88,6 +93,9 @@ public class FluidRenderer : MonoBehaviour
     ComputeBuffer particleVelocityMinMaxDummyBuffer;
     CommandBuffer thicknessCmd;
     CommandBuffer depthCmd;
+    readonly uint[] indirectDrawArgsScratch = new uint[5];
+    readonly uint[] indirectInstanceCountOnlyScratch = new uint[1];
+    readonly float[] float2SetDataScratch = new float[2];
     RenderTexture thicknessTexture;
     RenderTexture fluidDepthTexture;
     RenderTexture rawDepthTexture;
@@ -144,10 +152,11 @@ public class FluidRenderer : MonoBehaviour
         if (particleVelocityReduceShader == null)
             particleVelocityReduceShader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>("Assets/Scripts/ParticleVelocityReduce.compute");
 #endif
-        EnsureMaterial(ref particlesMaterial, "Custom/ParticlesPoints");
+        EnsureMaterial(ref particlesMaterial, ParticlesPointsShaderName);
         EnsureMaterial(ref particleDepthMaterial, "Custom/ParticleDepth");
         EnsureMaterial(ref nodeThicknessMaterial, "Custom/NodeThickness");
         EnsureMaterial(ref nodeWireframeMaterial, "Custom/NodeWireframe");
+        EnsureMaterial(ref uniformGridWireframeMaterial, "Custom/UniformGridWireframe");
         EnsureMaterial(ref voxelWireframeMaterial, "Custom/VoxelWireframe");
         EnsureMaterial(ref particleThicknessMaterial, "Custom/ParticleThickness");
         EnsureMaterial(ref normalMaterial, "Custom/NormalsFromDepth");
@@ -162,6 +171,31 @@ public class FluidRenderer : MonoBehaviour
         var sh = Shader.Find(shaderName);
         if (sh != null)
             mat = new Material(sh);
+    }
+
+    const string ParticlesPointsShaderName = "Custom/ParticlesPoints";
+
+    /// <summary>
+    /// Metal requires every <see cref="StructuredBuffer{T}"/> declared in the shader to be bound for each draw.
+    /// <c>Custom/ParticlesPoints</c> always declares <c>_ParticleVelocityMinMax</c> (slot 1); bind a dummy before any path
+    /// that might use this shader (including if <see cref="particleDepthMaterial"/> was reassigned to ParticlesPoints in the Inspector).
+    /// </summary>
+    void EnsureParticleVelocityMinMaxDummyBuffer()
+    {
+        if (particleVelocityMinMaxDummyBuffer != null)
+            return;
+        particleVelocityMinMaxDummyBuffer = new ComputeBuffer(1, sizeof(float) * 2);
+        float2SetDataScratch[0] = 0f;
+        float2SetDataScratch[1] = 1f;
+        particleVelocityMinMaxDummyBuffer.SetData(float2SetDataScratch);
+    }
+
+    void BindParticlesPointsMinMaxBufferIfNeeded(Material m)
+    {
+        if (m == null || m.shader == null || m.shader.name != ParticlesPointsShaderName)
+            return;
+        EnsureParticleVelocityMinMaxDummyBuffer();
+        m.SetBuffer("_ParticleVelocityMinMax", particleVelocityMinMaxDummyBuffer);
     }
 
     void ResolveMainLightIfNeeded()
@@ -261,7 +295,7 @@ public class FluidRenderer : MonoBehaviour
     }
 
     static bool IsNodeOrColliderVoxelView(RenderingMode mode) =>
-        mode == RenderingMode.Nodes || mode == RenderingMode.ColliderVoxels;
+        mode == RenderingMode.Nodes || mode == RenderingMode.UniformGridNodes || mode == RenderingMode.ColliderVoxels;
 
     /// <returns>False if min/max was not written (caller should keep dummy buffer + _VelocityAutoNormalize 0).</returns>
     bool DispatchParticleVelocityMinMaxForRendering(Material particleMat)
@@ -317,7 +351,9 @@ public class FluidRenderer : MonoBehaviour
         if (particleVelocitySmoothedMinMaxBuffer == null)
         {
             particleVelocitySmoothedMinMaxBuffer = new ComputeBuffer(1, sizeof(float) * 2);
-            particleVelocitySmoothedMinMaxBuffer.SetData(new[] { float.MaxValue, float.MinValue });
+            float2SetDataScratch[0] = float.MaxValue;
+            float2SetDataScratch[1] = float.MinValue;
+            particleVelocitySmoothedMinMaxBuffer.SetData(float2SetDataScratch);
         }
 
         float alpha = 1f / smoothFrames;
@@ -360,6 +396,10 @@ public class FluidRenderer : MonoBehaviour
         {
             using (s_RenderNodesMarker.Auto()) { RenderNodes(cam); }
         }
+        if (renderingMode == RenderingMode.UniformGridNodes)
+        {
+            using (s_RenderUniformGridNodesMarker.Auto()) { RenderUniformGridNodes(cam); }
+        }
         if (renderingMode == RenderingMode.ColliderVoxels)
         {
             using (s_RenderColliderVoxelsMarker.Auto()) { RenderColliderVoxels(cam); }
@@ -388,19 +428,17 @@ public class FluidRenderer : MonoBehaviour
             using (s_NormalsMarker.Auto()) { RenderNormals(cam); }
         }
 
-        if (renderingMode == RenderingMode.Nodes || renderingMode == RenderingMode.ColliderVoxels)
+        if (renderingMode == RenderingMode.Nodes || renderingMode == RenderingMode.UniformGridNodes || renderingMode == RenderingMode.ColliderVoxels)
         {
             Graphics.Blit(nodesTexture, (RenderTexture)null);
         }
         else if (renderingMode == RenderingMode.Thickness)
         {
-            float thicknessScale = thicknessSource == ThicknessSource.Nodes ? thicknessScaleNodes : thicknessScaleParticles;
-            DebugBlit(thicknessTexture, thicknessScale, 0.0f, false);
+            DebugBlit(thicknessTexture, ThicknessBlitDisplayScale, 0.0f, false);
         }
         else if (renderingMode == RenderingMode.BlurredThickness)
         {
-            float thicknessScale = thicknessSource == ThicknessSource.Nodes ? thicknessScaleNodes : thicknessScaleParticles;
-            DebugBlit(fluidThicknessTexture, thicknessScale, 0.0f, false);
+            DebugBlit(fluidThicknessTexture, ThicknessBlitDisplayScale, 0.0f, false);
         }
         else if (renderingMode == RenderingMode.Depth)
         {
@@ -470,14 +508,10 @@ public class FluidRenderer : MonoBehaviour
         if (particleArgsBuffer == null || particleArgsBuffer.count != 5)
             CreateParticleArgsBuffer();
         else
-        {
-            uint[] args = new uint[5];
-            particleArgsBuffer.GetData(args);
-            args[1] = (uint)_sim.NumParticlesForRender;
-            particleArgsBuffer.SetData(args);
-        }
+            PatchIndirectDrawInstanceCount(particleArgsBuffer, (uint)_sim.NumParticlesForRender);
 
         currentMaterial.SetBuffer("_Particles", _sim.ParticlesBuffer);
+        BindParticlesPointsMinMaxBufferIfNeeded(currentMaterial);
 
         int numParticles = _sim.NumParticlesForRender;
 
@@ -506,14 +540,7 @@ public class FluidRenderer : MonoBehaviour
 
         if (renderingMode == RenderingMode.Particles || renderingMode == RenderingMode.ParticlesVelocity)
         {
-            if (particleVelocityMinMaxDummyBuffer == null)
-            {
-                particleVelocityMinMaxDummyBuffer = new ComputeBuffer(1, sizeof(float) * 2);
-                particleVelocityMinMaxDummyBuffer.SetData(new[] { 0f, 1f });
-            }
-            // Metal requires every declared StructuredBuffer slot bound; autoNorm dispatch can early-out without setting this.
-            currentMaterial.SetBuffer("_ParticleVelocityMinMax", particleVelocityMinMaxDummyBuffer);
-
+            // Dummy min/max already bound in BindParticlesPointsMinMaxBufferIfNeeded; Dispatch may replace with GPU-reduced buffer.
             float calculatedMinValue = Mathf.Exp(calculatedDepthMinValue);
             float calculatedScale = Mathf.Exp(calculatedDepthDisplayScale);
             currentMaterial.SetFloat("_Scale", calculatedScale);
@@ -589,12 +616,7 @@ public class FluidRenderer : MonoBehaviour
                 if (particleArgsBuffer == null || particleArgsBuffer.count != 5)
                     CreateParticleArgsBuffer();
                 else
-                {
-                    uint[] args = new uint[5];
-                    particleArgsBuffer.GetData(args);
-                    args[1] = (uint)numParticles;
-                    particleArgsBuffer.SetData(args);
-                }
+                    PatchIndirectDrawInstanceCount(particleArgsBuffer, (uint)numParticles);
 
                 depthCmd.Clear();
                 depthCmd.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
@@ -632,12 +654,7 @@ public class FluidRenderer : MonoBehaviour
             if (argsBuffer == null || argsBuffer.count != 5)
                 CreateArgsBuffer();
             else
-            {
-                uint[] args = new uint[5];
-                argsBuffer.GetData(args);
-                args[1] = (uint)_sim.NumNodes;
-                argsBuffer.SetData(args);
-            }
+                PatchIndirectDrawInstanceCount(argsBuffer, (uint)_sim.NumNodes);
 
             nodeThicknessMaterial.SetBuffer("_Nodes", _sim.NodesBuffer);
             nodeThicknessMaterial.SetVector("_SimulationBoundsMin", SimBounds.min);
@@ -647,7 +664,7 @@ public class FluidRenderer : MonoBehaviour
 
             thicknessCmd.DrawMeshInstancedIndirect(quadMesh, 0, nodeThicknessMaterial, 0, argsBuffer);
         }
-        else
+        else if (thicknessSource == ThicknessSource.Particles)
         {
             if (_sim.ParticlesBuffer == null || _sim.NumParticlesForRender <= 0) return;
             if (particleThicknessMaterial == null) return;
@@ -655,12 +672,7 @@ public class FluidRenderer : MonoBehaviour
             if (particleArgsBuffer == null || particleArgsBuffer.count != 5)
                 CreateParticleArgsBuffer();
             else
-            {
-                uint[] args = new uint[5];
-                particleArgsBuffer.GetData(args);
-                args[1] = (uint)_sim.NumParticlesForRender;
-                particleArgsBuffer.SetData(args);
-            }
+                PatchIndirectDrawInstanceCount(particleArgsBuffer, (uint)_sim.NumParticlesForRender);
 
             particleThicknessMaterial.SetBuffer("_Particles", _sim.ParticlesBuffer);
             particleThicknessMaterial.SetVector("_SimulationBoundsMin", SimBounds.min);
@@ -699,12 +711,7 @@ public class FluidRenderer : MonoBehaviour
         if (argsBuffer == null || argsBuffer.count != 5)
             CreateArgsBuffer();
         else
-        {
-            uint[] args = new uint[5];
-            argsBuffer.GetData(args);
-            args[1] = (uint)_sim.NumNodes;
-            argsBuffer.SetData(args);
-        }
+            PatchIndirectDrawInstanceCount(argsBuffer, (uint)_sim.NumNodes);
 
         nodeWireframeMaterial.SetBuffer("_Nodes", _sim.NodesBuffer);
         nodeWireframeMaterial.SetVector("_SimulationBoundsMin", SimBounds.min);
@@ -724,6 +731,84 @@ public class FluidRenderer : MonoBehaviour
         }
 
         thicknessCmd.DrawMeshInstancedIndirect(quadMesh, 0, nodeWireframeMaterial, 0, argsBuffer);
+        Graphics.ExecuteCommandBuffer(thicknessCmd);
+    }
+
+    static bool s_warnedUniformGridNodesWrongMode;
+    static bool s_warnedUniformGridNodesBuffers;
+
+    void RenderUniformGridNodes(Camera cam)
+    {
+        if (cam == null) return;
+
+        if (quadMesh == null)
+            CreateQuadMesh();
+
+        if (nodesTexture == null || nodesTexture.width != cam.pixelWidth || nodesTexture.height != cam.pixelHeight)
+        {
+            if (nodesTexture != null)
+                nodesTexture.Release();
+            nodesTexture = new RenderTexture(cam.pixelWidth, cam.pixelHeight, 24, RenderTextureFormat.ARGBFloat);
+            nodesTexture.enableRandomWrite = true;
+            nodesTexture.Create();
+        }
+
+        thicknessCmd.Clear();
+        thicknessCmd.SetRenderTarget(nodesTexture);
+        thicknessCmd.ClearRenderTarget(true, true, Color.clear);
+
+        if (_sim.gridMode != GridMode.Uniform)
+        {
+            if (!s_warnedUniformGridNodesWrongMode)
+            {
+                s_warnedUniformGridNodesWrongMode = true;
+                Debug.LogWarning(
+                    "FluidRenderer: RenderingMode.UniformGridNodes is meant for FluidSimulator.GridMode.Uniform (octree leaves use RenderingMode.Nodes).");
+            }
+            Graphics.ExecuteCommandBuffer(thicknessCmd);
+            return;
+        }
+
+        if (_sim.NumNodes <= 0
+            || uniformGridWireframeMaterial == null
+            || _sim.UniformActiveMortonListBuffer == null
+            || _sim.UniformCellCountsBuffer == null)
+        {
+            if (!s_warnedUniformGridNodesBuffers && _sim.gridMode == GridMode.Uniform)
+            {
+                s_warnedUniformGridNodesBuffers = true;
+                Debug.LogWarning(
+                    "FluidRenderer: UniformGridNodes needs active uniform-grid buffers and NumNodes > 0 (run simulation in Uniform mode).");
+            }
+            Graphics.ExecuteCommandBuffer(thicknessCmd);
+            return;
+        }
+
+        if (argsBuffer == null || argsBuffer.count != 5)
+            CreateArgsBuffer();
+        else
+            PatchIndirectDrawInstanceCount(argsBuffer, (uint)_sim.NumNodes);
+
+        uniformGridWireframeMaterial.SetBuffer("_ActiveMortonList", _sim.UniformActiveMortonListBuffer);
+        uniformGridWireframeMaterial.SetBuffer("_CellCounts", _sim.UniformCellCountsBuffer);
+        uniformGridWireframeMaterial.SetInt("_UniformGridLog2K", _sim.UniformGridBinsPerAxisLog2);
+        uniformGridWireframeMaterial.SetInt("_UniformGridCellCount", _sim.UniformGridCellCount);
+        uniformGridWireframeMaterial.SetVector("_SimulationBoundsMin", SimBounds.min);
+        uniformGridWireframeMaterial.SetVector("_SimulationBoundsMax", SimBounds.max);
+
+        if (cam != null && SimBounds.size.sqrMagnitude > 1e-6f)
+        {
+            Vector3 cameraPos = cam.transform.position;
+            Bounds bounds = SimBounds;
+            float boundsDiagonal = bounds.size.magnitude;
+            CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
+            float calculatedMinValue = Mathf.Exp(calculatedDepthMinValue);
+            float calculatedScale = Mathf.Exp(calculatedDepthDisplayScale);
+            uniformGridWireframeMaterial.SetFloat("_Scale", calculatedScale);
+            uniformGridWireframeMaterial.SetFloat("_MinValue", calculatedMinValue);
+        }
+
+        thicknessCmd.DrawMeshInstancedIndirect(quadMesh, 0, uniformGridWireframeMaterial, 0, argsBuffer);
         Graphics.ExecuteCommandBuffer(thicknessCmd);
     }
 
@@ -803,16 +888,15 @@ public class FluidRenderer : MonoBehaviour
             return;
 
         const int subMeshIndex = 0;
-        uint[] args = new uint[5];
-        args[0] = (uint)quadMesh.GetIndexCount(subMeshIndex);
-        args[1] = instanceCount;
-        args[2] = (uint)quadMesh.GetIndexStart(subMeshIndex);
-        args[3] = (uint)quadMesh.GetBaseVertex(subMeshIndex);
-        args[4] = 0;
+        indirectDrawArgsScratch[0] = (uint)quadMesh.GetIndexCount(subMeshIndex);
+        indirectDrawArgsScratch[1] = instanceCount;
+        indirectDrawArgsScratch[2] = (uint)quadMesh.GetIndexStart(subMeshIndex);
+        indirectDrawArgsScratch[3] = (uint)quadMesh.GetBaseVertex(subMeshIndex);
+        indirectDrawArgsScratch[4] = 0;
 
         voxelArgsBuffer?.Release();
         voxelArgsBuffer = new ComputeBuffer(5, sizeof(uint), ComputeBufferType.IndirectArguments);
-        voxelArgsBuffer.SetData(args);
+        voxelArgsBuffer.SetData(indirectDrawArgsScratch);
         cachedVoxelArgsResolution = R;
     }
 
@@ -926,6 +1010,13 @@ public class FluidRenderer : MonoBehaviour
         quadMesh.triangles = triangles;
         quadMesh.uv = uv;
         quadMesh.RecalculateNormals();
+    }
+
+    /// <summary>Updates only indirect args element [1] (instance count). Avoids GetData+SetData of the full 5×uint buffer.</summary>
+    void PatchIndirectDrawInstanceCount(ComputeBuffer indirectArgs, uint instanceCount)
+    {
+        indirectInstanceCountOnlyScratch[0] = instanceCount;
+        indirectArgs.SetData(indirectInstanceCountOnlyScratch, 0, 1, 1);
     }
 
     void CreateArgsBuffer()
@@ -1132,8 +1223,7 @@ public class FluidRenderer : MonoBehaviour
 
         compositeMaterial.SetFloat("depthDisplayScale", calculatedDepthDisplayScale);
         compositeMaterial.SetFloat("depthMinValue", calculatedDepthMinValue);
-        float thicknessScale = thicknessSource == ThicknessSource.Nodes ? thicknessScaleNodes : thicknessScaleParticles;
-        compositeMaterial.SetFloat("thicknessDisplayScale", thicknessScale);
+        compositeMaterial.SetFloat("thicknessDisplayScale", ThicknessBlitDisplayScale);
         compositeMaterial.SetFloat("depthOfFieldStrength", depthOfFieldStrength);
 
         compositeMaterial.SetVector("floorPos", new Vector3(0, -2.5f, 0));

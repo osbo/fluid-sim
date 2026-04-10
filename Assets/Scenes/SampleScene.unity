@@ -737,13 +737,20 @@ MonoBehaviour:
   gravity: 100
   kinematicViscosity: 5
   flipRatio: 0.9
-  useRealTime: 1
+  useRealTime: 0
   frameRate: 60
   minLayer: 3
-  maxLayer: 4
+  maxLayer: 5
+  uniformGridCellLayer: 3
   logLayerCountsPerFrame: 0
   enablePerFrameDebugTimingLog: 0
+  debugValidateUniformParticleSort: 0
+  debugValidateUniformNeighbors: 0
+  debugUniformNeighborsMaxNodes: 2097152
+  debugUniformNeighborsMaxDenseCells: 2097152
+  debugUniformNeighborsMaxExamples: 16
   preconditioner: 2
+  gridMode: 1
   useColliders: 1
   collidersRoot: {fileID: 444293660}
   recorder: {fileID: 944897176}
@@ -759,7 +766,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c7e8f9a0b1d24e5f6a70819293a4b5c6, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  renderingMode: 2
+  renderingMode: 0
   thicknessSource: 0
   mainLight: {fileID: 410087040}
   blurCompute: {fileID: 7200000, guid: f6fd906dd186a4615ad9f1e3e3a4c9a8, type: 3}
@@ -767,7 +774,8 @@ MonoBehaviour:
   particleDepthMaterial: {fileID: 2100000, guid: 02cdf3bcc869241a49f58b5e8d42a8ea, type: 2}
   nodeThicknessMaterial: {fileID: 2100000, guid: 555cc73f225be420190af8e738526deb, type: 2}
   nodeWireframeMaterial: {fileID: 2100000, guid: 2642f661bfdf64d9a87b4324fd7f74a7, type: 2}
-  voxelWireframeMaterial: {fileID: 0}
+  uniformGridWireframeMaterial: {fileID: 2100000, guid: b91d1ee48b34749868570fe792689743, type: 2}
+  voxelWireframeMaterial: {fileID: 2100000, guid: 1314b35792f7043df856c709daf340ef, type: 2}
   particleThicknessMaterial: {fileID: 2100000, guid: 9df3c40a709154c7a8fcb0766b252408, type: 2}
   normalMaterial: {fileID: 2100000, guid: 2c9b4b14204124ea793fcbf0a077e303, type: 2}
   compositeMaterial: {fileID: 2100000, guid: 300258d4d41fa4015af599080020c3b9, type: 2}

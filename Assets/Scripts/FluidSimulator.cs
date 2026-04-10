@@ -1,7 +1,9 @@
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Serialization;
 using UnityEngine.InputSystem;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -28,6 +30,7 @@ public partial class FluidSimulator : MonoBehaviour
     ComputeShader nodesShader;
     ComputeShader cgSolverShader;
     ComputeShader csrBuilderShader;
+    ComputeShader uniformGridShader;
     public int numParticles = 1048576;
 
     // CG Solver parameters
@@ -65,6 +68,7 @@ public partial class FluidSimulator : MonoBehaviour
     private int dotProductKernel;
     private int applyPressureGradientKernel;
     private int updateParticlesKernel;
+    private int updateParticlesUniformKernel = -1;
     private int applyExternalForcesKernel;
     private int applyViscosityKernelId;
     private int solvePressureIterationKernel;
@@ -89,6 +93,9 @@ public partial class FluidSimulator : MonoBehaviour
     private int csrCountNnzKernelId;
     private int csrFinalizeRowPtrKernelId;
     private int csrFillKernelId;
+    private int buildMatrixAUniformKernelId;
+    private int csrCountNnzUniformKernelId;
+    private int csrFillUniformKernelId;
     // Cached octree/prefix-sum kernel IDs
     private int copyNodesKernelId;
     private int writeDispatchArgsKernelId;
@@ -100,7 +107,9 @@ public partial class FluidSimulator : MonoBehaviour
     private int npsPrefixFixupKernelId;
     private int writeDispatchArgsFromCountKernelId;
     private int copyUintBufferKernelId;
-    
+    private int uniformGridClearDenseKernel;
+    private int uniformGridBinParticlesKernel;
+
     // GPU Buffers
     private ComputeBuffer particlesBuffer;
     private ComputeBuffer indicators;
@@ -118,6 +127,8 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer tempNodesBuffer;
     private ComputeBuffer mortonCodesBuffer;
     private ComputeBuffer neighborsBuffer;
+    /// <summary>GridMode.Uniform only: 6 face neighbors per node, SoA stride <see cref="maxNodesCapacity"/>.</summary>
+    private ComputeBuffer uniformNeighborsBuffer;
     public ComputeBuffer reverseNeighborsBuffer;
     private ComputeBuffer divergenceBuffer;
     private ComputeBuffer pBuffer;
@@ -127,6 +138,8 @@ public partial class FluidSimulator : MonoBehaviour
     // NEW: Buffer for standard Laplacian Matrix A
     // Format: [25 * numNodes] where Slot 0 = Diagonal, 1-24 = Neighbors
     private ComputeBuffer matrixABuffer;
+    /// <summary>GridMode.Uniform only: 7 floats per node (diagonal at i, off-diagonals at (1..6)*stride+i).</summary>
+    private ComputeBuffer uniformMatrixABuffer;
     private ComputeBuffer phiBuffer;
     private ComputeBuffer phiBuffer_Read;
     private ComputeBuffer dirtyFlagBuffer;
@@ -143,10 +156,24 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer diffusionGradientBuffer; // Precomputed normalized density gradient per node
     private ComputeBuffer dispatchArgsBuffer;       // 3-uint indirect dispatch args for DispatchIndirect
     private ComputeBuffer particlePrefixElementCountBuffer; // [0] = numParticles for find-unique prefix scans
+
+    // Uniform grid hash (GridMode.Uniform): dense N³ maps + compact active list + per-node accumulation.
+    private ComputeBuffer uniformCellCountsBuffer;
+    private ComputeBuffer uniformDenseIndexMapBuffer;
+    private ComputeBuffer uniformActiveMortonListBuffer;
+    private ComputeBuffer uniformActiveNodeCountBuffer;
+    private ComputeBuffer uniformNodeAccumBuffer; // 19 * maxNodesCapacity uints
+
+    public const int UniformNeighborSlotCount = 6;
+    public const int UniformMatrixSlotCount = 7;
+
     private int maxNodesCapacity;
     private int maxPrefixThreadGroups;
     private int maxAuxBlocks;
     private readonly uint[] gpuNodeCountReadback = new uint[1];
+    private uint[] uniformNeighborDebugFacesScratch;
+    private uint[] uniformNeighborDebugMortonScratch;
+    private uint[] uniformNeighborDebugDenseScratch;
     // CSR matrix representation of A
     private ComputeBuffer nnzPerNode;   // Per-row nnz counts
     private ComputeBuffer csrRowPtr;    // Row pointer (size numNodes + 1)
@@ -167,6 +194,13 @@ public partial class FluidSimulator : MonoBehaviour
     public ComputeBuffer PhiBuffer => phiBuffer;
     public int NumNodes => numNodes;
     public int NumParticlesForRender => numParticles;
+
+    public ComputeBuffer UniformCellCountsBuffer => uniformCellCountsBuffer;
+    public ComputeBuffer UniformDenseIndexMapBuffer => uniformDenseIndexMapBuffer;
+    public ComputeBuffer UniformActiveMortonListBuffer => uniformActiveMortonListBuffer;
+    public ComputeBuffer UniformActiveNodeCountBuffer => uniformActiveNodeCountBuffer;
+    /// <summary>Capacity of <see cref="UniformActiveMortonListBuffer"/>; also max compact active cells per frame for uniform binning.</summary>
+    public int MaxUniformActiveCells => maxNodesCapacity;
     public Bounds WorldSimulationBounds => simulationBounds != null ? simulationBounds.bounds : new Bounds(Vector3.zero, Vector3.one);
     public float MaxDetailCellSize => maxDetailCellSize;
     private int numUniqueNodes; // rename to numUniqueNodes
@@ -184,23 +218,77 @@ public partial class FluidSimulator : MonoBehaviour
     [Tooltip("Finest octree layer for the sim; collider voxel grid uses R = 2^(10 - minLayer) along each axis (same as Nodes.compute kMortonAxisBits).")]
     [Range(0, 10)] public int minLayer = 4;
     [Range(0, 10)] public int maxLayer = 10;
+    [Tooltip("Octree-equivalent layer L (same as Nodes minLayer / node.layer for cell size): sim cell width = 2^L. Uniform grid uses k = (MortonAxisBits − L) bits per axis, N = 2^k cells per axis, so each bin matches a level-L octree cell.")]
+    [Range(0, 10)]
+    [FormerlySerializedAs("uniformGridResolutionLog2")]
+    public int uniformGridCellLayer = 3;
 
     /// <summary>Must match kMortonAxisBits in Nodes.compute.</summary>
     public const int MortonAxisBits = 10;
 
     /// <summary>Collider voxel resolution per axis: 2^(MortonAxisBits - minLayer).</summary>
     public int SolidVoxelResolution => 1 << (MortonAxisBits - Mathf.Clamp(minLayer, 0, MortonAxisBits));
+
+    /// <summary>k = MortonAxisBits − L; N = 2^k cells per axis (Morton fold matches octree cells of width 2^L).</summary>
+    public int UniformGridBinsPerAxisLog2 => MortonAxisBits - Mathf.Clamp(uniformGridCellLayer, 0, MortonAxisBits);
+
+    /// <summary>Uniform hash grid: N = 2^k cells per axis.</summary>
+    public int UniformGridCellsPerAxis { get; private set; }
+
+    /// <summary>Uniform hash grid: N³ total dense cell slots.</summary>
+    public int UniformGridCellCount { get; private set; }
     [Tooltip("When per-frame debug timing log is enabled: each frame, GPU readback of nodesBuffer and layer histogram text for the summary. No effect when that master toggle is off.")]
     public bool logLayerCountsPerFrame = true;
 
     [Header("Debug: frame stats / logging")]
-    [Tooltip("Master toggle for expensive per-frame diagnostics. When off (default): no frame summary Debug.Log, no cumulative timing averages, no layer-count readback, and no AsyncGPUReadback fences around timed sections. When on: section Stopwatches include tiny AsyncGPUReadback waits so ms ≈ GPU work per step (very slow). Stopwatches still run when off (cheap enqueue time only); use Unity Profiler FluidSim.* markers. Turn on only while profiling.")]
+    [Tooltip("Master toggle for expensive per-frame diagnostics. When off (default): no frame summary Debug.Log, no cumulative timing averages, no layer-count readback, and no AsyncGPUReadback fences around timed sections. When on: each section’s timer includes the GPU fence before it; summary logs after WaitForEndOfFrame with full wall-frame ms (aligns with Game view). Very slow.")]
     public bool enablePerFrameDebugTimingLog = false;
+
+    [Header("Debug: uniform grid neighbors")]
+    [Tooltip("GridMode.Uniform only: after FindNeighbors, read back stencil and log reciprocity, domain-wall, and denseIndexMap checks. Traces +/− per axis (faces 0/1=x, 2/3=y, 4/5=z). Very expensive (large GPU readback each frame).")]
+    public bool debugValidateUniformNeighbors = false;
+    [Tooltip("GPU readback: first N node slots per face (must be ≥ active nodes for full reciprocity). Increase if recipSkipped > 0.")]
+    [Min(1)]
+    public int debugUniformNeighborsMaxNodes = 2097152;
+    [Tooltip("Skip full denseIndexMap readback when uniform N³ exceeds this (still runs reciprocity + wall checks).")]
+    [Min(1024)]
+    public int debugUniformNeighborsMaxDenseCells = 2097152;
+    [Tooltip("Max example lines printed per category (reciprocity / wall / dense).")]
+    [Range(0, 64)]
+    public int debugUniformNeighborsMaxExamples = 16;
 
     public PreconditionerType preconditioner = PreconditionerType.Jacobi;
 
+    [Header("Grid")]
+    [Tooltip("Octree: adaptive refinement. Uniform: fixed cell size 2^uniformGridCellLayer, same pressure/FLIP pipeline with a 6-neighbor stencil.")]
+    public GridMode gridMode = GridMode.Octree;
+
     private int frameNumber = 0;
     private double cumulativeFrameTimeMs = 0.0;
+    private double cumulativeUnityUnscaledDeltaMsForTimingLog = 0.0;
+    private double cumulativeFullFrameWallMs = 0.0;
+    private int fullFrameWallSamples = 0;
+    private double lastTimingEndOfFrameRealtime = -1.0;
+    private bool hasPendingFrameTimingLog;
+    private FrameTimingLogPending frameTimingLogPending;
+
+    private struct FrameTimingLogPending
+    {
+        public int frameNumber;
+        public double simUpdateMs;
+        public double unityUnscaledDeltaMs;
+        public double averageSimUpdateMs;
+        public double averageUnityUnscaledMs;
+        public double sortMs, findUniqueMs, createLeavesMs, layerLoopMs, findNeighborsMs;
+        public double uniformGridBuildMs;
+        public double calculateGradientsMs, computeLevelSetMs, storeOldVelocitiesMs, applyExternalForcesMs;
+        public double solvePressureMs, updateParticlesMs, miscPipelineMs;
+        public bool useOctree;
+        public int numNodes;
+        public string layerCountsLine;
+        public string averageCgIterationsText;
+        public int lastCgIterations;
+    }
     private double cumulativeCgIterations = 0.0;
     private int cgSolveFrameCount = 0;
     private float averageCgIterations = 0.0f;
@@ -216,7 +304,6 @@ public partial class FluidSimulator : MonoBehaviour
     private bool isPaused = false;
 
     
-    private System.Diagnostics.Stopwatch totalOctreeSw;
     private double lastRenderTimeMs;
 
     // Profiler markers for Unity Profiler GPU timeline
@@ -226,13 +313,21 @@ public partial class FluidSimulator : MonoBehaviour
     static readonly ProfilerMarker s_CreateLeavesMarker     = new ProfilerMarker("FluidSim.CreateLeaves");
     static readonly ProfilerMarker s_LayerLoopMarker        = new ProfilerMarker("FluidSim.LayerLoop");
     static readonly ProfilerMarker s_FindNeighborsMarker    = new ProfilerMarker("FluidSim.FindNeighbors");
+    static readonly ProfilerMarker s_UniformGridBuildMarker = new ProfilerMarker("FluidSim.UniformGridBuild");
     static readonly ProfilerMarker s_GradientsMarker        = new ProfilerMarker("FluidSim.CalculateGradients");
     static readonly ProfilerMarker s_StoreVelocitiesMarker  = new ProfilerMarker("FluidSim.StoreOldVelocities");
     static readonly ProfilerMarker s_ExternalForcesMarker   = new ProfilerMarker("FluidSim.ApplyExternalForces");
     static readonly ProfilerMarker s_NodeCountReadbackMarker= new ProfilerMarker("FluidSim.NodeCountReadback");
     static readonly ProfilerMarker s_SolvePressureMarker    = new ProfilerMarker("FluidSim.SolvePressure");
     static readonly ProfilerMarker s_UpdateParticlesMarker  = new ProfilerMarker("FluidSim.UpdateParticles");
+    static readonly ProfilerMarker s_MiscPipelineMarker     = new ProfilerMarker("FluidSim.MiscPipeline");
     static readonly ProfilerMarker s_GpuTimingSyncMarker    = new ProfilerMarker("FluidSim.GpuTimingSync");
+
+    static readonly string s_FrameTimingModeNote =
+        "• Timing: GPU sync ON (each section includes pre-step AsyncGPUReadback fence; not full device idle).\n" +
+        "• Uniform build and octree Find Neighbors both fence nodesBuffer after their GPU tail (default flush only hits particles + nodeCount).\n" +
+        "• Full frame wall = realtime between successive WaitForEndOfFrame (~what Game view reflects).\n" +
+        "• FluidSimulator.Update excludes other scripts, editor, vsync wait; Rendering line is this frame’s FluidRenderer camera work (before EOF).\n";
     
     // Simulation parameters (calculated in InitializeParticleSystem)
     private Vector3 mortonNormalizationFactor;
@@ -277,6 +372,14 @@ public partial class FluidSimulator : MonoBehaviour
     private readonly int[] spatialDupPerLayerScratch = new int[16];
     private readonly Dictionary<ulong, int> spatialOverlapFirstIndexScratch = new Dictionary<ulong, int>(65536);
     private readonly StringBuilder layerCountLogSb = new StringBuilder(128);
+    /// <summary>Avoids <c>SetData(new uint[] {{ ... }})</c> allocations on hot paths (uniform prefix, node count, recording).</summary>
+    private readonly uint[] gpuUintScratch1 = new uint[1];
+    /// <summary>Pooled when <see cref="debugValidateUniformNeighbors"/> is enabled (5×6 face counters per frame).</summary>
+    private int[] uniformNeighborsDebugFaceStats30;
+    private StringBuilder uniformNeighborsDebugSbRecip;
+    private StringBuilder uniformNeighborsDebugSbWall;
+    private StringBuilder uniformNeighborsDebugSbDense;
+    private StringBuilder uniformNeighborsDebugSbSummary;
     private Particle[] particlesCPU;
     private string str;
 
@@ -327,6 +430,7 @@ public partial class FluidSimulator : MonoBehaviour
     private void OnValidate()
     {
         ValidateOctreeLayers();
+        uniformGridCellLayer = Mathf.Clamp(uniformGridCellLayer, 0, MortonAxisBits);
         if (Application.isPlaying && particlesBuffer != null)
             BakeAndUploadSolidVoxels();
     }
@@ -370,6 +474,7 @@ public partial class FluidSimulator : MonoBehaviour
         // Cache all kernel IDs once so hot paths never call FindKernel
         InitSolverKernels();
         InitOctreeKernels();
+        InitUniformGridKernels();
         TryLoadLeafOnlyWeightsFromDisk();
 
         // Auto-find recorder if not assigned
@@ -387,6 +492,8 @@ public partial class FluidSimulator : MonoBehaviour
         {
             recorder.StartNewRun();
         }
+
+        StartCoroutine(FrameTimingLogEndOfFrameRoutine());
     }
 
     private void BakeAndUploadSolidVoxels()
@@ -492,6 +599,35 @@ public partial class FluidSimulator : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Uniform-grid build finishes with normalize + FindNeighbors + face-velocity kernels that write/read <see cref="nodesBuffer"/>.
+    /// <see cref="GpuTimingReportFlushGpu"/> only fences <c>particlesBuffer</c> and <c>nodeCount</c>, so the next timed section’s opening flush
+    /// would wait for that tail GPU work and incorrectly charge it to e.g. Calculate Gradients. One byte readback on <c>nodesBuffer</c> ties the
+    /// full build to the Uniform Grid Build stopwatch when debug timing is on.
+    /// </summary>
+    private void GpuTimingFenceAfterUniformGridBuildGpuComplete()
+    {
+        if (!enablePerFrameDebugTimingLog || nodesBuffer == null)
+            return;
+        using (s_GpuTimingSyncMarker.Auto())
+        {
+            var r = AsyncGPUReadback.Request(nodesBuffer, sizeof(float), 0);
+            r.WaitForCompletion();
+        }
+    }
+
+    /// <summary>Octree <c>findNeighbors</c> ends with copy-face-vel → <see cref="nodesBuffer"/>; fence that so the next section does not absorb it.</summary>
+    private void GpuTimingFenceAfterFindNeighborsOctree()
+    {
+        if (!enablePerFrameDebugTimingLog || nodesBuffer == null)
+            return;
+        using (s_GpuTimingSyncMarker.Auto())
+        {
+            var r = AsyncGPUReadback.Request(nodesBuffer, sizeof(float), 0);
+            r.WaitForCompletion();
+        }
+    }
+
     void Update()
     {
         if (Keyboard.current != null && Keyboard.current.rKey.wasPressedThisFrame)
@@ -512,9 +648,7 @@ public partial class FluidSimulator : MonoBehaviour
         {
             return;
         }
-        
-        layer = minLayer;
-        
+
         var frameSw = System.Diagnostics.Stopwatch.StartNew();
         using var _ = s_FrameMarker.Auto();
 
@@ -522,6 +656,8 @@ public partial class FluidSimulator : MonoBehaviour
         // Use the normalized simulation bounds (simulationBoundsMin is now Vector3.zero)
         Vector3 simulationSize = simulationBoundsMax;
         maxDetailCellSize = Mathf.Min(simulationSize.x, simulationSize.y, simulationSize.z) / 1024.0f;
+
+        bool useOctreePipeline = gridMode == GridMode.Octree;
 
         var sortSw = new System.Diagnostics.Stopwatch();
         var findUniqueSw = new System.Diagnostics.Stopwatch();
@@ -532,147 +668,283 @@ public partial class FluidSimulator : MonoBehaviour
         var computeLevelSetSw = new System.Diagnostics.Stopwatch();
         var storeOldVelocitiesSw = new System.Diagnostics.Stopwatch();
         var applyExternalForcesSw = new System.Diagnostics.Stopwatch();
-
-        // Step 1: Sort particles
-        GpuTimingReportFlushGpu(false);
-        sortSw.Restart();
-        using (s_SortMarker.Auto())
-            SortParticles();
-        GpuTimingReportFlushGpu(false);
-        sortSw.Stop();
-
-        // Step 2: Find unique particles and create leaves
-        GpuTimingReportFlushGpu(false);
-        findUniqueSw.Restart();
-        using (s_FindUniqueMarker.Auto())
-            findUniqueParticles();
-        GpuTimingReportFlushGpu(false);
-        findUniqueSw.Stop();
-
-        GpuTimingReportFlushGpu(false);
-        createLeavesSw.Restart();
-        using (s_CreateLeavesMarker.Auto())
-            CreateLeaves();
-        GpuTimingReportFlushGpu(false);
-        createLeavesSw.Stop();
-
-        // Step 3: Layer loop (layers 1-10)
-        GpuTimingReportFlushGpu(false);
-        layerLoopSw.Restart();
-        using (s_LayerLoopMarker.Auto())
-        {
-            for (layer = layer + 1; layer <= maxLayer; layer++)
-            {
-                findUniqueNodes();
-                ProcessNodes();
-                compactNodes();
-                // mortonCodesBuffer is refreshed inside scatterActives (fused with compaction).
-            }
-        }
-        GpuTimingReportFlushGpu(false);
-        layerLoopSw.Stop();
-
-        // Step 4: Find neighbors (GPU: WriteIndirectArgsFromCount + DispatchIndirect — no CPU count needed)
-        GpuTimingReportFlushGpu(false);
-        findNeighborsSw.Restart();
-        using (s_FindNeighborsMarker.Auto())
-            findNeighbors();
-        GpuTimingReportFlushGpu(false);
-        findNeighborsSw.Stop();
-
-        // Step 4.5: Calculate density gradients (indirect from GPU nodeCount)
-        GpuTimingReportFlushGpu(false);
-        calculateGradientsSw.Restart();
-        using (s_GradientsMarker.Auto())
-            CalculateDensityGradients();
-        GpuTimingReportFlushGpu(false);
-        calculateGradientsSw.Stop();
-
-        // Step 5: Compute level set (distance field)
-        GpuTimingReportFlushGpu(false);
-        computeLevelSetSw.Restart();
-        // ComputeLevelSet();
-        GpuTimingReportFlushGpu(false);
-        computeLevelSetSw.Stop();
-
-        // Step 6: Store old velocities for FLIP method
-        GpuTimingReportFlushGpu(false);
-        storeOldVelocitiesSw.Restart();
-        using (s_StoreVelocitiesMarker.Auto())
-            StoreOldVelocities();
-        GpuTimingReportFlushGpu(false);
-        storeOldVelocitiesSw.Stop();
-
-        // Step 7: Apply external forces (indirect from GPU nodeCount)
-        GpuTimingReportFlushGpu(false);
-        applyExternalForcesSw.Restart();
-        using (s_ExternalForcesMarker.Auto())
-            ApplyExternalForces();
-        GpuTimingReportFlushGpu(false);
-        applyExternalForcesSw.Stop();
-
-        // Step 7b: Apply physical viscosity (ν∇²u) if enabled
-        if (kinematicViscosity > 0f)
-            ApplyViscosity();
-
-        // One uint sync readback: CPU must have correct numNodes this frame for SolvePressure (LeafOnly),
-        // BuildLayerCountsSummaryForLog, rendering instance counts, etc. GPU indirect dispatches already use nodeCount buffer.
-        using (s_NodeCountReadbackMarker.Auto())
-        {
-            nodeCount.GetData(gpuNodeCountReadback);
-            numNodes = (int)gpuNodeCountReadback[0];
-        }
-        string layerCountsLine = null;
-        if (enablePerFrameDebugTimingLog && logLayerCountsPerFrame)
-            layerCountsLine = BuildLayerCountsSummaryForLog();
-
-        // Step 9: Solve pressure
         var solvePressureSw = new System.Diagnostics.Stopwatch();
-        GpuTimingReportFlushGpu(false);
-        solvePressureSw.Restart();
-        using (s_SolvePressureMarker.Auto())
-            SolvePressure();
-        GpuTimingReportFlushGpu(true);
-        solvePressureSw.Stop();
-
-        // Step 10: Update particles
         var updateParticlesSw = new System.Diagnostics.Stopwatch();
-        GpuTimingReportFlushGpu(false);
-        updateParticlesSw.Restart();
-        using (s_UpdateParticlesMarker.Auto())
-            UpdateParticles();
-        GpuTimingReportFlushGpu(false);
-        updateParticlesSw.Stop();
+        var uniformGridBuildSw = new System.Diagnostics.Stopwatch();
+        var miscPipelineSw = new System.Diagnostics.Stopwatch();
 
-        // Frame timing summary (optional; Console + string build are costly on the main thread)
+        string layerCountsLine = null;
+
+        if (useOctreePipeline)
+        {
+            layer = minLayer;
+
+            // Each section: GPU fence (when timing log on) + work. Fences are attributed to the section they precede.
+            sortSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_SortMarker.Auto())
+                SortParticles();
+            sortSw.Stop();
+
+            findUniqueSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_FindUniqueMarker.Auto())
+                findUniqueParticles();
+            findUniqueSw.Stop();
+
+            createLeavesSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_CreateLeavesMarker.Auto())
+                CreateLeaves();
+            createLeavesSw.Stop();
+
+            layerLoopSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_LayerLoopMarker.Auto())
+            {
+                for (layer = layer + 1; layer <= maxLayer; layer++)
+                {
+                    findUniqueNodes();
+                    ProcessNodes();
+                    compactNodes();
+                }
+            }
+            layerLoopSw.Stop();
+
+            findNeighborsSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_FindNeighborsMarker.Auto())
+                findNeighbors();
+            GpuTimingFenceAfterFindNeighborsOctree();
+            findNeighborsSw.Stop();
+
+            calculateGradientsSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_GradientsMarker.Auto())
+                CalculateDensityGradients();
+            calculateGradientsSw.Stop();
+
+            computeLevelSetSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            // ComputeLevelSet();
+            computeLevelSetSw.Stop();
+
+            storeOldVelocitiesSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_StoreVelocitiesMarker.Auto())
+                StoreOldVelocities();
+            storeOldVelocitiesSw.Stop();
+
+            applyExternalForcesSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_ExternalForcesMarker.Auto())
+                ApplyExternalForces();
+            applyExternalForcesSw.Stop();
+
+            if (enablePerFrameDebugTimingLog)
+                miscPipelineSw.Restart();
+            using (s_MiscPipelineMarker.Auto())
+            {
+                GpuTimingReportFlushGpu(false);
+                if (kinematicViscosity > 0f)
+                    ApplyViscosity();
+                using (s_NodeCountReadbackMarker.Auto())
+                {
+                    nodeCount.GetData(gpuNodeCountReadback);
+                    numNodes = (int)gpuNodeCountReadback[0];
+                }
+                if (enablePerFrameDebugTimingLog && logLayerCountsPerFrame)
+                    layerCountsLine = BuildLayerCountsSummaryForLog();
+            }
+            if (enablePerFrameDebugTimingLog)
+                miscPipelineSw.Stop();
+
+            solvePressureSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_SolvePressureMarker.Auto())
+                SolvePressure();
+            GpuTimingReportFlushGpu(true);
+            solvePressureSw.Stop();
+
+            updateParticlesSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_UpdateParticlesMarker.Auto())
+                UpdateParticles();
+            GpuTimingReportFlushGpu(false);
+            updateParticlesSw.Stop();
+        }
+        else
+        {
+            uniformGridBuildSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_UniformGridBuildMarker.Auto())
+                DispatchUniformGridClearAndBin();
+            GpuTimingFenceAfterUniformGridBuildGpuComplete();
+            uniformGridBuildSw.Stop();
+
+            if (numNodes > 0)
+            {
+                calculateGradientsSw.Restart();
+                GpuTimingReportFlushGpu(false);
+                using (s_GradientsMarker.Auto())
+                    CalculateDensityGradients();
+                calculateGradientsSw.Stop();
+
+                computeLevelSetSw.Restart();
+                GpuTimingReportFlushGpu(false);
+                computeLevelSetSw.Stop();
+
+                storeOldVelocitiesSw.Restart();
+                GpuTimingReportFlushGpu(false);
+                using (s_StoreVelocitiesMarker.Auto())
+                    StoreOldVelocities();
+                storeOldVelocitiesSw.Stop();
+
+                applyExternalForcesSw.Restart();
+                GpuTimingReportFlushGpu(false);
+                using (s_ExternalForcesMarker.Auto())
+                    ApplyExternalForces();
+                applyExternalForcesSw.Stop();
+
+                if (enablePerFrameDebugTimingLog)
+                    miscPipelineSw.Restart();
+                using (s_MiscPipelineMarker.Auto())
+                {
+                    GpuTimingReportFlushGpu(false);
+                    if (kinematicViscosity > 0f)
+                        ApplyViscosity();
+                    // numNodes already set in DispatchUniformGridClearAndBin (no redundant nodeCount GetData).
+                    if (enablePerFrameDebugTimingLog && logLayerCountsPerFrame)
+                        layerCountsLine = BuildLayerCountsSummaryForLog();
+                }
+                if (enablePerFrameDebugTimingLog)
+                    miscPipelineSw.Stop();
+
+                solvePressureSw.Restart();
+                GpuTimingReportFlushGpu(false);
+                using (s_SolvePressureMarker.Auto())
+                    SolvePressure();
+                GpuTimingReportFlushGpu(true);
+                solvePressureSw.Stop();
+            }
+
+            updateParticlesSw.Restart();
+            GpuTimingReportFlushGpu(false);
+            using (s_UpdateParticlesMarker.Auto())
+                UpdateParticles();
+            GpuTimingReportFlushGpu(false);
+            updateParticlesSw.Stop();
+        }
+
         frameSw.Stop();
         if (enablePerFrameDebugTimingLog)
         {
             frameNumber++;
-            cumulativeFrameTimeMs += frameSw.Elapsed.TotalMilliseconds;
-            double averageFrameTimeMs = cumulativeFrameTimeMs / Math.Max(1, frameNumber);
+            double simMs = frameSw.Elapsed.TotalMilliseconds;
+            cumulativeFrameTimeMs += simMs;
+            double unityDeltaMs = Time.unscaledDeltaTime * 1000.0;
+            cumulativeUnityUnscaledDeltaMsForTimingLog += unityDeltaMs;
+
             string averageCgIterationsText = cgSolveFrameCount > 0 ? averageCgIterations.ToString("F2") : "N/A";
-            const string timingModeNote = "• Timing mode: GPU sync ON (section ms include AsyncGPUReadback waits; not a full device idle guarantee).\n";
-            Debug.Log($"Frame {frameNumber} Summary:\n" +
-                     $"• Total Frame: {frameSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Avg Frame Time: {averageFrameTimeMs:F2} ms\n" +
-                     timingModeNote +
-                     $"• # Nodes: {numNodes}\n" +
-                     (layerCountsLine != null ? $"• {layerCountsLine}\n" : "") +
-                     $"• Sort: {sortSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Find Unique: {findUniqueSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Create Leaves: {createLeavesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Layer Loop: {layerLoopSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Find Neighbors: {findNeighborsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Calculate Gradients: {calculateGradientsSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Compute Level Set: {computeLevelSetSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Store Old Velocities: {storeOldVelocitiesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Apply External Forces: {applyExternalForcesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Solve Pressure: {solvePressureSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Update Particles: {updateParticlesSw.Elapsed.TotalMilliseconds:F2} ms\n" +
-                     $"• Rendering: {lastRenderTimeMs:F2} ms\n" +
-                     $"• CG Iterations: {lastCgIterations}\n" +
-                     $"• Avg CG Iterations: {averageCgIterationsText}");
+            hasPendingFrameTimingLog = true;
+            frameTimingLogPending = new FrameTimingLogPending
+            {
+                frameNumber = frameNumber,
+                simUpdateMs = simMs,
+                unityUnscaledDeltaMs = unityDeltaMs,
+                averageSimUpdateMs = cumulativeFrameTimeMs / frameNumber,
+                averageUnityUnscaledMs = cumulativeUnityUnscaledDeltaMsForTimingLog / frameNumber,
+                sortMs = sortSw.Elapsed.TotalMilliseconds,
+                findUniqueMs = findUniqueSw.Elapsed.TotalMilliseconds,
+                createLeavesMs = createLeavesSw.Elapsed.TotalMilliseconds,
+                layerLoopMs = layerLoopSw.Elapsed.TotalMilliseconds,
+                findNeighborsMs = findNeighborsSw.Elapsed.TotalMilliseconds,
+                uniformGridBuildMs = uniformGridBuildSw.Elapsed.TotalMilliseconds,
+                calculateGradientsMs = calculateGradientsSw.Elapsed.TotalMilliseconds,
+                computeLevelSetMs = computeLevelSetSw.Elapsed.TotalMilliseconds,
+                storeOldVelocitiesMs = storeOldVelocitiesSw.Elapsed.TotalMilliseconds,
+                applyExternalForcesMs = applyExternalForcesSw.Elapsed.TotalMilliseconds,
+                solvePressureMs = solvePressureSw.Elapsed.TotalMilliseconds,
+                updateParticlesMs = updateParticlesSw.Elapsed.TotalMilliseconds,
+                miscPipelineMs = miscPipelineSw.Elapsed.TotalMilliseconds,
+                useOctree = useOctreePipeline,
+                numNodes = numNodes,
+                layerCountsLine = layerCountsLine,
+                averageCgIterationsText = averageCgIterationsText,
+                lastCgIterations = lastCgIterations
+            };
+        }
+    }
+
+    IEnumerator FrameTimingLogEndOfFrameRoutine()
+    {
+        var waitEnd = new WaitForEndOfFrame();
+        while (enabled)
+        {
+            yield return waitEnd;
+            if (!enablePerFrameDebugTimingLog || !hasPendingFrameTimingLog)
+                continue;
+
+            hasPendingFrameTimingLog = false;
+            FrameTimingLogPending p = frameTimingLogPending;
+
+            double now = Time.realtimeSinceStartupAsDouble;
+            double fullWallMs = double.NaN;
+            if (lastTimingEndOfFrameRealtime >= 0.0)
+            {
+                fullWallMs = (now - lastTimingEndOfFrameRealtime) * 1000.0;
+                cumulativeFullFrameWallMs += fullWallMs;
+                fullFrameWallSamples++;
+            }
+            lastTimingEndOfFrameRealtime = now;
+
+            double avgFullWall = fullFrameWallSamples > 0 ? cumulativeFullFrameWallMs / fullFrameWallSamples : 0.0;
+
+            double sumListed = p.miscPipelineMs + p.updateParticlesMs + p.solvePressureMs + p.applyExternalForcesMs
+                + p.storeOldVelocitiesMs + p.computeLevelSetMs + p.calculateGradientsMs;
+            if (p.useOctree)
+                sumListed += p.sortMs + p.findUniqueMs + p.createLeavesMs + p.layerLoopMs + p.findNeighborsMs;
+            else
+                sumListed += p.uniformGridBuildMs;
+
+            double drift = p.simUpdateMs - sumListed;
+
+            string fullWallBlock = double.IsNaN(fullWallMs)
+                ? "• Full frame wall (EOF→EOF): n/a (first sample)\n"
+                : $"• Full frame wall (realtime EOF→EOF, ~Game view): {fullWallMs:F2} ms\n" +
+                  $"• Avg full frame wall: {avgFullWall:F2} ms\n";
+
+            string pipelineSection = p.useOctree
+                ? $"• Sort: {p.sortMs:F2} ms\n" +
+                  $"• Find Unique: {p.findUniqueMs:F2} ms\n" +
+                  $"• Create Leaves: {p.createLeavesMs:F2} ms\n" +
+                  $"• Layer Loop: {p.layerLoopMs:F2} ms\n" +
+                  $"• Find Neighbors: {p.findNeighborsMs:F2} ms\n"
+                : $"• Uniform Grid Build: {p.uniformGridBuildMs:F2} ms\n" +
+                  "  (N³ clear, bin, splat+normalize, neighbors, face velocities)\n";
+
+            Debug.Log($"Frame {p.frameNumber} Summary:\n" +
+                fullWallBlock +
+                $"• Unity unscaledDeltaTime (engine last-frame interval): {p.unityUnscaledDeltaMs:F2} ms\n" +
+                $"• Avg unscaledDeltaTime: {p.averageUnityUnscaledMs:F2} ms\n" +
+                $"• FluidSimulator.Update (wall): {p.simUpdateMs:F2} ms\n" +
+                $"• Avg FluidSimulator.Update: {p.averageSimUpdateMs:F2} ms\n" +
+                $"• Sum of sections below: {sumListed:F2} ms (drift vs Update: {drift:+0.00;-0.00;0.00} ms)\n" +
+                s_FrameTimingModeNote +
+                $"• Grid: {(p.useOctree ? "Octree" : "Uniform")}\n" +
+                $"• # Nodes: {p.numNodes}\n" +
+                (p.layerCountsLine != null ? $"• {p.layerCountsLine}\n" : "") +
+                pipelineSection +
+                $"• Misc (viscosity, node readback, layer histogram): {p.miscPipelineMs:F2} ms\n" +
+                $"• Calculate Gradients: {p.calculateGradientsMs:F2} ms\n" +
+                $"• Compute Level Set: {p.computeLevelSetMs:F2} ms\n" +
+                $"• Store Old Velocities: {p.storeOldVelocitiesMs:F2} ms\n" +
+                $"• Apply External Forces: {p.applyExternalForcesMs:F2} ms\n" +
+                $"• Solve Pressure: {p.solvePressureMs:F2} ms\n" +
+                $"• Update Particles: {p.updateParticlesMs:F2} ms\n" +
+                $"• Rendering (FluidRenderer this frame, before EOF): {lastRenderTimeMs:F2} ms\n" +
+                $"• CG Iterations: {p.lastCgIterations}\n" +
+                $"• Avg CG Iterations: {p.averageCgIterationsText}");
         }
     }
 
@@ -772,6 +1044,26 @@ public partial class FluidSimulator : MonoBehaviour
 
     private void CalculateDensityGradients()
     {
+        if (gridMode == GridMode.Uniform)
+        {
+            if (uniformGridShader == null || uniformGridCalculateDensityGradientKernel < 0)
+            {
+                Debug.LogError("FluidSimulator: UniformGrid.compute kernel UniformGrid_CalculateDensityGradient is missing.");
+                return;
+            }
+            if (numNodes <= 0)
+                return;
+
+            uniformGridShader.SetInt("numNodesCapacity", maxNodesCapacity);
+            uniformGridShader.SetBuffer(uniformGridCalculateDensityGradientKernel, "nodeCountBuffer", nodeCount);
+            uniformGridShader.SetBuffer(uniformGridCalculateDensityGradientKernel, "nodesBuffer", nodesBuffer);
+            uniformGridShader.SetBuffer(uniformGridCalculateDensityGradientKernel, "uniformNeighborsBuffer", uniformNeighborsBuffer);
+            uniformGridShader.SetBuffer(uniformGridCalculateDensityGradientKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
+            WriteIndirectArgsFromCountBuffer(nodeCount);
+            uniformGridShader.DispatchIndirect(uniformGridCalculateDensityGradientKernel, dispatchArgsBuffer, 0);
+            return;
+        }
+
         if (nodesShader == null)
         {
             Debug.LogError("Nodes compute shader is not assigned.");
@@ -808,16 +1100,24 @@ public partial class FluidSimulator : MonoBehaviour
             return;
         }
 
-        updateParticlesKernel = particlesShader.FindKernel("UpdateParticles");
+        int kernel = gridMode == GridMode.Uniform ? updateParticlesUniformKernel : updateParticlesKernel;
+        if (kernel < 0)
+        {
+            Debug.LogError(
+                gridMode == GridMode.Uniform
+                    ? "Particles.compute kernel UpdateParticlesUniform not found (reimport shader)."
+                    : "Particles.compute kernel UpdateParticles not found (reimport shader).");
+            return;
+        }
 
-        // need: nodes buffer, nodes buffer old, particles buffer, numNodes, numParticles
-        particlesShader.SetBuffer(updateParticlesKernel, "nodesBuffer", nodesBuffer);
-        particlesShader.SetBuffer(updateParticlesKernel, "mortonCodesBuffer", mortonCodesBuffer);
-        particlesShader.SetBuffer(updateParticlesKernel, "nodesBufferOld", nodesBufferOld);
-        particlesShader.SetBuffer(updateParticlesKernel, "particlesBuffer", particlesBuffer);
-        particlesShader.SetBuffer(updateParticlesKernel, "diffusionGradientBuffer", diffusionGradientBuffer);
-        particlesShader.SetBuffer(updateParticlesKernel, "nodeCountBuffer", nodeCount);
-        particlesShader.SetBuffer(updateParticlesKernel, "solidSDFBuffer", solidSDFBuffer);
+        particlesShader.SetBuffer(kernel, "nodesBuffer", nodesBuffer);
+        if (gridMode == GridMode.Octree)
+            particlesShader.SetBuffer(kernel, "mortonCodesBuffer", mortonCodesBuffer);
+        particlesShader.SetBuffer(kernel, "nodesBufferOld", nodesBufferOld);
+        particlesShader.SetBuffer(kernel, "particlesBuffer", particlesBuffer);
+        particlesShader.SetBuffer(kernel, "diffusionGradientBuffer", diffusionGradientBuffer);
+        particlesShader.SetBuffer(kernel, "nodeCountBuffer", nodeCount);
+        particlesShader.SetBuffer(kernel, "solidSDFBuffer", solidSDFBuffer);
         particlesShader.SetInt("useColliders", useColliders ? 1 : 0);
         particlesShader.SetInt("solidVoxelResolution", ColliderGridResolution);
         particlesShader.SetInt("numParticles", numParticles);
@@ -832,8 +1132,15 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetVector("simulationBoundsMax", simulationBoundsMax);
         particlesShader.SetInt("minLayer", minLayer);
         particlesShader.SetInt("maxLayer", maxLayer);
+        if (gridMode == GridMode.Uniform)
+        {
+            particlesShader.SetBuffer(kernel, "uniformDenseIndexMap", uniformDenseIndexMapBuffer);
+            particlesShader.SetInt("uniformGridLog2K", UniformGridBinsPerAxisLog2);
+            particlesShader.SetInt("uniformGridCellCount", UniformGridCellCount);
+            particlesShader.SetInt("uniformGridCellLayer", Mathf.Clamp(uniformGridCellLayer, 0, MortonAxisBits));
+        }
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
-        particlesShader.Dispatch(updateParticlesKernel, threadGroups, 1, 1);
+        particlesShader.Dispatch(kernel, threadGroups, 1, 1);
     }
 
     private void InitializeParticleSystem()
@@ -959,19 +1266,19 @@ public partial class FluidSimulator : MonoBehaviour
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
 
-        AllocateOctreeBuffersToCapacity();
+        updateParticlesKernel = particlesShader.FindKernel("UpdateParticles");
+        updateParticlesUniformKernel = particlesShader.FindKernel("UpdateParticlesUniform");
 
-        radixSort?.ReleaseBuffers();
-        radixSort = null;
-        if (radixSortShader != null)
-            radixSort = new RadixSort(radixSortShader, (uint)numParticles);
+        AllocateOctreeBuffersToCapacity();
     }
 
     /// <summary>Preallocate octree/prefix buffers so the update loop never resizes or stalls on GPU count readbacks mid-pipeline.</summary>
     private void AllocateOctreeBuffersToCapacity()
     {
         maxNodesCapacity = Mathf.Max(512, Mathf.CeilToInt(numParticles * 1.5f));
-        maxPrefixThreadGroups = Mathf.Max(1, (maxNodesCapacity + 1023) / 1024);
+        GetUniformGridDims(out _, out _, out int uniformCellCount);
+        int prefixCapacity = Mathf.Max(maxNodesCapacity, uniformCellCount);
+        maxPrefixThreadGroups = Mathf.Max(1, (prefixCapacity + 1023) / 1024);
         maxAuxBlocks = maxPrefixThreadGroups;
 
         int nodeStride = sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) * 6 + sizeof(float) + sizeof(uint) * 3;
@@ -989,8 +1296,8 @@ public partial class FluidSimulator : MonoBehaviour
         diffusionGradientBuffer?.Release();
         particlePrefixElementCountBuffer?.Release();
 
-        indicators = new ComputeBuffer(maxNodesCapacity, sizeof(uint));
-        prefixSums = new ComputeBuffer(maxNodesCapacity, sizeof(uint));
+        indicators = new ComputeBuffer(prefixCapacity, sizeof(uint));
+        prefixSums = new ComputeBuffer(prefixCapacity, sizeof(uint));
         uniqueIndices = new ComputeBuffer(maxNodesCapacity, sizeof(uint));
         aux = new ComputeBuffer(maxAuxBlocks, sizeof(uint));
         aux2 = new ComputeBuffer(maxAuxBlocks, sizeof(uint));
@@ -1018,6 +1325,8 @@ public partial class FluidSimulator : MonoBehaviour
         pressureBuffer?.Release();   pressureBuffer   = new ComputeBuffer(solverCap, sizeof(float));
         zVectorBuffer?.Release();    zVectorBuffer    = new ComputeBuffer(solverCap, sizeof(float));
         matrixABuffer?.Release();    matrixABuffer    = new ComputeBuffer(maxNodesCapacity * 25, sizeof(float));
+        uniformMatrixABuffer?.Release();
+        uniformMatrixABuffer = new ComputeBuffer(maxNodesCapacity * UniformMatrixSlotCount, sizeof(float));
         nnzPerNode?.Release();       nnzPerNode       = new ComputeBuffer(solverCap, sizeof(uint));
         csrRowPtr?.Release();        csrRowPtr        = new ComputeBuffer(solverCap + 1, sizeof(uint));
         csrColIndices?.Release();    csrColIndices    = new ComputeBuffer(maxNnz, sizeof(uint));
@@ -1037,12 +1346,68 @@ public partial class FluidSimulator : MonoBehaviour
         solverReductionCount512Buffer = new ComputeBuffer(1, sizeof(uint));
         solverPrefixLenBuffer?.Release();
         solverPrefixLenBuffer = new ComputeBuffer(2, sizeof(uint));
+
+        AllocateUniformGridBuffers();
+    }
+
+    /// <summary>
+    /// Dense N³ hash arrays (cell counts, Morton → dense node id, exclusive-prefix offsets), compact active Morton list,
+    /// atomic active cell counter, and a full particle scratch buffer for counting-sort scatter.
+    /// </summary>
+    /// <summary>N³ cell count for current <see cref="uniformGridCellLayer"/>; matches GPU uniform grid.</summary>
+    private void GetUniformGridDims(out int k, out int nPerAxis, out int cellCount)
+    {
+        k = UniformGridBinsPerAxisLog2;
+        nPerAxis = 1 << k;
+        long cellCountLong = (long)nPerAxis * nPerAxis * nPerAxis;
+        if (cellCountLong > int.MaxValue)
+        {
+            Debug.LogError("FluidSimulator: uniform grid N³ exceeds int.MaxValue; clamping k.");
+            k = 8;
+            nPerAxis = 1 << k;
+        }
+
+        cellCount = checked(nPerAxis * nPerAxis * nPerAxis);
+    }
+
+    private void AllocateUniformGridBuffers()
+    {
+        GetUniformGridDims(out int k, out int nPerAxis, out int cellCount);
+        UniformGridCellsPerAxis = nPerAxis;
+        UniformGridCellCount = cellCount;
+
+        uniformCellCountsBuffer?.Release();
+        uniformDenseIndexMapBuffer?.Release();
+        uniformActiveMortonListBuffer?.Release();
+        uniformActiveNodeCountBuffer?.Release();
+        uniformNodeAccumBuffer?.Release();
+
+        uniformCellCountsBuffer = new ComputeBuffer(cellCount, sizeof(uint));
+        uniformDenseIndexMapBuffer = new ComputeBuffer(cellCount, sizeof(uint));
+
+        // Upper bound on nonempty cells for a single frame matches the octree node budget.
+        uniformActiveMortonListBuffer = new ComputeBuffer(maxNodesCapacity, sizeof(uint));
+        uniformActiveNodeCountBuffer = new ComputeBuffer(1, sizeof(uint));
+        uniformNodeAccumBuffer = new ComputeBuffer(19 * maxNodesCapacity, sizeof(uint));
+
+        uniformNeighborsBuffer?.Release();
+        uniformNeighborsBuffer = new ComputeBuffer(maxNodesCapacity * UniformNeighborSlotCount, sizeof(uint));
+
+        radixSort?.ReleaseBuffers();
+        radixSort = radixSortShader != null
+            ? new RadixSort(radixSortShader, (uint)numParticles, (uint)maxAuxBlocks)
+            : null;
     }
     
     void ResetSimulationAccumulators()
     {
         frameNumber = 0;
         cumulativeFrameTimeMs = 0.0;
+        cumulativeUnityUnscaledDeltaMsForTimingLog = 0.0;
+        cumulativeFullFrameWallMs = 0.0;
+        fullFrameWallSamples = 0;
+        lastTimingEndOfFrameRealtime = -1.0;
+        hasPendingFrameTimingLog = false;
         cumulativeCgIterations = 0.0;
         cgSolveFrameCount = 0;
         averageCgIterations = 0.0f;
@@ -1105,6 +1470,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesBufferOld?.Release();
         tempNodesBuffer?.Release();
         neighborsBuffer?.Release();
+        uniformNeighborsBuffer?.Release();
         reverseNeighborsBuffer?.Release();
         diffusionGradientBuffer?.Release();
         dispatchArgsBuffer?.Release();
@@ -1122,6 +1488,7 @@ public partial class FluidSimulator : MonoBehaviour
         ApBuffer?.Release();
         pressureBuffer?.Release();
         matrixABuffer?.Release();
+        uniformMatrixABuffer?.Release();
         nnzPerNode?.Release();
         csrRowPtr?.Release();
         csrColIndices?.Release();
@@ -1133,6 +1500,11 @@ public partial class FluidSimulator : MonoBehaviour
         mortonCodesBuffer?.Release();
         solidSDFBuffer?.Release();
         initialPositionsBuffer?.Release();
+        uniformCellCountsBuffer?.Release();
+        uniformDenseIndexMapBuffer?.Release();
+        uniformActiveMortonListBuffer?.Release();
+        uniformActiveNodeCountBuffer?.Release();
+        uniformNodeAccumBuffer?.Release();
         ReleasePreconditionerBuffers();
         ReleaseLeafOnlyBuffers();
         ReleaseLeafOnlyWeightsBuffers();

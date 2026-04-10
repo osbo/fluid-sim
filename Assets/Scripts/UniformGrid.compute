@@ -1,0 +1,664 @@
+// Uniform-grid hash: clear dense N³ maps, then atomic binning / active-cell discovery.
+// Morton on particles uses 10 bits per axis (same as Particles.compute). C# sets uniformGridLog2K = MortonAxisBits − L
+// so cell width in sim space is 2^L (same as exp2(layer) octree cells); N = 2^k per axis with k = 10 − L.
+//
+// Particle splatting pipeline (no sort required):
+//   1. ClearDense          – reset denseIndexMap, cellCounts, activeNodeCount
+//   2. BinParticles        – O(1) per particle: claim nodeID, populate denseIndexMap
+//   3. ClearNodeAccum      – zero 16-slot accumulation buffer for each active node
+//   4. SplatParticles      – per particle: float-CAS atomic accumulate into node accum slots
+//   5. NormalizeNodes      – per node: divide accumulators, write final Node struct
+
+#pragma kernel UniformGrid_ClearDense
+#pragma kernel UniformGrid_BinParticles
+#pragma kernel UniformGrid_ClearNodeAccum
+#pragma kernel UniformGrid_SplatParticles
+#pragma kernel UniformGrid_NormalizeNodes
+#pragma kernel UniformGrid_FindNeighbors
+#pragma kernel UniformGrid_CalculateDensityGradient
+#pragma kernel UniformGrid_ApplyPressureGradient
+#pragma kernel UniformGrid_ApplyViscosity
+#pragma kernel UniformGrid_InterpolateFaceVelocities
+#pragma kernel UniformGrid_CopyFaceVelocities
+
+static const uint kMaxAxisBits = 10u;
+static const uint kEmptyCell = 0xFFFFFFFFu;
+
+struct Particle
+{
+    float3 position;
+    float3 velocity;
+    uint mortonCode;
+};
+
+struct faceVelocities
+{
+    float left;
+    float right;
+    float bottom;
+    float top;
+    float front;
+    float back;
+};
+
+struct Node
+{
+    float3 position;
+    float3 velocity;
+    faceVelocities velocities;
+    float mass;
+    uint layer;
+    uint mortonCode;
+    uint active;
+};
+
+RWStructuredBuffer<uint> cellCounts;
+RWStructuredBuffer<uint> denseIndexMap;
+RWStructuredBuffer<uint> activeNodeCount;
+
+StructuredBuffer<Particle> particlesBuffer;
+
+RWStructuredBuffer<uint> activeMortonList;
+
+// Node accumulation buffer: 16 floats per node (as uint for atomic CAS).
+// Slots: [0]=posX [1]=posY [2]=posZ [3]=velX [4]=velY [5]=velZ
+//        [6]=vLeft [7]=vRight [8]=vBottom [9]=vTop [10]=vFront [11]=vBack
+//        [12..14]=face weight sums (left,right,bottom,top stored packed: [12]=left [13]=right [14]=bottom)
+//        [15]=count (integer, incremented with InterlockedAdd)
+// Weights for face velocities use the same trilinear weights as the old kernel.
+// We store 6 face velocity accumulators and 7 weight accumulators (left,right,bottom,top,front,back,count).
+// Layout (per node, stride = numNodesCapacity):
+//   slot 0..2  : position sum (float-as-uint CAS)
+//   slot 3..5  : velocity sum (float-as-uint CAS)
+//   slot 6..11 : face velocity sums: left,right,bottom,top,front,back (float-as-uint CAS)
+//   slot 12..17: face weight sums:  left,right,bottom,top,front,back (float-as-uint CAS)
+//   slot 18    : particle count (InterlockedAdd uint)
+// Total: 19 slots × numNodesCapacity uints.
+RWStructuredBuffer<uint> nodeAccumBuffer; // [19 * numNodesCapacity]
+
+uint uniformGridLog2K;
+uint uniformGridCellCount;
+uint uniformGridCellLayer;
+uint numParticles;
+uint maxUniformActiveCells;
+
+RWStructuredBuffer<Node> nodesBuffer;
+RWStructuredBuffer<uint> mortonCodesBuffer;
+
+// O(1) 6-face stencil: uniformNeighborsBuffer[d * numNodesCapacity + i], d = 0..5 (±x, ±y, ±z).
+// Domain wall: numFluidNodes+1; empty fluid cell: kEmptyCell (0xFFFFFFFF) from denseIndexMap.
+RWStructuredBuffer<uint> uniformNeighborsBuffer;
+RWStructuredBuffer<float3> diffusionGradientBuffer;
+
+uint numFluidNodes;
+uint numNodesCapacity;
+
+StructuredBuffer<uint> nodeCountBuffer;
+RWStructuredBuffer<Node> tempNodesBuffer;
+StructuredBuffer<float> pressureBuffer;
+float deltaTime;
+float kinematicViscosity;
+
+uint NActU()
+{
+    return nodeCountBuffer[0];
+}
+
+groupshared Node ug_s_nodes[256];
+groupshared float ug_s_pressure[256];
+
+uint3 deinterleave10(uint m)
+{
+    uint x = 0, y = 0, z = 0;
+    for (uint i = 0; i < kMaxAxisBits; i++)
+    {
+        x |= ((m >> (3 * i + 0)) & 1u) << i;
+        y |= ((m >> (3 * i + 1)) & 1u) << i;
+        z |= ((m >> (3 * i + 2)) & 1u) << i;
+    }
+    return uint3(x, y, z);
+}
+
+uint interleaveK(uint3 c, uint k)
+{
+    uint m = 0;
+    for (uint i = 0; i < k; i++)
+    {
+        m |= (((c.x >> i) & 1u) << (3 * i + 0));
+        m |= (((c.y >> i) & 1u) << (3 * i + 1));
+        m |= (((c.z >> i) & 1u) << (3 * i + 2));
+    }
+    return m;
+}
+
+// Fold fine 10-bit-per-axis Morton into N=2^k uniform cell Morton (3*k bits, Z-order in [0, N³)).
+uint uniformCellMorton(uint fineMorton, uint k)
+{
+    uint s = kMaxAxisBits - k;
+    uint3 p = deinterleave10(fineMorton);
+    uint3 c = uint3(p.x >> s, p.y >> s, p.z >> s);
+    return interleaveK(c, k);
+}
+
+[numthreads(256, 1, 1)]
+void UniformGrid_ClearDense(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i == 0u)
+        activeNodeCount[0] = 0u;
+    if (i < uniformGridCellCount)
+    {
+        cellCounts[i] = 0u;
+        denseIndexMap[i] = kEmptyCell;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void UniformGrid_BinParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numParticles)
+        return;
+
+    uint mortonCode = particlesBuffer[i].mortonCode;
+    uint k = uniformGridLog2K;
+    uint idx = uniformCellMorton(mortonCode, k);
+    if (idx >= uniformGridCellCount)
+        return;
+
+    uint prevCount;
+    InterlockedAdd(cellCounts[idx], 1u, prevCount);
+
+    if (prevCount != 0u)
+        return;
+
+    uint myNodeID;
+    InterlockedAdd(activeNodeCount[0], 1u, myNodeID);
+
+    if (myNodeID < maxUniformActiveCells)
+    {
+        denseIndexMap[idx] = myNodeID;
+        activeMortonList[myNodeID] = mortonCode;
+    }
+}
+
+// Helper: atomic float add via CAS loop (only correct when values are non-negative accumulations;
+// for signed values use the general version below).
+void AtomicAddFloat(RWStructuredBuffer<uint> buf, uint idx, float val)
+{
+    uint oldBits = buf[idx];
+    [allow_uav_condition]
+    for (;;)
+    {
+        uint newBits = asuint(asfloat(oldBits) + val);
+        uint cmp = oldBits;
+        uint actualOld;
+        // Metal/DX: 4-arg form — destination is the buffer element, not (buffer, index).
+        InterlockedCompareExchange(buf[idx], cmp, newBits, actualOld);
+        if (actualOld == cmp)
+            break;
+        oldBits = actualOld;
+    }
+}
+
+// One thread per active node: zero all 19 accumulator slots.
+[numthreads(512, 1, 1)]
+void UniformGrid_ClearNodeAccum(uint3 id : SV_DispatchThreadID)
+{
+    uint nodeID = id.x;
+    uint nActive = activeNodeCount[0];
+    if (nodeID >= nActive) return;
+
+    uint stride = numNodesCapacity;
+    [unroll]
+    for (uint s = 0; s < 19u; s++)
+        nodeAccumBuffer[s * stride + nodeID] = 0u;
+}
+
+// One thread per particle: look up its node via denseIndexMap, then CAS-accumulate position,
+// velocity, 6 face velocities with trilinear weights, and a particle count.
+[numthreads(256, 1, 1)]
+void UniformGrid_SplatParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numParticles) return;
+
+    Particle pt = particlesBuffer[i];
+    uint k = uniformGridLog2K;
+    uint cellIdx = uniformCellMorton(pt.mortonCode, k);
+    if (cellIdx >= uniformGridCellCount) return;
+
+    uint nodeID = denseIndexMap[cellIdx];
+    if (nodeID == kEmptyCell) return;
+
+    uint s = kMaxAxisBits - k;
+    uint3 pFine = deinterleave10(pt.mortonCode);
+    uint3 c = uint3(pFine.x >> s, pFine.y >> s, pFine.z >> s);
+    float cellSideLength = exp2((float)uniformGridCellLayer);
+    float3 nodeMin = float3(c.x << s, c.y << s, c.z << s);
+    float3 t = saturate((pt.position - nodeMin) / cellSideLength);
+
+    uint stride = numNodesCapacity;
+
+    // Position / velocity (equal-weight average; divide by count in normalize pass)
+    AtomicAddFloat(nodeAccumBuffer, 0u * stride + nodeID, pt.position.x);
+    AtomicAddFloat(nodeAccumBuffer, 1u * stride + nodeID, pt.position.y);
+    AtomicAddFloat(nodeAccumBuffer, 2u * stride + nodeID, pt.position.z);
+    AtomicAddFloat(nodeAccumBuffer, 3u * stride + nodeID, pt.velocity.x);
+    AtomicAddFloat(nodeAccumBuffer, 4u * stride + nodeID, pt.velocity.y);
+    AtomicAddFloat(nodeAccumBuffer, 5u * stride + nodeID, pt.velocity.z);
+
+    // Face velocity accumulators (weighted)
+    float wLeft   = 1.0 - t.x;  float wRight  = t.x;
+    float wBottom = 1.0 - t.y;  float wTop    = t.y;
+    float wFront  = 1.0 - t.z;  float wBack   = t.z;
+
+    AtomicAddFloat(nodeAccumBuffer,  6u * stride + nodeID, pt.velocity.x * wLeft);
+    AtomicAddFloat(nodeAccumBuffer,  7u * stride + nodeID, pt.velocity.x * wRight);
+    AtomicAddFloat(nodeAccumBuffer,  8u * stride + nodeID, pt.velocity.y * wBottom);
+    AtomicAddFloat(nodeAccumBuffer,  9u * stride + nodeID, pt.velocity.y * wTop);
+    AtomicAddFloat(nodeAccumBuffer, 10u * stride + nodeID, pt.velocity.z * wFront);
+    AtomicAddFloat(nodeAccumBuffer, 11u * stride + nodeID, pt.velocity.z * wBack);
+
+    // Face weight accumulators
+    AtomicAddFloat(nodeAccumBuffer, 12u * stride + nodeID, wLeft);
+    AtomicAddFloat(nodeAccumBuffer, 13u * stride + nodeID, wRight);
+    AtomicAddFloat(nodeAccumBuffer, 14u * stride + nodeID, wBottom);
+    AtomicAddFloat(nodeAccumBuffer, 15u * stride + nodeID, wTop);
+    AtomicAddFloat(nodeAccumBuffer, 16u * stride + nodeID, wFront);
+    AtomicAddFloat(nodeAccumBuffer, 17u * stride + nodeID, wBack);
+
+    // Particle count (integer)
+    InterlockedAdd(nodeAccumBuffer[18u * stride + nodeID], 1u);
+}
+
+// One thread per active node: read accumulators, normalize, write final Node struct.
+[numthreads(512, 1, 1)]
+void UniformGrid_NormalizeNodes(uint3 id : SV_DispatchThreadID)
+{
+    uint nodeID = id.x;
+    uint nActive = activeNodeCount[0];
+    if (nodeID >= nActive) return;
+
+    uint stride = numNodesCapacity;
+
+    uint countU = nodeAccumBuffer[18u * stride + nodeID];
+    float count = max(1.0, (float)countU);
+    float eps   = 1e-9;
+
+    // Recover morton from activeMortonList (set during BinParticles)
+    uint mortonCode = activeMortonList[nodeID];
+
+    float3 pos = float3(asfloat(nodeAccumBuffer[0u * stride + nodeID]),
+                        asfloat(nodeAccumBuffer[1u * stride + nodeID]),
+                        asfloat(nodeAccumBuffer[2u * stride + nodeID])) / count;
+    float3 vel = float3(asfloat(nodeAccumBuffer[3u * stride + nodeID]),
+                        asfloat(nodeAccumBuffer[4u * stride + nodeID]),
+                        asfloat(nodeAccumBuffer[5u * stride + nodeID])) / count;
+
+    float wL = max(eps, asfloat(nodeAccumBuffer[12u * stride + nodeID]));
+    float wR = max(eps, asfloat(nodeAccumBuffer[13u * stride + nodeID]));
+    float wB = max(eps, asfloat(nodeAccumBuffer[14u * stride + nodeID]));
+    float wT = max(eps, asfloat(nodeAccumBuffer[15u * stride + nodeID]));
+    float wF = max(eps, asfloat(nodeAccumBuffer[16u * stride + nodeID]));
+    float wK = max(eps, asfloat(nodeAccumBuffer[17u * stride + nodeID]));
+
+    faceVelocities fv;
+    fv.left   = asfloat(nodeAccumBuffer[ 6u * stride + nodeID]) / wL;
+    fv.right  = asfloat(nodeAccumBuffer[ 7u * stride + nodeID]) / wR;
+    fv.bottom = asfloat(nodeAccumBuffer[ 8u * stride + nodeID]) / wB;
+    fv.top    = asfloat(nodeAccumBuffer[ 9u * stride + nodeID]) / wT;
+    fv.front  = asfloat(nodeAccumBuffer[10u * stride + nodeID]) / wF;
+    fv.back   = asfloat(nodeAccumBuffer[11u * stride + nodeID]) / wK;
+
+    Node node;
+    node.position   = pos;
+    node.velocity   = vel;
+    node.velocities = fv;
+    node.layer      = uniformGridCellLayer;
+    node.mass       = (float)countU;
+    node.mortonCode = mortonCode;
+    node.active     = 1u;
+
+    nodesBuffer[nodeID]      = node;
+    mortonCodesBuffer[nodeID] = mortonCode;
+}
+
+[numthreads(512, 1, 1)]
+void UniformGrid_FindNeighbors(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= numFluidNodes)
+        return;
+
+    uint wall = numFluidNodes + 1u;
+
+    uint mortonFine = nodesBuffer[i].mortonCode;
+    uint binsK = uniformGridLog2K;
+    uint3 pFine = deinterleave10(mortonFine);
+    uint shift = kMaxAxisBits - binsK;
+    uint3 c = uint3(pFine.x >> shift, pFine.y >> shift, pFine.z >> shift);
+
+    uint gridDim = 1u << binsK;
+    int3 deltas[6] =
+    {
+        int3(-1, 0, 0), int3(1, 0, 0),
+        int3(0, -1, 0), int3(0, 1, 0),
+        int3(0, 0, -1), int3(0, 0, 1)
+    };
+
+    for (int d = 0; d < 6; d++)
+    {
+        int nx = (int)c.x + deltas[d].x;
+        int ny = (int)c.y + deltas[d].y;
+        int nz = (int)c.z + deltas[d].z;
+
+        if (nx < 0 || ny < 0 || nz < 0
+            || (uint)nx >= gridDim || (uint)ny >= gridDim || (uint)nz >= gridDim)
+        {
+            uniformNeighborsBuffer[(uint)d * numNodesCapacity + i] = wall;
+            continue;
+        }
+
+        uint nm = interleaveK(uint3((uint)nx, (uint)ny, (uint)nz), binsK);
+        if (nm >= uniformGridCellCount)
+        {
+            uniformNeighborsBuffer[(uint)d * numNodesCapacity + i] = wall;
+            continue;
+        }
+
+        uniformNeighborsBuffer[(uint)d * numNodesCapacity + i] = denseIndexMap[nm];
+    }
+}
+
+// Same normalized density gradient as Nodes.CalculateDensityGradient, using 6 uniform face slots (0..5).
+[numthreads(512, 1, 1)]
+void UniformGrid_CalculateDensityGradient(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint nAct = NActU();
+    if (i >= nAct)
+        return;
+
+    Node node = nodesBuffer[i];
+    float dx = exp2((float)node.layer);
+    float vol = dx * dx * dx;
+    float selfDensity = node.mass / max(1e-6, vol);
+
+    if (node.mass <= 1e-6)
+    {
+        diffusionGradientBuffer[i] = float3(0, 0, 0);
+        return;
+    }
+
+    float3 gradient = float3(0, 0, 0);
+    uint stride = numNodesCapacity;
+
+    {
+        uint idxLeft = uniformNeighborsBuffer[0 * stride + i];
+        uint idxRight = uniformNeighborsBuffer[1 * stride + i];
+
+        float rhoLeft = selfDensity;
+        if (idxLeft < nAct)
+        {
+            float ndx = exp2((float)nodesBuffer[idxLeft].layer);
+            rhoLeft = nodesBuffer[idxLeft].mass / max(1e-6, ndx * ndx * ndx);
+        }
+
+        float rhoRight = selfDensity;
+        if (idxRight < nAct)
+        {
+            float ndx = exp2((float)nodesBuffer[idxRight].layer);
+            rhoRight = nodesBuffer[idxRight].mass / max(1e-6, ndx * ndx * ndx);
+        }
+
+        float sum = rhoLeft + rhoRight;
+        if (sum > 1e-9)
+            gradient.x = (rhoLeft - rhoRight) / sum;
+    }
+
+    {
+        uint idxBottom = uniformNeighborsBuffer[2 * stride + i];
+        uint idxTop = uniformNeighborsBuffer[3 * stride + i];
+
+        float rhoBottom = selfDensity;
+        if (idxBottom < nAct)
+        {
+            float ndx = exp2((float)nodesBuffer[idxBottom].layer);
+            rhoBottom = nodesBuffer[idxBottom].mass / max(1e-6, ndx * ndx * ndx);
+        }
+
+        float rhoTop = selfDensity;
+        if (idxTop < nAct)
+        {
+            float ndx = exp2((float)nodesBuffer[idxTop].layer);
+            rhoTop = nodesBuffer[idxTop].mass / max(1e-6, ndx * ndx * ndx);
+        }
+
+        float sum = rhoBottom + rhoTop;
+        if (sum > 1e-9)
+            gradient.y = (rhoBottom - rhoTop) / sum;
+    }
+
+    {
+        uint idxFront = uniformNeighborsBuffer[4 * stride + i];
+        uint idxBack = uniformNeighborsBuffer[5 * stride + i];
+
+        float rhoFront = selfDensity;
+        if (idxFront < nAct)
+        {
+            float ndx = exp2((float)nodesBuffer[idxFront].layer);
+            rhoFront = nodesBuffer[idxFront].mass / max(1e-6, ndx * ndx * ndx);
+        }
+
+        float rhoBack = selfDensity;
+        if (idxBack < nAct)
+        {
+            float ndx = exp2((float)nodesBuffer[idxBack].layer);
+            rhoBack = nodesBuffer[idxBack].mass / max(1e-6, ndx * ndx * ndx);
+        }
+
+        float sum = rhoFront + rhoBack;
+        if (sum > 1e-9)
+            gradient.z = (rhoFront - rhoBack) / sum;
+    }
+
+    diffusionGradientBuffer[i] = gradient;
+}
+
+[numthreads(256, 1, 1)]
+void UniformGrid_ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
+{
+    uint threadIndex = id.x;
+    uint li = Gtid.x;
+    uint group_start_idx = Gid.x * 256;
+
+    if (threadIndex < NActU())
+    {
+        ug_s_nodes[li] = nodesBuffer[threadIndex];
+        ug_s_pressure[li] = pressureBuffer[threadIndex];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (threadIndex >= NActU()) return;
+
+    Node node = ug_s_nodes[li];
+    Node outNode = node;
+    float p_i = ug_s_pressure[li];
+    float dx_i = exp2((float)node.layer);
+    uint nAct = NActU();
+
+    for (int d = 0; d < 6; d++)
+    {
+        uint neighbor_idx = uniformNeighborsBuffer[(uint)d * numNodesCapacity + threadIndex];
+        float pressure_gradient = 0.0;
+        // Must match BuildMatrixAUniform and UniformGrid_InterpolateFaceVelocities:
+        // - nAct+1 = domain wall (Neumann / zero flux here)
+        // - nAct+2 = ghost solid (handled like wall for this kernel)
+        // - 0xFFFFFFFF = empty fluid cell / Dirichlet air (p=0), NOT a wall — do not use (neighbor >= nAct+1)
+        //   or UINT_MAX is treated as wall and top-facing (+z) air neighbors get zero gradient (stuck fluid).
+        if (neighbor_idx == nAct + 1u || neighbor_idx == nAct + 2u)
+        {
+            pressure_gradient = 0.0;
+        }
+        else if (neighbor_idx < nAct)
+        {
+            Node nNode;
+            bool is_cache_hit = (neighbor_idx >= group_start_idx && neighbor_idx < group_start_idx + 256);
+            if (is_cache_hit)
+                nNode = ug_s_nodes[neighbor_idx - group_start_idx];
+            else
+                nNode = nodesBuffer[neighbor_idx];
+
+            float p_j = is_cache_hit ? ug_s_pressure[neighbor_idx - group_start_idx] : pressureBuffer[neighbor_idx];
+            float dx_j = exp2((float)nNode.layer);
+            float distance = max(0.5 * (dx_i + dx_j), 1e-6);
+            pressure_gradient = (p_j - p_i) / distance;
+        }
+        else
+        {
+            // Dirichlet air (p=0): kEmptyCell from dense map or any non-wall non-fluid sentinel
+            float dx_k = dx_i * 0.5;
+            float distance = max(0.5 * (dx_i + dx_k), 1e-6);
+            pressure_gradient = (0.0 - p_i) / distance;
+        }
+
+        float velocity_correction = deltaTime * pressure_gradient;
+
+        if (d == 0) outNode.velocities.left += velocity_correction;
+        else if (d == 1) outNode.velocities.right -= velocity_correction;
+        else if (d == 2) outNode.velocities.bottom += velocity_correction;
+        else if (d == 3) outNode.velocities.top -= velocity_correction;
+        else if (d == 4) outNode.velocities.front += velocity_correction;
+        else outNode.velocities.back -= velocity_correction;
+    }
+
+    tempNodesBuffer[threadIndex] = outNode;
+}
+
+[numthreads(512, 1, 1)]
+void UniformGrid_ApplyViscosity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= NActU()) return;
+
+    Node node = nodesBuffer[i];
+    float dx_i = exp2((float)node.layer);
+    uint nAct = NActU();
+
+    float3 v_self = float3(
+        (node.velocities.left  + node.velocities.right) * 0.5,
+        (node.velocities.bottom + node.velocities.top)  * 0.5,
+        (node.velocities.front + node.velocities.back)  * 0.5
+    );
+
+    float3 laplacian = float3(0, 0, 0);
+
+    [unroll]
+    for (int d = 0; d < 6; d++)
+    {
+        uint nb_idx = uniformNeighborsBuffer[(uint)d * numNodesCapacity + i];
+        if (nb_idx >= nAct) continue;
+
+        Node nb = nodesBuffer[nb_idx];
+        float dx_j = exp2((float)nb.layer);
+        float dist = max(0.5 * (dx_i + dx_j), 1e-6);
+
+        float3 v_nb = float3(
+            (nb.velocities.left  + nb.velocities.right) * 0.5,
+            (nb.velocities.bottom + nb.velocities.top)  * 0.5,
+            (nb.velocities.front + nb.velocities.back) * 0.5
+        );
+
+        laplacian += (v_nb - v_self) / (dist * dist);
+    }
+
+    float3 delta = kinematicViscosity * deltaTime * laplacian;
+
+    node.velocities.left   += delta.x;
+    node.velocities.right  += delta.x;
+    node.velocities.bottom += delta.y;
+    node.velocities.top    += delta.y;
+    node.velocities.front  += delta.z;
+    node.velocities.back   += delta.z;
+
+    nodesBuffer[i] = node;
+}
+
+// Step 9: 1:1 face pairing — each face averages with the neighbor's opposing face (no T-junctions / child slots).
+static float UgFaceSelf(faceVelocities v, uint d)
+{
+    if (d == 0u) return v.left;
+    if (d == 1u) return v.right;
+    if (d == 2u) return v.bottom;
+    if (d == 3u) return v.top;
+    if (d == 4u) return v.front;
+    return v.back;
+}
+
+static float UgFaceFromNeighbor(faceVelocities v, uint d)
+{
+    if (d == 0u) return v.right;
+    if (d == 1u) return v.left;
+    if (d == 2u) return v.top;
+    if (d == 3u) return v.bottom;
+    if (d == 4u) return v.back;
+    return v.front;
+}
+
+static void UgWriteFace(inout faceVelocities fv, uint d, float val)
+{
+    if (d == 0u) fv.left = val;
+    else if (d == 1u) fv.right = val;
+    else if (d == 2u) fv.bottom = val;
+    else if (d == 3u) fv.top = val;
+    else if (d == 4u) fv.front = val;
+    else fv.back = val;
+}
+
+static void UgZeroFace(inout faceVelocities fv, uint d)
+{
+    UgWriteFace(fv, d, 0.0);
+}
+
+[numthreads(512, 1, 1)]
+void UniformGrid_InterpolateFaceVelocities(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= NActU()) return;
+
+    Node node = nodesBuffer[i];
+    Node outNode = node;
+    uint nAct = NActU();
+
+    for (uint d = 0u; d < 6u; d++)
+    {
+        uint nb = uniformNeighborsBuffer[d * numNodesCapacity + i];
+
+        if (nb == nAct + 1u || nb == nAct + 2u)
+        {
+            UgZeroFace(outNode.velocities, d);
+            continue;
+        }
+
+        if (nb < nAct)
+        {
+            Node nj = nodesBuffer[nb];
+            float a = UgFaceSelf(node.velocities, d);
+            float b = UgFaceFromNeighbor(nj.velocities, d);
+            float m = 0.5 * (a + b);
+            UgWriteFace(outNode.velocities, d, m);
+        }
+        // Else: Dirichlet air / empty (e.g. 0xFFFFFFFF) — keep face from outNode (unchanged from node).
+    }
+
+    tempNodesBuffer[i] = outNode;
+}
+
+[numthreads(512, 1, 1)]
+void UniformGrid_CopyFaceVelocities(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= NActU()) return;
+    nodesBuffer[i] = tempNodesBuffer[i];
+}

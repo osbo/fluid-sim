@@ -46,6 +46,9 @@ public partial class FluidSimulator : MonoBehaviour
         csrCountNnzKernelId         = csrBuilderShader.FindKernel("CountNNZ");
         csrFinalizeRowPtrKernelId   = csrBuilderShader.FindKernel("FinalizeRowPtr");
         csrFillKernelId             = csrBuilderShader.FindKernel("FillCSR");
+        buildMatrixAUniformKernelId = cgSolverShader.FindKernel("BuildMatrixAUniform");
+        csrCountNnzUniformKernelId  = csrBuilderShader.FindKernel("CountNNZUniform");
+        csrFillUniformKernelId      = csrBuilderShader.FindKernel("FillCSRUniform");
 
         radixPrefixSumKernelId           = radixSortShader.FindKernel("prefixSum");
         radixPrefixFixupKernelId         = radixSortShader.FindKernel("prefixFixup");
@@ -75,9 +78,11 @@ public partial class FluidSimulator : MonoBehaviour
             return;
         }
 
-        // All solver buffers are pre-allocated to maxNodesCapacity in AllocateOctreeBuffersToCapacity.
-        // Build all GPU-driven indirect dispatch args and scalar counts in one kernel.
-        int maxNnz = matrixABuffer.count; // = maxNodesCapacity * 25
+        // Step 8 (PCG): SpMV / dots / axpy use the same kernels and buffers as octree. Uniform grid only
+        // changes the CSR built upstream (≤7 NNZ/row, Morton-ordered columns → cheaper fill + better p[] reads).
+        bool useUniformGrid = gridMode == GridMode.Uniform;
+        int maxNnzBound = useUniformGrid ? uniformMatrixABuffer.count : matrixABuffer.count;
+
         if (cgAlphaBuffer == null) cgAlphaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgBetaBuffer == null) cgBetaBuffer = new ComputeBuffer(1, sizeof(float));
         if (cgRhoBuffer == null) cgRhoBuffer = new ComputeBuffer(1, sizeof(float));
@@ -108,6 +113,7 @@ public partial class FluidSimulator : MonoBehaviour
         // Bind nodeCountBuffer to all shaders that replaced the numNodes uniform.
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(buildMatrixAKernelId,      "nodeCountBuffer", nodeCount);
+        cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(scaleKernelId,             "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(axpyKernel,                "nodeCountBuffer", nodeCount);
         cgSolverShader.SetBuffer(dotProductKernel,          "nodeCountBuffer", nodeCount);
@@ -121,34 +127,58 @@ public partial class FluidSimulator : MonoBehaviour
         if (buildCsr)
         {
             csrBuilderShader.SetBuffer(csrCountNnzKernelId,     "nodeCountBuffer", nodeCount);
+            csrBuilderShader.SetBuffer(csrCountNnzUniformKernelId, "nodeCountBuffer", nodeCount);
             csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId,"nodeCountBuffer", nodeCount);
             csrBuilderShader.SetBuffer(csrFillKernelId,         "nodeCountBuffer", nodeCount);
+            csrBuilderShader.SetBuffer(csrFillUniformKernelId,  "nodeCountBuffer", nodeCount);
         }
 
         // --- Step 1: Calculate Divergence (RHS 'b') ---
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "nodesBuffer", nodesBuffer);
         cgSolverShader.SetBuffer(calculateDivergenceKernel, "divergenceBuffer", divergenceBuffer);
-        cgSolverShader.SetBuffer(calculateDivergenceKernel, "neighborsBuffer", neighborsBuffer);
         cgSolverShader.DispatchIndirect(calculateDivergenceKernel, solverIndirectArgsBuffer, SolverArgsOffset512);
 
         // --- Step 1b: Build Matrix A ---
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
-        cgSolverShader.SetBuffer(buildMatrixAKernelId, "nodesBuffer", nodesBuffer);
-        cgSolverShader.SetBuffer(buildMatrixAKernelId, "neighborsBuffer", neighborsBuffer);
-        cgSolverShader.SetBuffer(buildMatrixAKernelId, "matrixABuffer", matrixABuffer);
-        cgSolverShader.SetBuffer(buildMatrixAKernelId, "solidSDFBuffer", solidSDFBuffer);
-        cgSolverShader.SetInt("useColliders", useColliders ? 1 : 0);
-        cgSolverShader.SetInt("solidSDFResolution", ColliderGridResolution);
-        cgSolverShader.SetFloat("deltaTime", deltaTime);
-        cgSolverShader.DispatchIndirect(buildMatrixAKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+        if (useUniformGrid)
+        {
+            cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "nodesBuffer", nodesBuffer);
+            cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "uniformNeighborsBuffer", uniformNeighborsBuffer);
+            cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "uniformMatrixABuffer", uniformMatrixABuffer);
+            cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "solidSDFBuffer", solidSDFBuffer);
+            cgSolverShader.SetInt("useColliders", useColliders ? 1 : 0);
+            cgSolverShader.SetInt("solidSDFResolution", ColliderGridResolution);
+            cgSolverShader.SetFloat("deltaTime", deltaTime);
+            cgSolverShader.DispatchIndirect(buildMatrixAUniformKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+        }
+        else
+        {
+            cgSolverShader.SetBuffer(buildMatrixAKernelId, "nodesBuffer", nodesBuffer);
+            cgSolverShader.SetBuffer(buildMatrixAKernelId, "neighborsBuffer", neighborsBuffer);
+            cgSolverShader.SetBuffer(buildMatrixAKernelId, "matrixABuffer", matrixABuffer);
+            cgSolverShader.SetBuffer(buildMatrixAKernelId, "solidSDFBuffer", solidSDFBuffer);
+            cgSolverShader.SetInt("useColliders", useColliders ? 1 : 0);
+            cgSolverShader.SetInt("solidSDFResolution", ColliderGridResolution);
+            cgSolverShader.SetFloat("deltaTime", deltaTime);
+            cgSolverShader.DispatchIndirect(buildMatrixAKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+        }
 
         // --- Step 1c: Build CSR (only when PCG uses CSR matvec, neural leaf inputs, or training export) ---
         if (buildCsr)
         {
             // A. Count nnz per row
-            csrBuilderShader.SetBuffer(csrCountNnzKernelId, "neighborsBuffer", neighborsBuffer);
-            csrBuilderShader.SetBuffer(csrCountNnzKernelId, "nnzPerNode", nnzPerNode);
-            csrBuilderShader.DispatchIndirect(csrCountNnzKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+            if (useUniformGrid)
+            {
+                csrBuilderShader.SetBuffer(csrCountNnzUniformKernelId, "uniformNeighborsBuffer", uniformNeighborsBuffer);
+                csrBuilderShader.SetBuffer(csrCountNnzUniformKernelId, "nnzPerNode", nnzPerNode);
+                csrBuilderShader.DispatchIndirect(csrCountNnzUniformKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+            }
+            else
+            {
+                csrBuilderShader.SetBuffer(csrCountNnzKernelId, "neighborsBuffer", neighborsBuffer);
+                csrBuilderShader.SetBuffer(csrCountNnzKernelId, "nnzPerNode", nnzPerNode);
+                csrBuilderShader.DispatchIndirect(csrCountNnzKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+            }
 
             // B. Exclusive prefix sum nnzPerNode -> csrRowPtr (3-pass, all GPU-driven)
             radixSortShader.SetBuffer(radixPrefixSumSolverMainKernelId, "input",               nnzPerNode);
@@ -173,19 +203,32 @@ public partial class FluidSimulator : MonoBehaviour
             csrBuilderShader.SetBuffer(csrFinalizeRowPtrKernelId, "rowPtrBuffer", csrRowPtr);
             csrBuilderShader.Dispatch(csrFinalizeRowPtrKernelId, 1, 1, 1);
 
-            csrBuilderShader.SetBuffer(csrFillKernelId, "neighborsBuffer", neighborsBuffer);
-            csrBuilderShader.SetBuffer(csrFillKernelId, "matrixABuffer", matrixABuffer);
-            csrBuilderShader.SetBuffer(csrFillKernelId, "rowPtrBuffer", csrRowPtr);
-            csrBuilderShader.SetBuffer(csrFillKernelId, "colIndicesBuffer", csrColIndices);
-            csrBuilderShader.SetBuffer(csrFillKernelId, "rowIndicesBuffer", csrRowIndices);
-            csrBuilderShader.SetBuffer(csrFillKernelId, "valuesBuffer", csrValues);
-            csrBuilderShader.DispatchIndirect(csrFillKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+            if (useUniformGrid)
+            {
+                csrBuilderShader.SetBuffer(csrFillUniformKernelId, "uniformNeighborsBuffer", uniformNeighborsBuffer);
+                csrBuilderShader.SetBuffer(csrFillUniformKernelId, "uniformMatrixABuffer", uniformMatrixABuffer);
+                csrBuilderShader.SetBuffer(csrFillUniformKernelId, "rowPtrBuffer", csrRowPtr);
+                csrBuilderShader.SetBuffer(csrFillUniformKernelId, "colIndicesBuffer", csrColIndices);
+                csrBuilderShader.SetBuffer(csrFillUniformKernelId, "rowIndicesBuffer", csrRowIndices);
+                csrBuilderShader.SetBuffer(csrFillUniformKernelId, "valuesBuffer", csrValues);
+                csrBuilderShader.DispatchIndirect(csrFillUniformKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+            }
+            else
+            {
+                csrBuilderShader.SetBuffer(csrFillKernelId, "neighborsBuffer", neighborsBuffer);
+                csrBuilderShader.SetBuffer(csrFillKernelId, "matrixABuffer", matrixABuffer);
+                csrBuilderShader.SetBuffer(csrFillKernelId, "rowPtrBuffer", csrRowPtr);
+                csrBuilderShader.SetBuffer(csrFillKernelId, "colIndicesBuffer", csrColIndices);
+                csrBuilderShader.SetBuffer(csrFillKernelId, "rowIndicesBuffer", csrRowIndices);
+                csrBuilderShader.SetBuffer(csrFillKernelId, "valuesBuffer", csrValues);
+                csrBuilderShader.DispatchIndirect(csrFillKernelId, solverIndirectArgsBuffer, SolverArgsOffset256);
+            }
         }
 
-        if (buildCsr)
-            DispatchLeafOnlyGpuInputs(numNodes, maxNnz);
+        if (buildCsr && !useUniformGrid)
+            DispatchLeafOnlyGpuInputs(numNodes, maxNnzBound);
 
-        if (preconditioner == PreconditionerType.Neural)
+        if (preconditioner == PreconditionerType.Neural && !useUniformGrid)
             LeafOnlyEnsureJacobiInvDiagFromMatrixA(LeafOnlyLastNPadded);
 
         // Init Pressure x=0 via GPU Scale(0)
@@ -202,8 +245,13 @@ public partial class FluidSimulator : MonoBehaviour
         // p = z (GPU copy)
         GpuCopyBuffer(zVectorBuffer, pBuffer);
 
-        float initialResidual = GpuDotProduct(residualBuffer, residualBuffer);
-        if (initialResidual < convergenceThreshold) return;
+        // GpuDotProduct reads back divergence[0]; skip when debug off so pressure solve stays GPU-resident.
+        float initialResidual = 0f;
+        if (enablePerFrameDebugTimingLog)
+        {
+            initialResidual = GpuDotProduct(residualBuffer, residualBuffer);
+            if (initialResidual < convergenceThreshold) return;
+        }
 
         laplacianSw.Reset();
         dotProductSw.Reset();
@@ -298,9 +346,8 @@ public partial class FluidSimulator : MonoBehaviour
         if (recorder != null && recorder.isRecording)
         {
             int totalNNZ = csrColIndices.count; // pre-allocated upper bound
-            uint[] totalNnzArr = new uint[1];
-            csrRowPtr.GetData(totalNnzArr, 0, numNodes, 1);
-            totalNNZ = (int)totalNnzArr[0];
+            csrRowPtr.GetData(gpuUintScratch1, 0, numNodes, 1);
+            totalNNZ = (int)gpuUintScratch1[0];
 
             Vector3 simBoundsMin = simulationBounds != null ? simulationBounds.bounds.min : Vector3.zero;
             Vector3 simBoundsMax = simulationBounds != null ? simulationBounds.bounds.max : Vector3.zero;
@@ -309,7 +356,7 @@ public partial class FluidSimulator : MonoBehaviour
 
             recorder.SaveFrame(
                 nodesBuffer,
-                neighborsBuffer,
+                gridMode == GridMode.Uniform ? uniformNeighborsBuffer : neighborsBuffer,
                 divergenceBuffer,
                 pressureBuffer,
                 diffusionGradientBuffer,
@@ -328,8 +375,8 @@ public partial class FluidSimulator : MonoBehaviour
                 simBoundsMin,
                 simBoundsMax,
                 fluidBoundsMin,
-                fluidBoundsMax
-            );
+                fluidBoundsMax,
+                gridMode == GridMode.Uniform ? UniformNeighborSlotCount : 24);
         }
 
         // --- Step 4: Apply pressure to velocities ---
@@ -345,15 +392,34 @@ public partial class FluidSimulator : MonoBehaviour
         }
 
         BindNodesOctreeCounts();
-        nodesShader.SetBuffer(applyPressureGradientKernel, "nodesBuffer", nodesBuffer);
-        nodesShader.SetBuffer(applyPressureGradientKernel, "tempNodesBuffer", tempNodesBuffer);
-        nodesShader.SetBuffer(applyPressureGradientKernel, "neighborsBuffer", neighborsBuffer);
-        nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer);
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("deltaTime", deltaTime);
         nodesShader.SetFloat("maxDetailCellSize", maxDetailCellSize);
         nodesShader.SetInt("minLayer", minLayer);
-        nodesShader.DispatchIndirect(applyPressureGradientKernel, solverIndirectArgsBuffer, SolverArgsOffset256);
+        if (gridMode == GridMode.Uniform)
+        {
+            if (uniformGridShader == null || uniformGridApplyPressureKernel < 0)
+            {
+                Debug.LogError("FluidSimulator: UniformGrid.compute kernels missing for ApplyPressureGradient.");
+                return;
+            }
+            uniformGridShader.SetInt("numNodesCapacity", maxNodesCapacity);
+            uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "nodeCountBuffer", nodeCount);
+            uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "nodesBuffer", nodesBuffer);
+            uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "tempNodesBuffer", tempNodesBuffer);
+            uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "uniformNeighborsBuffer", uniformNeighborsBuffer);
+            uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "pressureBuffer", pressureBuffer);
+            uniformGridShader.SetFloat("deltaTime", deltaTime);
+            uniformGridShader.DispatchIndirect(uniformGridApplyPressureKernel, solverIndirectArgsBuffer, SolverArgsOffset256);
+        }
+        else
+        {
+            nodesShader.SetBuffer(applyPressureGradientKernel, "nodesBuffer", nodesBuffer);
+            nodesShader.SetBuffer(applyPressureGradientKernel, "tempNodesBuffer", tempNodesBuffer);
+            nodesShader.SetBuffer(applyPressureGradientKernel, "neighborsBuffer", neighborsBuffer);
+            nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer);
+            nodesShader.DispatchIndirect(applyPressureGradientKernel, solverIndirectArgsBuffer, SolverArgsOffset256);
+        }
 
         ComputeBuffer swap = nodesBuffer;
         nodesBuffer = tempNodesBuffer;
@@ -487,8 +553,23 @@ public partial class FluidSimulator : MonoBehaviour
         float deltaTime = useRealTime ? Time.deltaTime : (1 / frameRate);
         nodesShader.SetFloat("kinematicViscosity", kinematicViscosity);
         nodesShader.SetFloat("deltaTime", deltaTime);
-        nodesShader.SetBuffer(applyViscosityKernelId, "nodesBuffer", nodesBuffer);
-        nodesShader.SetBuffer(applyViscosityKernelId, "neighborsBuffer", neighborsBuffer);
-        nodesShader.DispatchIndirect(applyViscosityKernelId, dispatchArgsBuffer, 0);
+        if (gridMode == GridMode.Uniform)
+        {
+            if (uniformGridShader == null || uniformGridApplyViscosityKernel < 0)
+                return;
+            uniformGridShader.SetInt("numNodesCapacity", maxNodesCapacity);
+            uniformGridShader.SetBuffer(uniformGridApplyViscosityKernel, "nodeCountBuffer", nodeCount);
+            uniformGridShader.SetBuffer(uniformGridApplyViscosityKernel, "nodesBuffer", nodesBuffer);
+            uniformGridShader.SetBuffer(uniformGridApplyViscosityKernel, "uniformNeighborsBuffer", uniformNeighborsBuffer);
+            uniformGridShader.SetFloat("kinematicViscosity", kinematicViscosity);
+            uniformGridShader.SetFloat("deltaTime", deltaTime);
+            uniformGridShader.DispatchIndirect(uniformGridApplyViscosityKernel, dispatchArgsBuffer, 0);
+        }
+        else
+        {
+            nodesShader.SetBuffer(applyViscosityKernelId, "nodesBuffer", nodesBuffer);
+            nodesShader.SetBuffer(applyViscosityKernelId, "neighborsBuffer", neighborsBuffer);
+            nodesShader.DispatchIndirect(applyViscosityKernelId, dispatchArgsBuffer, 0);
+        }
     }
 }

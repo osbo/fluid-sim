@@ -4,6 +4,7 @@ using UnityEngine;
 public partial class FluidSimulator : MonoBehaviour
 {
     bool _loggedMissingOctreeBuffers;
+    bool _loggedPrefixRadixMissing;
 
     // Cache all octree/prefix-sum kernel IDs once in Start() so the layer loop never calls FindKernel.
     private void InitOctreeKernels()
@@ -111,7 +112,8 @@ public partial class FluidSimulator : MonoBehaviour
         int prefixBits = layer * 3;
         int groupsLinear = (np + 511) / 512;
 
-        particlePrefixElementCountBuffer.SetData(new uint[] { (uint)np });
+        gpuUintScratch1[0] = (uint)np;
+        particlePrefixElementCountBuffer.SetData(gpuUintScratch1);
         BindNpsPrefixCount(particlePrefixElementCountBuffer);
 
         nodesPrefixSumsShader.SetBuffer(markUniqueParticlesKernel, "sortedParticles", particlesBuffer);
@@ -119,7 +121,11 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
         nodesPrefixSumsShader.Dispatch(markUniqueParticlesKernel, groupsLinear, 1, 1);
 
-        RunPrefixScan(indicators, prefixSums, particlePrefixElementCountBuffer);
+        RunPrefixScan(
+            indicators,
+            prefixSums,
+            particlePrefixElementCountBuffer,
+            PrefixScanThreadGroupsForLength(np));
 
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "prefixSums", prefixSums);
@@ -178,7 +184,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetInt("prefixBits", prefixBits);
         nodesPrefixSumsShader.DispatchIndirect(markUniquesPrefixKernel, dispatchArgsBuffer, 0);
 
-        RunPrefixScan(indicators, prefixSums, nodeCount);
+        RunPrefixScan(indicators, prefixSums, nodeCount, maxPrefixThreadGroups);
 
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(scatterUniquesKernel, "prefixSums", prefixSums);
@@ -223,7 +229,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesPrefixSumsShader.SetBuffer(markActiveNodesKernelId, "indicators", indicators);
         nodesPrefixSumsShader.DispatchIndirect(markActiveNodesKernelId, dispatchArgsBuffer, 0);
 
-        RunPrefixScan(indicators, prefixSums, nodeCount);
+        RunPrefixScan(indicators, prefixSums, nodeCount, maxPrefixThreadGroups);
 
         nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "indicators", indicators);
         nodesPrefixSumsShader.SetBuffer(scatterActivesKernelId, "prefixSums", prefixSums);
@@ -326,27 +332,45 @@ public partial class FluidSimulator : MonoBehaviour
             GpuCopyBuffer(phiBuffer_Read, phiBuffer);
     }
 
-    private void RunPrefixScan(ComputeBuffer input, ComputeBuffer output, ComputeBuffer prefixLenSource)
+    /// <summary>NodesPrefixSums <c>prefixSum</c> covers 1024 inputs per group (2×512 in the compute shader).</summary>
+    private static int PrefixScanThreadGroupsForLength(int length) =>
+        Mathf.Max(1, (length + 1023) / 1024);
+
+    /// <param name="scanThreadGroups">
+    /// Dispatch X count for <c>prefixSum</c>/<c>prefixFixup</c> (ceil(prefixLength / 1024)), capped by allocation in <see cref="AllocateOctreeBuffersToCapacity"/>.
+    /// Use <see cref="maxPrefixThreadGroups"/> when prefix length is only known on GPU (node compaction scans).
+    /// </param>
+    private void RunPrefixScan(
+        ComputeBuffer input,
+        ComputeBuffer output,
+        ComputeBuffer prefixLenSource,
+        int scanThreadGroups)
     {
+        int groups = Mathf.Clamp(scanThreadGroups, 1, maxPrefixThreadGroups);
+
         BindNpsPrefixCount(prefixLenSource);
 
         nodesPrefixSumsShader.SetBuffer(npsPrefixSumKernelId, "indicators", input);
         nodesPrefixSumsShader.SetBuffer(npsPrefixSumKernelId, "prefixSums", output);
         nodesPrefixSumsShader.SetBuffer(npsPrefixSumKernelId, "aux", aux);
-        nodesPrefixSumsShader.Dispatch(npsPrefixSumKernelId, maxPrefixThreadGroups, 1, 1);
+        nodesPrefixSumsShader.Dispatch(npsPrefixSumKernelId, groups, 1, 1);
 
-        if (maxPrefixThreadGroups > 1)
+        if (groups > 1)
         {
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "input", aux);
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "output", aux2);
-            radixSortShader.SetBuffer(radixPrefixSumKernelId, "aux", auxSmall);
-            radixSortShader.SetInt("len", maxAuxBlocks);
-            radixSortShader.SetInt("zeroff", 1);
-            radixSortShader.Dispatch(radixPrefixSumKernelId, 1, 1, 1);
+            // Same path as each radix pass (RadixSort.EncodeScan): multi-group prefixSum + block-sum scan + prefixFixup.
+            if (radixSort != null)
+            {
+                radixSort.ExclusivePrefixScan(aux, aux2, (uint)groups);
 
-            nodesPrefixSumsShader.SetBuffer(npsPrefixFixupKernelId, "prefixSums", output);
-            nodesPrefixSumsShader.SetBuffer(npsPrefixFixupKernelId, "aux2", aux2);
-            nodesPrefixSumsShader.Dispatch(npsPrefixFixupKernelId, maxPrefixThreadGroups, 1, 1);
+                nodesPrefixSumsShader.SetBuffer(npsPrefixFixupKernelId, "prefixSums", output);
+                nodesPrefixSumsShader.SetBuffer(npsPrefixFixupKernelId, "aux2", aux2);
+                nodesPrefixSumsShader.Dispatch(npsPrefixFixupKernelId, groups, 1, 1);
+            }
+            else if (!_loggedPrefixRadixMissing)
+            {
+                _loggedPrefixRadixMissing = true;
+                Debug.LogError("FluidSimulator: RadixSort is required for hierarchical prefix (assign RadixSort compute shader).");
+            }
         }
     }
 

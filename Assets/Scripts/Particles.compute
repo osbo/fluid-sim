@@ -1,6 +1,7 @@
 // Each #kernel tells which function to compile;you can have many kernels
 #pragma kernel InitializeParticles
 #pragma kernel UpdateParticles
+#pragma kernel UpdateParticlesUniform
 #pragma kernel RemoveSolidParticles
 
 
@@ -185,6 +186,13 @@ StructuredBuffer<uint> nodeCountBuffer; // [0] = numNodes (GPU-driven, no CPU re
 uint numParticles;
 uint maxLayer;
 
+// GridMode.Uniform: O(1) cell → node via dense map (same fold as UniformGrid.compute).
+static const uint kUgEmptyCell = 0xFFFFFFFFu;
+StructuredBuffer<uint> uniformDenseIndexMap;
+uint uniformGridLog2K;
+uint uniformGridCellCount;
+uint uniformGridCellLayer;
+
 // Positions pre-generated on CPU (sim space 0–1023), one per particle
 StructuredBuffer<float3> initialPositionsBuffer;
 float3 initialVelocity;
@@ -364,6 +372,167 @@ void UpdateParticles (uint3 id : SV_DispatchThreadID)
 
     particle.velocity = newVelocity;
 
+    particle.mortonCode = EncodeMorton3D(newPosition);
+
+    particlesBuffer[index] = particle;
+}
+
+uint uniformCellMortonUp(uint fineMorton, uint k)
+{
+    uint s = 10u - k;
+    uint3 p = deinterleave(fineMorton);
+    uint3 c = uint3(p.x >> s, p.y >> s, p.z >> s);
+    uint m = 0;
+    for (uint i = 0; i < k; i++)
+    {
+        m |= (((c.x >> i) & 1u) << (3 * i + 0));
+        m |= (((c.y >> i) & 1u) << (3 * i + 1));
+        m |= (((c.z >> i) & 1u) << (3 * i + 2));
+    }
+    return m;
+}
+
+[numthreads(512,1,1)]
+void UpdateParticlesUniform(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= numParticles) return;
+
+    Particle particle = particlesBuffer[index];
+
+    uint k = uniformGridLog2K;
+    uint cellIdx = uniformCellMortonUp(particle.mortonCode, k);
+    uint nNodes = nodeCountBuffer[0];
+    uint nodeIndex = kUgEmptyCell;
+    if (cellIdx < uniformGridCellCount)
+        nodeIndex = uniformDenseIndexMap[cellIdx];
+
+    if (nodeIndex == kUgEmptyCell || nodeIndex >= nNodes)
+    {
+        float3 newVelocity = particle.velocity;
+        float3 newPosition = particle.position + newVelocity * deltaTime;
+
+        float eps = 0.05f;
+
+        if (newPosition.x <= eps)          { newPosition.x = eps;        newVelocity.x = max(0.0, newVelocity.x); }
+        else if (newPosition.x >= 1024-eps){ newPosition.x = 1024 - eps; newVelocity.x = min(0.0, newVelocity.x); }
+        if (newPosition.y <= eps)          { newPosition.y = eps;        newVelocity.y = max(0.0, newVelocity.y); }
+        else if (newPosition.y >= 1024-eps){ newPosition.y = 1024 - eps; newVelocity.y = min(0.0, newVelocity.y); }
+        if (newPosition.z <= eps)          { newPosition.z = eps;        newVelocity.z = max(0.0, newVelocity.z); }
+        else if (newPosition.z >= 1024-eps){ newPosition.z = 1024 - eps; newVelocity.z = min(0.0, newVelocity.z); }
+
+        float solidDist = SampleSDF(newPosition);
+        if (solidDist < 1.0)
+        {
+            float h = 1024.0 / (float)solidVoxelResolution;
+            float3 grad = float3(
+                SampleSDF(newPosition + float3(h, 0, 0)) - SampleSDF(newPosition - float3(h, 0, 0)),
+                SampleSDF(newPosition + float3(0, h, 0)) - SampleSDF(newPosition - float3(0, h, 0)),
+                SampleSDF(newPosition + float3(0, 0, h)) - SampleSDF(newPosition - float3(0, 0, h))
+            );
+            float gl = length(grad);
+
+            if (solidDist < 0.0)
+            {
+                if (gl > 1e-4)
+                {
+                    float3 n = grad / gl;
+                    newPosition -= (solidDist - 0.5) * n;
+                    float vn = dot(newVelocity, n);
+                    if (vn < 0.0) newVelocity -= vn * n;
+                    newVelocity += n * 0.5;
+                }
+                else
+                {
+                    newPosition = particle.position;
+                    newVelocity = float3(0, 0, 0);
+                }
+            }
+        }
+
+        particle.position = newPosition;
+        particle.velocity = newVelocity;
+        particle.mortonCode = EncodeMorton3D(newPosition);
+        particlesBuffer[index] = particle;
+        return;
+    }
+
+    Node node = nodesBuffer[nodeIndex];
+    Node nodeOld = nodesBufferOld[nodeIndex];
+
+    float cellSideLength = exp2((float)node.layer);
+    uint shift = 10u - k;
+    uint3 pFine = deinterleave(node.mortonCode);
+    uint3 c = uint3(pFine.x >> shift, pFine.y >> shift, pFine.z >> shift);
+    float3 nodeMin = float3(c.x << shift, c.y << shift, c.z << shift);
+    float3 extent = float3(cellSideLength, cellSideLength, cellSideLength);
+
+    float3 t = saturate((particle.position - nodeMin) / extent);
+
+    float3 newGridVelocity;
+    newGridVelocity.x = lerp(node.velocities.left, node.velocities.right, t.x);
+    newGridVelocity.y = lerp(node.velocities.bottom, node.velocities.top, t.y);
+    newGridVelocity.z = lerp(node.velocities.front, node.velocities.back, t.z);
+
+    float3 oldGridVelocity;
+    oldGridVelocity.x = lerp(nodeOld.velocities.left, nodeOld.velocities.right, t.x);
+    oldGridVelocity.y = lerp(nodeOld.velocities.bottom, nodeOld.velocities.top, t.y);
+    oldGridVelocity.z = lerp(nodeOld.velocities.front, nodeOld.velocities.back, t.z);
+
+    float3 grid_velocity_delta = newGridVelocity - oldGridVelocity;
+    float3 flip_velocity = particle.velocity + grid_velocity_delta;
+    float3 newVelocity = lerp(newGridVelocity, flip_velocity, flip_ratio);
+
+    float3 diffusionOffset = diffusionGradientBuffer[nodeIndex];
+    float diffusionStrength = 0.2;
+    float selfDx = exp2((float)node.layer);
+    float3 shiftVec = diffusionOffset * diffusionStrength * selfDx * deltaTime;
+    float maxShift = selfDx * 0.5;
+    shiftVec = clamp(shiftVec, -maxShift, maxShift);
+
+    float3 newPosition = particle.position + shiftVec;
+    newPosition = newPosition + newVelocity * deltaTime;
+
+    float eps = 0.05f;
+
+    if (newPosition.x <= eps)          { newPosition.x = eps;        newVelocity.x = max(0.0, newVelocity.x); }
+    else if (newPosition.x >= 1024-eps){ newPosition.x = 1024 - eps; newVelocity.x = min(0.0, newVelocity.x); }
+    if (newPosition.y <= eps)          { newPosition.y = eps;        newVelocity.y = max(0.0, newVelocity.y); }
+    else if (newPosition.y >= 1024-eps){ newPosition.y = 1024 - eps; newVelocity.y = min(0.0, newVelocity.y); }
+    if (newPosition.z <= eps)          { newPosition.z = eps;        newVelocity.z = max(0.0, newVelocity.z); }
+    else if (newPosition.z >= 1024-eps){ newPosition.z = 1024 - eps; newVelocity.z = min(0.0, newVelocity.z); }
+
+    float solidDist = SampleSDF(newPosition);
+    if (solidDist < 1.0)
+    {
+        float h = 1024.0 / (float)solidVoxelResolution;
+        float3 grad = float3(
+            SampleSDF(newPosition + float3(h, 0, 0)) - SampleSDF(newPosition - float3(h, 0, 0)),
+            SampleSDF(newPosition + float3(0, h, 0)) - SampleSDF(newPosition - float3(0, h, 0)),
+            SampleSDF(newPosition + float3(0, 0, h)) - SampleSDF(newPosition - float3(0, 0, h))
+        );
+        float gl = length(grad);
+
+        if (solidDist < 0.0)
+        {
+            if (gl > 1e-4)
+            {
+                float3 n = grad / gl;
+                newPosition -= (solidDist - 0.5) * n;
+                float vn = dot(newVelocity, n);
+                if (vn < 0.0) newVelocity -= vn * n;
+                newVelocity += n * 0.5;
+            }
+            else
+            {
+                newPosition = particle.position;
+                newVelocity = float3(0, 0, 0);
+            }
+        }
+    }
+
+    particle.position = newPosition;
+    particle.velocity = newVelocity;
     particle.mortonCode = EncodeMorton3D(newPosition);
 
     particlesBuffer[index] = particle;

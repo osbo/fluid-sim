@@ -29,11 +29,12 @@ public partial class FluidSimulator : MonoBehaviour
 
         if (preconditioner == PreconditionerType.Jacobi || preconditioner == PreconditionerType.Neural)
         {
-            if (kJacobi >= 0 && matrixABuffer != null)
+            ComputeBuffer laplacianDiag = gridMode == GridMode.Uniform ? uniformMatrixABuffer : matrixABuffer;
+            if (kJacobi >= 0 && laplacianDiag != null)
             {
                 cgSolverShader.SetBuffer(kJacobi, "xBuffer", r);
                 cgSolverShader.SetBuffer(kJacobi, "yBuffer", z_out);
-                cgSolverShader.SetBuffer(kJacobi, "matrixABuffer", matrixABuffer);
+                cgSolverShader.SetBuffer(kJacobi, "matrixABuffer", laplacianDiag);
                 cgSolverShader.DispatchIndirect(kJacobi, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
             }
             else
@@ -61,11 +62,12 @@ public partial class FluidSimulator : MonoBehaviour
         }
         else if (preconditioner == PreconditionerType.Jacobi)
         {
-            if (kJacobi >= 0 && matrixABuffer != null)
+            ComputeBuffer laplacianDiag = gridMode == GridMode.Uniform ? uniformMatrixABuffer : matrixABuffer;
+            if (kJacobi >= 0 && laplacianDiag != null)
             {
                 cgSolverShader.SetBuffer(kJacobi, "xBuffer", r);
                 cgSolverShader.SetBuffer(kJacobi, "yBuffer", z_out);
-                cgSolverShader.SetBuffer(kJacobi, "matrixABuffer", matrixABuffer);
+                cgSolverShader.SetBuffer(kJacobi, "matrixABuffer", laplacianDiag);
                 cgSolverShader.DispatchIndirect(kJacobi, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
             }
             else
