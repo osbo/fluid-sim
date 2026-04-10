@@ -94,10 +94,10 @@ Material:
     - _CoreThreshold: 0.0072991303
     - _Cull: 2
     - _Cutoff: 0.5
-    - _DepthFadeEnd: 115.94323
-    - _DepthFadeStart: 0
-    - _DepthMax: 81.17719
-    - _DepthMin: 11.884546
+    - _DepthFadeEnd: 166.32835
+    - _DepthFadeStart: 32.202293
+    - _DepthMax: 122.58635
+    - _DepthMin: 61.596172
     - _DetailAlbedoMapScale: 1
     - _DetailNormalMapScale: 1
     - _DstBlend: 0

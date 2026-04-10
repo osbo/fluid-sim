@@ -72,6 +72,8 @@ RWStructuredBuffer<uint> nodeAccumBuffer; // [7 * numNodesCapacity]
 
 uint uniformGridLog2K;
 uint uniformGridCellCount;
+// Linear cell index offset for UniformGrid_ClearDense when N³/256 exceeds API max thread-group count (65535).
+uint uniformGridClearCellBase;
 uint uniformGridCellLayer;
 uint numParticles;
 uint maxUniformActiveCells;
@@ -90,6 +92,7 @@ uint numNodesCapacity;
 StructuredBuffer<uint> nodeCountBuffer;
 RWStructuredBuffer<Node> tempNodesBuffer;
 StructuredBuffer<float> pressureBuffer;
+
 float deltaTime;
 float kinematicViscosity;
 
@@ -137,8 +140,8 @@ uint uniformCellMorton(uint fineMorton, uint k)
 [numthreads(256, 1, 1)]
 void UniformGrid_ClearDense(uint3 id : SV_DispatchThreadID)
 {
-    uint i = id.x;
-    if (i == 0u)
+    uint i = uniformGridClearCellBase + id.x;
+    if (uniformGridClearCellBase == 0u && id.x == 0u)
         activeNodeCount[0] = 0u;
     if (i < uniformGridCellCount)
     {
@@ -623,3 +626,4 @@ void UniformGrid_CopyFaceVelocities(uint3 id : SV_DispatchThreadID)
     if (i >= NActU()) return;
     nodesBuffer[i] = tempNodesBuffer[i];
 }
+
