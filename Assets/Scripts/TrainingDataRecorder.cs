@@ -1,5 +1,6 @@
 using UnityEngine;
 using System.IO;
+using System;
 
 public class TrainingDataRecorder : MonoBehaviour
 {
@@ -11,6 +12,7 @@ public class TrainingDataRecorder : MonoBehaviour
     public bool isRecording { get; private set; } = false;
     private string currentRunFolder;
     private int frameIndex = 0;
+    private byte[] saveBytesScratch;
 
     // Struct matching your Compute Shader Node exactly for byte-alignment
     // Node struct: Vector3 position (12) + Vector3 velocity (12) + faceVelocities (24) + float mass (4) + uint layer (4) + uint mortonCode (4) + uint active (4) = 64 bytes total
@@ -46,7 +48,8 @@ public class TrainingDataRecorder : MonoBehaviour
     public void SaveFrame(ComputeBuffer nodes, ComputeBuffer neighbors, ComputeBuffer divergence, ComputeBuffer pressure,
         ComputeBuffer diffusionGradient, ComputeBuffer rowIndices, ComputeBuffer colIndices, ComputeBuffer csrValues, int totalNNZ,
         int numNodes, int minLayer, int maxLayer, float gravity, int numParticles, int maxCgIterations, float convergenceThreshold, float frameRate,
-        Vector3 simulationBoundsMin, Vector3 simulationBoundsMax, Vector3 fluidInitialBoundsMin, Vector3 fluidInitialBoundsMax)
+        Vector3 simulationBoundsMin, Vector3 simulationBoundsMax, Vector3 fluidInitialBoundsMin, Vector3 fluidInitialBoundsMax,
+        int neighborUintsPerNode = 24)
     {
         if (!isRecording || !record) return;
         
@@ -80,8 +83,7 @@ public class TrainingDataRecorder : MonoBehaviour
         // Node buffer: 64 bytes per node
         // Structure: Vector3 position (12) + Vector3 velocity (12) + 6 face velocities (24) + float mass (4) + uint layer (4) + uint mortonCode (4) + uint active (4) = 64 bytes
         SaveBuffer(nodes, numNodes, 64, Path.Combine(framePath, "nodes.bin"));
-        // Neighbors buffer: 24 uints per node = 24 * 4 = 96 bytes
-        SaveBuffer(neighbors, numNodes, 24 * sizeof(uint), Path.Combine(framePath, "neighbors.bin"));
+        SaveBuffer(neighbors, numNodes, neighborUintsPerNode * sizeof(uint), Path.Combine(framePath, "neighbors.bin"));
         // Divergence buffer: 1 float per node = 4 bytes
         SaveBuffer(divergence, numNodes, sizeof(float), Path.Combine(framePath, "divergence.bin"));
         // Pressure buffer: 1 float per node = 4 bytes
@@ -126,10 +128,13 @@ public class TrainingDataRecorder : MonoBehaviour
             count = buffer.count;
         }
 
-        // We read as bytes to avoid struct marshalling overhead
-        byte[] rawBytes = new byte[count * stride];
-        buffer.GetData(rawBytes, 0, 0, count * stride);
-        File.WriteAllBytes(path, rawBytes);
+        int nBytes = count * stride;
+        if (saveBytesScratch == null || saveBytesScratch.Length < nBytes)
+            saveBytesScratch = new byte[Math.Max(nBytes, saveBytesScratch?.Length * 2 ?? 65536)];
+
+        buffer.GetData(saveBytesScratch, 0, 0, nBytes);
+        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+            fs.Write(saveBytesScratch, 0, nBytes);
     }
 
     public void StopRecording()

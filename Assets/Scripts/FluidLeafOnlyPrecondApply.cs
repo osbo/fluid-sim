@@ -224,7 +224,8 @@ public partial class FluidSimulator : MonoBehaviour
     /// </summary>
     private void LeafOnlyEnsureJacobiInvDiagFromMatrixA(int nPad)
     {
-        if (!LeafOnlyWeightsLoadedSuccessfully || nPad <= 0 || matrixABuffer == null || numNodes <= 0)
+        ComputeBuffer laplacianMatrix = gridMode == GridMode.Uniform ? uniformMatrixABuffer : matrixABuffer;
+        if (!LeafOnlyWeightsLoadedSuccessfully || nPad <= 0 || laplacianMatrix == null || numNodes <= 0)
             return;
         if (leafOnlyJacobiInvDiagBuffer != null)
             return;
@@ -248,10 +249,10 @@ public partial class FluidSimulator : MonoBehaviour
             leafOnlyJacobiInvDiagInternal = new ComputeBuffer(nPad, sizeof(float));
         }
 
-        int mc = matrixABuffer.count;
+        int mc = laplacianMatrix.count;
         if (leafOnlyMatrixADiagReadbackCache == null || leafOnlyMatrixADiagReadbackCache.Length < mc)
             leafOnlyMatrixADiagReadbackCache = new float[mc];
-        matrixABuffer.GetData(leafOnlyMatrixADiagReadbackCache);
+        laplacianMatrix.GetData(leafOnlyMatrixADiagReadbackCache);
 
         var inv = new float[nPad];
         const float eps = 1e-12f;

@@ -1,4 +1,6 @@
 // High-level shader language
+// PCG (Step 8): SpMV_CSR, DotProduct, Axpy/Scale/..., and Jacobi are grid-agnostic. Uniform grid uses
+// a 7-wide Laplacian → CSR rows with at most 7 NNZ; p[col] gathers stay coalesced when columns follow Morton order.
 #pragma kernel ApplyMatrixAndDot
 #pragma kernel BuildMatrixA
 #pragma kernel Axpy
@@ -16,6 +18,7 @@
 #pragma kernel AxpyNegAlpha
 #pragma kernel ScaleAddBeta
 #pragma kernel CheckConvergence
+#pragma kernel BuildMatrixAUniform
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 
@@ -34,6 +37,10 @@ struct Node
 RWStructuredBuffer<Node> nodesBuffer;
 RWStructuredBuffer<float> divergenceBuffer;
 RWStructuredBuffer<uint> neighborsBuffer;
+
+// Uniform grid: 6 face neighbors per node (SoA stride numNodesCapacity); matrix 7-wide (diag + 6 off-diagonals).
+StructuredBuffer<uint> uniformNeighborsBuffer;
+RWStructuredBuffer<float> uniformMatrixABuffer;
 
 RWStructuredBuffer<float> pBuffer; 
 RWStructuredBuffer<float> ApBuffer;
@@ -80,21 +87,36 @@ uint3 DeinterleaveCG(uint m)
     return uint3(x, y, z);
 }
 
-// Nearest-voxel SDF sample in sim space [0,1023].
-// Returns large positive if out-of-bounds (treat as outside).
+// Trilinear SDF in sim space [0,1023] — must match Particles.compute and Nodes.compute (SampleSDF_Nodes)
+// so ghost-fluid theta in BuildMatrixA / BuildMatrixAUniform agrees with particle-solid interaction.
 float SampleSDF(float3 simPos)
 {
     float sdf = 1e9f;
     if (useColliders != 0u)
     {
-        int3 vc = (int3)(simPos * ((float)solidSDFResolution / 1024.0));
-        if (!(any(vc < int3(0,0,0)) || any(vc >= (int3)solidSDFResolution)))
-        {
-            uint idx = (uint)vc.z * solidSDFResolution * solidSDFResolution
-                     + (uint)vc.y * solidSDFResolution
-                     + (uint)vc.x;
-            sdf = solidSDFBuffer[idx];
-        }
+        float Rf = (float)solidSDFResolution;
+        float3 vf = simPos * (Rf / 1024.0) - 0.5; // voxel centers at 0.5 in voxel space
+        int3 v0 = (int3)floor(vf);
+        float3 t = vf - (float3)v0;
+
+        int Ri = (int)solidSDFResolution;
+        int3 v0c = clamp(v0,        int3(0, 0, 0), int3(Ri - 1, Ri - 1, Ri - 1));
+        int3 v1c = clamp(v0 + 1,   int3(0, 0, 0), int3(Ri - 1, Ri - 1, Ri - 1));
+
+        uint Ru = solidSDFResolution;
+        #define CG_SDF_AT(ix, iy, iz) solidSDFBuffer[(uint)(iz)*Ru*Ru + (uint)(iy)*Ru + (uint)(ix)]
+        float v000 = CG_SDF_AT(v0c.x, v0c.y, v0c.z);
+        float v100 = CG_SDF_AT(v1c.x, v0c.y, v0c.z);
+        float v010 = CG_SDF_AT(v0c.x, v1c.y, v0c.z);
+        float v110 = CG_SDF_AT(v1c.x, v1c.y, v0c.z);
+        float v001 = CG_SDF_AT(v0c.x, v0c.y, v1c.z);
+        float v101 = CG_SDF_AT(v1c.x, v0c.y, v1c.z);
+        float v011 = CG_SDF_AT(v0c.x, v1c.y, v1c.z);
+        float v111 = CG_SDF_AT(v1c.x, v1c.y, v1c.z);
+        #undef CG_SDF_AT
+
+        sdf = lerp(lerp(lerp(v000, v100, t.x), lerp(v010, v110, t.x), t.y),
+                   lerp(lerp(v001, v101, t.x), lerp(v011, v111, t.x), t.y), t.z);
     }
     return sdf;
 }
@@ -228,6 +250,69 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
     matrixABuffer[i] = diagonal; // Slot 0 is Diagonal (0 * numNodesCapacity + i = i)
 }
 
+// --- Uniform grid: fixed dx, face area dx^2, face-to-face distance dx → Laplacian face weight dx * deltaTime.
+// Ghost-fluid (+2): unchanged theta-weighted Neumann from BuildMatrixA.
+[numthreads(256, 1, 1)]
+void BuildMatrixAUniform(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint numNodes = nodeCountBuffer[0];
+    if (i >= numNodes) return;
+
+    Node node = nodesBuffer[i];
+    // Single global cell size on the uniform grid (all nodes share uniformGridCellLayer).
+    float dx = exp2((float)node.layer);
+    float diagonal = 0.0;
+
+    for (int k = 0; k < 6; k++)
+        uniformMatrixABuffer[(k + 1) * numNodesCapacity + i] = 0.0;
+
+    // Cell center in sim space [0,1023]: same geometry as UniformGrid_CreateLeaves / UpdateParticlesUniform.
+    // Do not use morton >> (3*layer) here — node.mortonCode is a particle fine Morton, not octree-canonical.
+    uint s = node.layer;
+    uint3 pFine = DeinterleaveCG(node.mortonCode);
+    uint3 c = uint3(pFine.x >> s, pFine.y >> s, pFine.z >> s);
+    float3 nodeMin = float3((float)(c.x << s), (float)(c.y << s), (float)(c.z << s));
+    float3 nodeCenter = nodeMin + float3(0.5, 0.5, 0.5) * dx;
+
+    // (faceArea / distance) * deltaTime = (dx*dx / dx) * deltaTime
+    float wFace = dx * deltaTime;
+
+    for (int d = 0; d < 6; d++)
+    {
+        uint neighbor_idx = uniformNeighborsBuffer[d * numNodesCapacity + i];
+
+        if (neighbor_idx == numNodes + 1u) { continue; }
+
+        if (neighbor_idx == numNodes + 2u)
+        {
+            float phi_i = SampleSDF(nodeCenter);
+            float3 neighborCenter = nodeCenter + kFaceDirs[d] * dx;
+            float phi_j = SampleSDF(neighborCenter);
+            float denom = phi_i - phi_j;
+            float theta = (denom > 1e-4f) ? saturate(phi_i / denom) : 1.0f;
+            theta = max(theta, 0.02f);
+            float weight = (dx * dx / max(0.5f * dx, 1e-6f)) * deltaTime * theta;
+            diagonal += weight;
+            continue;
+        }
+
+        if (neighbor_idx < numNodes)
+        {
+            diagonal += wFace;
+            uniformMatrixABuffer[(d + 1) * numNodesCapacity + i] = -wFace;
+        }
+        else
+        {
+            // Dirichlet air (numNodes, 0xFFFFFFFF, etc.)
+            diagonal += wFace;
+        }
+    }
+
+    if (!isfinite(diagonal)) diagonal = 0.0;
+    uniformMatrixABuffer[i] = diagonal;
+}
+
 // --- KERNEL: APPLY MATRIX A + DOT ---
 // Standard Sparse Matrix-Vector Multiply: Ap = A * p
 // + Fused Dot Product (p . Ap)
@@ -316,6 +401,7 @@ void ApplyMatrixAndDot(uint3 Gid : SV_GroupID, uint3 Gtid : SV_GroupThreadID, ui
 }
 
 // --- KERNEL: SpMV_CSR + DOT -------------------------------------------------
+// Same kernel for octree (≤25 NNZ/row) and uniform (≤7 NNZ/row); only CSR contents differ.
 // Standard CSR SpMV:
 //      Ap[i] = sum_{j in row i} A_ij * p[j]
 // Fused with dot product p . Ap using the same reduction pattern as

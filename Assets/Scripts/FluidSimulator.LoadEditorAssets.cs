@@ -17,6 +17,7 @@ public partial class FluidSimulator
         Ens(ref nodesShader, "Assets/Scripts/Nodes.compute");
         Ens(ref cgSolverShader, "Assets/Scripts/CGSolver.compute");
         Ens(ref csrBuilderShader, "Assets/Scripts/CSRBuilder.compute");
+        Ens(ref uniformGridShader, "Assets/Scripts/UniformGrid.compute");
 
         Ens(ref leafOnlyInputsShader, "Assets/Scripts/LeafOnlyInputs.compute");
         Ens(ref leafOnlyEmbedShader, "Assets/Scripts/LeafOnlyEmbed.compute");

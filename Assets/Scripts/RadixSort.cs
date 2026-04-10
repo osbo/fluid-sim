@@ -22,9 +22,14 @@ public class RadixSort
 
     private uint maxLength;
 
-    public RadixSort(ComputeShader shader, uint maxLength)
+    /// <param name="maxParticleCount">Max radix-sort particle count (keys / e / f buffers).</param>
+    /// <param name="maxExclusiveScanLength">
+    /// Max length for <see cref="ExclusivePrefixScan"/> (e.g. uniform-grid block-sum chain = ceil(N³/1024)).
+    /// Aux buffers are sized for max(particles, this) so multi-block prefix + fixup matches octree <see cref="EncodeScan"/>.
+    /// </param>
+    public RadixSort(ComputeShader shader, uint maxParticleCount, uint maxExclusiveScanLength = 0)
     {
-        this.maxLength = maxLength;
+        maxLength = maxParticleCount;
         sortShader = shader;
 
         prefixSumKernel = sortShader.FindKernel("prefixSum");
@@ -36,19 +41,19 @@ public class RadixSort
         copyParticlesKernel = sortShader.FindKernel("CopyParticles");
 
         int keySize = sizeof(uint) * 2;
-        keysBufferA = new ComputeBuffer((int)maxLength, keySize, ComputeBufferType.Default);
-        keysBufferB = new ComputeBuffer((int)maxLength, keySize, ComputeBufferType.Default);
+        keysBufferA = new ComputeBuffer((int)maxParticleCount, keySize, ComputeBufferType.Default);
+        keysBufferB = new ComputeBuffer((int)maxParticleCount, keySize, ComputeBufferType.Default);
 
-        eBuffer = new ComputeBuffer((int)maxLength, sizeof(uint), ComputeBufferType.Default);
-        fBuffer = new ComputeBuffer((int)maxLength, sizeof(uint), ComputeBufferType.Default);
+        eBuffer = new ComputeBuffer((int)maxParticleCount, sizeof(uint), ComputeBufferType.Default);
+        fBuffer = new ComputeBuffer((int)maxParticleCount, sizeof(uint), ComputeBufferType.Default);
 
         int particleStride = 3 * 4 + 3 * 4 + 4;
-        particleSortScratch = new ComputeBuffer((int)maxLength, particleStride, ComputeBufferType.Default);
-
+        particleSortScratch = new ComputeBuffer((int)maxParticleCount, particleStride, ComputeBufferType.Default);
 
         uint threadgroupSize = 512;
-        uint numThreadgroups = (maxLength + (threadgroupSize * 2) - 1) / (threadgroupSize * 2);
-        uint requiredAuxSize = System.Math.Max(1, numThreadgroups);
+        uint ngParticles = (maxParticleCount + (threadgroupSize * 2) - 1) / (threadgroupSize * 2);
+        uint ngScan = (maxExclusiveScanLength + (threadgroupSize * 2) - 1) / (threadgroupSize * 2);
+        uint requiredAuxSize = System.Math.Max(1, System.Math.Max(ngParticles, ngScan));
 
         auxBuffer = new ComputeBuffer((int)requiredAuxSize, sizeof(uint), ComputeBufferType.Default);
         aux2Buffer = new ComputeBuffer((int)requiredAuxSize, sizeof(uint), ComputeBufferType.Default);
@@ -105,6 +110,16 @@ public class RadixSort
             sortShader.SetInt("count", (int)actualCount);
             sortShader.Dispatch(copyParticlesKernel, threadGroups, 1, 1);
         }
+    }
+
+    /// <summary>
+    /// Same exclusive prefix as each radix pass (<see cref="EncodeScan"/>): multi-group scan + block-sum scan + fixup.
+    /// Used by uniform-grid cell-count prefix (block totals in <c>aux</c> after NodesPrefixSums pass 1).
+    /// </summary>
+    public void ExclusivePrefixScan(ComputeBuffer input, ComputeBuffer output, uint length)
+    {
+        if (length == 0) return;
+        EncodeScan(input, output, length);
     }
 
     private void EncodeSplit(ComputeBuffer inputKeys, ComputeBuffer outputKeys, uint bit, uint count)

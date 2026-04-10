@@ -182,6 +182,8 @@ public partial class FluidSimulator : MonoBehaviour
     /// <summary>Call after CSR fill (same frame as matrix A). Entirely GPU-side except dispatch bookkeeping.</summary>
     public void DispatchLeafOnlyGpuInputs(int numNodes, int maxNnz)
     {
+        if (gridMode == GridMode.Uniform)
+            return;
         if (leafOnlyInputsShader == null || !buildLeafOnlyInputsEachPressureSolve || numNodes <= 0)
             return;
         if (diffusionGradientBuffer == null || nodesBuffer == null || matrixABuffer == null

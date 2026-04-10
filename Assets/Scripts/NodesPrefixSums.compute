@@ -335,9 +335,9 @@ void BuildSolverIndirectArgs(uint3 id : SV_DispatchThreadID)
     uint pfx1 = max(1u, (n + 1023u) / 1024u);
     uint pfx2 = max(1u, (pfx1 + 1023u) / 1024u);
 
-    // 256-thread dispatch (BuildMatrixA, CalculateDivergence, CSR kernels, ApplyPressureGradient)
+    // 256-thread dispatch (BuildMatrixA/Uniform, SpMV_CSR, CSR build/fill, uniform ApplyPressureGradient)
     solverIndirectArgsBuffer[0]  = g256; solverIndirectArgsBuffer[1]  = 1u; solverIndirectArgsBuffer[2]  = 1u;
-    // 512-thread dispatch (Scale, Axpy, DotProduct, CopyFloat, AxpyAlpha, AxpyNegAlpha, ScaleAddBeta, ApplyJacobi)
+    // 512-thread dispatch (CalculateDivergence, Scale, Axpy, DotProduct, CopyFloat, AxpyAlpha, AxpyNegAlpha, ScaleAddBeta, ApplyJacobi)
     solverIndirectArgsBuffer[3]  = g512; solverIndirectArgsBuffer[4]  = 1u; solverIndirectArgsBuffer[5]  = 1u;
     // 1-group dispatch (GlobalReduceSum, ComputeAlpha, ComputeBeta, StoreRhoFromDot)
     solverIndirectArgsBuffer[6]  = 1u;   solverIndirectArgsBuffer[7]  = 1u; solverIndirectArgsBuffer[8]  = 1u;

@@ -12,7 +12,9 @@ public enum RenderingMode
     BlurredDepth,
     BlurredThickness,
     Normal,
-    Composite
+    Composite,
+    /// <summary>Uniform grid: wireframe cell per occupied hash bin (use with <see cref="GridMode.Uniform"/>).</summary>
+    UniformGridNodes,
 }
 
 public enum PreconditionerType
@@ -20,6 +22,14 @@ public enum PreconditionerType
     None,
     Neural,
     Jacobi
+}
+
+/// <summary>Which background grid backs the pressure solve and node-based stages.</summary>
+public enum GridMode
+{
+    Octree,
+    /// <summary>Not implemented yet; octree-only dispatches are skipped so the app stays stable.</summary>
+    Uniform
 }
 
 public enum ThicknessSource
