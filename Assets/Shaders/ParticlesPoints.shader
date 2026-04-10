@@ -108,7 +108,8 @@ Shader "Custom/ParticlesPoints"
                 
                 o.pos = TransformWorldToHClip(positionWS);
 
-                float3 rgb = float3(0.0, 0.5, 1.0);
+                // col.rgb carries HSV (not RGB) so the PS only needs one HsvToRgb call.
+                float3 hsv;
                 if (_UseVelocityColor > 0.5)
                 {
                     float speed = length(p.velocity);
@@ -127,9 +128,13 @@ Shader "Custom/ParticlesPoints"
                         t = saturate(speed / denom);
                     }
                     float hue = (2.0 / 3.0) * (1.0 - t);
-                    rgb = HsvToRgb(float3(hue, 0.92, 1.0));
+                    hsv = float3(hue, 0.92, 1.0);
                 }
-                o.col = float4(rgb, 1.0);
+                else
+                {
+                    hsv = float3(0.583, 1.0, 1.0); // RgbToHsv(float3(0, 0.5, 1)) — constant
+                }
+                o.col = float4(hsv, 1.0);
                 o.uv = input.uv;
                 
                 // Calculate distance from camera to particle
@@ -154,8 +159,7 @@ Shader "Custom/ParticlesPoints"
                 wNear = pow(max(wNear, 1e-5), max(_DepthShadeGamma, 0.01));
                 float floorV = saturate(_DepthLumaFloor);
                 float vScale = floorV + (1.0 - floorV) * wNear;
-                float3 rgb = i.col.rgb;
-                float3 hsv = RgbToHsv(rgb);
+                float3 hsv = i.col.rgb; // VS passes HSV directly
                 hsv.z *= vScale;
                 float3 outRgb = HsvToRgb(hsv);
                 return float4(outRgb, i.col.a);

@@ -162,7 +162,7 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer uniformDenseIndexMapBuffer;
     private ComputeBuffer uniformActiveMortonListBuffer;
     private ComputeBuffer uniformActiveNodeCountBuffer;
-    private ComputeBuffer uniformNodeAccumBuffer; // 19 * maxNodesCapacity uints
+    private ComputeBuffer uniformNodeAccumBuffer; // 7 * maxNodesCapacity uints
 
     public const int UniformNeighborSlotCount = 6;
     public const int UniformMatrixSlotCount = 7;
@@ -1388,7 +1388,7 @@ public partial class FluidSimulator : MonoBehaviour
         // Upper bound on nonempty cells for a single frame matches the octree node budget.
         uniformActiveMortonListBuffer = new ComputeBuffer(maxNodesCapacity, sizeof(uint));
         uniformActiveNodeCountBuffer = new ComputeBuffer(1, sizeof(uint));
-        uniformNodeAccumBuffer = new ComputeBuffer(19 * maxNodesCapacity, sizeof(uint));
+        uniformNodeAccumBuffer = new ComputeBuffer(7 * maxNodesCapacity, sizeof(uint));
 
         uniformNeighborsBuffer?.Release();
         uniformNeighborsBuffer = new ComputeBuffer(maxNodesCapacity * UniformNeighborSlotCount, sizeof(uint));

@@ -548,13 +548,28 @@ void ApplyJacobi(uint3 id : SV_DispatchThreadID) {
     yBuffer[i] = z_val;
 }
 
+groupshared float s_reduce64[64];
+
 [numthreads(64, 1, 1)]
 void GlobalReduceSum(uint3 id : SV_DispatchThreadID) {
-    if (id.x != 0) return;
+    uint li = id.x;
     uint count = min(reductionCountBuffer[0], 2048u);
+
     float total = 0.0;
-    for(uint i = 0; i < count; i++) total += divergenceBuffer[i];
-    divergenceBuffer[0] = total;
+    for (uint i = li; i < count; i += 64u)
+        total += divergenceBuffer[i];
+
+    s_reduce64[li] = total;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint s = 32u; s > 0u; s >>= 1u)
+    {
+        if (li < s) s_reduce64[li] += s_reduce64[li + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (li == 0u) divergenceBuffer[0] = s_reduce64[0];
 }
 
 // After SpMV + GlobalReduceSum: divergenceBuffer[0] = p·Ap
