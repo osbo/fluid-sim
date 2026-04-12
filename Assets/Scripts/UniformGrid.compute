@@ -60,15 +60,19 @@ StructuredBuffer<Particle> particlesBuffer;
 
 RWStructuredBuffer<uint> activeMortonList;
 
-// Node accumulation buffer: 7 slots per node (as uint for atomic CAS).
-// Layout (per node, stride = numNodesCapacity):
-//   slot 0..2 : position sum (float-as-uint CAS)
-//   slot 3..5 : velocity sum (float-as-uint CAS)
-//   slot 6    : particle count (InterlockedAdd uint)
-// Face velocities are derived from center velocity in NormalizeNodes; InterpolateFaceVelocities
-// then averages across neighbors, making within-cell face weighting a negligible correction.
-// Total: 7 slots × numNodesCapacity uints.
-RWStructuredBuffer<uint> nodeAccumBuffer; // [7 * numNodesCapacity]
+// Node accumulation buffer: 7 logical slots × kSplatStripes stripes per node (uint atomics only).
+// Splat uses striped InterlockedAdd (fixed-point) instead of float CAS loops so high particle counts
+// per cell (common near colliders) do not devolve into unbounded retry storms.
+// Layout index: (slot * kSplatStripes + stripe) * numNodesCapacity + nodeID, slot in [0,6].
+//   slots 0..2 : position sum (uint, units = position * kSplatPosScale)
+//   slots 3..5 : velocity sum (int-as-uint InterlockedAdd, units = velocity * kSplatVelScale)
+//   slot 6     : particle count per stripe (summed in normalize)
+// 8 stripes keeps worst-case int velocity sums under ~1e9 when ~numParticles/8 land in one cell (collider sheets).
+static const uint kSplatStripes = 8u;
+static const uint kSplatPosScale = 8u;
+static const uint kSplatVelScale = 16u;
+
+RWStructuredBuffer<uint> nodeAccumBuffer; // [7 * kSplatStripes * numNodesCapacity]
 
 uint uniformGridLog2K;
 uint uniformGridCellCount;
@@ -88,6 +92,9 @@ RWStructuredBuffer<float3> diffusionGradientBuffer;
 
 uint numFluidNodes;
 uint numNodesCapacity;
+// CPU fills after binning readback: actual fluid node count this frame (<= maxUniformActiveCells).
+// Used so rounded-up dispatches do not normalize/clear phantom tail threads.
+uint uniformGridBuildNodeCount;
 
 StructuredBuffer<uint> nodeCountBuffer;
 RWStructuredBuffer<Node> tempNodesBuffer;
@@ -177,43 +184,37 @@ void UniformGrid_BinParticles(uint3 id : SV_DispatchThreadID)
         denseIndexMap[idx] = myNodeID;
         activeMortonList[myNodeID] = mortonCode;
     }
-}
-
-// Helper: atomic float add via CAS loop (only correct when values are non-negative accumulations;
-// for signed values use the general version below).
-void AtomicAddFloat(RWStructuredBuffer<uint> buf, uint idx, float val)
-{
-    uint oldBits = buf[idx];
-    [allow_uav_condition]
-    for (;;)
+    else
     {
-        uint newBits = asuint(asfloat(oldBits) + val);
-        uint cmp = oldBits;
-        uint actualOld;
-        // Metal/DX: 4-arg form — destination is the buffer element, not (buffer, index).
-        InterlockedCompareExchange(buf[idx], cmp, newBits, actualOld);
-        if (actualOld == cmp)
-            break;
-        oldBits = actualOld;
+        // Roll back: do not let activeNodeCount exceed assigned slots (avoids nActive > capacity in later kernels).
+        InterlockedAdd(activeNodeCount[0], 0xFFFFFFFFu);
     }
 }
 
-// One thread per active node: zero all 7 accumulator slots.
+uint NodeAccumFlatIndex(uint slot, uint stripe, uint nodeID, uint stride)
+{
+    return (slot * kSplatStripes + stripe) * stride + nodeID;
+}
+
+// One thread per active node: zero all splat accumulator stripes.
 [numthreads(512, 1, 1)]
 void UniformGrid_ClearNodeAccum(uint3 id : SV_DispatchThreadID)
 {
     uint nodeID = id.x;
-    uint nActive = activeNodeCount[0];
-    if (nodeID >= nActive) return;
+    if (nodeID >= uniformGridBuildNodeCount)
+        return;
 
     uint stride = numNodesCapacity;
     [unroll]
     for (uint s = 0; s < 7u; s++)
-        nodeAccumBuffer[s * stride + nodeID] = 0u;
+    {
+        [unroll]
+        for (uint t = 0; t < kSplatStripes; t++)
+            nodeAccumBuffer[NodeAccumFlatIndex(s, t, nodeID, stride)] = 0u;
+    }
 }
 
-// One thread per particle: look up its node via denseIndexMap, then CAS-accumulate position,
-// velocity, and particle count. Face velocities are derived from center velocity in NormalizeNodes.
+// One thread per particle: look up its node via denseIndexMap, then striped InterlockedAdd.
 [numthreads(256, 1, 1)]
 void UniformGrid_SplatParticles(uint3 id : SV_DispatchThreadID)
 {
@@ -229,17 +230,26 @@ void UniformGrid_SplatParticles(uint3 id : SV_DispatchThreadID)
     if (nodeID == kEmptyCell) return;
 
     uint stride = numNodesCapacity;
+    uint stripe = (i * 4164903690u) & (kSplatStripes - 1u);
 
-    // Position / velocity (equal-weight average; divide by count in normalize pass)
-    AtomicAddFloat(nodeAccumBuffer, 0u * stride + nodeID, pt.position.x);
-    AtomicAddFloat(nodeAccumBuffer, 1u * stride + nodeID, pt.position.y);
-    AtomicAddFloat(nodeAccumBuffer, 2u * stride + nodeID, pt.position.z);
-    AtomicAddFloat(nodeAccumBuffer, 3u * stride + nodeID, pt.velocity.x);
-    AtomicAddFloat(nodeAccumBuffer, 4u * stride + nodeID, pt.velocity.y);
-    AtomicAddFloat(nodeAccumBuffer, 5u * stride + nodeID, pt.velocity.z);
+    uint pxs = (uint)round(pt.position.x * (float)kSplatPosScale);
+    uint pys = (uint)round(pt.position.y * (float)kSplatPosScale);
+    uint pzs = (uint)round(pt.position.z * (float)kSplatPosScale);
+    InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(0u, stripe, nodeID, stride)], pxs);
+    InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(1u, stripe, nodeID, stride)], pys);
+    InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(2u, stripe, nodeID, stride)], pzs);
 
-    // Particle count (integer)
-    InterlockedAdd(nodeAccumBuffer[6u * stride + nodeID], 1u);
+    float vxm = clamp(pt.velocity.x, -512.0, 512.0);
+    float vym = clamp(pt.velocity.y, -512.0, 512.0);
+    float vzm = clamp(pt.velocity.z, -512.0, 512.0);
+    int ivx = (int)round(vxm * (float)kSplatVelScale);
+    int ivy = (int)round(vym * (float)kSplatVelScale);
+    int ivz = (int)round(vzm * (float)kSplatVelScale);
+    InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(3u, stripe, nodeID, stride)], (uint)ivx);
+    InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(4u, stripe, nodeID, stride)], (uint)ivy);
+    InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(5u, stripe, nodeID, stride)], (uint)ivz);
+
+    InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(6u, stripe, nodeID, stride)], 1u);
 }
 
 // One thread per active node: read accumulators, normalize, write final Node struct.
@@ -249,23 +259,33 @@ void UniformGrid_SplatParticles(uint3 id : SV_DispatchThreadID)
 void UniformGrid_NormalizeNodes(uint3 id : SV_DispatchThreadID)
 {
     uint nodeID = id.x;
-    uint nActive = activeNodeCount[0];
-    if (nodeID >= nActive) return;
+    if (nodeID >= uniformGridBuildNodeCount)
+        return;
 
     uint stride = numNodesCapacity;
 
-    uint countU = nodeAccumBuffer[6u * stride + nodeID];
+    uint countU = 0u;
+    uint spx = 0u, spy = 0u, spz = 0u;
+    int svx = 0, svy = 0, svz = 0;
+    [unroll]
+    for (uint t = 0; t < kSplatStripes; t++)
+    {
+        countU += nodeAccumBuffer[NodeAccumFlatIndex(6u, t, nodeID, stride)];
+        spx += nodeAccumBuffer[NodeAccumFlatIndex(0u, t, nodeID, stride)];
+        spy += nodeAccumBuffer[NodeAccumFlatIndex(1u, t, nodeID, stride)];
+        spz += nodeAccumBuffer[NodeAccumFlatIndex(2u, t, nodeID, stride)];
+        svx += (int)nodeAccumBuffer[NodeAccumFlatIndex(3u, t, nodeID, stride)];
+        svy += (int)nodeAccumBuffer[NodeAccumFlatIndex(4u, t, nodeID, stride)];
+        svz += (int)nodeAccumBuffer[NodeAccumFlatIndex(5u, t, nodeID, stride)];
+    }
+
     float count = max(1.0, (float)countU);
 
     // Recover morton from activeMortonList (set during BinParticles)
     uint mortonCode = activeMortonList[nodeID];
 
-    float3 pos = float3(asfloat(nodeAccumBuffer[0u * stride + nodeID]),
-                        asfloat(nodeAccumBuffer[1u * stride + nodeID]),
-                        asfloat(nodeAccumBuffer[2u * stride + nodeID])) / count;
-    float3 vel = float3(asfloat(nodeAccumBuffer[3u * stride + nodeID]),
-                        asfloat(nodeAccumBuffer[4u * stride + nodeID]),
-                        asfloat(nodeAccumBuffer[5u * stride + nodeID])) / count;
+    float3 pos = float3((float)spx, (float)spy, (float)spz) / (float)kSplatPosScale / count;
+    float3 vel = float3((float)svx, (float)svy, (float)svz) / (float)kSplatVelScale / count;
 
     faceVelocities fv;
     fv.left   = vel.x;

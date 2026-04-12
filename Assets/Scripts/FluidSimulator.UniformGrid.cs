@@ -113,6 +113,8 @@ public partial class FluidSimulator
             return;
         }
 
+        uniformGridShader.SetInt("uniformGridBuildNodeCount", capped);
+
         // 3. Clear per-node accumulation buffer
         uniformGridShader.SetBuffer(uniformGridClearNodeAccumKernel, "activeNodeCount", uniformActiveNodeCountBuffer);
         uniformGridShader.SetBuffer(uniformGridClearNodeAccumKernel, "nodeAccumBuffer", uniformNodeAccumBuffer);
