@@ -550,10 +550,12 @@ void ApplyJacobi(uint3 id : SV_DispatchThreadID) {
 
 groupshared float s_reduce64[64];
 
+// Sums divergenceBuffer[0 .. count-1] into divergenceBuffer[0] (DotProduct writes one partial per 512-thread group).
+// count = ceil(numNodes/512) from BuildSolverIndirectArgs. Do not clamp: a 2048 cap silently dropped tail groups for large n.
 [numthreads(64, 1, 1)]
 void GlobalReduceSum(uint3 id : SV_DispatchThreadID) {
     uint li = id.x;
-    uint count = min(reductionCountBuffer[0], 2048u);
+    uint count = reductionCountBuffer[0];
 
     float total = 0.0;
     for (uint i = li; i < count; i += 64u)

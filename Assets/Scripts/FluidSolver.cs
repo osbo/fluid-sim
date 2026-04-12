@@ -245,13 +245,12 @@ public partial class FluidSimulator : MonoBehaviour
         // p = z (GPU copy)
         GpuCopyBuffer(zVectorBuffer, pBuffer);
 
-        // GpuDotProduct reads back divergence[0]; skip when debug off so pressure solve stays GPU-resident.
+        // GpuDotProduct reads back ||r||² for logging only. Do not early-return: SolvePressure must always run
+        // ApplyPressureGradient(), which swaps nodesBuffer ↔ tempNodesBuffer every frame; skipping that swap
+        // desynchronizes FLIP history and causes blow-ups (especially easy to hit with mis-reduced ||r||²).
         float initialResidual = 0f;
         if (enablePerFrameDebugTimingLog)
-        {
             initialResidual = GpuDotProduct(residualBuffer, residualBuffer);
-            if (initialResidual < convergenceThreshold) return;
-        }
 
         laplacianSw.Reset();
         dotProductSw.Reset();
