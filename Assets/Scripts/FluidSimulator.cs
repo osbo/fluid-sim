@@ -218,7 +218,7 @@ public partial class FluidSimulator : MonoBehaviour
     [Tooltip("Finest octree layer for the sim; collider voxel grid uses R = 2^(10 - minLayer) along each axis (same as Nodes.compute kMortonAxisBits).")]
     [Range(0, 10)] public int minLayer = 4;
     [Range(0, 10)] public int maxLayer = 10;
-    [Tooltip("Octree-equivalent layer L (same as Nodes minLayer / node.layer for cell size): sim cell width = 2^L. Uniform grid uses k = (MortonAxisBits − L) bits per axis, N = 2^k cells per axis, so each bin matches a level-L octree cell.")]
+    [Tooltip("Octree-equivalent layer L: sim cell width = 2^L. Smaller L = finer bins (huge N³, often ~numParticles active nodes). Larger L = coarser and cheaper.")]
     [Range(0, 10)]
     [FormerlySerializedAs("uniformGridResolutionLog2")]
     public int uniformGridCellLayer = 3;
