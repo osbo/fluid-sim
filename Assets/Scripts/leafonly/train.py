@@ -30,6 +30,7 @@ from .data import (
     build_leaf_block_connectivity,
     most_recent_run_folder,
 )
+from .eval import leafonly_grad_norms_by_group
 from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 from .probe_z import jacobi_smooth_hutchinson_z_inplace
 from .sparse_operator import (
@@ -396,6 +397,7 @@ def train_leaf_only(args, runtime):
     )
     _az_desc = "sparse block-diagonal A@Z (all devices; dense bmm only if context cache has use_dense_A)"
     print(f"  Probe MAZ path: --leafonly-pcg={leafonly_pcg} (A@Z: {_az_desc}; {_pcg_tail})")
+    print(f"  Loss mode: hutchinson (cosine-similarity probe; --loss-mode hutchinson)")
     ms_startup_to_loop = (time.perf_counter() - t_wall0) * 1000.0
     if print_timing:
         print("\n=== Startup timing (wall clock, ms) ===")
@@ -436,6 +438,7 @@ def train_leaf_only(args, runtime):
     loss_history = deque(maxlen=print_interval)
     t_start = time.perf_counter()
     t_start_avg = None
+    grad_mags = bool(getattr(args, "grad_mags", False))
 
     def _cuda_sync():
         if device.type == "cuda":
@@ -608,11 +611,6 @@ def train_leaf_only(args, runtime):
             t_forward = time.perf_counter() - t_mark
             t_mark = time.perf_counter()
 
-        Z = torch.randn(B_step, max_n_pad_step, batch_vectors, device=device, dtype=x_batched.dtype)
-        for b_idx, n_orig_ctx in enumerate(n_orig_list):
-            if n_orig_ctx < max_n_pad_step:
-                Z[b_idx, n_orig_ctx:, :] = 0.0
-
         if use_dense_batch:
             _az_call = lambda Zt: _probe_bmm(A_batched, Zt)
         else:
@@ -623,6 +621,11 @@ def train_leaf_only(args, runtime):
                 dtype=x_batched.dtype,
                 device=device,
             )
+
+        Z = torch.randn(B_step, max_n_pad_step, batch_vectors, device=device, dtype=x_batched.dtype)
+        for b_idx, n_orig_ctx in enumerate(n_orig_list):
+            if n_orig_ctx < max_n_pad_step:
+                Z[b_idx, n_orig_ctx:, :] = 0.0
 
         def _az_probe(Zt: torch.Tensor) -> torch.Tensor:
             return _az_call(Zt)
@@ -701,7 +704,13 @@ def train_leaf_only(args, runtime):
         step_loss = step_loss_sum
         loss_history.append(step_loss)
 
-        if step % print_interval == 0:
+        log_grad_suffix = ""
+        if step % print_interval == 0 and grad_mags:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            elif device.type == "mps":
+                torch.mps.synchronize()
+
             def _grad_norm(params):
                 total = torch.tensor(0.0, device=device)
                 for p in params:
@@ -710,9 +719,9 @@ def train_leaf_only(args, runtime):
                 return total.sqrt().item()
 
             _all = list(model.parameters())
-            _leaf = [p for n, p in model.named_parameters() if "leaf_head" in n]
             log_tot = _grad_norm(_all)
-            log_leaf = _grad_norm(_leaf)
+            log_grad_parts = "".join(f" {tag}={val:.2e}" for tag, val in leafonly_grad_norms_by_group(model, device))
+            log_grad_suffix = f" gTot={log_tot:.2e}{log_grad_parts}"
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
@@ -767,8 +776,6 @@ def train_leaf_only(args, runtime):
             print("----------------------------------------\n")
 
         if step % print_interval == 0:
-            if device.type == "cuda":
-                torch.cuda.synchronize()
             elapsed = time.perf_counter() - t_start
             n = len(loss_history)
             if n > 0:
@@ -795,12 +802,12 @@ def train_leaf_only(args, runtime):
                     avg_per_100 = (now - t_start_avg) * 100 / (step - TIMING_STEP)
                 print(
                     f"{step:05d}: {loss_str}  ({elapsed:.3f}s, avg: {avg_per_100:.3f}s)"
-                    f" lr={lr_after:.2e} gTot={log_tot:.2e} gL={log_leaf:.2e}"
+                    f" lr={lr_after:.2e}{log_grad_suffix}"
                 )
             else:
                 print(
                     f"{step:05d}: {loss_str}  ({elapsed:.3f}s)"
-                    f" lr={lr_after:.2e} gTot={log_tot:.2e} gL={log_leaf:.2e}"
+                    f" lr={lr_after:.2e}{log_grad_suffix}"
                 )
             if step > 0 and step % (print_interval * 10) == 0:
                 save_leaf_only_weights(model, str(save_path), input_dim=9)
