@@ -14,8 +14,7 @@ Use ``--fast-plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``ei
 
 CUDA Graph (``--pcg-cuda-backend cudagraph``, default on CUDA) records real GPU kernels and replays them — low CPU launch overhead. On Apple MPS there is no CUDAGraph; the same flag selects ``torch.compile(one PCG iter)`` + a Python loop. Use ``--pcg-cuda-backend compile`` explicitly for Inductor on both; ``eager`` keeps per-iter Python dispatch.
 
-GPU PCG runs in float64 by default on CUDA (better for stiff systems); use ``--no-gpu-pcg-fp64`` for float32 (often faster on easy data).
-On MPS, float64 PCG is unsupported, so float32 is used automatically (same as ``--no-gpu-pcg-fp64``). The neural preconditioner stays float32; casts bridge residual / search directions at the PCG loop.
+GPU PCG uses float64 on CUDA for numerical stability; on MPS/CPU it uses float32. The neural preconditioner stays float32.
 
 H-matrix rank profiler (see ``_hmatrix_rank_profiler_bands``): builds the true dense A^-1, extracts
 blocks aligned with ``HM_R0_CPU`` / ``HM_C0_CPU`` / ``HM_S_CPU``, runs SVD on sampled blocks, and
@@ -1084,12 +1083,15 @@ class _GpuElapsedTimer:
         return (time.perf_counter() - self._t0) * 1000.0
 
 
-def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=False, check_freq=3):
+def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=False, check_freq=3, acc_dtype=None):
     if device is None:
         device = b.device
+    vec_dtype = b.dtype
+    if acc_dtype is None:
+        acc_dtype = vec_dtype
 
     n = b.shape[0]
-    x = torch.zeros(n, 1, device=device, dtype=b.dtype)
+    x = torch.zeros(n, 1, device=device, dtype=vec_dtype)
 
     if device.type == "cuda":
         start_event = torch.cuda.Event(enable_timing=True)
@@ -1105,29 +1107,29 @@ def pcg_gpu(A, b, apply_precond, tol=1e-8, max_iter=500, device=None, debug=Fals
     z = apply_precond(r)
     p = z.clone()
 
-    rho = (r * z).sum()
-    b_norm_sq = (b * b).sum()
+    rho = (r * z).sum().to(acc_dtype)
+    b_norm_sq = (b * b).sum().to(acc_dtype)
     tol_sq_val = (tol * tol) * b_norm_sq.item()
 
     iters = 0
     if tol_sq_val > 0 or b_norm_sq.item() > 0:
         for k in range(max_iter):
             Ap = (A @ p.squeeze(-1)).unsqueeze(-1)
-            pAp = (p * Ap).sum()
+            pAp = (p * Ap).sum().to(acc_dtype)
 
-            alpha = rho / pAp
+            alpha = (rho / pAp).to(vec_dtype)
             x = x + alpha * p
             r = r - alpha * Ap
 
             z = apply_precond(r)
-            rho_new = (r * z).sum()
+            rho_new = (r * z).sum().to(acc_dtype)
 
-            beta = rho_new / rho
+            beta = (rho_new / rho).to(vec_dtype)
             p = z + beta * p
             rho = rho_new
 
             if (k + 1) % check_freq == 0 or k == max_iter - 1:
-                r_sq = (r * r).sum()
+                r_sq = (r * r).sum().to(acc_dtype)
                 if r_sq.item() <= tol_sq_val:
                     if debug:
                         print(f"    [PCG GPU] converged at iter {k+1}")
@@ -1155,6 +1157,7 @@ def pcg_gpu_cudagraph_bsr(
     max_iter=500,
     device=None,
     check_freq=3,
+    acc_dtype=None,
 ):
     """
     PCG using sparse block-row ``M`` (BSR from ``build_sparse_bsr_preconditioner``) for ``z = M @ r``,
@@ -1168,27 +1171,29 @@ def pcg_gpu_cudagraph_bsr(
     if device.type != "cuda":
         raise ValueError("pcg_gpu_cudagraph_bsr requires CUDA")
 
-    dtype = b_gpu.dtype
+    vec_dtype = b_gpu.dtype
+    if acc_dtype is None:
+        acc_dtype = vec_dtype
     x_static = torch.zeros_like(b_gpu)
     r_static = b_gpu.clone()
     z_static = torch.zeros_like(b_gpu)
     z_static.copy_(M_sparse_bsr @ r_static)
     p_static = z_static.clone()
-    rho_static = torch.zeros(1, device=device, dtype=dtype)
-    rho_static.fill_((r_static * z_static).sum())
+    rho_static = torch.zeros(1, device=device, dtype=acc_dtype)
+    rho_static.copy_((r_static * z_static).sum())
 
     tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
 
     def one_iter():
         Ap = A_gpu @ p_static
-        pAp = (p_static * Ap).sum()
-        alpha = rho_static / pAp
+        pAp = (p_static * Ap).sum().to(acc_dtype)
+        alpha = (rho_static / pAp).to(vec_dtype)
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
         z_static.copy_(M_sparse_bsr @ r_static)
-        rho_new = (r_static * z_static).sum()
-        beta = rho_new / rho_static
-        rho_static.fill_(rho_new)
+        rho_new = (r_static * z_static).sum().to(acc_dtype)
+        beta = (rho_new / rho_static).to(vec_dtype)
+        rho_static.copy_(rho_new)
         p_static.mul_(beta).add_(z_static)
 
     n = int(b_gpu.shape[0])
@@ -1219,6 +1224,7 @@ def pcg_gpu_cudagraph_bsr(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
 
     # ``one_iter`` ran once during capture; restore true PCG initial state before replay.
@@ -1226,7 +1232,7 @@ def pcg_gpu_cudagraph_bsr(
     r_static.copy_(b_gpu)
     z_static.copy_(M_sparse_bsr @ r_static)
     p_static.copy_(z_static)
-    rho_static.fill_((r_static * z_static).sum())
+    rho_static.copy_((r_static * z_static).sum())
 
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
@@ -1254,6 +1260,7 @@ def pcg_gpu_cudagraph_matrix_free(
     max_iter=500,
     device=None,
     check_freq=3,
+    acc_dtype=None,
 ):
     """
     Matrix-free PCG ``z = M @ r`` with one iteration captured in a CUDA Graph (``torch.cuda.CUDAGraph``).
@@ -1271,27 +1278,29 @@ def pcg_gpu_cudagraph_matrix_free(
     if device.type != "cuda":
         raise ValueError("pcg_gpu_cudagraph_matrix_free requires CUDA")
 
-    dtype = b_gpu.dtype
+    vec_dtype = b_gpu.dtype
+    if acc_dtype is None:
+        acc_dtype = vec_dtype
     x_static = torch.zeros_like(b_gpu)
     r_static = b_gpu.clone()
     z_static = torch.zeros_like(b_gpu)
     apply_precond_into(r_static, z_static)
     p_static = z_static.clone()
-    rho_static = torch.zeros(1, device=device, dtype=dtype)
-    rho_static.fill_((r_static * z_static).sum())
+    rho_static = torch.zeros(1, device=device, dtype=acc_dtype)
+    rho_static.copy_((r_static * z_static).sum())
 
     tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
 
     def one_iter():
         Ap = A_gpu @ p_static
-        pAp = (p_static * Ap).sum()
-        alpha = rho_static / pAp
+        pAp = (p_static * Ap).sum().to(acc_dtype)
+        alpha = (rho_static / pAp).to(vec_dtype)
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
         apply_precond_into(r_static, z_static)
-        rho_new = (r_static * z_static).sum()
-        beta = rho_new / rho_static
-        rho_static.fill_(rho_new)
+        rho_new = (r_static * z_static).sum().to(acc_dtype)
+        beta = (rho_new / rho_static).to(vec_dtype)
+        rho_static.copy_(rho_new)
         p_static.mul_(beta).add_(z_static)
 
     n = int(b_gpu.shape[0])
@@ -1327,6 +1336,7 @@ def pcg_gpu_cudagraph_matrix_free(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
 
     # ``one_iter`` ran once during capture; restore true PCG initial state before replay.
@@ -1334,7 +1344,7 @@ def pcg_gpu_cudagraph_matrix_free(
     r_static.copy_(b_gpu)
     apply_precond_into(r_static, z_static)
     p_static.copy_(z_static)
-    rho_static.fill_((r_static * z_static).sum())
+    rho_static.copy_((r_static * z_static).sum())
 
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
@@ -1362,6 +1372,7 @@ def pcg_gpu_compiled_bsr(
     max_iter=500,
     device=None,
     check_freq=3,
+    acc_dtype=None,
     *,
     compile_mode: str = "reduce-overhead",
 ):
@@ -1375,27 +1386,29 @@ def pcg_gpu_compiled_bsr(
     if device.type not in ("cuda", "mps"):
         raise ValueError("pcg_gpu_compiled_bsr requires CUDA or MPS")
 
-    dtype = b_gpu.dtype
+    vec_dtype = b_gpu.dtype
+    if acc_dtype is None:
+        acc_dtype = vec_dtype
     x_static = torch.zeros_like(b_gpu)
     r_static = b_gpu.clone()
     z_static = torch.zeros_like(b_gpu)
     z_static.copy_(M_sparse_bsr @ r_static)
     p_static = z_static.clone()
-    rho_static = torch.zeros(1, device=device, dtype=dtype)
-    rho_static.fill_((r_static * z_static).sum())
+    rho_static = torch.zeros(1, device=device, dtype=acc_dtype)
+    rho_static.copy_((r_static * z_static).sum())
 
     tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
 
     def one_iter():
         Ap = A_gpu @ p_static
-        pAp = (p_static * Ap).sum()
-        alpha = rho_static / pAp
+        pAp = (p_static * Ap).sum().to(acc_dtype)
+        alpha = (rho_static / pAp).to(vec_dtype)
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
         z_static.copy_(M_sparse_bsr @ r_static)
-        rho_new = (r_static * z_static).sum()
-        beta = rho_new / rho_static
-        rho_static.fill_(rho_new)
+        rho_new = (r_static * z_static).sum().to(acc_dtype)
+        beta = (rho_new / rho_static).to(vec_dtype)
+        rho_static.copy_(rho_new)
         p_static.mul_(beta).add_(z_static)
 
     n = int(b_gpu.shape[0])
@@ -1423,6 +1436,7 @@ def pcg_gpu_compiled_bsr(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
 
     try:
@@ -1431,7 +1445,7 @@ def pcg_gpu_compiled_bsr(
             r_static.copy_(b_gpu)
             z_static.copy_(M_sparse_bsr @ r_static)
             p_static.copy_(z_static)
-            rho_static.fill_((r_static * z_static).sum())
+            rho_static.copy_((r_static * z_static).sum())
             one_iter_compiled()
     except Exception as e:
         warnings.warn(
@@ -1447,13 +1461,14 @@ def pcg_gpu_compiled_bsr(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
 
     x_static.zero_()
     r_static.copy_(b_gpu)
     z_static.copy_(M_sparse_bsr @ r_static)
     p_static.copy_(z_static)
-    rho_static.fill_((r_static * z_static).sum())
+    rho_static.copy_((r_static * z_static).sum())
 
     _timer = _GpuElapsedTimer(device)
     _timer.start()
@@ -1477,6 +1492,7 @@ def pcg_gpu_compiled_matrix_free(
     max_iter=500,
     device=None,
     check_freq=3,
+    acc_dtype=None,
     *,
     compile_mode: str = "reduce-overhead",
 ):
@@ -1489,27 +1505,29 @@ def pcg_gpu_compiled_matrix_free(
     if device.type not in ("cuda", "mps"):
         raise ValueError("pcg_gpu_compiled_matrix_free requires CUDA or MPS")
 
-    dtype = b_gpu.dtype
+    vec_dtype = b_gpu.dtype
+    if acc_dtype is None:
+        acc_dtype = vec_dtype
     x_static = torch.zeros_like(b_gpu)
     r_static = b_gpu.clone()
     z_static = torch.zeros_like(b_gpu)
     apply_precond_into(r_static, z_static)
     p_static = z_static.clone()
-    rho_static = torch.zeros(1, device=device, dtype=dtype)
-    rho_static.fill_((r_static * z_static).sum())
+    rho_static = torch.zeros(1, device=device, dtype=acc_dtype)
+    rho_static.copy_((r_static * z_static).sum())
 
     tol_sq_val = (tol * tol) * (b_gpu * b_gpu).sum().item()
 
     def one_iter():
         Ap = A_gpu @ p_static
-        pAp = (p_static * Ap).sum()
-        alpha = rho_static / pAp
+        pAp = (p_static * Ap).sum().to(acc_dtype)
+        alpha = (rho_static / pAp).to(vec_dtype)
         x_static.add_(p_static * alpha)
         r_static.sub_(Ap * alpha)
         apply_precond_into(r_static, z_static)
-        rho_new = (r_static * z_static).sum()
-        beta = rho_new / rho_static
-        rho_static.fill_(rho_new)
+        rho_new = (r_static * z_static).sum().to(acc_dtype)
+        beta = (rho_new / rho_static).to(vec_dtype)
+        rho_static.copy_(rho_new)
         p_static.mul_(beta).add_(z_static)
 
     n = int(b_gpu.shape[0])
@@ -1542,6 +1560,7 @@ def pcg_gpu_compiled_matrix_free(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
 
     try:
@@ -1550,7 +1569,7 @@ def pcg_gpu_compiled_matrix_free(
             r_static.copy_(b_gpu)
             apply_precond_into(r_static, z_static)
             p_static.copy_(z_static)
-            rho_static.fill_((r_static * z_static).sum())
+            rho_static.copy_((r_static * z_static).sum())
             one_iter_compiled()
     except Exception as e:
         warnings.warn(
@@ -1571,13 +1590,14 @@ def pcg_gpu_compiled_matrix_free(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
 
     x_static.zero_()
     r_static.copy_(b_gpu)
     apply_precond_into(r_static, z_static)
     p_static.copy_(z_static)
-    rho_static.fill_((r_static * z_static).sum())
+    rho_static.copy_((r_static * z_static).sum())
 
     _timer = _GpuElapsedTimer(device)
     _timer.start()
@@ -1601,14 +1621,14 @@ def _effective_pcg_gpu_backend(device: torch.device, backend: str) -> str:
 
 
 def _resolve_gpu_pcg_backend(
-    device: torch.device, user_backend: str, gpu_pcg_fp64: bool, leafonly_pcg: str
+    device: torch.device, user_backend: str, pcg_prec: str, leafonly_pcg: str
 ) -> str:
     """
-    Float64 PCG with float32 BSR ``M`` needs a Python-side cast wrapper; CUDAGraph/compile capture assumes
-    homogeneous dtypes inside one_iter. Fall back to eager for ``bsr`` when ``gpu_pcg_fp64``.
+    Full float64 PCG with float32 BSR ``M`` needs a Python-side cast wrapper that breaks graph capture.
+    Mixed/f32 precision keeps vectors float32 so BSR output matches directly — no fallback needed.
     """
     eff = _effective_pcg_gpu_backend(device, user_backend)
-    if gpu_pcg_fp64 and leafonly_pcg == "bsr" and eff in ("cudagraph", "compile"):
+    if pcg_prec == "f64" and leafonly_pcg == "bsr" and eff in ("cudagraph", "compile"):
         return "eager"
     return eff
 
@@ -1623,6 +1643,7 @@ def _dispatch_pcg_matrix_free_gpu(
     max_iter: int,
     device: torch.device,
     check_freq: int,
+    acc_dtype=None,
 ):
     """CUDA: ``cudagraph`` | ``compile`` | ``eager``. MPS: ``cudagraph``/``compile`` → compiled iter; ``eager`` → ``pcg_gpu``."""
     eff = _effective_pcg_gpu_backend(device, backend)
@@ -1635,6 +1656,7 @@ def _dispatch_pcg_matrix_free_gpu(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
     if eff == "compile":
         return pcg_gpu_compiled_matrix_free(
@@ -1645,6 +1667,7 @@ def _dispatch_pcg_matrix_free_gpu(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
 
     def _apply_alloc(r: torch.Tensor) -> torch.Tensor:
@@ -1659,6 +1682,7 @@ def _dispatch_pcg_matrix_free_gpu(
         max_iter=max_iter,
         device=device,
         check_freq=check_freq,
+        acc_dtype=acc_dtype,
     )
 
 
@@ -1672,6 +1696,7 @@ def _dispatch_pcg_bsr_gpu(
     max_iter: int,
     device: torch.device,
     check_freq: int,
+    acc_dtype=None,
 ):
     eff = _effective_pcg_gpu_backend(device, backend)
     if device.type == "cuda" and eff == "cudagraph":
@@ -1683,6 +1708,7 @@ def _dispatch_pcg_bsr_gpu(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
     if eff == "compile":
         return pcg_gpu_compiled_bsr(
@@ -1693,6 +1719,7 @@ def _dispatch_pcg_bsr_gpu(
             max_iter=max_iter,
             device=device,
             check_freq=check_freq,
+            acc_dtype=acc_dtype,
         )
     return pcg_gpu(
         A_gpu,
@@ -1702,6 +1729,7 @@ def _dispatch_pcg_bsr_gpu(
         max_iter=max_iter,
         device=device,
         check_freq=check_freq,
+        acc_dtype=acc_dtype,
     )
 
 
@@ -1995,17 +2023,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--gpu-pcg-fp64",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "GPU PCG (A, b, x, r, p, Ap) in float64 (default on CUDA); LeafOnly / Jacobi preconditioner stays float32. "
-            "Use --no-gpu-pcg-fp64 for float32 PCG (faster on well-conditioned data). "
-            "MPS always uses float32 PCG (float64 is not supported). "
-            "With --leafonly-pcg bsr, mixed precision uses eager PCG (not CUDAGraph)."
-        ),
-    )
-    parser.add_argument(
         "--off-diag-dense-attn",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2058,11 +2075,17 @@ def main():
         metavar="PATH",
         help="Leaf-only checkpoint .bytes. Default: leaf_only_weights.bytes next to InspectModel.py.",
     )
+    parser.add_argument(
+        "--pcg-precision",
+        choices=["f32", "mixed", "f64"],
+        default="f64",
+        help="GPU PCG precision: f32 (all float32), mixed (float32 vectors + float64 accumulators), "
+             "f64 (all float64). Default: mixed on CUDA, f32 on CPU/MPS.",
+    )
     args = parser.parse_args()
     test_only = bool(args.test_only)
     fast_plot = bool(getattr(args, "fast_plot", False))
     pcg_cuda_backend = str(getattr(args, "pcg_cuda_backend", "cudagraph"))
-    gpu_pcg_fp64 = bool(getattr(args, "gpu_pcg_fp64", True))
 
     def _info(*a, **k):
         if not test_only:
@@ -2103,11 +2126,6 @@ def main():
     if device.type == "mps":
         # Fewer .item() / host syncs per solve than K=3; major win vs CUDA Graph + CUDA events.
         check_freq = max(check_freq, 10)
-        if gpu_pcg_fp64:
-            gpu_pcg_fp64 = False
-            _info(
-                "  MPS: using float32 GPU PCG (same as --no-gpu-pcg-fp64); MPS does not support float64 tensors."
-            )
 
     _info(f"Loading data from {data_folder}")
     dataset = FluidGraphDataset([Path(data_folder)])
@@ -2383,8 +2401,14 @@ def main():
     b_np = b_np / (np.linalg.norm(b_np) + 1e-12)
     b_np = b_np.reshape(-1, 1)
 
-    pcg_elem_dtype = torch.float64 if gpu_pcg_fp64 else torch.float32
-    _np_pcg = np.float64 if gpu_pcg_fp64 else np.float32
+    _prec_arg = getattr(args, "pcg_precision", None)
+    if _prec_arg is None:
+        pcg_prec = "mixed" if device.type == "cuda" else "f32"
+    else:
+        pcg_prec = _prec_arg
+    pcg_elem_dtype = torch.float64 if pcg_prec == "f64" else torch.float32
+    pcg_acc_dtype = torch.float64 if pcg_prec in ("f64", "mixed") else torch.float32
+    _np_pcg = np.float64 if pcg_prec == "f64" else np.float32
     A_scipy_csr = csr_matrix(A_viz_n.astype(_np_pcg))
 
     precond_s = precond_out.detach().contiguous()
@@ -2395,18 +2419,16 @@ def main():
     leaf_rel_res = float("nan")
     with torch.inference_mode():
         pcg_gpu_backend_eff = _resolve_gpu_pcg_backend(
-            device, pcg_cuda_backend, gpu_pcg_fp64, str(args.leafonly_pcg)
+            device, pcg_cuda_backend, pcg_prec, str(args.leafonly_pcg)
         )
         A_gpu = _build_A_gpu_laplacian(
             A_scipy_csr, A_viz_n, viz_n, device, dtype=pcg_elem_dtype
         )
         b_gpu = torch.from_numpy(b_np).to(device=device, dtype=pcg_elem_dtype).contiguous()
-        if gpu_pcg_fp64:
-            _info(
-                "  GPU PCG: float64 A,b and iterates (matches CPU PCG numerics); "
-                "LeafOnly preconditioner stays float32 (cast r→float32, z→float64)."
-            )
-
+        if pcg_prec == "mixed":
+            _info("  GPU PCG: mixed precision — float32 vectors, float64 scalar accumulators (rho, alpha, beta).")
+        elif pcg_prec == "f64":
+            _info("  GPU PCG: float64 A,b and iterates; LeafOnly/Jacobi preconditioner stays float32.")
         if device.type in ("cuda", "mps"):
 
             def _apply_none_into(r: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -2422,6 +2444,7 @@ def main():
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=check_freq,
+                acc_dtype=pcg_acc_dtype,
             )
             _inv_jac_np = 1.0 / np.maximum(np.abs(np.diag(A_f64).astype(np.float64)), 1e-30)
             _inv_jac = _inv_jac_np.astype(_np_pcg)
@@ -2440,6 +2463,7 @@ def main():
                 max_iter=pcg_max_iter,
                 device=device,
                 check_freq=check_freq,
+                acc_dtype=pcg_acc_dtype,
             )
             _eff_be = pcg_gpu_backend_eff
             _gpu_pcg_desc_map = {
@@ -2480,7 +2504,7 @@ def main():
                 else ""
             )
             + (f"; resolved_backend={pcg_gpu_backend_eff}" if pcg_gpu_backend_eff != pcg_cuda_backend else "")
-            + ("; elem=float64" if gpu_pcg_fp64 else "")
+            + {"f64": "; elem=float64", "mixed": "; elem=float32/acc=float64", "f32": ""}.get(pcg_prec, "")
         )
         if test_only:
             print(
@@ -2505,7 +2529,7 @@ def main():
             verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
 
             if device.type in ("cuda", "mps"):
-                if gpu_pcg_fp64:
+                if pcg_prec == "f64":
                     bsr_r_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
 
                     def _apply_bsr_fp64(r: torch.Tensor) -> torch.Tensor:
@@ -2522,6 +2546,7 @@ def main():
                         max_iter=pcg_max_iter,
                         device=device,
                         check_freq=check_freq,
+                        acc_dtype=pcg_acc_dtype,
                     )
                     _bsr_be = "eager (fp64 PCG + fp32 BSR M·r)"
                 else:
@@ -2534,6 +2559,7 @@ def main():
                         max_iter=pcg_max_iter,
                         device=device,
                         check_freq=check_freq,
+                        acc_dtype=pcg_acc_dtype,
                     )
                     _bsr_be = {"cudagraph": "CUDAGraph", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
                         pcg_gpu_backend_eff,
@@ -2570,7 +2596,7 @@ def main():
             )
             warmup_hmatrix_prolong_gpu(device)
 
-            if gpu_pcg_fp64:
+            if pcg_prec == "f64":
                 pcg_r_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
                 pcg_z_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
 
@@ -2614,6 +2640,7 @@ def main():
                     max_iter=pcg_max_iter,
                     device=device,
                     check_freq=check_freq,
+                    acc_dtype=pcg_acc_dtype,
                 )
                 _mf_be = {"cudagraph": "CUDAGraph replay", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
                     pcg_gpu_backend_eff,

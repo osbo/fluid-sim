@@ -7,7 +7,7 @@ from leafonly.eval import evaluate_estimator_variance, evaluate_gradient_interfe
 from leafonly.train import train_leaf_only as _train_leaf_only_impl
 
 # Single source of truth for InspectModel.py and training CLI (default, help, checkpoint errors).
-DEFAULT_USE_HIGHWAYS = False
+DEFAULT_USE_HIGHWAYS = True
 
 USE_HIGHWAYS_HELP = (
     "Use highway + global DC features in each Transformer FFN: concat 4×d_model "
@@ -45,12 +45,12 @@ def _build_parser():
         ),
     )
     parser.add_argument("--steps", type=int, default=50000)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument(
         "--num-layers",
         type=int,
-        default=1,
+        default=3,
         help="Transformer depth: number of diagonal-leaf blocks and H-off blocks (each stack). Checkpoint must match.",
     )
     parser.add_argument("--num-heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
@@ -60,6 +60,14 @@ def _build_parser():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--contexts-per-step", type=int, default=4, help="Gradient accumulation: number of random cached contexts per optimizer step.")
     parser.add_argument("--continue-training", action="store_true", help="Load initial weights from the saved .bytes file and continue training from that state.")
+    parser.add_argument(
+        "--grad-mags",
+        action="store_true",
+        help=(
+            "On each loss log line (every 100 steps): print per-module L2 grad norms (gTot, gDiag0, …). "
+            "When omitted, skip those prints and skip extra device sync used only for those metrics."
+        ),
+    )
     parser.add_argument(
         "--rebuild-context-cache",
         action="store_true",
@@ -119,6 +127,15 @@ def _build_parser():
         help=(
             "On the same step as the detailed timing breakdown (step 300), run torch.profiler around "
             "loss.backward() only and print top CUDA kernels (self time vs total time). CUDA only."
+        ),
+    )
+    parser.add_argument(
+        "--loss-mode",
+        type=str,
+        choices=("hutchinson",),
+        default="hutchinson",
+        help=(
+            "Training loss. Only hutchinson is supported: cosine-similarity Hutchinson probe loss."
         ),
     )
     parser.add_argument(

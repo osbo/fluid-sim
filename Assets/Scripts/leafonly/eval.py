@@ -1,6 +1,6 @@
 import random
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -554,6 +554,52 @@ def leafonly_grad_param_groups(model: LeafOnlyNet, num_blocks: Optional[int] = N
     g["Global node V linear"] = lambda m: list(m.node_v.parameters())
     g["Jacobi params"] = lambda m: list(m.jacobi_gate.parameters())
     return g
+
+
+def _grad_l2_norm_params(params, device: torch.device) -> float:
+    """L2 norm of gradients for a disjoint parameter list (same definition as training log gTot on that subset)."""
+    total = torch.tensor(0.0, device=device)
+    for p in params:
+        if p.grad is not None:
+            total += p.grad.data.pow(2).sum()
+    return float(total.sqrt().item())
+
+
+def _leafonly_grad_log_key(group_name: str) -> str:
+    """Short metric name for training logs; labels match ``leafonly_grad_param_groups`` keys."""
+    if group_name == "Lift (linear 0)":
+        return "gLift0"
+    if group_name == "Lift (linear 2)":
+        return "gLift2"
+    if group_name == "Embedding LayerNorm":
+        return "gEmbLn"
+    if group_name == "Encoder input projection":
+        return "gEnc"
+    if group_name == "Diagonal Leaf Head":
+        return "gL"
+    if group_name == "Off-diag U/V heads":
+        return "gOffUV"
+    if group_name == "Global node U linear":
+        return "gNU"
+    if group_name == "Global node V linear":
+        return "gNV"
+    if group_name == "Jacobi params":
+        return "gJac"
+    if group_name.startswith("GCN layer "):
+        return f"gGCN{group_name.split()[-1]}"
+    if group_name.startswith("Off-diag Transformer block "):
+        return f"gOffTf{group_name.split()[-1]}"
+    if group_name.startswith("Transformer block "):
+        return f"gDiag{group_name.split()[-1]}"
+    return "g_" + group_name.replace(" ", "_")[:24]
+
+
+def leafonly_grad_norms_by_group(model: LeafOnlyNet, device: torch.device) -> List[Tuple[str, float]]:
+    """
+    Per-submodule L2 grad norms in forward-path order (disjoint partition of ``model.parameters()``).
+    """
+    groups = leafonly_grad_param_groups(model)
+    return [(_leafonly_grad_log_key(name), _grad_l2_norm_params(fn(model), device)) for name, fn in groups.items()]
 
 
 def _float_tensor_distribution_stats(t: torch.Tensor):

@@ -1517,7 +1517,7 @@ def build_sparse_bsr_preconditioner(
 
     if cache_key not in _BSR_TOPOLOGY_CACHE:
         E = int(all_indices.shape[1])
-        dummy_vals = torch.arange(E, device=device, dtype=torch.float64)
+        dummy_vals = torch.arange(E, device=device, dtype=torch.float32)
         dummy_coo = torch.sparse_coo_tensor(all_indices, dummy_vals, (N, N), device=device).coalesce()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)

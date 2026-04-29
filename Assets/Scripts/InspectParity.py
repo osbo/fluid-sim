@@ -723,12 +723,6 @@ def main() -> None:
         metavar="K",
         help="Forwarded to InspectModel --pcg-check-freq when using --pcg.",
     )
-    p.add_argument(
-        "--pcg-gpu-fp64",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Forwarded to InspectModel --gpu-pcg-fp64 / --no-gpu-pcg-fp64 when using --pcg (MPS forces float32).",
-    )
     args = p.parse_args()
     if args.inputs_parity_only:
         args.print_unity_inputs = True
@@ -1027,10 +1021,6 @@ def _run_inspect_model_pcg_subprocess(
         "--pcg-check-freq",
         str(args.pcg_check_freq),
     ]
-    if args.pcg_gpu_fp64:
-        cmd.append("--gpu-pcg-fp64")
-    else:
-        cmd.append("--no-gpu-pcg-fp64")
     cmd.append("--off-diag-dense-attn")
     cmd.append("--diag-dense-attn")
     print(f"[LeafOnlyParity] phase=pytorch pcg_subprocess={' '.join(cmd)}")
