@@ -19,10 +19,17 @@ public partial class FluidSimulator : MonoBehaviour
 {
     BoxCollider simulationBounds;
     BoxCollider fluidInitialBounds;
+    BoxCollider fluidSecondBounds;
     [Tooltip("Optional mesh whose interior defines the fluid spawn volume. If unset, falls back to the Fluid Initial Bounds box.")]
     public MeshFilter fluidInitialMesh;
     [Tooltip("Initial velocity applied to all spawned particles.")]
     public Vector3 initialVelocity = Vector3.zero;
+
+    [Header("Multiphase")]
+    [Tooltip("Density of the primary fluid (kg/m³). Particles outside the second-fluid region use this value.")]
+    public float baseDensity = 1.0f;
+    [Tooltip("Density ratio: secondary fluid density = baseDensity * densityRatio.")]
+    public float densityRatio = 10.0f;
 
     ComputeShader radixSortShader;
     ComputeShader particlesShader;
@@ -163,6 +170,8 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer uniformActiveMortonListBuffer;
     private ComputeBuffer uniformActiveNodeCountBuffer;
     private ComputeBuffer uniformNodeAccumBuffer; // 7 * kSplatStripes * maxNodesCapacity uints (see UniformGrid.compute)
+    private ComputeBuffer nodeDensityBuffer;      // float per node: P2G-averaged fluid density
+    private ComputeBuffer uniformDensityAccumBuffer; // uint per node: scaled-int density accumulator for uniform grid
 
     public const int UniformNeighborSlotCount = 6;
     public const int UniformMatrixSlotCount = 7;
@@ -194,6 +203,9 @@ public partial class FluidSimulator : MonoBehaviour
     public ComputeBuffer PhiBuffer => phiBuffer;
     public int NumNodes => numNodes;
     public int NumParticlesForRender => numParticles;
+
+    public ComputeBuffer NodeDensityBuffer => nodeDensityBuffer;
+    public ComputeBuffer UniformDensityAccumBuffer => uniformDensityAccumBuffer;
 
     public ComputeBuffer UniformCellCountsBuffer => uniformCellCountsBuffer;
     public ComputeBuffer UniformDenseIndexMapBuffer => uniformDenseIndexMapBuffer;
@@ -353,6 +365,7 @@ public partial class FluidSimulator : MonoBehaviour
         public Vector3 position;    // 12 bytes
         public Vector3 velocity;    // 12 bytes
         public uint mortonCode;     // 4 bytes
+        public float density;       // 4 bytes
     }
 
     // Node struct (must match compute shader)
@@ -454,6 +467,12 @@ public partial class FluidSimulator : MonoBehaviour
             var go = GameObject.Find("Fluid Initial Bounds");
             if (go != null)
                 fluidInitialBounds = go.GetComponent<BoxCollider>();
+        }
+        if (fluidSecondBounds == null)
+        {
+            var go = GameObject.Find("Fluid Second Bounds");
+            if (go != null)
+                fluidSecondBounds = go.GetComponent<BoxCollider>();
         }
         if (collidersRoot == null)
         {
@@ -1162,7 +1181,7 @@ public partial class FluidSimulator : MonoBehaviour
 
         // Create particle buffer
         particlesBuffer?.Release();
-        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint));
+        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(float));
         particlesCPU = new Particle[numParticles];
 
         // Compute sim-space transform: world → 0..1023 on each axis
@@ -1251,6 +1270,24 @@ public partial class FluidSimulator : MonoBehaviour
         initialPositionsBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3);
         initialPositionsBuffer.SetData(simPositions);
 
+        // Compute second-bounds in sim space (same convention as fluidInitialBoundsMin/Max)
+        bool hasSecond = fluidSecondBounds != null;
+        Vector3 secondBoundsMin = hasSecond
+            ? (fluidSecondBounds.bounds.min - simulationBounds.bounds.min)
+            : Vector3.zero;
+        Vector3 secondBoundsMax = hasSecond
+            ? (fluidSecondBounds.bounds.max - simulationBounds.bounds.min)
+            : Vector3.zero;
+        // Convert from world offsets to sim-space Morton coordinates (0–1023)
+        Vector3 secondSimMin = new Vector3(
+            secondBoundsMin.x * mortonNormalizationFactor.x,
+            secondBoundsMin.y * mortonNormalizationFactor.y,
+            secondBoundsMin.z * mortonNormalizationFactor.z);
+        Vector3 secondSimMax = new Vector3(
+            secondBoundsMax.x * mortonNormalizationFactor.x,
+            secondBoundsMax.y * mortonNormalizationFactor.y,
+            secondBoundsMax.z * mortonNormalizationFactor.z);
+
         // Dispatch init kernel
         particlesShader.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetBuffer(initializeParticlesKernel, "initialPositionsBuffer", initialPositionsBuffer);
@@ -1263,6 +1300,11 @@ public partial class FluidSimulator : MonoBehaviour
         particlesShader.SetVector("simulationSize", simulationSize);
         particlesShader.SetVector("mortonNormalizationFactor", mortonNormalizationFactor);
         particlesShader.SetFloat("mortonMaxValue", mortonMaxValue);
+        particlesShader.SetFloat("baseDensity", baseDensity);
+        particlesShader.SetFloat("secondDensity", baseDensity * densityRatio);
+        particlesShader.SetVector("fluidSecondBoundsMin", secondSimMin);
+        particlesShader.SetVector("fluidSecondBoundsMax", secondSimMax);
+        particlesShader.SetInt("hasSecondFluid", hasSecond ? 1 : 0);
         int threadGroups = Mathf.CeilToInt(numParticles / 512.0f);
         particlesShader.Dispatch(initializeParticlesKernel, threadGroups, 1, 1);
 
@@ -1298,6 +1340,8 @@ public partial class FluidSimulator : MonoBehaviour
         reverseNeighborsBuffer?.Release();
         diffusionGradientBuffer?.Release();
         particlePrefixElementCountBuffer?.Release();
+        nodeDensityBuffer?.Release();
+        uniformDensityAccumBuffer?.Release();
 
         indicators = new ComputeBuffer(prefixCapacity, sizeof(uint));
         prefixSums = new ComputeBuffer(prefixCapacity, sizeof(uint));
@@ -1317,6 +1361,8 @@ public partial class FluidSimulator : MonoBehaviour
         reverseNeighborsBuffer = new ComputeBuffer(maxNodesCapacity * 24, sizeof(uint));
         diffusionGradientBuffer = new ComputeBuffer(maxNodesCapacity, sizeof(float) * 3);
         particlePrefixElementCountBuffer = new ComputeBuffer(1, sizeof(uint));
+        nodeDensityBuffer = new ComputeBuffer(maxNodesCapacity, sizeof(float));
+        uniformDensityAccumBuffer = new ComputeBuffer(maxNodesCapacity, sizeof(uint));
 
         // Pre-allocate solver buffers to max capacity so SolvePressure never resizes mid-frame.
         int solverCap = Mathf.NextPowerOfTwo(Mathf.Max(maxNodesCapacity, 512));

@@ -11,6 +11,7 @@ struct Particle
     float3 position;   // 3-component position vector
     float3 velocity;   // float face velocities
     uint mortonCode;   // Morton code for spatial indexing
+    float density;     // fluid density (kg/m^3) for multiphase
 };
 
 struct faceVelocities
@@ -186,6 +187,13 @@ StructuredBuffer<uint> nodeCountBuffer; // [0] = numNodes (GPU-driven, no CPU re
 uint numParticles;
 uint maxLayer;
 
+// Multiphase parameters
+float baseDensity;
+float secondDensity;
+float3 fluidSecondBoundsMin;
+float3 fluidSecondBoundsMax;
+uint hasSecondFluid;
+
 // GridMode.Uniform: O(1) cell → node via dense map (same fold as UniformGrid.compute).
 static const uint kUgEmptyCell = 0xFFFFFFFFu;
 StructuredBuffer<uint> uniformDenseIndexMap;
@@ -210,6 +218,18 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     particle.position   = initialPositionsBuffer[index];
     particle.velocity   = initialVelocity;
     particle.mortonCode = EncodeMorton3D((uint3)particle.position);
+
+    float d = baseDensity;
+    if (hasSecondFluid != 0u)
+    {
+        float3 p = particle.position;
+        if (p.x >= fluidSecondBoundsMin.x && p.x <= fluidSecondBoundsMax.x &&
+            p.y >= fluidSecondBoundsMin.y && p.y <= fluidSecondBoundsMax.y &&
+            p.z >= fluidSecondBoundsMin.z && p.z <= fluidSecondBoundsMax.z)
+            d = secondDensity;
+    }
+    particle.density = d;
+
     particlesBuffer[index] = particle;
 }
 

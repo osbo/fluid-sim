@@ -22,6 +22,7 @@ struct Particle
     float3 position;    // 3-component position vector
     float3 velocity;    // float face velocities
     uint mortonCode;    // Morton code for spatial indexing
+    float density;      // fluid density for multiphase
 };
 
 struct faceVelocities

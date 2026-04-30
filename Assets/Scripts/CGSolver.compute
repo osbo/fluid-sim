@@ -68,6 +68,7 @@ StructuredBuffer<uint> reductionCountBuffer;
 uint numNodesCapacity; // fixed SoA stride for neighborsBuffer AND matrixABuffer
 float a;
 float deltaTime;
+StructuredBuffer<float> nodeDensityBuffer; // float per node: P2G-averaged fluid density (for multiphase)
 
 // Ghost-fluid / SDF support
 StructuredBuffer<float> solidSDFBuffer; // signed dist in sim units (negative = inside solid)
@@ -149,6 +150,7 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
 
     Node node = nodesBuffer[i];
     float dx_i = exp2((float)node.layer);
+    float rho_i = nodeDensityBuffer[i];
     float diagonal = 0.0;
     
     // Initialize off-diagonals to 0
@@ -185,7 +187,7 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
             float denom = phi_i - phi_j;
             float theta = (denom > 1e-4f) ? saturate(phi_i / denom) : 1.0f;
             theta = max(theta, 0.02f); // avoid near-zero theta causing huge pressure gradients
-            float weight = (dx_i * dx_i / max(0.5f * dx_i, 1e-6f)) * deltaTime * theta;
+            float weight = (dx_i * dx_i / max(0.5f * dx_i, 1e-6f)) * deltaTime / max(rho_i, 1e-4f) * theta;
             diagonal += weight;
             continue;
         }
@@ -196,10 +198,12 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
             // We cannot access neighborsBuffer here for properties, must read nodesBuffer
             Node nNode = nodesBuffer[neighbor_idx];
             float dx_j = exp2((float)nNode.layer);
-            
+            float rho_j = nodeDensityBuffer[neighbor_idx];
+            float rho_face = 2.0 * rho_i * rho_j / max(rho_i + rho_j, 1e-4f);
+
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
             float faceArea = dx_i * dx_i;
-            float weight = faceArea / distance;
+            float weight = faceArea / distance / max(rho_face, 1e-4f);
 
             // Apply time step scaling immediately
             weight *= deltaTime;
@@ -229,8 +233,10 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
                 {
                     Node cNode = nodesBuffer[child_idx];
                     float dx_k = exp2((float)cNode.layer);
+                    float rho_k = nodeDensityBuffer[child_idx];
+                    float rho_face_k = 2.0 * rho_i * rho_k / max(rho_i + rho_k, 1e-4f);
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    float weight = (childFaceArea / distance) * deltaTime;
+                    float weight = (childFaceArea / distance / max(rho_face_k, 1e-4f)) * deltaTime;
 
                     diagonal += weight;
                     matrixABuffer[(slot + 1) * numNodesCapacity + i] = -weight;
@@ -239,7 +245,7 @@ void BuildMatrixA(uint3 id : SV_DispatchThreadID)
                 {
                     float dx_k = dx_i * 0.5;
                     float distance = max(0.5 * (dx_i + dx_k), 1e-6);
-                    float weight = (childFaceArea / distance) * deltaTime;
+                    float weight = (childFaceArea / distance / max(rho_i, 1e-4f)) * deltaTime;
                     diagonal += weight;
                 }
             }
@@ -262,6 +268,7 @@ void BuildMatrixAUniform(uint3 id : SV_DispatchThreadID)
     Node node = nodesBuffer[i];
     // Single global cell size on the uniform grid (all nodes share uniformGridCellLayer).
     float dx = exp2((float)node.layer);
+    float rho_i = nodeDensityBuffer[i];
     float diagonal = 0.0;
 
     for (int k = 0; k < 6; k++)
@@ -275,8 +282,8 @@ void BuildMatrixAUniform(uint3 id : SV_DispatchThreadID)
     float3 nodeMin = float3((float)(c.x << s), (float)(c.y << s), (float)(c.z << s));
     float3 nodeCenter = nodeMin + float3(0.5, 0.5, 0.5) * dx;
 
-    // (faceArea / distance) * deltaTime = (dx*dx / dx) * deltaTime
-    float wFace = dx * deltaTime;
+    // Base face weight without density: (faceArea / distance) * deltaTime = dx * deltaTime
+    float wFaceBase = dx * deltaTime;
 
     for (int d = 0; d < 6; d++)
     {
@@ -292,19 +299,23 @@ void BuildMatrixAUniform(uint3 id : SV_DispatchThreadID)
             float denom = phi_i - phi_j;
             float theta = (denom > 1e-4f) ? saturate(phi_i / denom) : 1.0f;
             theta = max(theta, 0.02f);
-            float weight = (dx * dx / max(0.5f * dx, 1e-6f)) * deltaTime * theta;
+            float weight = (dx * dx / max(0.5f * dx, 1e-6f)) * deltaTime / max(rho_i, 1e-4f) * theta;
             diagonal += weight;
             continue;
         }
 
         if (neighbor_idx < numNodes)
         {
+            float rho_j = nodeDensityBuffer[neighbor_idx];
+            float rho_face = 2.0 * rho_i * rho_j / max(rho_i + rho_j, 1e-4f);
+            float wFace = wFaceBase / max(rho_face, 1e-4f);
             diagonal += wFace;
             uniformMatrixABuffer[(d + 1) * numNodesCapacity + i] = -wFace;
         }
         else
         {
             // Dirichlet air (numNodes, 0xFFFFFFFF, etc.)
+            float wFace = wFaceBase / max(rho_i, 1e-4f);
             diagonal += wFace;
         }
     }
