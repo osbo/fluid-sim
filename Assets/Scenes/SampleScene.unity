@@ -734,12 +734,12 @@ MonoBehaviour:
   phase1ParticleFraction: 0.5
   fluidInitialMesh: {fileID: 1326165321}
   initialVelocity: {x: 0, y: 0, z: 0}
-  baseDensity: 0.1
-  densityRatio: 5
+  baseDensity: 1
+  densityRatio: 0.02
   numParticles: 1048576
   maxCgIterations: 500
   convergenceThreshold: 0.001
-  cgConvergenceCheckInterval: 10
+  cgConvergenceCheckInterval: 5
   gravity: 100
   kinematicViscosity: 0
   flipRatio: 0.9
@@ -1262,8 +1262,8 @@ Transform:
   m_GameObject: {fileID: 1326165318}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -10, y: 15, z: -10}
-  m_LocalScale: {x: 20, y: 30, z: 30}
+  m_LocalPosition: {x: 10, y: 20, z: -10}
+  m_LocalScale: {x: 20, y: 40, z: 30}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
@@ -1374,8 +1374,8 @@ Transform:
   m_GameObject: {fileID: 1328315952}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 10, y: 15, z: -10}
-  m_LocalScale: {x: 20, y: 30, z: 30}
+  m_LocalPosition: {x: -10, y: 20, z: -10}
+  m_LocalScale: {x: 20, y: 40, z: 30}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}

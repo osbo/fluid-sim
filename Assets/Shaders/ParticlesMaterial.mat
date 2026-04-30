@@ -122,7 +122,7 @@ Material:
     - _MinLayer: 5
     - _OcclusionStrength: 1
     - _Parallax: 0.005
-    - _PhaseDensityMid: 0.3
+    - _PhaseDensityMid: 0.51
     - _PointSize: 2
     - _QueueOffset: 0
     - _Radius: 0.049
