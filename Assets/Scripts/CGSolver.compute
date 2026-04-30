@@ -18,6 +18,8 @@
 #pragma kernel AxpyNegAlpha
 #pragma kernel ScaleAddBeta
 #pragma kernel CheckConvergence
+#pragma kernel InitPcgIndirectArgs
+#pragma kernel StoreInitialResidualSq
 #pragma kernel BuildMatrixAUniform
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
@@ -128,13 +130,13 @@ static const float3 kFaceDirs[6] = {
     float3(0,0,-1), float3(0,0,1)
 };
 
-// PCG indirect early-out (see FluidSolver.DispatchIndirect triples in cgPcgIndirectArgsBuffer):
-// [0..2] = SpMV_CSR (256 threads/group), [3..5] = 512-thread kernels, [6..8] = 1-group kernels (reduce/alpha/beta/...)
+// PCG-only indirect args (first 9 uints mirror solverIndirectArgsBuffer[0..8]). CheckConvergence zeros X counts to stop remaining PCG dispatches.
 RWStructuredBuffer<uint> cgIndirectDispatchArgs;
 RWStructuredBuffer<uint> cgPcgIterationStat; // 1-based iteration index when converged; 0 = not stopped this solve
-float convergenceThreshold;
-float initialResidualSq; // GpuDotProduct(r,r) at PCG start; used for blow-up test
-uint pcgLoopK; // 0-based PCG iteration index when convergence check runs
+StructuredBuffer<uint> solverIndirectArgsSrc; // same buffer as main solver indirect; read [0..8] for InitPcgIndirectArgs
+RWStructuredBuffer<float> cgInitialResidualSqBuffer; // [0] = ||r0||^2 at PCG start (after r=b, before first SpMV)
+float convergenceThreshold; // relative L2 target tau: stop when sqrt(r·r)/sqrt(r0·r0) <= tau  <=>  r·r <= tau^2 * ||r0||^2
+uint pcgLoopK; // 0-based PCG iteration index when convergence check runs (completed iteration k)
 
 // Shared memory for dot product reduction (used by DotProduct)
 groupshared float s_data[512];
@@ -653,15 +655,30 @@ void CheckConvergence(uint3 id : SV_DispatchThreadID)
     float r_dot_r = divergenceBuffer[0];
     if (!isfinite(r_dot_r)) r_dot_r = 0.0;
 
-    bool belowTol = (r_dot_r < convergenceThreshold);
-    bool blowUp = (initialResidualSq > 1e-30f) && (r_dot_r > (10.0f * initialResidualSq));
+    float r0sq = cgInitialResidualSqBuffer[0];
+    float tauSq = convergenceThreshold * convergenceThreshold;
+    bool belowTol = (r0sq > 1e-30f) ? (r_dot_r <= tauSq * r0sq) : (r_dot_r <= 1e-30f);
+    bool blowUp = (r0sq > 1e-30f) && (r_dot_r > (10.0f * r0sq));
 
     if (belowTol || blowUp)
     {
         cgIndirectDispatchArgs[0] = 0u;
         cgIndirectDispatchArgs[3] = 0u;
         cgIndirectDispatchArgs[6] = 0u;
-        // 1-based count matches lastCgIterations (k=0 -> first iter done -> 1)
         cgPcgIterationStat[0] = pcgLoopK + 1u;
     }
+}
+
+[numthreads(1, 1, 1)]
+void InitPcgIndirectArgs(uint3 id : SV_DispatchThreadID)
+{
+    for (uint i = 0u; i < 9u; i++)
+        cgIndirectDispatchArgs[i] = solverIndirectArgsSrc[i];
+    cgPcgIterationStat[0] = 0u;
+}
+
+[numthreads(1, 1, 1)]
+void StoreInitialResidualSq(uint3 id : SV_DispatchThreadID)
+{
+    cgInitialResidualSqBuffer[0] = divergenceBuffer[0];
 }

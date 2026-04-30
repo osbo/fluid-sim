@@ -1,0 +1,155 @@
+% SIGGRAPH Asia 2026 Technical Papers (Journal / dual-track submission)
+% Format per https://asia.siggraph.org/2026/submissions/technical-papers/
+% Requires acmart.cls version 2.16 or newer (ACM Primary Article Template).
+\documentclass[acmtog,anonymous,review]{acmart}
+
+\citestyle{acmauthoryear}
+
+%% Assigned submission ID from the Linklings form (placeholder).
+\acmSubmissionID{0000}
+
+\setcopyright{none}
+\copyrightyear{2026}
+\acmYear{2026}
+\acmDOI{10.1145/nnnnnnn.nnnnnnn}
+\acmJournal{TOG}
+\acmVolume{45}
+\acmNumber{6}
+\acmArticle{1}
+\acmMonth{12}
+
+\received{30 April 2026}
+\received[revised]{}
+\received[accepted]{}
+
+\begin{document}
+
+\title{Hierarchical Transformer Preconditioning for Real-Time Simulation}
+
+\author{Anonymous Author(s)}
+\affiliation{%
+  \institution{Paper under double-blind review}
+  \country{}}
+
+\renewcommand{\shortauthors}{Anonymous Author(s)}
+
+\begin{abstract}
+  We outline research on hierarchical transformer-based preconditioners for linear systems that arise in time-stepping fluid simulation, with the goal of real-time or interactive performance after amortized training. This submission template follows ACM \texttt{acmtog} instructions for SIGGRAPH Asia Technical Papers; replace this abstract with the final text.
+\end{abstract}
+
+\begin{CCSXML}
+<ccs2012>
+ <concept>
+  <concept_id>10010147.10010341.10010342.10010343</concept_id>
+  <concept_desc>Computing methodologies~Physical simulation</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+</ccs2012>
+\end{CCSXML}
+\ccsdesc[500]{Computing methodologies~Physical simulation}
+
+\keywords{preconditioning, iterative solvers, neural operators, fluid simulation, real-time graphics}
+
+\maketitle
+
+% --- 1. INTRODUCTION ---
+\section{Introduction}
+% Introduce the demand for real-time fluid simulation and the bottleneck of solving SPD linear systems.
+% Discuss the limitations of classical preconditioners (e.g., AMG memory overhead and poor GPU parallelization for setup) and existing neural methods.
+% Introduce your solution: A learning-based Sparse Approximate Inverse (SPAI) preconditioner utilizing a Recursive Hierarchical Transformer.
+% Clearly list your core contributions in a bulleted list (e.g., the architecture, the novel loss function, the real-time performance achievements).
+
+Real-time fluid simulation often reduces to repeatedly solving large, sparse symmetric positive definite linear systems, for example in pressure projection steps~\citep{Lyu2026multigrid}. Classical multigrid and Krylov methods remain strong baselines~\citep{Luz2020learning}, while learning-based approaches have targeted preconditioners and fast surrogate operators~\citep{Li2023learning, Chen2025graph, Yang2025sparse, Xu2025neural}. Hierarchical and low-rank structure appears both in classical fast algorithms and in recent neural architectures for Green's operators and PDE maps~\citep{Fan2019multiscale, Fognini2025neural, Sittoni2026neural, Yang2026lowrank}. Differentiable simulation and inverse problems further motivate fast linear algebra inside optimization loops~\citep{Ma2023neural, Hartland2023hodlr, Li2024neuralfluid, Li2025adjoint}. We develop a learning-based sparse approximate inverse (SPAI) preconditioner built from a recursive hierarchical transformer (\textsc{LeafOnly} architecture) for use inside preconditioned conjugate gradient (PCG) solves.
+
+\begin{itemize}
+  \item \textbf{Architecture.} Recursive hierarchical transformer preconditioner with block tokens, hierarchical attention, GCN layers, and highway connections (Section~\ref{sec:method}).
+  \item \textbf{Training.} Self-supervised objective based on Hutchinson-type estimators (cosine vs.\ $L_2$ variants) for operator quality without paired ground-truth solves.
+  \item \textbf{Performance.} GPU-friendly SPAI structure avoiding triangular solves; target real-time total solve time with reported iteration counts and residuals vs.\ baselines (Jacobi, IC, AMGX, unpreconditioned CG).
+\end{itemize}
+
+% --- 2. RELATED WORK ---
+\section{Related Work}
+% 2.1 Classical Iterative Solvers and Preconditioners (PCG, Jacobi, IC, AMGX)
+\subsection{Classical Iterative Solvers and Preconditioners}
+
+% 2.2 Neural Operators and Machine Learning for Physics (PDE surrogates)
+\subsection{Neural Operators and Machine Learning for Physics}
+
+% 2.3 Learning-Based Preconditioners (Contrast with GNN-based incomplete factorization which struggles with triangular solves on GPUs).
+\subsection{Learning-Based Preconditioners}
+
+% --- 3. BACKGROUND ---
+\section{Background}
+% 3.1 The Conjugate Gradient Method
+\subsection{The Conjugate Gradient Method}
+
+% 3.2 H-Matrix Approximation
+\subsection{\texorpdfstring{$\mathcal{H}$}{H}-Matrix Approximation}
+
+% 3.3 Hutchinson Trace Estimation
+\subsection{Hutchinson Trace Estimation}
+
+% --- 4. METHOD ---
+\section{Method: Recursive Hierarchical Transformer Preconditioner}
+\label{sec:method}
+% Detail the "LeafOnly" architecture. Formalize it mathematically as a Recursive Hierarchical Transformer.
+% 4.1 Feature Representation (Edge features, block tokens)
+\subsection{Feature Representation}
+
+% 4.2 Network Architecture (Detail the hierarchical attention, the GCN layers, and the use of highway connections).
+\subsection{Network Architecture}
+
+% 4.3 Operator Construction (How the network maps to the SPAI structure).
+\subsection{Operator Construction}
+
+% --- 5. TRAINING ---
+\section{Training Methodology}
+% Detail the unsupervised/self-supervised training regime.
+% 5.1 Objective Function (Explain the Cosine Hutchinson vs. L2 Hutchinson formulations).
+\subsection{Objective Function}
+
+% 5.2 Training Dynamics (Provide insights into loss curves, training times, and equivalent SAI loss).
+\subsection{Training Dynamics}
+
+% --- 6. RESULTS AND EVALUATION ---
+\section{Experiments and Results}
+% Begin by defining the evaluation hardware, datasets, and baseline methods (Unpreconditioned CG, Jacobi, IC, AMGX).
+
+\subsection{Performance and Speedup}
+% Address the real-time constraint. Show the overall time breakdown (Inference vs. Solve time) and iteration reduction.
+% Highlight the benchmark: Total solve times (e.g., 18.72ms vs AMGX 188.48ms) and the exact precision metrics (relative residual).
+
+\subsection{Generalization and Robustness}
+% 6.2.1 Scale and Problem Types: Test in- and out-of-range problem scales.
+\subsubsection{Scale and Problem Types}
+
+% 6.2.2 Contrast Ratios: Evaluate performance across varying material contrast ratios.
+\subsubsection{Contrast Ratios}
+
+% 6.2.3 Precision Limits: Compare speed/accuracy at different floating-point precisions. Identify explicitly where the solver breaks down.
+\subsubsection{Precision Limits}
+
+\subsection{Hardware Efficiency}
+% Profile GPU, Tensor Core, Memory, and Memory Bandwidth utilization. Demonstrate why the sparse structure is GPU-friendly compared to standard AMG.
+
+\subsection{Ablation Studies}
+% Isolate the impact of specific architectural choices:
+% - Network Capacity: Variations in d_model and number of attention layers.
+% - Architectural Components: The impact of use_highways and GCN layers.
+% - Loss Formulation: Impact of Cosine vs. L2 Hutchinson on eigenvalue clustering and condition number.
+
+% --- 7. LIMITATIONS AND FUTURE WORK ---
+\section{Limitations and Future Work}
+% Candidly discuss the boundaries of the method based on your generalization tests (e.g., extreme contrast ratios, specific problem types where the preconditioner fails to converge).
+
+% --- 8. CONCLUSION ---
+\section{Conclusion}
+% Brief wrap-up of how this enables real-time simulation pipelines.
+
+\section*{Acknowledgments}
+Omitted for anonymous review.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,209 @@
+%%% -*-BibTeX-*-
+%%% Do NOT edit. File created by BibTeX with style
+%%% ACM-Reference-Format-Journals [18-Jan-2012].
+
+\begin{thebibliography}{14}
+
+%%% ====================================================================
+%%% NOTE TO THE USER: you can override these defaults by providing
+%%% customized versions of any of these macros before the \bibliography
+%%% command.  Each of them MUST provide its own final punctuation,
+%%% except for \shownote{} and \showURL{}.  The latter two
+%%% do not use final punctuation, in order to avoid confusing it with
+%%% the Web address.
+%%%
+%%% To suppress output of a particular field, define its macro to expand
+%%% to an empty string, or better, \unskip, like this:
+%%%
+%%% \newcommand{\showURL}[1]{\unskip}   % LaTeX syntax
+%%%
+%%% \def \showURL #1{\unskip}           % plain TeX syntax
+%%%
+%%% ====================================================================
+
+\ifx \showCODEN    \undefined \def \showCODEN     #1{\unskip}     \fi
+\ifx \showISBNx    \undefined \def \showISBNx     #1{\unskip}     \fi
+\ifx \showISBNxiii \undefined \def \showISBNxiii  #1{\unskip}     \fi
+\ifx \showISSN     \undefined \def \showISSN      #1{\unskip}     \fi
+\ifx \showLCCN     \undefined \def \showLCCN      #1{\unskip}     \fi
+\ifx \shownote     \undefined \def \shownote      #1{#1}          \fi
+\ifx \showarticletitle \undefined \def \showarticletitle #1{#1}   \fi
+\ifx \showURL      \undefined \def \showURL       {\relax}        \fi
+% The following commands are used for tagged output and should be
+% invisible to TeX
+\providecommand\bibfield[2]{#2}
+\providecommand\bibinfo[2]{#2}
+\providecommand\natexlab[1]{#1}
+\providecommand\showeprint[2][]{arXiv:#2}
+
+\bibitem[Chen(2025)]%
+        {Chen2025graph}
+\bibfield{author}{\bibinfo{person}{Jie Chen}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Graph Neural Preconditioners for Iterative Solutions of Sparse Linear Systems}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2406.00809}} (\bibinfo{year}{2025}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2406.00809}
+\showURL{%
+\tempurl}
+\newblock
+\shownote{Published at {ICLR} 2025.}.
+
+
+\bibitem[Fan et~al\mbox{.}(2019)]%
+        {Fan2019multiscale}
+\bibfield{author}{\bibinfo{person}{Yuwei Fan}, \bibinfo{person}{Lin Lin}, \bibinfo{person}{Lexing Ying}, {and} \bibinfo{person}{Leonardo Zepeda-N{\'u}{\~n}ez}.} \bibinfo{year}{2019}\natexlab{}.
+\newblock \showarticletitle{A Multiscale Neural Network Based on Hierarchical Matrices}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:1807.01883}} (\bibinfo{year}{2019}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/1807.01883}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Fognini et~al\mbox{.}(2025)]%
+        {Fognini2025neural}
+\bibfield{author}{\bibinfo{person}{Emilio~McAllister Fognini}, \bibinfo{person}{Marta~M. Betcke}, {and} \bibinfo{person}{Ben~T. Cox}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Learning {Green's} Operators through Hierarchical Neural Networks Inspired by the Fast Multipole Method}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2509.20591}} (\bibinfo{year}{2025}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2509.20591}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Hartland et~al\mbox{.}(2023)]%
+        {Hartland2023hodlr}
+\bibfield{author}{\bibinfo{person}{Tucker Hartland}, \bibinfo{person}{Georg Stadler}, \bibinfo{person}{Mauro Perego}, \bibinfo{person}{Kim Liegeois}, {and} \bibinfo{person}{No{\'e}mi Petra}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Hierarchical Off-Diagonal Low-Rank Approximation of Hessians in Inverse Problems, with Application to Ice Sheet Model Initialization}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2301.03644}} (\bibinfo{year}{2023}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2301.03644}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Li et~al\mbox{.}(2023)]%
+        {Li2023learning}
+\bibfield{author}{\bibinfo{person}{Yichen Li}, \bibinfo{person}{Peter~Yichen Chen}, \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Wojciech Matusik}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Learning Preconditioners for Conjugate Gradient {PDE} Solvers}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2305.16432}} (\bibinfo{year}{2023}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2305.16432}
+\showURL{%
+\tempurl}
+\newblock
+\shownote{Public drafts also used the name Neural PCG (ICLR 2023).}.
+
+
+\bibitem[Li et~al\mbox{.}(2024)]%
+        {Li2024neuralfluid}
+\bibfield{author}{\bibinfo{person}{Yifei Li}, \bibinfo{person}{Yuchen Sun}, \bibinfo{person}{Eftychios Sifakis}, \bibinfo{person}{Pingchuan Ma}, \bibinfo{person}{Tao Du}, \bibinfo{person}{Bo Zhu}, {and} \bibinfo{person}{Wojciech Matusik}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{{NeuralFluid}: Neural Fluidic System Design and Control with Differentiable Simulation}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2405.14903}} (\bibinfo{year}{2024}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2405.14903}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Li et~al\mbox{.}(2025)]%
+        {Li2025adjoint}
+\bibfield{author}{\bibinfo{person}{Zhiqi Li}, \bibinfo{person}{Jinjin He}, \bibinfo{person}{Barnab{\'a}s B{\"o}rcs{\"o}k}, \bibinfo{person}{Taiyuan Zhang}, \bibinfo{person}{Duowen Chen}, \bibinfo{person}{Tao Du}, \bibinfo{person}{Ming~C. Lin}, \bibinfo{person}{Greg Turk}, {and} \bibinfo{person}{Bo Zhu}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{An Adjoint Method for Differentiable Fluid Simulation on Flow Maps}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2511.01259}} (\bibinfo{year}{2025}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2511.01259}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Luz et~al\mbox{.}(2020)]%
+        {Luz2020learning}
+\bibfield{author}{\bibinfo{person}{Ilay Luz}, \bibinfo{person}{Meirav Galun}, \bibinfo{person}{Haggai Maron}, \bibinfo{person}{Ronen Basri}, {and} \bibinfo{person}{Irad Yavneh}.} \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Learning Algebraic Multigrid Using Graph Neural Networks}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2003.05744}} (\bibinfo{year}{2020}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2003.05744}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Lyu et~al\mbox{.}(2026)]%
+        {Lyu2026multigrid}
+\bibfield{author}{\bibinfo{person}{Kangbo Lyu}, \bibinfo{person}{Ruihong Cen}, \bibinfo{person}{Yushen Wu}, {and} \bibinfo{person}{Tao Du}.} \bibinfo{year}{2026}\natexlab{}.
+\newblock \bibinfo{title}{A Multigrid-Inspired Neural Iterative Solver for Poisson Equations on Large Voxel Grids}.
+\newblock \bibinfo{howpublished}{\url{https://openreview.net/forum?id=lNcbGSWhJo}}.
+\newblock
+\newblock
+\shownote{OpenReview workshop/conference submission.}.
+
+
+\bibitem[Ma et~al\mbox{.}(2023)]%
+        {Ma2023neural}
+\bibfield{author}{\bibinfo{person}{Pingchuan Ma}, \bibinfo{person}{Peter~Yichen Chen}, \bibinfo{person}{Bolei Deng}, \bibinfo{person}{Joshua~B. Tenenbaum}, \bibinfo{person}{Tao Du}, \bibinfo{person}{Chuang Gan}, {and} \bibinfo{person}{Wojciech Matusik}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Learning Neural Constitutive Laws from Motion Observations for Generalizable {PDE} Dynamics}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2304.14369}} (\bibinfo{year}{2023}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2304.14369}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Sittoni et~al\mbox{.}(2026)]%
+        {Sittoni2026neural}
+\bibfield{author}{\bibinfo{person}{Pietro Sittoni}, \bibinfo{person}{Emanuele Zangrando}, \bibinfo{person}{Angelo~Alberto Casulli}, \bibinfo{person}{Nicola Guglielmi}, {and} \bibinfo{person}{Francesco Tudisco}.} \bibinfo{year}{2026}\natexlab{}.
+\newblock \showarticletitle{{Neural-HSS}: Hierarchical Semi-Separable Neural {PDE} Solver}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2602.18248}} (\bibinfo{year}{2026}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2602.18248}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Xu et~al\mbox{.}(2025)]%
+        {Xu2025neural}
+\bibfield{author}{\bibinfo{person}{Tianshi Xu}, \bibinfo{person}{Rui~Peng Li}, {and} \bibinfo{person}{Yuanzhe Xi}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Neural Approximate Inverse Preconditioners}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2510.13034}} (\bibinfo{year}{2025}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2510.13034}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Yang et~al\mbox{.}(2025)]%
+        {Yang2025sparse}
+\bibfield{author}{\bibinfo{person}{Zherui Yang}, \bibinfo{person}{Zhehao Li}, \bibinfo{person}{Kangbo Lyu}, \bibinfo{person}{Yixuan Li}, \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Ligang Liu}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Learning Sparse Approximate Inverse Preconditioners for Conjugate Gradient Solvers on {GPUs}}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2510.27517}} (\bibinfo{year}{2025}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2510.27517}
+\showURL{%
+\tempurl}
+
+
+\bibitem[Yang et~al\mbox{.}(2026)]%
+        {Yang2026lowrank}
+\bibfield{author}{\bibinfo{person}{Zherui Yang}, \bibinfo{person}{Haiyang Xin}, \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Ligang Liu}.} \bibinfo{year}{2026}\natexlab{}.
+\newblock \showarticletitle{Simple yet Effective: Low-Rank Spatial Attention for Neural Operators}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2604.03582}} (\bibinfo{year}{2026}).
+\newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2604.03582}
+\showURL{%
+\tempurl}
+
+
+\end{thebibliography}

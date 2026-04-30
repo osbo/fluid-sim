@@ -2,6 +2,9 @@
 #pragma kernel BlockReduce
 #pragma kernel ReduceLevel
 #pragma kernel SmoothVelocityMinMax
+#pragma kernel BlockReducePhaseVelocity
+#pragma kernel ReduceLevelPhase
+#pragma kernel SmoothPhaseVelocityMinMax
 
 struct Particle
 {
@@ -93,4 +96,109 @@ void SmoothVelocityMinMax(uint3 id : SV_DispatchThreadID)
     float a = saturate(_VelocityMinMaxSmoothAlpha);
     float2 outv = uninitialized ? raw : lerp(prev, raw, a);
     _SmoothedMinMax[0] = outv;
+}
+
+// --- Per-phase |v| min/max for split-spectrum velocity coloring (packed: xy = light phase, zw = heavy phase) ---
+float _PhaseDensityMidReduce;
+RWStructuredBuffer<float4> _BlockPhaseMinMaxOut;
+
+groupshared float bp1min[256];
+groupshared float bp1max[256];
+groupshared float bp2min[256];
+groupshared float bp2max[256];
+
+[numthreads(256, 1, 1)]
+void BlockReducePhaseVelocity(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint i = gid.x * 256u + gi;
+    const float fmax = 3.402823466e+38;
+    float p1min = fmax, p1max = -fmax, p2min = fmax, p2max = -fmax;
+    if (i < _ParticleCount)
+    {
+        float sp = length(_Particles[i].velocity);
+        float d = _Particles[i].density;
+        if (d < _PhaseDensityMidReduce)
+        {
+            p1min = sp;
+            p1max = sp;
+        }
+        else
+        {
+            p2min = sp;
+            p2max = sp;
+        }
+    }
+    bp1min[gi] = p1min;
+    bp1max[gi] = p1max;
+    bp2min[gi] = p2min;
+    bp2max[gi] = p2max;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 128u; s > 0u; s >>= 1)
+    {
+        if (gi < s)
+        {
+            bp1min[gi] = min(bp1min[gi], bp1min[gi + s]);
+            bp1max[gi] = max(bp1max[gi], bp1max[gi + s]);
+            bp2min[gi] = min(bp2min[gi], bp2min[gi + s]);
+            bp2max[gi] = max(bp2max[gi], bp2max[gi + s]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0u)
+        _BlockPhaseMinMaxOut[gid.x] = float4(bp1min[0], bp1max[0], bp2min[0], bp2max[0]);
+}
+
+StructuredBuffer<float4> _LevelInPhase;
+RWStructuredBuffer<float4> _LevelOutPhase;
+
+groupshared float4 reducePhase_s[256];
+
+[numthreads(256, 1, 1)]
+void ReduceLevelPhase(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint idx = gid.x * 256u + gi;
+    const float fmax = 3.402823466e+38;
+    float4 v = (idx < _LevelCount) ? _LevelInPhase[idx] : float4(fmax, -fmax, fmax, -fmax);
+    reducePhase_s[gi] = v;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1)
+    {
+        if (gi < stride)
+        {
+            float4 a = reducePhase_s[gi];
+            float4 b = reducePhase_s[gi + stride];
+            reducePhase_s[gi] = float4(min(a.x, b.x), max(a.y, b.y), min(a.z, b.z), max(a.w, b.w));
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0u)
+        _LevelOutPhase[gid.x] = reducePhase_s[0];
+}
+
+StructuredBuffer<float4> _RawPhaseMinMax;
+RWStructuredBuffer<float4> _SmoothedPhaseMinMax;
+float _VelocityRefEmptyPhase;
+
+[numthreads(1, 1, 1)]
+void SmoothPhaseVelocityMinMax(uint3 id : SV_DispatchThreadID)
+{
+    float4 raw = _RawPhaseMinMax[0];
+    float refv = max(_VelocityRefEmptyPhase, 1e-4f);
+    if (raw.x >= raw.y)
+        raw.xy = float2(0.0, refv);
+    if (raw.z >= raw.w)
+        raw.zw = float2(0.0, refv);
+
+    float4 prev = _SmoothedPhaseMinMax[0];
+    const float huge = 1e37;
+    bool bad1 = (prev.x > prev.y) || (prev.x > huge * 0.5) || (prev.y < -huge * 0.5);
+    bool bad2 = (prev.z > prev.w) || (prev.z > huge * 0.5) || (prev.w < -huge * 0.5);
+    bool uninitialized = bad1 || bad2;
+    float a = saturate(_VelocityMinMaxSmoothAlpha);
+    float4 outv = uninitialized ? raw : lerp(prev, raw, a);
+    _SmoothedPhaseMinMax[0] = outv;
 }

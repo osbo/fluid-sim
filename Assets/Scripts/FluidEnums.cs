@@ -15,6 +15,10 @@ public enum RenderingMode
     Composite,
     /// <summary>Uniform grid: wireframe cell per occupied hash bin (use with <see cref="GridMode.Uniform"/>).</summary>
     UniformGridNodes,
+    /// <summary>Billboard particles colored by stored density: light phase blue, heavy phase red (uses multiphase baseDensity / densityRatio).</summary>
+    ParticlesPhase,
+    /// <summary>Like ParticlesVelocity but each phase uses half the hue range and its own GPU-reduced speed min/max.</summary>
+    ParticlesPhaseVelocity,
 }
 
 public enum PreconditionerType
@@ -48,12 +52,13 @@ public struct faceVelocities
     public float back;
 }
 
-// Particle struct (must match compute shader)
+// Particle struct (must match compute shader; stride = FluidSimulator.ParticleBufferStrideBytes)
 public struct Particle
 {
     public Vector3 position;    // 12 bytes
     public Vector3 velocity;    // 12 bytes
     public uint mortonCode;     // 4 bytes
+    public float density;       // 4 bytes
 }
 
 // Node struct (must match compute shader)

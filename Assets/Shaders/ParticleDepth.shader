@@ -25,6 +25,7 @@ Shader "Custom/ParticleDepth"
                 float3 position;
                 float3 velocity;
                 uint mortonCode;
+                float density;
             };
 
             StructuredBuffer<Particle> _Particles;

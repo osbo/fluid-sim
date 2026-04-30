@@ -35,7 +35,7 @@ public partial class FluidSimulator : MonoBehaviour
                 cgSolverShader.SetBuffer(kJacobi, "xBuffer", r);
                 cgSolverShader.SetBuffer(kJacobi, "yBuffer", z_out);
                 cgSolverShader.SetBuffer(kJacobi, "matrixABuffer", laplacianDiag);
-                cgSolverShader.DispatchIndirect(kJacobi, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
+                cgSolverShader.DispatchIndirect(kJacobi, CgDispatchIndirectArgs, CgIndirectArgsOffsetVec512);
             }
             else
             {
@@ -68,7 +68,7 @@ public partial class FluidSimulator : MonoBehaviour
                 cgSolverShader.SetBuffer(kJacobi, "xBuffer", r);
                 cgSolverShader.SetBuffer(kJacobi, "yBuffer", z_out);
                 cgSolverShader.SetBuffer(kJacobi, "matrixABuffer", laplacianDiag);
-                cgSolverShader.DispatchIndirect(kJacobi, solverIndirectArgsBuffer, CgIndirectArgsOffsetVec512);
+                cgSolverShader.DispatchIndirect(kJacobi, CgDispatchIndirectArgs, CgIndirectArgsOffsetVec512);
             }
             else
                 GpuCopyBufferIndirect(r, z_out);

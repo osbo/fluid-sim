@@ -1,0 +1,82 @@
+This is BibTeX, Version 0.99d (TeX Live 2025)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: paper.aux
+The style file: ACM-Reference-Format.bst
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated wiz_functions (elt_size=4) to 6000 items from 3000.
+Database file #1: references.bib
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated glb_str_ptr (elt_size=4) to 20 items from 10.
+Reallocated global_strs (elt_size=200001) to 20 items from 10.
+Reallocated glb_str_end (elt_size=4) to 20 items from 10.
+Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated wiz_functions (elt_size=4) to 9000 items from 6000.
+Warning--no number and no volume in Chen2025graph
+Warning--page numbers missing in both pages and numpages fields in Chen2025graph
+Warning--no number and no volume in Fan2019multiscale
+Warning--page numbers missing in both pages and numpages fields in Fan2019multiscale
+Warning--no number and no volume in Fognini2025neural
+Warning--page numbers missing in both pages and numpages fields in Fognini2025neural
+Warning--no number and no volume in Hartland2023hodlr
+Warning--page numbers missing in both pages and numpages fields in Hartland2023hodlr
+Warning--no number and no volume in Li2023learning
+Warning--page numbers missing in both pages and numpages fields in Li2023learning
+Warning--no number and no volume in Li2024neuralfluid
+Warning--page numbers missing in both pages and numpages fields in Li2024neuralfluid
+Warning--no number and no volume in Li2025adjoint
+Warning--page numbers missing in both pages and numpages fields in Li2025adjoint
+Warning--no number and no volume in Luz2020learning
+Warning--page numbers missing in both pages and numpages fields in Luz2020learning
+Warning--no number and no volume in Ma2023neural
+Warning--page numbers missing in both pages and numpages fields in Ma2023neural
+Warning--no number and no volume in Sittoni2026neural
+Warning--page numbers missing in both pages and numpages fields in Sittoni2026neural
+Warning--no number and no volume in Xu2025neural
+Warning--page numbers missing in both pages and numpages fields in Xu2025neural
+Warning--no number and no volume in Yang2025sparse
+Warning--page numbers missing in both pages and numpages fields in Yang2025sparse
+Warning--no number and no volume in Yang2026lowrank
+Warning--page numbers missing in both pages and numpages fields in Yang2026lowrank
+You've used 14 entries,
+            6056 wiz_defined-function locations,
+            1573 strings with 21490 characters,
+and the built_in function-call counts, 15500 in all, are:
+= -- 2288
+> -- 636
+< -- 0
++ -- 221
+- -- 205
+* -- 1209
+:= -- 1492
+add.period$ -- 73
+call.type$ -- 14
+change.case$ -- 123
+chr.to.int$ -- 14
+cite$ -- 40
+duplicate$ -- 1152
+empty$ -- 846
+format.name$ -- 257
+if$ -- 3969
+int.to.chr$ -- 2
+int.to.str$ -- 1
+missing$ -- 52
+newline$ -- 209
+num.names$ -- 98
+pop$ -- 540
+preamble$ -- 1
+purify$ -- 235
+quote$ -- 0
+skip$ -- 329
+stack$ -- 0
+substring$ -- 780
+swap$ -- 56
+text.length$ -- 0
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 238
+warning$ -- 26
+while$ -- 46
+width$ -- 0
+write$ -- 348
+(There were 26 warnings)

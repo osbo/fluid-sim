@@ -47,7 +47,8 @@ public class RadixSort
         eBuffer = new ComputeBuffer((int)maxParticleCount, sizeof(uint), ComputeBufferType.Default);
         fBuffer = new ComputeBuffer((int)maxParticleCount, sizeof(uint), ComputeBufferType.Default);
 
-        int particleStride = 3 * 4 + 3 * 4 + 4;
+        // Must match FluidSimulator.Particle / Particles.compute (includes multiphase density float).
+        int particleStride = FluidSimulator.ParticleBufferStrideBytes;
         particleSortScratch = new ComputeBuffer((int)maxParticleCount, particleStride, ComputeBufferType.Default);
 
         uint threadgroupSize = 512;

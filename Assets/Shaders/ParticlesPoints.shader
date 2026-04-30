@@ -8,6 +8,9 @@ Shader "Custom/ParticlesPoints"
         _UseVelocityColor ("Use Velocity Color", Float) = 0
         _VelocityReferenceSpeed ("Velocity Reference Speed", Float) = 10
         _VelocityAutoNormalize ("Velocity Auto Normalize", Float) = 0
+        _UsePhaseColor ("Use Phase Color", Float) = 0
+        _PhaseDensityMid ("Phase Density Mid", Float) = 5.5
+        _UsePhaseVelocityColor ("Use Phase Velocity Color", Float) = 0
     }
     SubShader
     {
@@ -29,10 +32,12 @@ Shader "Custom/ParticlesPoints"
                 float3 position;
                 float3 velocity;
                 uint mortonCode;
+                float density; // must match Particles.compute / FluidSimulator buffer stride
             };
 
             StructuredBuffer<Particle> _Particles;
             StructuredBuffer<float2> _ParticleVelocityMinMax; // [0] = (minSpeed, maxSpeed) for this frame (GPU)
+            StructuredBuffer<float4> _ParticlePhaseVelocityMinMax; // [0] = (min1,max1,min2,max2) per phase |v|
             float _Radius;
             float3 _SimulationBoundsMin;
             float3 _SimulationBoundsMax;
@@ -43,6 +48,9 @@ Shader "Custom/ParticlesPoints"
             float _UseVelocityColor;
             float _VelocityReferenceSpeed;
             float _VelocityAutoNormalize;
+            float _UsePhaseColor;
+            float _PhaseDensityMid;
+            float _UsePhaseVelocityColor;
 
             float3 RgbToHsv(float3 rgb)
             {
@@ -110,7 +118,42 @@ Shader "Custom/ParticlesPoints"
 
                 // col.rgb carries HSV (not RGB) so the PS only needs one HsvToRgb call.
                 float3 hsv;
-                if (_UseVelocityColor > 0.5)
+                if (_UsePhaseVelocityColor > 0.5)
+                {
+                    // Split the velocity hue ramp: light phase maps |v| to hue [2/3 → 1/3], heavy to [1/3 → 0]; each phase uses its own min/max when auto-normalized.
+                    float speed = length(p.velocity);
+                    float heavy = step(_PhaseDensityMid, p.density);
+                    float t;
+                    if (_VelocityAutoNormalize > 0.5)
+                    {
+                        float4 mm = _ParticlePhaseVelocityMinMax[0];
+                        float2 r = (heavy > 0.5) ? mm.zw : mm.xy;
+                        float lo = r.x;
+                        float hi = r.y;
+                        if (lo < hi - 1e-6)
+                        {
+                            float range = max(hi - lo, 1e-6);
+                            t = saturate((speed - lo) / range);
+                        }
+                        else
+                            t = 0.0;
+                    }
+                    else
+                    {
+                        float denom = max(_VelocityReferenceSpeed, 1e-5);
+                        t = saturate(speed / denom);
+                    }
+                    float hue = (heavy > 0.5) ? lerp(1.0 / 3.0, 0.0, t) : lerp(2.0 / 3.0, 1.0 / 3.0, t);
+                    hsv = float3(hue, 0.92, 1.0);
+                }
+                else if (_UsePhaseColor > 0.5)
+                {
+                    // Light phase → blue (hue 2/3), heavy phase → red (hue 0); split at nominal midpoint between base and second densities.
+                    float heavy = step(_PhaseDensityMid, p.density);
+                    float hue = lerp(2.0 / 3.0, 0.0, heavy);
+                    hsv = float3(hue, 0.92, 1.0);
+                }
+                else if (_UseVelocityColor > 0.5)
                 {
                     float speed = length(p.velocity);
                     float t;
