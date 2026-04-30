@@ -118,6 +118,7 @@ public partial class FluidSimulator
         // 3. Clear per-node accumulation buffer
         uniformGridShader.SetBuffer(uniformGridClearNodeAccumKernel, "activeNodeCount", uniformActiveNodeCountBuffer);
         uniformGridShader.SetBuffer(uniformGridClearNodeAccumKernel, "nodeAccumBuffer", uniformNodeAccumBuffer);
+        uniformGridShader.SetBuffer(uniformGridClearNodeAccumKernel, "densityAccumBuffer", uniformDensityAccumBuffer);
         int clearAccumGroups = Mathf.Max(1, (capped + 511) / 512);
         uniformGridShader.Dispatch(uniformGridClearNodeAccumKernel, clearAccumGroups, 1, 1);
 
@@ -125,6 +126,7 @@ public partial class FluidSimulator
         uniformGridShader.SetBuffer(uniformGridSplatParticlesKernel, "particlesBuffer", particlesBuffer);
         uniformGridShader.SetBuffer(uniformGridSplatParticlesKernel, "denseIndexMap", uniformDenseIndexMapBuffer);
         uniformGridShader.SetBuffer(uniformGridSplatParticlesKernel, "nodeAccumBuffer", uniformNodeAccumBuffer);
+        uniformGridShader.SetBuffer(uniformGridSplatParticlesKernel, "densityAccumBuffer", uniformDensityAccumBuffer);
         int splatGroups = Mathf.Max(1, (numParticles + 255) / 256);
         uniformGridShader.Dispatch(uniformGridSplatParticlesKernel, splatGroups, 1, 1);
 
@@ -134,6 +136,8 @@ public partial class FluidSimulator
         uniformGridShader.SetBuffer(uniformGridNormalizeNodesKernel, "activeMortonList", uniformActiveMortonListBuffer);
         uniformGridShader.SetBuffer(uniformGridNormalizeNodesKernel, "nodesBuffer", nodesBuffer);
         uniformGridShader.SetBuffer(uniformGridNormalizeNodesKernel, "mortonCodesBuffer", mortonCodesBuffer);
+        uniformGridShader.SetBuffer(uniformGridNormalizeNodesKernel, "densityAccumBuffer", uniformDensityAccumBuffer);
+        uniformGridShader.SetBuffer(uniformGridNormalizeNodesKernel, "nodeDensityBuffer", nodeDensityBuffer);
         uniformGridShader.Dispatch(uniformGridNormalizeNodesKernel, clearAccumGroups, 1, 1);
 
         gpuUintScratch1[0] = (uint)capped;
