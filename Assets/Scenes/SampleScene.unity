@@ -737,9 +737,10 @@ MonoBehaviour:
   baseDensity: 1
   densityRatio: 0.02
   numParticles: 1048576
-  maxCgIterations: 500
+  maxCgIterations: 50
   convergenceThreshold: 0.001
   cgConvergenceCheckInterval: 5
+  pcgRunMaxIterationsWithoutConvergenceCheck: 1
   gravity: 100
   kinematicViscosity: 0
   flipRatio: 0.9
