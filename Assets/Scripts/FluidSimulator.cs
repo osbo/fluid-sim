@@ -52,7 +52,9 @@ public partial class FluidSimulator : MonoBehaviour
     public float convergenceThreshold = 1e-05f;
     [Tooltip("How often to test convergence (GPU) and sync a 4-byte stat to break the PCG host loop. Larger = fewer tiny readbacks, later exit after crossing τ.")]
     public int cgConvergenceCheckInterval = 8;
-    
+    [Tooltip("When enabled, PCG always runs maxCgIterations with no relative residual test or early exit (behavior before GPU convergence checks).")]
+    public bool pcgRunMaxIterationsWithoutConvergenceCheck;
+
     // Simulation parameters
     private float maxDetailCellSize;
     

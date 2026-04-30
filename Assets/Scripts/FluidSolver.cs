@@ -275,7 +275,7 @@ public partial class FluidSimulator : MonoBehaviour
             return gpuUintScratch1[0] != 0;
         }
 
-        void RunPcgIterationBody(int k, int checkEvery, ref int convergedAt)
+        void RunPcgIterationBody(int k, int checkEvery, ref int convergedAt, bool enableConvergenceChecks)
         {
             // 1. Ap = A*p, partial p·Ap → divergenceBuffer (CSR SpMV)
             int matvecKernel = spmvCsrKernelId;
@@ -314,11 +314,14 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.DispatchIndirect(axpyNegAlphaKernelId, CgDispatchIndirectArgs, CgIndirectArgsOffsetVec512);
             updateVectorSw.Stop();
 
-            bool doCheck = (k == 0) || ((k + 1) % checkEvery == 0) || (k == maxCgIterations - 1);
-            if (doCheck && TryPcgConvergenceCheckGpu(k))
+            if (enableConvergenceChecks)
             {
-                convergedAt = (int)gpuUintScratch1[0];
-                return;
+                bool doCheck = (k == 0) || ((k + 1) % checkEvery == 0) || (k == maxCgIterations - 1);
+                if (doCheck && TryPcgConvergenceCheckGpu(k))
+                {
+                    convergedAt = (int)gpuUintScratch1[0];
+                    return;
+                }
             }
 
             // 4. z = M^-1 r, rho_new = r·z → divergence[0]; beta and rho on GPU
@@ -349,23 +352,27 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(initPcgIndirectArgsKernelId, "cgPcgIterationStat", cgPcgIterationStatBuffer);
             cgSolverShader.Dispatch(initPcgIndirectArgsKernelId, 1, 1, 1);
 
-            GpuDotProductReduceNoReadback(residualBuffer, residualBuffer);
-            cgSolverShader.SetBuffer(storeInitialResidualSqKernelId, "divergenceBuffer", divergenceBuffer);
-            cgSolverShader.SetBuffer(storeInitialResidualSqKernelId, "cgInitialResidualSqBuffer", cgInitialResidualSqBuffer);
-            cgSolverShader.Dispatch(storeInitialResidualSqKernelId, 1, 1, 1);
+            bool pcgCheckConvergence = !pcgRunMaxIterationsWithoutConvergenceCheck;
+            if (pcgCheckConvergence)
+            {
+                GpuDotProductReduceNoReadback(residualBuffer, residualBuffer);
+                cgSolverShader.SetBuffer(storeInitialResidualSqKernelId, "divergenceBuffer", divergenceBuffer);
+                cgSolverShader.SetBuffer(storeInitialResidualSqKernelId, "cgInitialResidualSqBuffer", cgInitialResidualSqBuffer);
+                cgSolverShader.Dispatch(storeInitialResidualSqKernelId, 1, 1, 1);
 
-            cgSolverShader.SetBuffer(checkConvergenceKernelId, "divergenceBuffer", divergenceBuffer);
-            cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgIndirectDispatchArgs", pcgIndirectArgsBuffer);
-            cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgPcgIterationStat", cgPcgIterationStatBuffer);
-            cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgInitialResidualSqBuffer", cgInitialResidualSqBuffer);
-            cgSolverShader.SetFloat("convergenceThreshold", convergenceThreshold);
+                cgSolverShader.SetBuffer(checkConvergenceKernelId, "divergenceBuffer", divergenceBuffer);
+                cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgIndirectDispatchArgs", pcgIndirectArgsBuffer);
+                cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgPcgIterationStat", cgPcgIterationStatBuffer);
+                cgSolverShader.SetBuffer(checkConvergenceKernelId, "cgInitialResidualSqBuffer", cgInitialResidualSqBuffer);
+                cgSolverShader.SetFloat("convergenceThreshold", convergenceThreshold);
+            }
 
             int checkEvery = Mathf.Max(1, cgConvergenceCheckInterval);
             int convergedAt = 0;
             for (int k = 0; k < maxCgIterations; k++)
             {
-                RunPcgIterationBody(k, checkEvery, ref convergedAt);
-                if (convergedAt != 0)
+                RunPcgIterationBody(k, checkEvery, ref convergedAt, pcgCheckConvergence);
+                if (pcgCheckConvergence && convergedAt != 0)
                 {
                     pcgItersThisFrame = convergedAt;
                     break;
