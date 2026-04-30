@@ -87,15 +87,23 @@ public class FluidRenderer : MonoBehaviour
     int particleVelocityBlockReduceKernel = -1;
     int particleVelocityReduceLevelKernel = -1;
     int particleVelocitySmoothMinMaxKernel = -1;
+    int particlePhaseVelocityBlockReduceKernel = -1;
+    int particlePhaseVelocityReduceLevelKernel = -1;
+    int particlePhaseVelocitySmoothMinMaxKernel = -1;
     ComputeBuffer particleVelocityReduceBufferA;
     ComputeBuffer particleVelocityReduceBufferB;
     ComputeBuffer particleVelocitySmoothedMinMaxBuffer;
     ComputeBuffer particleVelocityMinMaxDummyBuffer;
+    ComputeBuffer particlePhaseVelocityReduceBufferA;
+    ComputeBuffer particlePhaseVelocityReduceBufferB;
+    ComputeBuffer particlePhaseVelocitySmoothedMinMaxBuffer;
+    ComputeBuffer particlePhaseVelocityMinMaxDummyBuffer;
     CommandBuffer thicknessCmd;
     CommandBuffer depthCmd;
     readonly uint[] indirectDrawArgsScratch = new uint[5];
     readonly uint[] indirectInstanceCountOnlyScratch = new uint[1];
     readonly float[] float2SetDataScratch = new float[2];
+    readonly float[] float4SetDataScratch = new float[4];
     RenderTexture thicknessTexture;
     RenderTexture fluidDepthTexture;
     RenderTexture rawDepthTexture;
@@ -140,6 +148,9 @@ public class FluidRenderer : MonoBehaviour
             particleVelocityBlockReduceKernel = particleVelocityReduceShader.FindKernel("BlockReduce");
             particleVelocityReduceLevelKernel = particleVelocityReduceShader.FindKernel("ReduceLevel");
             particleVelocitySmoothMinMaxKernel = particleVelocityReduceShader.FindKernel("SmoothVelocityMinMax");
+            particlePhaseVelocityBlockReduceKernel = particleVelocityReduceShader.FindKernel("BlockReducePhaseVelocity");
+            particlePhaseVelocityReduceLevelKernel = particleVelocityReduceShader.FindKernel("ReduceLevelPhase");
+            particlePhaseVelocitySmoothMinMaxKernel = particleVelocityReduceShader.FindKernel("SmoothPhaseVelocityMinMax");
         }
         RenderPipelineManager.endCameraRendering += OnEndCameraRendering;
     }
@@ -177,8 +188,8 @@ public class FluidRenderer : MonoBehaviour
 
     /// <summary>
     /// Metal requires every <see cref="StructuredBuffer{T}"/> declared in the shader to be bound for each draw.
-    /// <c>Custom/ParticlesPoints</c> always declares <c>_ParticleVelocityMinMax</c> (slot 1); bind a dummy before any path
-    /// that might use this shader (including if <see cref="particleDepthMaterial"/> was reassigned to ParticlesPoints in the Inspector).
+    /// <c>Custom/ParticlesPoints</c> always declares <c>_ParticleVelocityMinMax</c> and <c>_ParticlePhaseVelocityMinMax</c>;
+    /// bind dummies before any path that might use this shader (including if <see cref="particleDepthMaterial"/> was reassigned to ParticlesPoints in the Inspector).
     /// </summary>
     void EnsureParticleVelocityMinMaxDummyBuffer()
     {
@@ -190,12 +201,26 @@ public class FluidRenderer : MonoBehaviour
         particleVelocityMinMaxDummyBuffer.SetData(float2SetDataScratch);
     }
 
+    void EnsureParticlePhaseVelocityMinMaxDummyBuffer()
+    {
+        if (particlePhaseVelocityMinMaxDummyBuffer != null)
+            return;
+        particlePhaseVelocityMinMaxDummyBuffer = new ComputeBuffer(1, sizeof(float) * 4);
+        float4SetDataScratch[0] = 0f;
+        float4SetDataScratch[1] = 1f;
+        float4SetDataScratch[2] = 0f;
+        float4SetDataScratch[3] = 1f;
+        particlePhaseVelocityMinMaxDummyBuffer.SetData(float4SetDataScratch);
+    }
+
     void BindParticlesPointsMinMaxBufferIfNeeded(Material m)
     {
         if (m == null || m.shader == null || m.shader.name != ParticlesPointsShaderName)
             return;
         EnsureParticleVelocityMinMaxDummyBuffer();
+        EnsureParticlePhaseVelocityMinMaxDummyBuffer();
         m.SetBuffer("_ParticleVelocityMinMax", particleVelocityMinMaxDummyBuffer);
+        m.SetBuffer("_ParticlePhaseVelocityMinMax", particlePhaseVelocityMinMaxDummyBuffer);
     }
 
     void ResolveMainLightIfNeeded()
@@ -267,6 +292,14 @@ public class FluidRenderer : MonoBehaviour
         particleVelocityMinMaxDummyBuffer = null;
         particleVelocitySmoothedMinMaxBuffer?.Release();
         particleVelocitySmoothedMinMaxBuffer = null;
+        particlePhaseVelocityReduceBufferA?.Release();
+        particlePhaseVelocityReduceBufferA = null;
+        particlePhaseVelocityReduceBufferB?.Release();
+        particlePhaseVelocityReduceBufferB = null;
+        particlePhaseVelocitySmoothedMinMaxBuffer?.Release();
+        particlePhaseVelocitySmoothedMinMaxBuffer = null;
+        particlePhaseVelocityMinMaxDummyBuffer?.Release();
+        particlePhaseVelocityMinMaxDummyBuffer = null;
         if (fluidDepthTexture != null)
         {
             fluidDepthTexture.Release();
@@ -293,6 +326,12 @@ public class FluidRenderer : MonoBehaviour
             return _sim.WorldSimulationBounds;
         }
     }
+
+    static bool UsesParticlesBillboardView(RenderingMode mode) =>
+        mode == RenderingMode.Particles
+        || mode == RenderingMode.ParticlesVelocity
+        || mode == RenderingMode.ParticlesPhase
+        || mode == RenderingMode.ParticlesPhaseVelocity;
 
     static bool IsNodeOrColliderVoxelView(RenderingMode mode) =>
         mode == RenderingMode.Nodes || mode == RenderingMode.UniformGridNodes || mode == RenderingMode.ColliderVoxels;
@@ -365,6 +404,81 @@ public class FluidRenderer : MonoBehaviour
         return true;
     }
 
+    /// <returns>False if per-phase min/max was not written (caller should keep dummy buffer + <c>_VelocityAutoNormalize</c> 0).</returns>
+    bool DispatchParticlePhaseVelocityMinMaxForRendering(Material particleMat)
+    {
+        if (particleVelocityReduceShader == null
+            || particlePhaseVelocityBlockReduceKernel < 0
+            || _sim.ParticlesBuffer == null
+            || _sim.NumParticlesForRender <= 0
+            || particleMat == null)
+            return false;
+
+        int smoothFrames = Mathf.Max(1, particleVelocityNormalizeSmoothingFrames);
+        int numParticles = _sim.NumParticlesForRender;
+
+        int blocks = (numParticles + 255) / 256;
+        int cap = Mathf.NextPowerOfTwo(Mathf.Max(blocks, 512));
+        if (particlePhaseVelocityReduceBufferA == null || particlePhaseVelocityReduceBufferA.count < cap)
+        {
+            particlePhaseVelocityReduceBufferA?.Release();
+            particlePhaseVelocityReduceBufferB?.Release();
+            particlePhaseVelocityReduceBufferA = new ComputeBuffer(cap, sizeof(float) * 4);
+            particlePhaseVelocityReduceBufferB = new ComputeBuffer(cap, sizeof(float) * 4);
+        }
+
+        float rho1 = _sim.baseDensity;
+        float rho2 = _sim.baseDensity * _sim.densityRatio;
+        float phaseMid = 0.5f * (rho1 + rho2);
+        particleVelocityReduceShader.SetFloat("_PhaseDensityMidReduce", phaseMid);
+        particleVelocityReduceShader.SetBuffer(particlePhaseVelocityBlockReduceKernel, "_Particles", _sim.ParticlesBuffer);
+        particleVelocityReduceShader.SetInt("_ParticleCount", numParticles);
+        particleVelocityReduceShader.SetBuffer(particlePhaseVelocityBlockReduceKernel, "_BlockPhaseMinMaxOut", particlePhaseVelocityReduceBufferA);
+        particleVelocityReduceShader.Dispatch(particlePhaseVelocityBlockReduceKernel, blocks, 1, 1);
+
+        bool dataInA = true;
+        int count = blocks;
+        while (count > 1)
+        {
+            int outCount = (count + 255) / 256;
+            ComputeBuffer src = dataInA ? particlePhaseVelocityReduceBufferA : particlePhaseVelocityReduceBufferB;
+            ComputeBuffer dst = dataInA ? particlePhaseVelocityReduceBufferB : particlePhaseVelocityReduceBufferA;
+            particleVelocityReduceShader.SetBuffer(particlePhaseVelocityReduceLevelKernel, "_LevelInPhase", src);
+            particleVelocityReduceShader.SetBuffer(particlePhaseVelocityReduceLevelKernel, "_LevelOutPhase", dst);
+            particleVelocityReduceShader.SetInt("_LevelCount", count);
+            particleVelocityReduceShader.Dispatch(particlePhaseVelocityReduceLevelKernel, outCount, 1, 1);
+            dataInA = !dataInA;
+            count = outCount;
+        }
+
+        ComputeBuffer minMaxSrc = dataInA ? particlePhaseVelocityReduceBufferA : particlePhaseVelocityReduceBufferB;
+
+        if (smoothFrames <= 1 || particlePhaseVelocitySmoothMinMaxKernel < 0)
+        {
+            particleMat.SetBuffer("_ParticlePhaseVelocityMinMax", minMaxSrc);
+            return true;
+        }
+
+        if (particlePhaseVelocitySmoothedMinMaxBuffer == null)
+        {
+            particlePhaseVelocitySmoothedMinMaxBuffer = new ComputeBuffer(1, sizeof(float) * 4);
+            float4SetDataScratch[0] = float.MaxValue;
+            float4SetDataScratch[1] = float.MinValue;
+            float4SetDataScratch[2] = float.MaxValue;
+            float4SetDataScratch[3] = float.MinValue;
+            particlePhaseVelocitySmoothedMinMaxBuffer.SetData(float4SetDataScratch);
+        }
+
+        float alpha = 1f / smoothFrames;
+        particleVelocityReduceShader.SetFloat("_VelocityRefEmptyPhase", Mathf.Max(particleVelocityColorReference, 1e-4f));
+        particleVelocityReduceShader.SetBuffer(particlePhaseVelocitySmoothMinMaxKernel, "_RawPhaseMinMax", minMaxSrc);
+        particleVelocityReduceShader.SetBuffer(particlePhaseVelocitySmoothMinMaxKernel, "_SmoothedPhaseMinMax", particlePhaseVelocitySmoothedMinMaxBuffer);
+        particleVelocityReduceShader.SetFloat("_VelocityMinMaxSmoothAlpha", alpha);
+        particleVelocityReduceShader.Dispatch(particlePhaseVelocitySmoothMinMaxKernel, 1, 1, 1);
+        particleMat.SetBuffer("_ParticlePhaseVelocityMinMax", particlePhaseVelocitySmoothedMinMaxBuffer);
+        return true;
+    }
+
     void OnEndCameraRendering(ScriptableRenderContext ctx, Camera cam)
     {
         if (_sim == null)
@@ -405,7 +519,7 @@ public class FluidRenderer : MonoBehaviour
             using (s_RenderColliderVoxelsMarker.Auto()) { RenderColliderVoxels(cam); }
         }
 
-        // Particles / ParticlesVelocity: URP has already drawn opaque scene geometry (colliders, bunny, etc.) into the
+        // Particles / ParticlesVelocity / ParticlesPhase / ParticlesPhaseVelocity: URP has already drawn opaque scene geometry (colliders, bunny, etc.) into the
         // camera target. DrawParticles only adds particle splats on top with depth test — no fullscreen blit, unlike
         // Thickness, Nodes, ColliderVoxels, Depth, Normal, or Composite (those replace the framebuffer).
         if (renderingMode != RenderingMode.Thickness && renderingMode != RenderingMode.BlurredThickness && !IsNodeOrColliderVoxelView(renderingMode))
@@ -487,6 +601,8 @@ public class FluidRenderer : MonoBehaviour
         {
             case RenderingMode.Particles:
             case RenderingMode.ParticlesVelocity:
+            case RenderingMode.ParticlesPhase:
+            case RenderingMode.ParticlesPhaseVelocity:
                 currentMaterial = particlesMaterial;
                 break;
             case RenderingMode.Depth:
@@ -515,7 +631,7 @@ public class FluidRenderer : MonoBehaviour
 
         int numParticles = _sim.NumParticlesForRender;
 
-        if (renderingMode == RenderingMode.Particles || renderingMode == RenderingMode.ParticlesVelocity)
+        if (UsesParticlesBillboardView(renderingMode))
             currentMaterial.SetFloat("_Radius", particleRadius);
         else if (renderingMode == RenderingMode.Depth || renderingMode == RenderingMode.BlurredDepth || renderingMode == RenderingMode.Normal || renderingMode == RenderingMode.Composite)
             currentMaterial.SetFloat("_Radius", depthRadius);
@@ -538,7 +654,7 @@ public class FluidRenderer : MonoBehaviour
 
         CalculateDepthParameters(cameraPos, bounds, boundsDiagonal);
 
-        if (renderingMode == RenderingMode.Particles || renderingMode == RenderingMode.ParticlesVelocity)
+        if (UsesParticlesBillboardView(renderingMode))
         {
             // Dummy min/max already bound in BindParticlesPointsMinMaxBufferIfNeeded; Dispatch may replace with GPU-reduced buffer.
             float calculatedMinValue = Mathf.Exp(calculatedDepthMinValue);
@@ -547,15 +663,29 @@ public class FluidRenderer : MonoBehaviour
             currentMaterial.SetFloat("_MinValue", calculatedMinValue);
             currentMaterial.SetFloat("_DepthShadeGamma", Mathf.Max(0.01f, particleDepthShadeGamma));
             currentMaterial.SetFloat("_DepthLumaFloor", Mathf.Clamp01(particleDepthLumaFloor));
+            bool phaseColorMode = renderingMode == RenderingMode.ParticlesPhase;
+            bool phaseVelocityMode = renderingMode == RenderingMode.ParticlesPhaseVelocity;
+            currentMaterial.SetFloat("_UsePhaseColor", phaseColorMode ? 1f : 0f);
+            currentMaterial.SetFloat("_UsePhaseVelocityColor", phaseVelocityMode ? 1f : 0f);
+            if ((phaseColorMode || phaseVelocityMode) && _sim != null)
+            {
+                float rho1 = _sim.baseDensity;
+                float rho2 = _sim.baseDensity * _sim.densityRatio;
+                currentMaterial.SetFloat("_PhaseDensityMid", 0.5f * (rho1 + rho2));
+            }
+            else
+                currentMaterial.SetFloat("_PhaseDensityMid", 0f);
             currentMaterial.SetFloat("_UseVelocityColor", renderingMode == RenderingMode.ParticlesVelocity ? 1f : 0f);
             currentMaterial.SetFloat("_VelocityReferenceSpeed", Mathf.Max(particleVelocityColorReference, 1e-4f));
-            bool autoNorm = renderingMode == RenderingMode.ParticlesVelocity
-                && particleVelocityNormalizePerFrame
+            bool autoNorm = particleVelocityNormalizePerFrame
                 && particleVelocityReduceShader != null
-                && particleVelocityBlockReduceKernel >= 0;
+                && ((renderingMode == RenderingMode.ParticlesVelocity && particleVelocityBlockReduceKernel >= 0)
+                    || (phaseVelocityMode && particlePhaseVelocityBlockReduceKernel >= 0));
             if (autoNorm)
             {
-                bool minMaxOk = DispatchParticleVelocityMinMaxForRendering(currentMaterial);
+                bool minMaxOk = phaseVelocityMode
+                    ? DispatchParticlePhaseVelocityMinMaxForRendering(currentMaterial)
+                    : DispatchParticleVelocityMinMaxForRendering(currentMaterial);
                 currentMaterial.SetFloat("_VelocityAutoNormalize", minMaxOk ? 1f : 0f);
             }
             else
@@ -564,7 +694,7 @@ public class FluidRenderer : MonoBehaviour
             }
         }
 
-        if (renderingMode != RenderingMode.Particles && renderingMode != RenderingMode.ParticlesVelocity)
+        if (!UsesParticlesBillboardView(renderingMode))
         {
             float fadeStart = Mathf.Max(0.0f, distanceToNearest - boundsDiagonal * 0.3f);
             float fadeEnd = distanceToCenter + boundsDiagonal * 0.8f;

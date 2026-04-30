@@ -193,6 +193,9 @@ float secondDensity;
 float3 fluidSecondBoundsMin;
 float3 fluidSecondBoundsMax;
 uint hasSecondFluid;
+// When non-zero, particle.density = initialDensityBuffer[index] (two initial meshes on CPU).
+StructuredBuffer<float> initialDensityBuffer;
+uint usePerParticleInitialDensity;
 
 // GridMode.Uniform: O(1) cell → node via dense map (same fold as UniformGrid.compute).
 static const uint kUgEmptyCell = 0xFFFFFFFFu;
@@ -219,14 +222,20 @@ void InitializeParticles (uint3 id : SV_DispatchThreadID)
     particle.velocity   = initialVelocity;
     particle.mortonCode = EncodeMorton3D((uint3)particle.position);
 
-    float d = baseDensity;
-    if (hasSecondFluid != 0u)
+    float d;
+    if (usePerParticleInitialDensity != 0u)
+        d = initialDensityBuffer[index];
+    else
     {
-        float3 p = particle.position;
-        if (p.x >= fluidSecondBoundsMin.x && p.x <= fluidSecondBoundsMax.x &&
-            p.y >= fluidSecondBoundsMin.y && p.y <= fluidSecondBoundsMax.y &&
-            p.z >= fluidSecondBoundsMin.z && p.z <= fluidSecondBoundsMax.z)
-            d = secondDensity;
+        d = baseDensity;
+        if (hasSecondFluid != 0u)
+        {
+            float3 p = particle.position;
+            if (p.x >= fluidSecondBoundsMin.x && p.x <= fluidSecondBoundsMax.x &&
+                p.y >= fluidSecondBoundsMin.y && p.y <= fluidSecondBoundsMax.y &&
+                p.z >= fluidSecondBoundsMin.z && p.z <= fluidSecondBoundsMax.z)
+                d = secondDensity;
+        }
     }
     particle.density = d;
 

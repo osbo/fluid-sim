@@ -19,7 +19,13 @@ public partial class FluidSimulator : MonoBehaviour
 {
     BoxCollider simulationBounds;
     BoxCollider fluidInitialBounds;
-    BoxCollider fluidSecondBounds;
+    [Tooltip("Optional axis-aligned region for second-phase density at spawn. Ignored when Fluid Initial Mesh Phase 2 is assigned (densities come from mesh volumes instead). Leave unassigned to skip auto-find.")]
+    [SerializeField] BoxCollider fluidSecondBounds;
+    [Tooltip("Optional second closed mesh volume: spawn particles in both meshes; phase 1 uses baseDensity, phase 2 uses baseDensity × densityRatio. Assign transforms freely in the scene.")]
+    public MeshFilter fluidInitialMeshPhase2;
+    [Tooltip("Fraction of particles sampled from Fluid Initial Mesh (phase 1); the rest from Phase 2 mesh.")]
+    [Range(0.0f, 1.0f)]
+    public float phase1ParticleFraction = 0.5f;
     [Tooltip("Optional mesh whose interior defines the fluid spawn volume. If unset, falls back to the Fluid Initial Bounds box.")]
     public MeshFilter fluidInitialMesh;
     [Tooltip("Initial velocity applied to all spawned particles.")]
@@ -42,9 +48,10 @@ public partial class FluidSimulator : MonoBehaviour
 
     // CG Solver parameters
     public int maxCgIterations = 400;
+    [Tooltip("PCG relative L2 stopping tolerance τ: iterations stop once ||r||₂ / ||r₀||₂ ≤ τ (equivalently r·r ≤ τ²·||r₀||²).")]
     public float convergenceThreshold = 1e-05f;
-    [Tooltip("Unused: PCG always runs maxCgIterations with no mid-loop convergence check. Enable per-frame debug timing log to print final ||r||² after the solve.")]
-    public int cgConvergenceCheckInterval = 5;
+    [Tooltip("How often to test convergence (GPU) and sync a 4-byte stat to break the PCG host loop. Larger = fewer tiny readbacks, later exit after crossing τ.")]
+    public int cgConvergenceCheckInterval = 8;
     
     // Simulation parameters
     private float maxDetailCellSize;
@@ -96,6 +103,9 @@ public partial class FluidSimulator : MonoBehaviour
     private int axpyAlphaKernelId;
     private int axpyNegAlphaKernelId;
     private int scaleAddBetaKernelId;
+    private int initPcgIndirectArgsKernelId;
+    private int storeInitialResidualSqKernelId;
+    private int checkConvergenceKernelId;
     // Cached CSR builder kernel IDs
     private int csrCountNnzKernelId;
     private int csrFinalizeRowPtrKernelId;
@@ -154,9 +164,13 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer cgAlphaBuffer;
     private ComputeBuffer cgBetaBuffer;
     private ComputeBuffer cgRhoBuffer;
-    /// <summary>12 uints: 4× DispatchIndirect triples — [0] SpMV/256-thread, [1] 512-thread, [2] 1-group, [3] prefix-pass1.
-    /// Replaces cgPcgIndirectArgsBuffer; first 9 uints are written by BuildSolverIndirectArgs each frame.</summary>
+    /// <summary>15 uints: 5× DispatchIndirect triples — see <c>BuildSolverIndirectArgs</c> in NodesPrefixSums.compute.</summary>
     private ComputeBuffer solverIndirectArgsBuffer;
+    /// <summary>First 3 triples (9 uints) copied from <see cref="solverIndirectArgsBuffer"/> for PCG; may be zeroed by <c>CheckConvergence</c>.</summary>
+    private ComputeBuffer pcgIndirectArgsBuffer;
+    private ComputeBuffer cgPcgIterationStatBuffer;
+    private ComputeBuffer cgInitialResidualSqBuffer;
+    bool _pcgLoopUsesPcgIndirectArgs;
     private ComputeBuffer solverReductionCount256Buffer; // ceil(n/256) for GlobalReduceSum after SpMV
     private ComputeBuffer solverReductionCount512Buffer; // ceil(n/512) for GlobalReduceSum after DotProduct
     private ComputeBuffer solverPrefixLenBuffer;         // [0]=numNodes [1]=pfx1, for CSR prefix sum kernels
@@ -217,6 +231,7 @@ public partial class FluidSimulator : MonoBehaviour
     public float MaxDetailCellSize => maxDetailCellSize;
     private int numUniqueNodes; // rename to numUniqueNodes
     private int layer;
+    [Tooltip("Magnitude of downward gravity. The solver applies it along simulation Morton axis Y (node faces bottom/top), which matches Unity world Y when Simulation Bounds is axis-aligned and not rotated.")]
     public float gravity = 100.0f;
 
     [Header("Viscosity")]
@@ -368,6 +383,10 @@ public partial class FluidSimulator : MonoBehaviour
         public float density;       // 4 bytes
     }
 
+    /// <summary>Stride of <see cref="Particle"/> in every GPU <c>StructuredBuffer&lt;Particle&gt;</c> (must match all *.compute and <see cref="RadixSort"/> scratch).</summary>
+    public const int ParticleBufferStrideBytes =
+        sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(float);
+
     // Node struct (must match compute shader)
     private struct Node
     {
@@ -409,6 +428,7 @@ public partial class FluidSimulator : MonoBehaviour
     private ComputeBuffer solidSDFBuffer;
     public  ComputeBuffer SolidSDFBuffer      => solidSDFBuffer;
     private ComputeBuffer initialPositionsBuffer;
+    private ComputeBuffer initialDensityBuffer;
     /// <summary>Per-voxel occupancy (0/1) for debug draw; same R³ layout as <see cref="SolidSDFBuffer"/>.</summary>
     private ComputeBuffer solidVoxelsBuffer;
     public  ComputeBuffer SolidVoxelsBuffer     => solidVoxelsBuffer;
@@ -1165,6 +1185,12 @@ public partial class FluidSimulator : MonoBehaviour
     private void InitializeParticleSystem()
     {
         bool hasMesh = fluidInitialMesh != null;
+        bool useDualFluidMeshes = hasMesh && fluidInitialMeshPhase2 != null;
+        if (fluidInitialMeshPhase2 != null && !hasMesh)
+        {
+            Debug.LogError("FluidSimulator: assign Fluid Initial Mesh (phase 1) when using Fluid Initial Mesh Phase 2.");
+            return;
+        }
         if (simulationBounds == null || (!hasMesh && fluidInitialBounds == null))
         {
             Debug.LogError(
@@ -1181,7 +1207,7 @@ public partial class FluidSimulator : MonoBehaviour
 
         // Create particle buffer
         particlesBuffer?.Release();
-        particlesBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3 + sizeof(float) * 3 + sizeof(uint) + sizeof(float));
+        particlesBuffer = new ComputeBuffer(numParticles, ParticleBufferStrideBytes);
         particlesCPU = new Particle[numParticles];
 
         // Compute sim-space transform: world → 0..1023 on each axis
@@ -1207,9 +1233,24 @@ public partial class FluidSimulator : MonoBehaviour
         fluidInitialBoundsMax = (fluidInitialBounds != null ? fluidInitialBounds.bounds.max : simulationBounds.bounds.max)
                                 - simulationBounds.bounds.min;
 
-        // --- Generate initial positions in sim space (0–1023) ---
+        // --- Generate initial positions in world space ---
+        int dualMeshPhase1Count = 0;
         Vector3[] worldPositions;
-        if (hasMesh)
+        if (useDualFluidMeshes)
+        {
+            dualMeshPhase1Count = Mathf.Clamp(Mathf.RoundToInt(numParticles * phase1ParticleFraction), 1, numParticles - 1);
+            int n2 = numParticles - dualMeshPhase1Count;
+            Vector3[] wp1 = MeshColliderBaker.GenerateVolumePoints(fluidInitialMesh, simulationBounds.bounds, dualMeshPhase1Count);
+            Vector3[] wp2 = MeshColliderBaker.GenerateVolumePoints(fluidInitialMeshPhase2, simulationBounds.bounds, n2);
+            worldPositions = new Vector3[numParticles];
+            int len1 = Mathf.Max(1, wp1 != null ? wp1.Length : 0);
+            int len2 = Mathf.Max(1, wp2 != null ? wp2.Length : 0);
+            for (int i = 0; i < dualMeshPhase1Count; i++)
+                worldPositions[i] = wp1[i % len1];
+            for (int i = 0; i < n2; i++)
+                worldPositions[dualMeshPhase1Count + i] = wp2[i % len2];
+        }
+        else if (hasMesh)
         {
             worldPositions = MeshColliderBaker.GenerateVolumePoints(
                 fluidInitialMesh, simulationBounds.bounds, numParticles);
@@ -1270,8 +1311,9 @@ public partial class FluidSimulator : MonoBehaviour
         initialPositionsBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3);
         initialPositionsBuffer.SetData(simPositions);
 
-        // Compute second-bounds in sim space (same convention as fluidInitialBoundsMin/Max)
-        bool hasSecond = fluidSecondBounds != null;
+        // Compute second-bounds in sim space (same convention as fluidInitialBoundsMin/Max).
+        // Two separate initial meshes set per-particle density on the CPU; ignore the second-fluid box then.
+        bool hasSecond = fluidSecondBounds != null && !useDualFluidMeshes;
         Vector3 secondBoundsMin = hasSecond
             ? (fluidSecondBounds.bounds.min - simulationBounds.bounds.min)
             : Vector3.zero;
@@ -1291,6 +1333,28 @@ public partial class FluidSimulator : MonoBehaviour
         // Dispatch init kernel
         particlesShader.SetBuffer(initializeParticlesKernel, "particlesBuffer", particlesBuffer);
         particlesShader.SetBuffer(initializeParticlesKernel, "initialPositionsBuffer", initialPositionsBuffer);
+        initialDensityBuffer?.Release();
+        initialDensityBuffer = null;
+        if (useDualFluidMeshes)
+        {
+            float secondD = baseDensity * densityRatio;
+            var densities = new float[numParticles];
+            for (int i = 0; i < dualMeshPhase1Count; i++)
+                densities[i] = baseDensity;
+            for (int i = dualMeshPhase1Count; i < numParticles; i++)
+                densities[i] = secondD;
+            initialDensityBuffer = new ComputeBuffer(numParticles, sizeof(float));
+            initialDensityBuffer.SetData(densities);
+            particlesShader.SetBuffer(initializeParticlesKernel, "initialDensityBuffer", initialDensityBuffer);
+            particlesShader.SetInt("usePerParticleInitialDensity", 1);
+        }
+        else
+        {
+            initialDensityBuffer = new ComputeBuffer(1, sizeof(float));
+            initialDensityBuffer.SetData(new[] { baseDensity });
+            particlesShader.SetBuffer(initializeParticlesKernel, "initialDensityBuffer", initialDensityBuffer);
+            particlesShader.SetInt("usePerParticleInitialDensity", 0);
+        }
         particlesShader.SetVector("initialVelocity", initialVelocity);
         particlesShader.SetInt("count", numParticles);
         particlesShader.SetInt("minLayer", minLayer);
@@ -1382,13 +1446,16 @@ public partial class FluidSimulator : MonoBehaviour
         csrRowIndices?.Release();    csrRowIndices    = new ComputeBuffer(maxNnz, sizeof(uint));
         csrValues?.Release();        csrValues        = new ComputeBuffer(maxNnz, sizeof(float));
 
-        // Solver indirect dispatch args (4 triples = 12 uints):
-        //   [0-2]  256-thread (BuildMatrixA, divergence, CSR, ApplyPressure)
-        //   [3-5]  512-thread (vector ops: axpy, scale, dot, copy, jacobi)
-        //   [6-8]  1-group    (GlobalReduceSum, ComputeAlpha/Beta, StoreRho)
-        //   [9-11] pfx1-groups (CSR exclusive prefix sum passes 1 & 2)
+        // Solver indirect dispatch args (5 triples = 15 uints): BuildSolverIndirectArgs in NodesPrefixSums.compute
+        //   [0-2]  256-thread, [3-5] 512-thread, [6-8] 1-group, [9-11] CSR prefix pass1, [12-14] prefix pass2
         solverIndirectArgsBuffer?.Release();
-        solverIndirectArgsBuffer = new ComputeBuffer(12, sizeof(uint), ComputeBufferType.IndirectArguments);
+        solverIndirectArgsBuffer = new ComputeBuffer(15, sizeof(uint), ComputeBufferType.IndirectArguments);
+        pcgIndirectArgsBuffer?.Release();
+        pcgIndirectArgsBuffer = new ComputeBuffer(9, sizeof(uint), ComputeBufferType.IndirectArguments);
+        cgPcgIterationStatBuffer?.Release();
+        cgPcgIterationStatBuffer = new ComputeBuffer(1, sizeof(uint));
+        cgInitialResidualSqBuffer?.Release();
+        cgInitialResidualSqBuffer = new ComputeBuffer(1, sizeof(float));
         solverReductionCount256Buffer?.Release();
         solverReductionCount256Buffer = new ComputeBuffer(1, sizeof(uint));
         solverReductionCount512Buffer?.Release();
@@ -1531,6 +1598,9 @@ public partial class FluidSimulator : MonoBehaviour
         cgBetaBuffer?.Release();
         cgRhoBuffer?.Release();
         solverIndirectArgsBuffer?.Release();
+        pcgIndirectArgsBuffer?.Release();
+        cgPcgIterationStatBuffer?.Release();
+        cgInitialResidualSqBuffer?.Release();
         solverReductionCount256Buffer?.Release();
         solverReductionCount512Buffer?.Release();
         solverPrefixLenBuffer?.Release();
@@ -1550,6 +1620,7 @@ public partial class FluidSimulator : MonoBehaviour
         mortonCodesBuffer?.Release();
         solidSDFBuffer?.Release();
         initialPositionsBuffer?.Release();
+        initialDensityBuffer?.Release();
         uniformCellCountsBuffer?.Release();
         uniformDenseIndexMapBuffer?.Release();
         uniformActiveMortonListBuffer?.Release();
