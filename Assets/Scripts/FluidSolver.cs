@@ -146,6 +146,7 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "uniformNeighborsBuffer", uniformNeighborsBuffer);
             cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "uniformMatrixABuffer", uniformMatrixABuffer);
             cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "solidSDFBuffer", solidSDFBuffer);
+            cgSolverShader.SetBuffer(buildMatrixAUniformKernelId, "nodeDensityBuffer", nodeDensityBuffer);
             cgSolverShader.SetInt("useColliders", useColliders ? 1 : 0);
             cgSolverShader.SetInt("solidSDFResolution", ColliderGridResolution);
             cgSolverShader.SetFloat("deltaTime", deltaTime);
@@ -157,6 +158,7 @@ public partial class FluidSimulator : MonoBehaviour
             cgSolverShader.SetBuffer(buildMatrixAKernelId, "neighborsBuffer", neighborsBuffer);
             cgSolverShader.SetBuffer(buildMatrixAKernelId, "matrixABuffer", matrixABuffer);
             cgSolverShader.SetBuffer(buildMatrixAKernelId, "solidSDFBuffer", solidSDFBuffer);
+            cgSolverShader.SetBuffer(buildMatrixAKernelId, "nodeDensityBuffer", nodeDensityBuffer);
             cgSolverShader.SetInt("useColliders", useColliders ? 1 : 0);
             cgSolverShader.SetInt("solidSDFResolution", ColliderGridResolution);
             cgSolverShader.SetFloat("deltaTime", deltaTime);
@@ -408,6 +410,7 @@ public partial class FluidSimulator : MonoBehaviour
             uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "tempNodesBuffer", tempNodesBuffer);
             uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "uniformNeighborsBuffer", uniformNeighborsBuffer);
             uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "pressureBuffer", pressureBuffer);
+            uniformGridShader.SetBuffer(uniformGridApplyPressureKernel, "nodeDensityBuffer", nodeDensityBuffer);
             uniformGridShader.SetFloat("deltaTime", deltaTime);
             uniformGridShader.DispatchIndirect(uniformGridApplyPressureKernel, solverIndirectArgsBuffer, SolverArgsOffset256);
         }
@@ -417,6 +420,7 @@ public partial class FluidSimulator : MonoBehaviour
             nodesShader.SetBuffer(applyPressureGradientKernel, "tempNodesBuffer", tempNodesBuffer);
             nodesShader.SetBuffer(applyPressureGradientKernel, "neighborsBuffer", neighborsBuffer);
             nodesShader.SetBuffer(applyPressureGradientKernel, "pressureBuffer", pressureBuffer);
+            nodesShader.SetBuffer(applyPressureGradientKernel, "nodeDensityBuffer", nodeDensityBuffer);
             nodesShader.DispatchIndirect(applyPressureGradientKernel, solverIndirectArgsBuffer, SolverArgsOffset256);
         }
 

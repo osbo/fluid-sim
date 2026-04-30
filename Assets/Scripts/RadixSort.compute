@@ -17,6 +17,7 @@ struct Particle
     float3 position;
     float3 velocity;
     uint mortonCode;
+    float density;
 };
 
 // --- BUFFERS ---

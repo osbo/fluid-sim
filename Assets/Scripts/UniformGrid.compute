@@ -29,6 +29,7 @@ struct Particle
     float3 position;
     float3 velocity;
     uint mortonCode;
+    float density;
 };
 
 struct faceVelocities
@@ -73,6 +74,10 @@ static const uint kSplatPosScale = 8u;
 static const uint kSplatVelScale = 16u;
 
 RWStructuredBuffer<uint> nodeAccumBuffer; // [7 * kSplatStripes * numNodesCapacity]
+// Density accumulation: uint per node (scaled-int, scale = kSplatDensityScale). Written by SplatParticles, read by NormalizeNodes.
+RWStructuredBuffer<uint> densityAccumBuffer;
+RWStructuredBuffer<float> nodeDensityBuffer;
+static const float kSplatDensityScale = 1000.0;
 
 uint uniformGridLog2K;
 uint uniformGridCellCount;
@@ -212,6 +217,7 @@ void UniformGrid_ClearNodeAccum(uint3 id : SV_DispatchThreadID)
         for (uint t = 0; t < kSplatStripes; t++)
             nodeAccumBuffer[NodeAccumFlatIndex(s, t, nodeID, stride)] = 0u;
     }
+    densityAccumBuffer[nodeID] = 0u;
 }
 
 // One thread per particle: look up its node via denseIndexMap, then striped InterlockedAdd.
@@ -250,6 +256,9 @@ void UniformGrid_SplatParticles(uint3 id : SV_DispatchThreadID)
     InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(5u, stripe, nodeID, stride)], (uint)ivz);
 
     InterlockedAdd(nodeAccumBuffer[NodeAccumFlatIndex(6u, stripe, nodeID, stride)], 1u);
+
+    uint scaledDensity = (uint)round(pt.density * kSplatDensityScale);
+    InterlockedAdd(densityAccumBuffer[nodeID], scaledDensity);
 }
 
 // One thread per active node: read accumulators, normalize, write final Node struct.
@@ -304,8 +313,11 @@ void UniformGrid_NormalizeNodes(uint3 id : SV_DispatchThreadID)
     node.mortonCode = mortonCode;
     node.active     = 1u;
 
-    nodesBuffer[nodeID]      = node;
+    nodesBuffer[nodeID]       = node;
     mortonCodesBuffer[nodeID] = mortonCode;
+
+    float densityAccum = (float)densityAccumBuffer[nodeID];
+    nodeDensityBuffer[nodeID] = (countU > 0u) ? (densityAccum / (kSplatDensityScale * (float)countU)) : 1.0;
 }
 
 [numthreads(512, 1, 1)]
@@ -470,12 +482,14 @@ void UniformGrid_ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_G
     Node outNode = node;
     float p_i = ug_s_pressure[li];
     float dx_i = exp2((float)node.layer);
+    float rho_i = nodeDensityBuffer[threadIndex];
     uint nAct = NActU();
 
     for (int d = 0; d < 6; d++)
     {
         uint neighbor_idx = uniformNeighborsBuffer[(uint)d * numNodesCapacity + threadIndex];
         float pressure_gradient = 0.0;
+        float rho_face = rho_i;
         // Must match BuildMatrixAUniform and UniformGrid_InterpolateFaceVelocities:
         // - nAct+1 = domain wall (Neumann / zero flux here)
         // - nAct+2 = ghost solid (handled like wall for this kernel)
@@ -495,6 +509,8 @@ void UniformGrid_ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_G
                 nNode = nodesBuffer[neighbor_idx];
 
             float p_j = is_cache_hit ? ug_s_pressure[neighbor_idx - group_start_idx] : pressureBuffer[neighbor_idx];
+            float rho_j = nodeDensityBuffer[neighbor_idx];
+            rho_face = 2.0 * rho_i * rho_j / max(rho_i + rho_j, 1e-4f);
             float dx_j = exp2((float)nNode.layer);
             float distance = max(0.5 * (dx_i + dx_j), 1e-6);
             pressure_gradient = (p_j - p_i) / distance;
@@ -507,7 +523,7 @@ void UniformGrid_ApplyPressureGradient(uint3 Gid : SV_GroupID, uint3 Gtid : SV_G
             pressure_gradient = (0.0 - p_i) / distance;
         }
 
-        float velocity_correction = deltaTime * pressure_gradient;
+        float velocity_correction = deltaTime * pressure_gradient / max(rho_face, 1e-4f);
 
         if (d == 0) outNode.velocities.left += velocity_correction;
         else if (d == 1) outNode.velocities.right -= velocity_correction;

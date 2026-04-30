@@ -160,6 +160,7 @@ public partial class FluidSimulator : MonoBehaviour
         nodesShader.SetBuffer(createLeavesKernel, "uniqueIndices", uniqueIndices);
         nodesShader.SetBuffer(createLeavesKernel, "mortonCodesBuffer", mortonCodesBuffer);
         nodesShader.SetBuffer(createLeavesKernel, "uniqueCount", uniqueCount);
+        nodesShader.SetBuffer(createLeavesKernel, "nodeDensityBuffer", nodeDensityBuffer);
         nodesShader.SetInt("numParticles", numParticles);
         nodesShader.SetInt("minLayer", minLayer);
         nodesShader.SetInt("maxLayer", maxLayer);
