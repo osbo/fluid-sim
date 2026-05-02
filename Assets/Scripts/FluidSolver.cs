@@ -421,6 +421,7 @@ public partial class FluidSimulator : MonoBehaviour
                 gridMode == GridMode.Uniform ? uniformNeighborsBuffer : neighborsBuffer,
                 divergenceBuffer,
                 pressureBuffer,
+                nodeDensityBuffer,
                 diffusionGradientBuffer,
                 csrRowIndices,
                 csrColIndices,
