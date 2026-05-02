@@ -1013,7 +1013,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::TrainingDataRecorder
   record: 0
-  maxFrames: 400
+  maxFrames: 40
   baseFolder: TestData
 --- !u!4 &944897177
 Transform:
