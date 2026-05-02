@@ -45,6 +45,13 @@ def _build_parser():
         ),
     )
     parser.add_argument("--steps", type=int, default=50000)
+    parser.add_argument(
+        "--weights-out",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Override save path for trained weights .bytes file. Default: leaf_only_weights.bytes next to LeafOnly.py.",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument(
@@ -184,6 +191,16 @@ def _build_parser():
         default=DEFAULT_USE_HIGHWAYS,
         help=USE_HIGHWAYS_HELP,
     )
+    parser.add_argument(
+        "--stop-at-min-lr",
+        action="store_true",
+        default=False,
+        help=(
+            "Stop training early when the LR scheduler reaches min_lr (max(lr*1e-3, 1e-6)). "
+            "Exits with code 0 and saves weights. Useful with --continue-training to pick up "
+            "from the final LR of a prior run."
+        ),
+    )
     return parser
 
 
@@ -194,6 +211,8 @@ def train_leaf_only():
     runtime = fixed_runtime_config(__file__)
     if args.data_folder is not None:
         runtime["data_folder"] = str(Path(args.data_folder).expanduser().resolve())
+    if args.weights_out is not None:
+        runtime["save_path"] = Path(args.weights_out).expanduser().resolve()
     runtime["device"] = require_cuda_or_mps_device()
     if args.evaluate_gradients:
         evaluate_gradient_interference(args, runtime)
