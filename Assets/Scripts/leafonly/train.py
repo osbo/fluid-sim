@@ -355,6 +355,7 @@ def train_leaf_only(args, runtime):
 
     t_seg = time.perf_counter()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    _min_lr_val = max(args.lr * 1e-3, 1e-6)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -363,12 +364,14 @@ def train_leaf_only(args, runtime):
         threshold=5e-3,
         threshold_mode="rel",
         cooldown=1,
-        min_lr=max(args.lr * 1e-3, 1e-6),
+        min_lr=_min_lr_val,
     )
+    _stop_at_min_lr = bool(getattr(args, "stop_at_min_lr", False))
     ms_optim = (time.perf_counter() - t_seg) * 1000.0
     print(
         "  [startup] LR scheduler: ReduceLROnPlateau"
-        f" (factor=0.5, patience=5, threshold=5e-3, min_lr={max(args.lr * 1e-2, 1e-6):.2e})"
+        f" (factor=0.5, patience=5, threshold=5e-3, min_lr={_min_lr_val:.2e}"
+        f"{', stop-at-min-lr' if _stop_at_min_lr else ''})"
     )
     num_leaves_max = max_n_pad // LEAF_SIZE
     print(
@@ -792,6 +795,25 @@ def train_leaf_only(args, runtime):
             lr_after = optimizer.param_groups[0]["lr"]
             if lr_after < lr_before:
                 print(f"  [lr] plateau detected: lr {lr_before:.2e} -> {lr_after:.2e}")
+            if _stop_at_min_lr and lr_after <= _min_lr_val * 1.001:
+                # Print the step line before breaking so the log has the final lr.
+                print(
+                    f"{step:05d}: {loss_str}  ({elapsed:.3f}s)"
+                    f" lr={lr_after:.2e}{log_grad_suffix}"
+                )
+                print(f"  [lr] reached min_lr={_min_lr_val:.2e}; stopping (--stop-at-min-lr).")
+                save_leaf_only_weights(model, str(save_path), input_dim=9)
+                print(f"Saved to {save_path}")
+                return {
+                    "target_step": target_step,
+                    "loss_mean_at_target": target_loss_mean,
+                    "loss_std_at_target": target_loss_std,
+                    "lr_at_target": target_lr,
+                    "save_path": str(save_path),
+                    "stopped_at_min_lr": True,
+                    "final_lr": lr_after,
+                    "final_step": step,
+                }
 
             if step >= TIMING_STEP:
                 now = time.perf_counter()
