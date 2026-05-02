@@ -46,7 +46,7 @@ public class TrainingDataRecorder : MonoBehaviour
     }
 
     public void SaveFrame(ComputeBuffer nodes, ComputeBuffer neighbors, ComputeBuffer divergence, ComputeBuffer pressure,
-        ComputeBuffer diffusionGradient, ComputeBuffer rowIndices, ComputeBuffer colIndices, ComputeBuffer csrValues, int totalNNZ,
+        ComputeBuffer nodeDensity, ComputeBuffer diffusionGradient, ComputeBuffer rowIndices, ComputeBuffer colIndices, ComputeBuffer csrValues, int totalNNZ,
         int numNodes, int minLayer, int maxLayer, float gravity, int numParticles, int maxCgIterations, float convergenceThreshold, float frameRate,
         Vector3 simulationBoundsMin, Vector3 simulationBoundsMax, Vector3 fluidInitialBoundsMin, Vector3 fluidInitialBoundsMax,
         int neighborUintsPerNode = 24)
@@ -88,6 +88,9 @@ public class TrainingDataRecorder : MonoBehaviour
         SaveBuffer(divergence, numNodes, sizeof(float), Path.Combine(framePath, "divergence.bin"));
         // Pressure buffer: 1 float per node = 4 bytes
         SaveBuffer(pressure, numNodes, sizeof(float), Path.Combine(framePath, "pressure.bin"));
+        // P2G-averaged fluid density per node (multiphase); 1 float per node = 4 bytes
+        if (nodeDensity != null)
+            SaveBuffer(nodeDensity, numNodes, sizeof(float), Path.Combine(framePath, "node_density.bin"));
         // Diffusion gradient: float3 per node = 12 bytes
         if (diffusionGradient != null)
             SaveBuffer(diffusionGradient, numNodes, 3 * sizeof(float), Path.Combine(framePath, "diffusion_gradient.bin"));

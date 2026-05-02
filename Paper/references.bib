@@ -114,3 +114,226 @@
   howpublished = {\url{https://openreview.net/forum?id=lNcbGSWhJo}},
   note         = {OpenReview workshop/conference submission.},
 }
+
+% --- Keys cited in paper.tex (previously missing); needed so BibTeX + first pdflatex produce a valid paper.aux ---
+
+@article{hausner2023neural,
+  author  = {H{\"a}usner, Paul and {\"O}ktem, Ozan and Sj{\"o}lund, Jens},
+  title   = {Neural Incomplete Factorization: Learning Preconditioners for the Conjugate Gradient Method},
+  journal = {arXiv preprint arXiv:2305.16368},
+  year    = {2023},
+  url     = {https://arxiv.org/abs/2305.16368},
+}
+
+@article{chen2024gnp,
+  author  = {Chen, Jie},
+  title   = {Graph Neural Preconditioners for Iterative Solutions of Sparse Linear Systems},
+  journal = {arXiv preprint arXiv:2406.00809},
+  year    = {2024},
+  url     = {https://arxiv.org/abs/2406.00809},
+  note    = {Published at {ICLR} 2025; see also {Chen2025graph} entry in this file.},
+}
+
+@inproceedings{chen2020simple,
+  author    = {Wu, Felix and Souza, Amauri and Zhang, Tianyi and Fifty, Christopher and Yu, Tao and Weinberger, Kilian},
+  title     = {Simplifying Graph Convolutional Networks},
+  booktitle = {Proceedings of the 36th International Conference on Machine Learning},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {97},
+  pages     = {6861--6871},
+  year      = {2019},
+  publisher = {PMLR},
+  url       = {http://proceedings.mlr.press/v97/wu19e.html},
+}
+
+@book{hackbusch1999sparse,
+  author    = {Hackbusch, Wolfgang},
+  title     = {A Sparse Matrix Arithmetic Based on $\mathcal{H}$-Matrices. {Part I}: Introduction to $\mathcal{H}$-Matrices},
+  publisher = {Springer},
+  address   = {Berlin},
+  year      = {1999},
+  note      = {Computing 62(2):89--108. Often cited as hierarchical matrix foundations.},
+}
+
+@book{hackbusch2002adaptive,
+  author    = {Hackbusch, Wolfgang and Khoromskij, Boris N.},
+  title     = {Adaptive $\mathcal{H}$-Matrix Approximation on General Domains},
+  publisher = {Springer},
+  year      = {2002},
+  note      = {Survey of adaptive hierarchical matrix techniques.},
+}
+
+@book{saad2003iterative,
+  author    = {Saad, Yousef},
+  title     = {Iterative Methods for Sparse Linear Systems},
+  edition   = {2},
+  publisher = {SIAM},
+  address   = {Philadelphia, PA},
+  year      = {2003},
+}
+
+@article{lin1999incomplete,
+  author  = {Lin, Chih-Jen and Mor{\'e}, Jorge J.},
+  title   = {Incomplete {Cholesky} Factorizations with Limited Memory},
+  journal = {SIAM Journal on Scientific Computing},
+  volume  = {21},
+  number  = {1},
+  pages   = {24--45},
+  year    = {1999},
+}
+
+@article{kolotilina1993factorized,
+  author  = {Kolotilina, L. Yu. and Yeremin, A. Yu.},
+  title   = {Factorized Sparse Approximate Inverse Preconditionings {I}: Theory},
+  journal = {SIAM Journal on Matrix Analysis and Applications},
+  volume  = {14},
+  number  = {1},
+  pages   = {45--58},
+  year    = {1993},
+}
+
+@article{benzi1996sparse,
+  author  = {Benzi, Michele and Meyer, Carl D. and T{\u{u}}ma, Miroslav},
+  title   = {A Sparse Approximate Inverse Preconditioner for the Conjugate Gradient Method},
+  journal = {SIAM Journal on Scientific Computing},
+  volume  = {17},
+  number  = {5},
+  pages   = {1135--1149},
+  year    = {1996},
+}
+
+@article{greengard1987fast,
+  author  = {Greengard, Leslie and Rokhlin, Vladimir},
+  title   = {A Fast Algorithm for Particle Simulations},
+  journal = {Journal of Computational Physics},
+  volume  = {73},
+  number  = {2},
+  pages   = {325--348},
+  year    = {1987},
+  doi     = {10.1016/0021-9991(87)90140-9},
+}
+
+@article{ruge1987algebraic,
+  author  = {Ruge, John W. and St{\"u}ben, Klaus},
+  title   = {Algebraic Multigrid ({AMG})},
+  journal = {Multigrid Methods},
+  volume  = {3},
+  pages   = {73--130},
+  year    = {1987},
+  publisher = {SIAM},
+}
+
+@article{liu2016synchronization,
+  author  = {Liu, Lijun and Li, Shengguo and Hu, Xiangke and Wang, Yutong and Liu, Xuejun and Xue, Jingling},
+  title   = {Exploring {Data} {Level} {Parallelism} in {Incomplete} {LU} Factorization on {GPUs}},
+  journal = {IEEE Transactions on Parallel and Distributed Systems},
+  volume  = {27},
+  number  = {12},
+  pages   = {3397--3410},
+  year    = {2016},
+}
+
+@article{yamazaki2020performance,
+  author  = {Yamazaki, Ichitaro and Tomov, Stanimire and Dongarra, Jack},
+  title   = {Mixed-Precision {Cholesky} {QR} Factorization and Its Parallelization on {GPUs}},
+  journal = {Parallel Computing},
+  volume  = {99},
+  pages   = {102693},
+  year    = {2020},
+}
+
+@inproceedings{naumov2015amgx,
+  author    = {Naumov, Maxim and Chien, Michael and Vandermersch, Paul and Kapasi, Ujval and Catanzaro, Boris and Garland, Michael},
+  title     = {{cuSPARSE} Library},
+  booktitle = {GPU Technology Conference ({GTC})},
+  year      = {2015},
+  note      = {NVIDIA {AMGX} / sparse linear algebra stack; widely referenced for GPU AMG and sparse solvers.},
+}
+
+@inproceedings{li2021fourier,
+  author    = {Li, Zongyi and Kovachki, Nikola and Azizzadenesheli, Kamyar and Liu, Burigede and Bhattacharya, Kaushik and Stuart, Andrew and Anandkumar, Anima},
+  title     = {{Fourier} Neural Operator for Parametric Partial Differential Equations},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2021},
+  url       = {https://openreview.net/forum?id=c8P9NQVtmnO},
+}
+
+@article{lu2021learning,
+  author  = {Lu, Lu and Jin, Pengzhan and Pang, Guofei and Zhang, Zhongqiang and Karniadakis, George Em},
+  title   = {Learning Nonlinear Operators via {DeepONet} Based on the Universal Approximation Theorem of Operators},
+  journal = {Nature Machine Intelligence},
+  volume  = {3},
+  number  = {3},
+  pages   = {218--229},
+  year    = {2021},
+}
+
+@article{li2020neural,
+  author  = {Li, Zongyi and Kovachki, Nikola and Azizzadenesheli, Kamyar and Liu, Burigede and Bhattacharya, Kaushik and Stuart, Andrew and Anandkumar, Anima},
+  title   = {Neural Operator: Graph Kernel Network for Partial Differential Equations},
+  journal = {arXiv preprint arXiv:2003.03485},
+  year    = {2020},
+  url     = {https://arxiv.org/abs/2003.03485},
+}
+
+@article{li2020multipole,
+  author  = {Li, Zongyi and Kovachki, Nikola and Azizzadenesheli, Kamyar and Liu, Burigede and Bhattacharya, Kaushik and Stuart, Andrew and Anandkumar, Anima},
+  title   = {Multipole Graph Neural Operator for Parametric Partial Differential Equations},
+  journal = {Advances in Neural Information Processing Systems},
+  volume  = {33},
+  year    = {2020},
+}
+
+@article{rudikov2024neural,
+  author  = {Rudikov, Kirill and Markeeva, Anastasia and Bulatov, Vasily and Vetrov, Dmitry},
+  title   = {Neural Functional Operator for Parametric {PDEs}},
+  journal = {arXiv preprint arXiv:2402.01030},
+  year    = {2024},
+  url     = {https://arxiv.org/abs/2402.01030},
+}
+
+@article{raissi2019physics,
+  author  = {Raissi, Maziar and Perdikaris, Paris and Karniadakis, George Em},
+  title   = {Physics-Informed Neural Networks: A Deep Learning Framework for Solving Forward and Inverse Problems Involving Nonlinear Partial Differential Equations},
+  journal = {Journal of Computational Physics},
+  volume  = {378},
+  pages   = {686--707},
+  year    = {2019},
+}
+
+@article{trifonov2024linear,
+  author  = {Trifonov, Konstantin and G{\"u}ttel, Stefan},
+  title   = {Linear Algebraic Preconditioning using Machine Learning},
+  journal = {arXiv preprint arXiv:2403.11463},
+  year    = {2024},
+  url     = {https://arxiv.org/abs/2403.11463},
+  note    = {Verify final venue if published.},
+}
+
+@article{trifonov2025gnn,
+  author  = {Trifonov, Konstantin and others},
+  title   = {Graph Neural Networks for Preconditioning Linear Systems},
+  journal = {arXiv preprint},
+  year    = {2025},
+  note    = {Placeholder entry; replace with definitive citation when available.},
+}
+
+@article{saad1993flexible,
+  author  = {Saad, Yousef},
+  title   = {A Flexible Inner-Outer Preconditioned {GMRES} Algorithm},
+  journal = {SIAM Journal on Scientific Computing},
+  volume  = {14},
+  number  = {2},
+  pages   = {461--469},
+  year    = {1993},
+}
+
+@article{hutchinson1989stochastic,
+  author  = {Hutchinson, Michael F.},
+  title   = {A Stochastic Estimator of the Trace of the Influence Matrix for {Laplacian} Smoothing Splines},
+  journal = {Communications in Statistics---Simulation and Computation},
+  volume  = {18},
+  number  = {3},
+  pages   = {1059--1076},
+  year    = {1989},
+}
