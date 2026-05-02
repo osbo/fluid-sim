@@ -8,11 +8,16 @@ public class TrainingDataRecorder : MonoBehaviour
     [Tooltip("When checked, begins a new run folder and saves up to Max Frames counting from this moment. Uncheck anytime to stop without saving the current solver step.")]
     public bool record = true;
     public int maxFrames = 600;
+    [Tooltip("Persist one snapshot every N solver steps while recording (1 = every step).")]
+    [Min(1)]
+    public int saveEvery = 1;
     public string baseFolder = "SimulationData";
     
     public bool isRecording { get; private set; } = false;
     private string currentRunFolder;
     private int frameIndex = 0;
+    /// <summary>Solver steps since this run started; used with <see cref="saveEvery"/>.</summary>
+    private int recordSimStep;
     private byte[] saveBytesScratch;
     /// <summary>Last serialized <see cref="record"/>; used to detect Inspector toggles so max-frames stop does not auto-start a new run.</summary>
     private bool recordPrev;
@@ -62,6 +67,7 @@ public class TrainingDataRecorder : MonoBehaviour
         currentRunFolder = Path.Combine(Application.streamingAssetsPath, baseFolder, "Run_" + timestamp);
         Directory.CreateDirectory(currentRunFolder);
         frameIndex = 0;
+        recordSimStep = 0;
         isRecording = true;
         Debug.Log($"Started recording to: {currentRunFolder} (max {maxFrames} frames from this moment)");
     }
@@ -88,11 +94,18 @@ public class TrainingDataRecorder : MonoBehaviour
             return;
         }
 
+        recordSimStep++;
+        int every = Mathf.Max(1, saveEvery);
+        if ((recordSimStep - 1) % every != 0)
+            return;
+
         string framePath = Path.Combine(currentRunFolder, $"frame_{frameIndex:D4}");
         Directory.CreateDirectory(framePath);
 
         // 1. Save Metadata
         string metadata = $"numNodes: {numNodes}\n" +
+                         $"saveEvery: {every}\n" +
+                         $"recordingSimStep: {recordSimStep}\n" +
                          $"minLayer: {minLayer}\n" +
                          $"maxLayer: {maxLayer}\n" +
                          $"gravity: {gravity}\n" +
