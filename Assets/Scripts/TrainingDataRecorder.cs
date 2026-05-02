@@ -5,6 +5,7 @@ using System;
 public class TrainingDataRecorder : MonoBehaviour
 {
     [Header("Recording Settings")]
+    [Tooltip("When checked, begins a new run folder and saves up to Max Frames counting from this moment. Uncheck anytime to stop without saving the current solver step.")]
     public bool record = true;
     public int maxFrames = 600;
     public string baseFolder = "SimulationData";
@@ -13,6 +14,8 @@ public class TrainingDataRecorder : MonoBehaviour
     private string currentRunFolder;
     private int frameIndex = 0;
     private byte[] saveBytesScratch;
+    /// <summary>Last serialized <see cref="record"/>; used to detect Inspector toggles so max-frames stop does not auto-start a new run.</summary>
+    private bool recordPrev;
 
     // Struct matching your Compute Shader Node exactly for byte-alignment
     // Node struct: Vector3 position (12) + Vector3 velocity (12) + faceVelocities (24) + float mass (4) + uint layer (4) + uint mortonCode (4) + uint active (4) = 64 bytes total
@@ -29,6 +32,22 @@ public class TrainingDataRecorder : MonoBehaviour
         public uint active;         // 4
     }
 
+    void OnEnable()
+    {
+        recordPrev = record;
+    }
+
+    void Update()
+    {
+        if (record == recordPrev)
+            return;
+        if (record)
+            StartNewRun();
+        else
+            StopRecording();
+        recordPrev = record;
+    }
+
     public void StartNewRun()
     {
         if (!record)
@@ -36,13 +55,15 @@ public class TrainingDataRecorder : MonoBehaviour
             isRecording = false;
             return;
         }
-        
+
+        StopRecording();
+
         string timestamp = System.DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
         currentRunFolder = Path.Combine(Application.streamingAssetsPath, baseFolder, "Run_" + timestamp);
         Directory.CreateDirectory(currentRunFolder);
         frameIndex = 0;
         isRecording = true;
-        Debug.Log($"Started recording to: {currentRunFolder} (max {maxFrames} frames)");
+        Debug.Log($"Started recording to: {currentRunFolder} (max {maxFrames} frames from this moment)");
     }
 
     public void SaveFrame(ComputeBuffer nodes, ComputeBuffer neighbors, ComputeBuffer divergence, ComputeBuffer pressure,
@@ -51,8 +72,15 @@ public class TrainingDataRecorder : MonoBehaviour
         Vector3 simulationBoundsMin, Vector3 simulationBoundsMax, Vector3 fluidInitialBoundsMin, Vector3 fluidInitialBoundsMax,
         int neighborUintsPerNode = 24)
     {
-        if (!isRecording || !record) return;
-        
+        if (!isRecording)
+            return;
+        // Inspector cleared Record before Update: do not write this timestep.
+        if (!record)
+        {
+            StopRecording();
+            return;
+        }
+
         // Check if we've reached the max frame count before saving
         if (frameIndex >= maxFrames)
         {
@@ -142,8 +170,9 @@ public class TrainingDataRecorder : MonoBehaviour
 
     public void StopRecording()
     {
-        if (!isRecording) return; // Already stopped
-        
+        if (!isRecording)
+            return;
+
         isRecording = false;
         Debug.Log($"Stopped recording. Total frames saved: {frameIndex}/{maxFrames}");
     }
