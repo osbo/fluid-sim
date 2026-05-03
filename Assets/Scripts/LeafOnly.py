@@ -52,7 +52,7 @@ def _build_parser():
         metavar="PATH",
         help="Override save path for trained weights .bytes file. Default: leaf_only_weights.bytes next to LeafOnly.py.",
     )
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument(
         "--num-layers",

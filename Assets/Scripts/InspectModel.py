@@ -2395,7 +2395,7 @@ def main():
         M_amg_n = M_amg[:viz_n, :viz_n]
 
     pcg_tol = 1e-8
-    pcg_max_iter = 5000
+    pcg_max_iter = 50000
     np.random.seed(123)
     b_np = np.random.randn(viz_n).astype(np.float64)
     b_np = b_np / (np.linalg.norm(b_np) + 1e-12)
@@ -2860,15 +2860,23 @@ def main():
                 eig_A_err = str(e)
 
         log_ainv = np.log10(np.abs(A_inv_viz) + 1e-9)
-        log_m_leaf = np.log10(np.abs(M_neural_n) + 1e-9)
-        log_m_amg = np.log10(np.abs(M_amg_n) + 1e-9)
-        vmin_log = min(log_ainv.min(), log_m_leaf.min(), log_m_amg.min())
-        vmax_log = max(log_ainv.max(), log_m_leaf.max(), log_m_amg.max())
-
-        axes[0, 0].imshow(np.log10(np.abs(A_viz_n) + 1e-9), cmap='magma', aspect='auto')
+        log_a_in = np.log10(np.abs(A_viz_n) + 1e-9)
+        im_a0 = axes[0, 0].imshow(
+            log_a_in,
+            cmap="magma",
+            aspect="auto",
+            vmin=float(log_a_in.min()),
+            vmax=float(log_a_in.max()),
+        )
         axes[0, 0].set_title(f"A (input) log10 [leaf {leaf_L}x{leaf_L}]")
-        plt.colorbar(axes[0, 0].images[0], ax=axes[0, 0])
-        im_ainv = axes[0, 1].imshow(log_ainv, cmap='magma', aspect='auto', vmin=vmin_log, vmax=vmax_log)
+        plt.colorbar(im_a0, ax=axes[0, 0])
+        im_ainv = axes[0, 1].imshow(
+            log_ainv,
+            cmap="magma",
+            aspect="auto",
+            vmin=float(log_ainv.min()),
+            vmax=float(log_ainv.max()),
+        )
         axes[0, 1].set_title(f"A^{{-1}} (viz {viz_n}x{viz_n}) log10")
         plt.colorbar(im_ainv, ax=axes[0, 1])
         ax_blk = axes[0, 2]
@@ -2983,33 +2991,39 @@ def main():
             style="italic",
         )
 
-        am_log_min, am_log_max = None, None
-        am_by_method: dict[str, np.ndarray] = {}
         t_am_build = time.perf_counter()
-        for name, M in methods:
-            AM = A_viz_n @ M
-            am_by_method[name] = AM
-            am_abs_log = np.log10(np.abs(AM) + 1e-9)
-            lo, hi = am_abs_log.min(), am_abs_log.max()
-            am_log_min = lo if am_log_min is None else min(am_log_min, lo)
-            am_log_max = hi if am_log_max is None else max(am_log_max, hi)
-        if am_log_min is None:
-            am_log_min, am_log_max = -8.0, 0.0
-        _info(f"  Dense A·M for plot color scale ({len(methods)}× matmul): {time.perf_counter() - t_am_build:.1f}s")
-
         for idx, (name, M) in enumerate(methods):
             row = 1 + idx
-            im_m = axes[row, 0].imshow(np.log10(np.abs(M) + 1e-9), cmap='magma', aspect='auto', vmin=vmin_log, vmax=vmax_log)
+            log_m = np.log10(np.abs(M) + 1e-9)
+            im_m = axes[row, 0].imshow(
+                log_m,
+                cmap="magma",
+                aspect="auto",
+                vmin=float(log_m.min()),
+                vmax=float(log_m.max()),
+            )
             axes[row, 0].set_title(f"{name} M (log10)")
             plt.colorbar(im_m, ax=axes[row, 0])
             abs_err = np.abs(M - A_inv_viz)
             log_err = np.log10(abs_err + 1e-12)
-            im_diff = axes[row, 1].imshow(log_err, cmap='magma', aspect='auto')
+            im_diff = axes[row, 1].imshow(
+                log_err,
+                cmap="magma",
+                aspect="auto",
+                vmin=float(log_err.min()),
+                vmax=float(log_err.max()),
+            )
             axes[row, 1].set_title(f"{name} |M − A^{{-1}}| (log10)")
             plt.colorbar(im_diff, ax=axes[row, 1])
-            AM = am_by_method[name]
+            AM = A_viz_n @ M
             am_abs_log = np.log10(np.abs(AM) + 1e-9)
-            im_am = axes[row, 2].imshow(am_abs_log, cmap='magma', aspect='auto', vmin=am_log_min, vmax=am_log_max)
+            im_am = axes[row, 2].imshow(
+                am_abs_log,
+                cmap="magma",
+                aspect="auto",
+                vmin=float(am_abs_log.min()),
+                vmax=float(am_abs_log.max()),
+            )
             axes[row, 2].set_title(f"{name} A·M (log10 |·|)")
             plt.colorbar(im_am, ax=axes[row, 2])
 
@@ -3106,6 +3120,8 @@ def main():
                 ax_ray.set_ylabel(r"$|1 - \mu_i|$")
                 ax_ray.set_title(f"{name}: error on $A$-eigenmodes")
                 ax_ray.grid(True, which="both", alpha=0.3)
+
+        _info(f"  Dense A·M heatmaps ({len(methods)}× matmul): {time.perf_counter() - t_am_build:.1f}s")
 
         _plot_hmatrix_rank_profiler_row(axes[n_rows - 1, :], hm_rank_bands[:n_cols])
 
