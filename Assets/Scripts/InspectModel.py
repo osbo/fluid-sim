@@ -2992,6 +2992,10 @@ def main():
         )
 
         t_am_build = time.perf_counter()
+        # Frobenius-normalize before |M - A^-1| so the heatmap is not dominated by unrelated global scales.
+        _eps_nf = 1e-30
+        fro_a_inv = float(np.linalg.norm(A_inv_viz, "fro")) + _eps_nf
+        A_inv_viz_unit = A_inv_viz / fro_a_inv
         for idx, (name, M) in enumerate(methods):
             row = 1 + idx
             log_m = np.log10(np.abs(M) + 1e-9)
@@ -3004,7 +3008,9 @@ def main():
             )
             axes[row, 0].set_title(f"{name} M (log10)")
             plt.colorbar(im_m, ax=axes[row, 0])
-            abs_err = np.abs(M - A_inv_viz)
+            fro_m = float(np.linalg.norm(M, "fro")) + _eps_nf
+            M_unit = M / fro_m
+            abs_err = np.abs(M_unit - A_inv_viz_unit)
             log_err = np.log10(abs_err + 1e-12)
             im_diff = axes[row, 1].imshow(
                 log_err,
@@ -3013,7 +3019,9 @@ def main():
                 vmin=float(log_err.min()),
                 vmax=float(log_err.max()),
             )
-            axes[row, 1].set_title(f"{name} |M − A^{{-1}}| (log10)")
+            axes[row, 1].set_title(
+                f"{name} $|M/\\|M\\|_F - A^{{-1}}/\\|A^{{-1}}\\|_F|$ (log10)"
+            )
             plt.colorbar(im_diff, ax=axes[row, 1])
             AM = A_viz_n @ M
             am_abs_log = np.log10(np.abs(AM) + 1e-9)
