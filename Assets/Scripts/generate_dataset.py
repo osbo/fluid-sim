@@ -45,11 +45,11 @@ def _rng(seed: int) -> Any:
 
 
 # Defaults (override with CLI).
-_DEFAULT_N_TARGET = 4096
+_DEFAULT_N_TARGET = 16384
 _DEFAULT_NUM_TRAIN = 100
 _DEFAULT_NUM_TEST = 20
 _DEFAULT_DATASET_TYPE = "hard-multiphase"
-_DEFAULT_DATASET_BUNDLE = "hard_multiphase_4096"
+_DEFAULT_DATASET_BUNDLE = "hard_multiphase_16384"
 
 # Default output folder name per --dataset-type (under --output-root).
 TYPE_OUTPUT_SUBDIR = {
