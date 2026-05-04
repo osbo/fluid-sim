@@ -13,7 +13,6 @@
 \@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
 \newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
 \@writefile{toc}{\contentsline {paragraph}{Spatial ordering and spectral content.}{1}{section*.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Our approach.}{1}{section*.3}\protected@file@percent }
 \citation{saad2003iterative}
 \citation{lin1999incomplete}
 \citation{kolotilina1993factorized,benzi1996sparse}
@@ -32,13 +31,14 @@
 \citation{chen2024gnp}
 \citation{li2023learning}
 \citation{hackbusch1999sparse,hackbusch2002adaptive}
-\citation{saad1993flexible,chen2024gnp}
+\@writefile{toc}{\contentsline {paragraph}{Our approach.}{2}{section*.3}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {2}Related Work}{2}{section.2}\protected@file@percent }
 \newlabel{sec:related}{{2}{2}{Related Work}{section.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Classical Iterative Solvers and Preconditioners}{2}{subsection.2.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Neural Operators and Machine Learning for Physics}{2}{subsection.2.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Learning-Based Preconditioners}{2}{subsection.2.3}\protected@file@percent }
 \newlabel{sec:related:precond}{{2.3}{2}{Learning-Based Preconditioners}{subsection.2.3}{}}
+\citation{saad1993flexible,chen2024gnp}
 \citation{hutchinson1989stochastic}
 \@writefile{toc}{\contentsline {section}{\numberline {3}Background}{3}{section.3}\protected@file@percent }
 \newlabel{sec:background}{{3}{3}{Background}{section.3}{}}
@@ -47,12 +47,12 @@
 \newlabel{sec:background:hmatrix}{{3.2}{3}{\texorpdfstring {$\mathcal {H}$}{H}-Matrices and Weak Admissibility}{subsection.3.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Hutchinson Trace Estimation}{3}{subsection.3.3}\protected@file@percent }
 \newlabel{sec:background:hutchinson}{{3.3}{3}{Hutchinson Trace Estimation}{subsection.3.3}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {4}Method}{3}{section.4}\protected@file@percent }
-\newlabel{sec:method}{{4}{3}{Method}{section.4}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Overview}{3}{subsection.4.1}\protected@file@percent }
 \@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Schematic of a weak-admissibility $\mathcal  {H}$-matrix partition on a uniform leaf grid (illustrative leaf count). Dense diagonal blocks appear as small squares along the main diagonal; admissible off-diagonal tiles grow with separation from the diagonal. A translucent, desaturated red overlay marks the upper-triangle portion (including the diagonal) of the row- and column-strip leaf index sets for one exemplar off-diagonal tile near the grid center (the same index sets accumulated into row/column token highways in training), drawn on top of the usual blue tile tint. Figure produced with \texttt  {hmatrixgraphic.py}.}}{3}{figure.caption.4}\protected@file@percent }
 \providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
 \newlabel{fig:hmatrix-schematic}{{1}{3}{Schematic of a weak-admissibility $\mathcal {H}$-matrix partition on a uniform leaf grid (illustrative leaf count). Dense diagonal blocks appear as small squares along the main diagonal; admissible off-diagonal tiles grow with separation from the diagonal. A translucent, desaturated red overlay marks the upper-triangle portion (including the diagonal) of the row- and column-strip leaf index sets for one exemplar off-diagonal tile near the grid center (the same index sets accumulated into row/column token highways in training), drawn on top of the usual blue tile tint. Figure produced with \texttt {hmatrixgraphic.py}}{figure.caption.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Method}{3}{section.4}\protected@file@percent }
+\newlabel{sec:method}{{4}{3}{Method}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Overview}{3}{subsection.4.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.2}The $\mathcal  {H}$-Matrix Partition}{3}{subsection.4.2}\protected@file@percent }
 \newlabel{sec:method:hmatrix}{{4.2}{3}{The \texorpdfstring {$\mathcal {H}$}{H}-Matrix Partition}{subsection.4.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Physics-Aware Encoder}{4}{subsection.4.3}\protected@file@percent }
@@ -66,11 +66,10 @@
 \newlabel{eq:strip}{{2}{4}{Off-Diagonal Transformer Stack}{equation.2}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.6}Highway Connections}{4}{subsection.4.6}\protected@file@percent }
 \newlabel{sec:method:highways}{{4.6}{4}{Highway Connections}{subsection.4.6}{}}
-\newlabel{eq:highway_concat}{{3}{4}{Highway Connections}{equation.3}{}}
 \citation{yang2025sparse,kolotilina1993factorized}
-\citation{yang2025sparse}
 \@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Leaf-grid schematic of the same weak-admissibility partition as Figure\nonbreakingspace \ref {fig:hmatrix-schematic}, with translucent red highlighting the upper-triangle portion (including the diagonal) of the row- and column-strip leaf index sets accumulated from one exemplar off-diagonal tile---the same index pattern written by prolongation into the row and column highway buffers during training. Figure produced with \texttt  {hmatrixgraphic.py} (\texttt  {SHOW\_HIGHWAYS=True}).}}{5}{figure.caption.6}\protected@file@percent }
 \newlabel{fig:highways-schematic}{{2}{5}{Leaf-grid schematic of the same weak-admissibility partition as Figure~\ref {fig:hmatrix-schematic}, with translucent red highlighting the upper-triangle portion (including the diagonal) of the row- and column-strip leaf index sets accumulated from one exemplar off-diagonal tile---the same index pattern written by prolongation into the row and column highway buffers during training. Figure produced with \texttt {hmatrixgraphic.py} (\texttt {SHOW\_HIGHWAYS=True})}{figure.caption.6}{}}
+\newlabel{eq:highway_concat}{{3}{5}{Highway Connections}{equation.3}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.7}Decoder and Output Structure}{5}{subsection.4.7}\protected@file@percent }
 \newlabel{sec:method:decoder}{{4.7}{5}{Decoder and Output Structure}{subsection.4.7}{}}
 \@writefile{toc}{\contentsline {paragraph}{Diagonal blocks.}{5}{section*.7}\protected@file@percent }
@@ -84,6 +83,7 @@
 \newlabel{sec:application}{{5}{5}{Preconditioner Application}{section.5}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Matrix-Free Operator Application}{5}{subsection.5.1}\protected@file@percent }
 \newlabel{sec:application:matrixfree}{{5.1}{5}{Matrix-Free Operator Application}{subsection.5.1}{}}
+\citation{yang2025sparse}
 \citation{greengard1987fast}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Diagonal Block Application}{6}{subsection.5.2}\protected@file@percent }
 \newlabel{sec:application:diag}{{5.2}{6}{Diagonal Block Application}{subsection.5.2}{}}
@@ -97,30 +97,30 @@
 \@writefile{toc}{\contentsline {paragraph}{Stage 3: Coarse interaction.}{6}{section*.14}\protected@file@percent }
 \newlabel{eq:coarse_r}{{7}{6}{Stage 3: Coarse interaction}{equation.7}{}}
 \newlabel{eq:coarse_c}{{8}{6}{Stage 3: Coarse interaction}{equation.8}{}}
-\@writefile{toc}{\contentsline {paragraph}{Stage 4: Prolongation (scatter back).}{6}{section*.15}\protected@file@percent }
-\newlabel{eq:prolong}{{9}{6}{Stage 4: Prolongation (scatter back)}{equation.9}{}}
 \citation{yang2025sparse}
 \citation{yang2025sparse}
 \citation{yang2025sparse}
+\@writefile{toc}{\contentsline {paragraph}{Stage 4: Prolongation (scatter back).}{7}{section*.15}\protected@file@percent }
+\newlabel{eq:prolong}{{9}{7}{Stage 4: Prolongation (scatter back)}{equation.9}{}}
 \@writefile{toc}{\contentsline {paragraph}{Jacobi residual.}{7}{section*.16}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Allocation-Free CUDAGraph Integration}{7}{subsection.5.4}\protected@file@percent }
 \newlabel{sec:application:cudagraph}{{5.4}{7}{Allocation-Free CUDAGraph Integration}{subsection.5.4}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Complexity and Comparison}{7}{subsection.5.5}\protected@file@percent }
 \newlabel{sec:application:complexity}{{5.5}{7}{Complexity and Comparison}{subsection.5.5}{}}
-\@writefile{toc}{\contentsline {paragraph}{IC vs.\ ours.}{7}{section*.18}\protected@file@percent }
 \@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Per-iteration preconditioner application cost. $N$: system size. $L_s$: leaf apply size (our method). $K = N/L$: number of leaves. $M_\mathcal  {H} \approx 9K$: off-diagonal blocks. $\mathrm  {nnz}$: nonzeros in the factor. ``Sequential'' indicates operations with unavoidable data-dependent wavefront scheduling that prevent full GPU parallelization.}}{7}{table.caption.17}\protected@file@percent }
 \newlabel{tab:apply_complexity}{{1}{7}{Per-iteration preconditioner application cost. $N$: system size. $L_s$: leaf apply size (our method). $K = N/L$: number of leaves. $M_\mathcal {H} \approx 9K$: off-diagonal blocks. $\mathrm {nnz}$: nonzeros in the factor. ``Sequential'' indicates operations with unavoidable data-dependent wavefront scheduling that prevent full GPU parallelization}{table.caption.17}{}}
+\@writefile{toc}{\contentsline {paragraph}{IC vs.\ ours.}{7}{section*.18}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Neural SPAI vs.\ ours.}{7}{section*.19}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Why not form $M$ and compute $AM$?}{7}{section*.20}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {6}Training}{7}{section.6}\protected@file@percent }
-\newlabel{sec:training}{{6}{7}{Training}{section.6}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Objective Function}{7}{subsection.6.1}\protected@file@percent }
-\newlabel{sec:training:loss}{{6.1}{7}{Objective Function}{subsection.6.1}{}}
-\@writefile{toc}{\contentsline {paragraph}{Cosine-similarity Hutchinson loss.}{7}{section*.21}\protected@file@percent }
 \citation{yang2025sparse}
 \citation{lin1999incomplete}
 \citation{naumov2015amgx}
 \citation{yang2025sparse}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Training}{8}{section.6}\protected@file@percent }
+\newlabel{sec:training}{{6}{8}{Training}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Objective Function}{8}{subsection.6.1}\protected@file@percent }
+\newlabel{sec:training:loss}{{6.1}{8}{Objective Function}{subsection.6.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Cosine-similarity Hutchinson loss.}{8}{section*.21}\protected@file@percent }
 \newlabel{eq:loss}{{10}{8}{Cosine-similarity Hutchinson loss}{equation.10}{}}
 \@writefile{toc}{\contentsline {paragraph}{Scale invariance and eigenvalue clustering.}{8}{section*.22}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Spectrally biased probe vectors.}{8}{section*.23}\protected@file@percent }
@@ -133,13 +133,12 @@
 \@writefile{toc}{\contentsline {paragraph}{Hardware.}{8}{section*.24}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Simulation dataset.}{8}{section*.25}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Baselines.}{8}{section*.26}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Best configuration.}{8}{section*.27}\protected@file@percent }
 \citation{yang2025sparse}
 \citation{yang2025sparse}
 \citation{yang2025sparse}
 \citation{yang2025sparse}
 \citation{yang2025sparse}
-\citation{yang2025sparse}
+\@writefile{toc}{\contentsline {paragraph}{Best configuration.}{9}{section*.27}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Ablation: Architecture Capacity and Components}{9}{subsection.7.2}\protected@file@percent }
 \newlabel{sec:ablation}{{7.2}{9}{Ablation: Architecture Capacity and Components}{subsection.7.2}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Ablation over architecture capacity and components at $N = $[FIXED SCALE]. ``Inf.''\nonbreakingspace =\nonbreakingspace inference time (ms); ``Solve''\nonbreakingspace =\nonbreakingspace PCG solve time (ms); ``Total''\nonbreakingspace =\nonbreakingspace Inf.\nonbreakingspace +\nonbreakingspace Solve; ``Iters''\nonbreakingspace =\nonbreakingspace PCG iterations to \texttt  {rtol}\nonbreakingspace $= 10^{-6}$; ``Params''\nonbreakingspace =\nonbreakingspace trainable parameter count. Best value per column in \textbf  {bold}. All times are GPU wall-clock with CUDAGraph replay.}}{9}{table.caption.28}\protected@file@percent }
@@ -148,16 +147,16 @@
 \newlabel{fig:training:ablation}{{3}{9}{Training curves for architecture ablations at $N = $[FIXED SCALE]. \emph {Left}: cosine-Hutchinson loss $\mathcal {L}_{\mathrm {cos}}$ vs.\ training step. \emph {Right}: PCG iteration count on held-out validation frames, evaluated every 1{,}000 steps. The dashed line shows the equivalent SAI loss~\cite {yang2025sparse} value computed from the same probe vectors at each checkpoint (not used for training; shown for comparability). Horizontal grey line: Jacobi baseline iteration count (constant)}{figure.caption.29}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Loss Function Ablation}{9}{subsection.7.3}\protected@file@percent }
 \newlabel{sec:ablation:loss}{{7.3}{9}{Loss Function Ablation}{subsection.7.3}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Eigenvalue distribution of $MA$ and training dynamics for three loss functions ($N = $[SMALL SCALE WHERE FULL EIG IS TRACTABLE]). \emph  {Top}: eigenvalue histograms of $MA$ for models trained with each loss, evaluated on a held-out test frame. All three models use the same architecture. \emph  {Bottom}: $\mathcal  {L}_{\mathrm  {cos}}$ on the validation set vs.\ training step for all three losses (common axis enables direct comparison of plateau speed). }}{9}{figure.caption.31}\protected@file@percent }
-\newlabel{fig:loss:eigenvalues}{{4}{9}{Eigenvalue distribution of $MA$ and training dynamics for three loss functions ($N = $[SMALL SCALE WHERE FULL EIG IS TRACTABLE]). \emph {Top}: eigenvalue histograms of $MA$ for models trained with each loss, evaluated on a held-out test frame. All three models use the same architecture. \emph {Bottom}: $\mathcal {L}_{\mathrm {cos}}$ on the validation set vs.\ training step for all three losses (common axis enables direct comparison of plateau speed)}{figure.caption.31}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Loss function ablation at $N = $[FIXED SCALE], best architecture. ``$\kappa $''\nonbreakingspace =\nonbreakingspace condition number of $MA$ (median over test frames, computed via full eigendecomposition for small $N$, power iteration estimate for large $N$); ``EV spread''\nonbreakingspace =\nonbreakingspace $({\lambda _{\max } - \lambda _{\min }})/{\lambda _{\mathrm  {median}}}$ of $MA$ eigenvalues; ``EV location''\nonbreakingspace =\nonbreakingspace $\lambda _{\mathrm  {median}}$ of $MA$; ``Iters''\nonbreakingspace =\nonbreakingspace PCG iterations. Plateau step\nonbreakingspace =\nonbreakingspace training step at which $\mathcal  {L}_{\mathrm  {cos}}$ first reaches {[TARGET VALUE]} on validation (use $\mathcal  {L}_{\mathrm  {cos}}$ for all three to compare on a common axis).}}{9}{table.caption.30}\protected@file@percent }
 \newlabel{tab:ablation:loss}{{3}{9}{Loss function ablation at $N = $[FIXED SCALE], best architecture. ``$\kappa $''~=~condition number of $MA$ (median over test frames, computed via full eigendecomposition for small $N$, power iteration estimate for large $N$); ``EV spread''~=~$({\lambda _{\max } - \lambda _{\min }})/{\lambda _{\mathrm {median}}}$ of $MA$ eigenvalues; ``EV location''~=~$\lambda _{\mathrm {median}}$ of $MA$; ``Iters''~=~PCG iterations. Plateau step~=~training step at which $\mathcal {L}_{\mathrm {cos}}$ first reaches {[TARGET VALUE]} on validation (use $\mathcal {L}_{\mathrm {cos}}$ for all three to compare on a common axis)}{table.caption.30}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Eigenvalue distribution of $MA$ and training dynamics for three loss functions ($N = $[SMALL SCALE WHERE FULL EIG IS TRACTABLE]). \emph  {Top}: eigenvalue histograms of $MA$ for models trained with each loss, evaluated on a held-out test frame. All three models use the same architecture. \emph  {Bottom}: $\mathcal  {L}_{\mathrm  {cos}}$ on the validation set vs.\ training step for all three losses (common axis enables direct comparison of plateau speed). }}{9}{figure.caption.31}\protected@file@percent }
+\newlabel{fig:loss:eigenvalues}{{4}{9}{Eigenvalue distribution of $MA$ and training dynamics for three loss functions ($N = $[SMALL SCALE WHERE FULL EIG IS TRACTABLE]). \emph {Top}: eigenvalue histograms of $MA$ for models trained with each loss, evaluated on a held-out test frame. All three models use the same architecture. \emph {Bottom}: $\mathcal {L}_{\mathrm {cos}}$ on the validation set vs.\ training step for all three losses (common axis enables direct comparison of plateau speed)}{figure.caption.31}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Performance vs.\ Existing Methods}{9}{subsection.7.4}\protected@file@percent }
+\newlabel{sec:results:perf}{{7.4}{9}{Performance vs.\ Existing Methods}{subsection.7.4}{}}
 \@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Scalability: total solve time (Setup + PCG) vs.\ $N$ on [PROBLEM TYPE] (log--log scale). Dashed reference line shows $O(N)$ slope. Error bars show 95\% CI over [NUM] test frames. }}{9}{figure.caption.33}\protected@file@percent }
 \newlabel{fig:scalability}{{5}{9}{Scalability: total solve time (Setup + PCG) vs.\ $N$ on [PROBLEM TYPE] (log--log scale). Dashed reference line shows $O(N)$ slope. Error bars show 95\% CI over [NUM] test frames}{figure.caption.33}{}}
 \@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Convergence histories ($\|A\mathbf  {x} - \mathbf  {b}\|/\|\mathbf  {b}\|$ vs.\ iteration) on [NUM] representative test frames at $N = $[MEDIUM SCALE]. }}{9}{figure.caption.34}\protected@file@percent }
 \newlabel{fig:convergence}{{6}{9}{Convergence histories ($\|A\mathbf {x} - \mathbf {b}\|/\|\mathbf {b}\|$ vs.\ iteration) on [NUM] representative test frames at $N = $[MEDIUM SCALE]}{figure.caption.34}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Performance vs.\ Existing Methods}{9}{subsection.7.4}\protected@file@percent }
-\newlabel{sec:results:perf}{{7.4}{9}{Performance vs.\ Existing Methods}{subsection.7.4}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Generalization}{9}{subsection.7.5}\protected@file@percent }
 \newlabel{sec:results:generalization}{{7.5}{9}{Generalization}{subsection.7.5}{}}
 \newlabel{sec:results:gen:scale}{{7.5.1}{9}{Scale and Contrast Ratio Generalization}{subsubsection.7.5.1}{}}
@@ -166,8 +165,7 @@
 \@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.2}Problem Type Generalization}{9}{subsubsection.7.5.2}\protected@file@percent }
 \newlabel{sec:results:precision}{{7.5.3}{9}{Precision and Breakdown}{subsubsection.7.5.3}{}}
 \@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.3}Precision and Breakdown}{9}{subsubsection.7.5.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Hardware Efficiency}{9}{subsection.7.6}\protected@file@percent }
-\newlabel{sec:results:hw}{{7.6}{9}{Hardware Efficiency}{subsection.7.6}{}}
+\citation{yang2025sparse}
 \@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces PCG solve performance across problem scales, [PROBLEM TYPE]. ``Setup''\nonbreakingspace =\nonbreakingspace preconditioner construction time (ms); ``Solve''\nonbreakingspace =\nonbreakingspace PCG solve time (ms) with CUDAGraph replay where supported; ``Total''\nonbreakingspace =\nonbreakingspace Setup\nonbreakingspace +\nonbreakingspace Solve; ``Iters''\nonbreakingspace =\nonbreakingspace PCG iterations; \texttt  {rtol}\nonbreakingspace $= 10^{-6}$. ``---''\nonbreakingspace =\nonbreakingspace method failed to converge within [MAX ITERS] iterations. ``*''\nonbreakingspace =\nonbreakingspace CUDAGraph not supported; times include Python dispatch overhead. Our inference time is the same as ``Setup''; solve uses CUDAGraph. Best GPU total time per scale in \textbf  {bold}.}}{10}{table.caption.32}\protected@file@percent }
 \newlabel{tab:main:perf}{{4}{10}{PCG solve performance across problem scales, [PROBLEM TYPE]. ``Setup''~=~preconditioner construction time (ms); ``Solve''~=~PCG solve time (ms) with CUDAGraph replay where supported; ``Total''~=~Setup~+~Solve; ``Iters''~=~PCG iterations; \texttt {rtol}~$= 10^{-6}$. ``---''~=~method failed to converge within [MAX ITERS] iterations. ``*''~=~CUDAGraph not supported; times include Python dispatch overhead. Our inference time is the same as ``Setup''; solve uses CUDAGraph. Best GPU total time per scale in \textbf {bold}}{table.caption.32}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Generalization to out-of-distribution scales and contrast ratios. ``ID''\nonbreakingspace =\nonbreakingspace in-distribution test; ``OOD''\nonbreakingspace =\nonbreakingspace out-of-distribution. PCG iterations to \texttt  {rtol}\nonbreakingspace $=10^{-6}$; ``$\dagger $''\nonbreakingspace =\nonbreakingspace failed to converge. Best per row in \textbf  {bold}.}}{10}{table.caption.35}\protected@file@percent }
@@ -176,18 +174,16 @@
 \newlabel{tab:gen:type}{{6}{10}{Cross-problem-type generalization. Model trained on [TRAINING TYPE] only, tested zero-shot on other types. Reported metric: PCG iterations to \texttt {rtol}~$=10^{-6}$. ``FT''~=~result after [NUM STEPS] fine-tuning on 10\% of target-domain training frames}{table.caption.36}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Effect of PCG floating-point precision at $N = $[MEDIUM SCALE], [PROBLEM TYPE]. ``Elem.''\nonbreakingspace =\nonbreakingspace element dtype for $A$, $\mathbf  {b}$, iterates; ``Acc.''\nonbreakingspace =\nonbreakingspace scalar accumulator dtype. ``Achieved \texttt  {rtol}''\nonbreakingspace =\nonbreakingspace actual relative residual at convergence or [MAX ITERS] if not converged. Times in ms (GPU, CUDAGraph).}}{10}{table.caption.37}\protected@file@percent }
 \newlabel{tab:precision}{{7}{10}{Effect of PCG floating-point precision at $N = $[MEDIUM SCALE], [PROBLEM TYPE]. ``Elem.''~=~element dtype for $A$, $\mathbf {b}$, iterates; ``Acc.''~=~scalar accumulator dtype. ``Achieved \texttt {rtol}''~=~actual relative residual at convergence or [MAX ITERS] if not converged. Times in ms (GPU, CUDAGraph)}{table.caption.37}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.7}Training Dynamics and Convergence}{10}{subsection.7.7}\protected@file@percent }
-\newlabel{sec:results:training}{{7.7}{10}{Training Dynamics and Convergence}{subsection.7.7}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Limitations and Future Work}{10}{section.8}\protected@file@percent }
-\newlabel{sec:limitations}{{8}{10}{Limitations and Future Work}{section.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Hardware Efficiency}{10}{subsection.7.6}\protected@file@percent }
+\newlabel{sec:results:hw}{{7.6}{10}{Hardware Efficiency}{subsection.7.6}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces GPU hardware utilization at $N = $[MEDIUM SCALE] on [GPU MODEL]. ``TC util.''\nonbreakingspace =\nonbreakingspace Tensor Core utilization (\% of peak); ``BW util.''\nonbreakingspace =\nonbreakingspace DRAM bandwidth utilization; ``Occ.''\nonbreakingspace =\nonbreakingspace SM warp occupancy; ``GFLOP/s''\nonbreakingspace =\nonbreakingspace achieved vs.\ theoretical peak. Profiled with \texttt  {nsight-compute} / \texttt  {torch.profiler}. }}{10}{table.caption.38}\protected@file@percent }
 \newlabel{tab:hw:util}{{8}{10}{GPU hardware utilization at $N = $[MEDIUM SCALE] on [GPU MODEL]. ``TC util.''~=~Tensor Core utilization (\% of peak); ``BW util.''~=~DRAM bandwidth utilization; ``Occ.''~=~SM warp occupancy; ``GFLOP/s''~=~achieved vs.\ theoretical peak. Profiled with \texttt {nsight-compute} / \texttt {torch.profiler}}{table.caption.38}{}}
 \@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Roofline analysis on [GPU MODEL] for per-PCG-iteration operations. Dashed lines show hardware-peak GFLOP/s (horizontal) and bandwidth-bound slope. Our batched GEMM operations (squares) are compute-bound; SpMV-based methods (circles) and IC triangular solves (triangles) are bandwidth-bound. }}{10}{figure.caption.39}\protected@file@percent }
 \newlabel{fig:roofline}{{7}{10}{Roofline analysis on [GPU MODEL] for per-PCG-iteration operations. Dashed lines show hardware-peak GFLOP/s (horizontal) and bandwidth-bound slope. Our batched GEMM operations (squares) are compute-bound; SpMV-based methods (circles) and IC triangular solves (triangles) are bandwidth-bound}{figure.caption.39}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.7}Training Dynamics and Convergence}{10}{subsection.7.7}\protected@file@percent }
+\newlabel{sec:results:training}{{7.7}{10}{Training Dynamics and Convergence}{subsection.7.7}{}}
 \@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces Training dynamics of the best configuration on [PROBLEM TYPE], $N = $[SCALE]. \emph  {Left}: $\mathcal  {L}_{\mathrm  {cos}}$ (solid) and equivalent SAI loss value (dashed, secondary axis) vs.\ training step. Shaded region: $\pm 1$ std.\ across [NUM] seeds. \emph  {Right}: PCG iteration count (median $\pm $ IQR over validation frames) vs.\ training step. Horizontal lines show classical baselines. }}{10}{figure.caption.40}\protected@file@percent }
 \newlabel{fig:training:dynamics}{{8}{10}{Training dynamics of the best configuration on [PROBLEM TYPE], $N = $[SCALE]. \emph {Left}: $\mathcal {L}_{\mathrm {cos}}$ (solid) and equivalent SAI loss value (dashed, secondary axis) vs.\ training step. Shaded region: $\pm 1$ std.\ across [NUM] seeds. \emph {Right}: PCG iteration count (median $\pm $ IQR over validation frames) vs.\ training step. Horizontal lines show classical baselines}{figure.caption.40}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{10}{section.9}\protected@file@percent }
-\newlabel{sec:conclusion}{{9}{10}{Conclusion}{section.9}{}}
 \bibstyle{ACM-Reference-Format}
 \bibdata{references}
 \bibcite{benzi1996sparse}{{1}{1996}{{Benzi et~al\mbox  {.}}}{{}}}
@@ -223,6 +219,10 @@
 \newlabel{tocindent3}{18.198pt}
 \newlabel{tocindent4}{0pt}
 \newlabel{tocindent5}{0pt}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Limitations and Future Work}{11}{section.8}\protected@file@percent }
+\newlabel{sec:limitations}{{8}{11}{Limitations and Future Work}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{11}{section.9}\protected@file@percent }
+\newlabel{sec:conclusion}{{9}{11}{Conclusion}{section.9}{}}
 \@writefile{toc}{\contentsline {section}{References}{11}{section*.43}\protected@file@percent }
 \newlabel{TotPages}{{11}{11}{}{page.11}{}}
 \gdef \@abspage@last{11}

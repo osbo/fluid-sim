@@ -1,14 +1,14 @@
 # Fdb version 4
-["bibtex paper"] 1777694162.60464 "paper.aux" "paper.bbl" "paper" 1777694253.79362 0
+["bibtex paper"] 1777922440.25961 "paper.aux" "paper.bbl" "paper" 1777922442.17397 0
   "./references.bib" 1777663704.67988 13204 1b040c71d10d697c003d9c5a3734d1f9 ""
   "/usr/local/texlive/2025/texmf-dist/bibtex/bst/acmart/ACM-Reference-Format.bst" 1735764768 90749 48abc1cbed6fafc6fc31528e3aa606ca ""
-  "paper.aux" 1777694253.41977 31377 c7bb999c4799dc5c38e8b9ca6b6c12c6 "pdflatex"
+  "paper.aux" 1777922441.80372 31379 16e0866e52d9ba3ed563c2e369396014 "pdflatex"
   (generated)
   "paper.bbl"
   "paper.blg"
   (rewritten before read)
-["pdflatex"] 1777694251.83911 "/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/paper.tex" "paper.pdf" "paper" 1777694253.79383 0
-  "/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/paper.tex" 1777694251.64775 78416 76bed0886b50e5a14cf1862d3106963a ""
+["pdflatex"] 1777922440.38595 "/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/paper.tex" "paper.pdf" "paper" 1777922442.17461 0
+  "/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/paper.tex" 1777922438.17727 78614 fa02da15f7a6937d9848aa3c00c5a811 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/inconsolata/i4-t1-4.enc" 1558214095 7693 0f2dce6d313c82989ec3a67fc24df2a0 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/libertine/lbtn_25tcsq.enc" 1490131464 2921 8ca0eb0831f9bc5da080d3697cfe67bf ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/libertine/lbtn_76gpa5.enc" 1490131464 2933 9ad527ce78d7c5fa0a642dead095f172 ""
@@ -249,10 +249,10 @@
   "/usr/local/texlive/2025/texmf.cnf" 1741450484 577 418a7058ec8e006d8704f60ecd22c938 ""
   "highwaysgraphic.png" 1777693993.4977 1568192 2cacfd91086e6cb6b25d8e85249998fe ""
   "hmatrixgraphic.png" 1777694024.8069 1505892 ba372809ce0ec18a359a9f1c110fea6d ""
-  "paper.aux" 1777694253.41977 31377 c7bb999c4799dc5c38e8b9ca6b6c12c6 "pdflatex"
-  "paper.bbl" 1777694162.70827 15560 20dc18e2173eddc6812923f1a4733047 "bibtex paper"
-  "paper.out" 1777694253.42122 7807 790b8e440382e38fe276fc0702ab8c51 "pdflatex"
-  "paper.tex" 1777694251.64775 78416 76bed0886b50e5a14cf1862d3106963a ""
+  "paper.aux" 1777922441.80372 31379 16e0866e52d9ba3ed563c2e369396014 "pdflatex"
+  "paper.bbl" 1777922440.38265 15348 f4ac5a9255d03db3fded589f5550e5b6 "bibtex paper"
+  "paper.out" 1777922441.80534 7807 790b8e440382e38fe276fc0702ab8c51 "pdflatex"
+  "paper.tex" 1777922438.17727 78614 fa02da15f7a6937d9848aa3c00c5a811 ""
   (generated)
   "paper.aux"
   "paper.log"
