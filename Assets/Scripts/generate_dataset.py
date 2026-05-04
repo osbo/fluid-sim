@@ -45,15 +45,16 @@ def _rng(seed: int) -> Any:
 
 
 # Defaults (override with CLI).
-_DEFAULT_N_TARGET = 4096
+_DEFAULT_N_TARGET = 16384
 _DEFAULT_NUM_TRAIN = 100
 _DEFAULT_NUM_TEST = 20
-_DEFAULT_DATASET_TYPE = "hard-multiphase"
-_DEFAULT_DATASET_BUNDLE = "hard_multiphase_4096"
+_DEFAULT_DATASET_TYPE = "multiphase-v2"
+_DEFAULT_DATASET_BUNDLE = "multiphase_v2_16384"
 
 # Default output folder name per --dataset-type (under --output-root).
 TYPE_OUTPUT_SUBDIR = {
     "hard-multiphase": "hard_multiphase",
+    "multiphase-v2": "multiphase_v2",
     "moving-barrier": "moving_barrier",
     "unstructured-multiphase": "unstructured_multiphase",
     "fractured-media": "fractured_media",
@@ -104,6 +105,8 @@ def _in_wall_barrier(
         return True
     if gap_type == "middle_hole" and (y < grid_h * 0.4 or y > grid_h * 0.6):
         return True
+    if gap_type == "closed":
+        return True
     return False
 
 
@@ -150,6 +153,63 @@ def _rho_grid_hard_multiphase(
         for x in range(grid_w):
             morton = get_morton_code(x, y)
             in_wall = _in_wall_barrier(x, y, grid_w, grid_h, wall_x_center, wall_thickness, gap_type)
+            noise = float(frame_rng.normal(0, 0.05))
+            rho = (rho_heavy if in_wall else rho_light) * (1.0 + noise)
+            nodes.append((x, y, morton, rho))
+    return nodes
+
+
+def _rho_grid_multiphase_v2(
+    grid_w: int,
+    grid_h: int,
+    frame_rng: Any,
+    rho_light: float,
+    rho_heavy_min: float,
+    rho_heavy_max: float,
+    max_barriers: int = 3,
+) -> List[Tuple[int, int, int, float]]:
+    """Upgraded multiphase grid for architecture benchmarking.
+
+    Per-frame variation across three axes that stress the H-matrix preconditioner:
+    - **Contrast**: ``rho_heavy`` drawn log-uniformly from ``[rho_heavy_min, rho_heavy_max]``
+      each frame, so condition numbers span a wide range across the dataset.
+    - **Topology**: 1–``max_barriers`` barriers, each independently vertical or horizontal,
+      with gap type drawn from {top, bottom, middle_hole, closed}.  ``closed`` walls create
+      near-disconnected chambers where pressure equilibration is purely long-range — exactly
+      the regime where off-diagonal H-matrix blocks provide value over IC or local GNNs.
+    - **Orientation**: horizontal barriers (wall runs along x-axis; swap x/y in the barrier
+      test) create a different banding structure under Morton ordering, exercising the
+      architecture's row/column-strip highway connections.
+
+    Barriers may overlap freely; overlapping high-density regions form cross or L-shaped
+    inclusions, further diversifying the spectral structure across frames.
+    """
+    log_lo = np.log(max(rho_light * 1.01, float(rho_heavy_min)))
+    log_hi = np.log(max(float(rho_heavy_min) * 1.01, float(rho_heavy_max)))
+    rho_heavy = float(np.exp(frame_rng.uniform(log_lo, log_hi)))
+
+    n_barriers = int(frame_rng.choice(list(range(1, max(2, int(max_barriers) + 1)))))
+    gap_choices = ["top", "bottom", "middle_hole", "closed"]
+    barriers: List[Tuple[str, float, float, str]] = []
+    for _ in range(n_barriers):
+        orientation = str(frame_rng.choice(["vertical", "horizontal"]))
+        center = float(frame_rng.uniform(0.2, 0.8))
+        thickness = float(frame_rng.uniform(0.05, 0.20))
+        gap_type = str(frame_rng.choice(gap_choices))
+        barriers.append((orientation, center, thickness, gap_type))
+
+    nodes: List[Tuple[int, int, int, float]] = []
+    for y in range(grid_h):
+        for x in range(grid_w):
+            morton = get_morton_code(x, y)
+            in_wall = any(
+                (
+                    _in_wall_barrier(x, y, grid_w, grid_h, c, t, g)
+                    if ori == "vertical"
+                    else _in_wall_barrier(y, x, grid_h, grid_w, c, t, g)
+                )
+                for ori, c, t, g in barriers
+            )
             noise = float(frame_rng.normal(0, 0.05))
             rho = (rho_heavy if in_wall else rho_light) * (1.0 + noise)
             nodes.append((x, y, morton, rho))
@@ -435,6 +495,8 @@ def generate_frame(
     morton_bins: int = 1024,
     num_fractures: int = 8,
     fracture_thickness: float = 0.015,
+    rho_heavy_min: float = 5.0,
+    max_barriers: int = 3,
 ) -> None:
     _ = blob_threshold
     grid_w, grid_h = _grid_dims(n_target)
@@ -467,6 +529,10 @@ def generate_frame(
 
     if dataset_type == "hard-multiphase":
         nodes_full = _rho_grid_hard_multiphase(grid_w, grid_h, frame_rng, rho_light, rho_heavy)
+    elif dataset_type == "multiphase-v2":
+        nodes_full = _rho_grid_multiphase_v2(
+            grid_w, grid_h, frame_rng, rho_light, rho_heavy_min, rho_heavy, max_barriers
+        )
     elif dataset_type == "moving-barrier":
         if episode_rng is None:
             episode_rng = frame_rng
@@ -534,10 +600,10 @@ def main() -> None:
     p.add_argument(
         "--rho-heavy",
         type=float,
-        default=10.0,
+        default=100.0,
         help=(
-            "Heavy/matrix density. Grid multiphase: often 10. Fractured-media: rock (e.g. 10000); "
-            "fractures use --rho-light."
+            "Heavy/matrix density (upper bound of per-frame log-uniform range for multiphase-v2). "
+            "hard-multiphase: often 10. Fractured-media: rock (e.g. 10000); fractures use --rho-light."
         ),
     )
     p.add_argument(
@@ -583,6 +649,21 @@ def main() -> None:
         help="Strip half-width in normalized coords for fractured-media (distance to line < thickness/2).",
     )
     p.add_argument(
+        "--rho-heavy-min",
+        type=float,
+        default=5.0,
+        help=(
+            "Lower bound of the per-frame log-uniform contrast range for --dataset-type multiphase-v2. "
+            "Use --rho-heavy as the upper bound (suggest 100–200 for a varied dataset)."
+        ),
+    )
+    p.add_argument(
+        "--max-barriers",
+        type=int,
+        default=3,
+        help="Maximum number of barriers per frame for --dataset-type multiphase-v2 (drawn uniformly from 1..max).",
+    )
+    p.add_argument(
         "--pilot",
         action="store_true",
         help="Small dry run: 8 train / 4 test into bundle pilot_* dirs if train/test dirs not set.",
@@ -624,6 +705,10 @@ def main() -> None:
     rho_heavy = float(args.rho_heavy)
     if rho_light <= 0 or rho_heavy <= 0:
         raise SystemExit("--rho-light and --rho-heavy must be positive")
+    if args.dataset_type == "multiphase-v2" and float(args.rho_heavy_min) >= float(args.rho_heavy):
+        raise SystemExit("--rho-heavy-min must be less than --rho-heavy for multiphase-v2")
+    if int(args.max_barriers) < 1:
+        raise SystemExit("--max-barriers must be at least 1")
     if args.dataset_type in ("unstructured-multiphase", "fractured-media") and _KDTree is None:
         raise SystemExit(f"{args.dataset_type} requires scipy; install scipy for KDTree support.")
     if int(args.morton_quant_bins) < 2:
@@ -668,6 +753,8 @@ def main() -> None:
                 morton_bins=int(args.morton_quant_bins),
                 num_fractures=int(args.num_fractures),
                 fracture_thickness=float(args.fracture_thickness),
+                rho_heavy_min=float(args.rho_heavy_min),
+                max_barriers=int(args.max_barriers),
             )
 
     print("Done.")
