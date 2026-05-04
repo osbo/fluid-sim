@@ -29,7 +29,7 @@
 
 \begin{document}
 
-\title{Hierarchical Transformer Preconditioning for Real-Time Simulation}
+\title{Hierarchical Transformer Preconditioning for Interactive Physics Simulation}
 
 \author{Anonymous Author(s)}
 \affiliation{%
@@ -39,23 +39,11 @@
 \renewcommand{\shortauthors}{Anonymous Author(s)}
 
 \begin{abstract}
-We present a hierarchical transformer-based neural preconditioner for the large, sparse linear
-systems that arise in real-time physics simulation.  Unlike prior learning-based preconditioners
-that either impose sparsity patterns inherited from incomplete factorizations or rely on purely
-local graph convolutions, our method learns an approximation to the full matrix inverse structured
-by an analytically constructed, weak-admissibility $\mathcal{H}$-matrix partition.  On the
-diagonal, full-rank symmetric factors $UU^\top$ are produced per leaf block, capturing
-high-frequency local interactions without rank restriction.  Off the diagonal, a scale-matched
-low-rank factorization $UV^\top$ is produced at a fixed coarse resolution independent of block
-separation, encoding low-frequency long-range couplings with a rank budget that naturally shrinks
-as distance from the diagonal grows---matching the spectral structure of simulation residuals.
-All blocks are processed by two compact transformer stacks operating on contiguous memory,
-eliminating the pointer-chasing and triangular-solve bottlenecks that limit GPU utilization in
-competing approaches.  The result is an $O(N)$ preconditioner with substantially higher
-arithmetic intensity than graph-neural-network baselines, fully differentiable and trained
-end-to-end via a cosine-similarity Hutchinson probe loss.  We demonstrate real-time preconditioner
-inference and significantly accelerated PCG convergence across a range of simulation problem
-scales and material configurations.
+Neural preconditioners for real-time physics simulation offer promising data-driven priors but struggle to efficiently resolve long-range physical couplings due to their reliance on local message passing or inherited sparsity patterns. We introduce the Hierarchical Transformer Preconditioner, a neural preconditioner anchored to a weak-admissibility H-matrix partition. This structural prior processes the system matrix as a tree of coarsening off-diagonal blocks, enabling full-graph approximate inverse computation in O(N) time. The network explicitly models the multiscale spectral structure of the inverse, compressing longer-range interactions into lower-rank factorizations. To propagate context between transformer layers, we introduce highway connections via axial buffers and a global summary vector. At each PCG iteration, preconditioner application reduces to a single batched GEMM with regular memory access.
+
+Because both inference and per-iteration application consist of dense tensor operations with no sequential dependencies, the complete solver is captured as a single CUDA Graph. The preconditioner is trained self-supervised via a new cosine-similarity Hutchinson probe loss. This loss eliminates restrictions on eigenvalue cluster position to enable better preconditioning of irregular spectra. 
+
+Evaluating on highly stiff, unstructured multiphase Poisson systems (8192 nodes), our preconditioner reduces iteration count from 2163 to 141. Including inference time, our end-to-end solve of 15.7 ms is over 3x faster than classical GPU preconditioners including Jacobi and AMG. The efficiency of our neural preconditioner makes high-contrast multiphase simulation practical for interactive applications.    
 \end{abstract}
 
 \begin{CCSXML}
