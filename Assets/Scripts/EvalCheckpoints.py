@@ -23,6 +23,8 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore", message=r".*torch\._prims_common\.check.*", category=FutureWarning)
 
+# Leaf size used per scale — must match train_configs.py convention.
+_SCALE_LEAF_SIZE = {1024: 128, 2048: 128, 4096: 128, 8192: 128, 16384: 256}
 _DEFAULT_LEAF_SIZE = 128
 _DEFAULT_MAX_MIXED_SIZE = 8192
 
@@ -58,34 +60,48 @@ def _step_from_filename(name: str):
     return int(m.group(1)) if m else None
 
 
+def _infer_scale_from_csv(csv_arg: str):
+    """Parse scale from filename like 'v2_8192_d128_L3_hw_training_profile.csv'."""
+    m = re.search(r"v2_(\d+)_", Path(csv_arg).name)
+    return int(m.group(1)) if m else None
+
+
 def main():
+    # Peek at --csv before full arg parsing so we can infer scale → leaf_size/max_mixed_size
+    # for the bootstrap, which must run before any leafonly import.
     pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--leaf-size", type=int, default=_DEFAULT_LEAF_SIZE)
-    pre.add_argument("--max-mixed-size", type=int, default=_DEFAULT_MAX_MIXED_SIZE)
+    pre.add_argument("--csv", default=None)
+    pre.add_argument("--leaf-size", type=int, default=None)
+    pre.add_argument("--max-mixed-size", type=int, default=None)
     ns, _ = pre.parse_known_args()
-    _bootstrap_leafonly_config(ns.leaf_size, ns.max_mixed_size)
+
+    _inferred_scale = _infer_scale_from_csv(ns.csv) if ns.csv else None
+    _auto_leaf = _SCALE_LEAF_SIZE.get(_inferred_scale, _DEFAULT_LEAF_SIZE)
+    _auto_max  = _inferred_scale if _inferred_scale else _DEFAULT_MAX_MIXED_SIZE
+    _leaf_size    = ns.leaf_size    if ns.leaf_size    is not None else _auto_leaf
+    _max_mixed    = ns.max_mixed_size if ns.max_mixed_size is not None else _auto_max
+
+    _bootstrap_leafonly_config(_leaf_size, _max_mixed)
 
     import numpy as np
     import torch
     import torch.nn.functional as F
 
-    from leafonly import (
+    from leafonly.architecture import (
         LeafOnlyNet,
         apply_block_diagonal_m_into,
         block_diagonal_m_apply_workspace,
-        build_leaf_block_connectivity,
         default_attention_layout,
-        FluidGraphDataset,
-        load_leaf_only_weights,
         warmup_hmatrix_prolong_gpu,
     )
-    from leafonly.checkpoint import leaf_only_arch_from_checkpoint
+    from leafonly.checkpoint import leaf_only_arch_from_checkpoint, load_leaf_only_weights
     from leafonly.config import (
         LEAF_APPLY_SIZE,
         LEAF_APPLY_SIZE_OFF,
         LEAF_SIZE,
         problem_padded_num_nodes,
     )
+    from leafonly.data import FluidGraphDataset, build_leaf_block_connectivity
     from leafonly.hmatrix import NUM_HMATRIX_OFF_BLOCKS
 
     parser = argparse.ArgumentParser(
@@ -106,15 +122,22 @@ def main():
     parser.add_argument(
         "--frame",
         type=int,
-        default=600,
+        default=0,
         metavar="N",
-        help="Dataset frame index (consistent across all checkpoints). Default: 600.",
+        help="Dataset frame index (consistent across all checkpoints). Default: 0.",
+    )
+    _auto_data = (
+        str(_scripts_dir / "data" / f"multiphase_v2_{_inferred_scale}" / "test")
+        if _inferred_scale else None
     )
     parser.add_argument(
         "--data-folder",
-        default=None,
+        default=_auto_data,
         metavar="DIR",
-        help="Frame root (rglob nodes.bin). Default: StreamingAssets/TestData beside Assets/.",
+        help=(
+            "Frame root (rglob nodes.bin). "
+            f"Auto-detected from CSV name: {_auto_data or '(unknown — pass explicitly)'}."
+        ),
     )
     parser.add_argument(
         "--num-probes",
@@ -132,11 +155,11 @@ def main():
     parser.add_argument(
         "--pcg-max-iter",
         type=int,
-        default=50000,
-        help="PCG maximum iterations. Default: 50000.",
+        default=5000,
+        help="PCG maximum iterations. Default: 5000.",
     )
-    parser.add_argument("--leaf-size", type=int, default=ns.leaf_size)
-    parser.add_argument("--max-mixed-size", type=int, default=ns.max_mixed_size)
+    parser.add_argument("--leaf-size", type=int, default=_leaf_size)
+    parser.add_argument("--max-mixed-size", type=int, default=_max_mixed)
     parser.add_argument(
         "--use-highways",
         action=argparse.BooleanOptionalAction,
@@ -154,9 +177,15 @@ def main():
         if args.checkpoints_dir
         else csv_path.parent
     )
-    ckpt_files = sorted(ckpts_dir.glob("*_step*.bytes"))
+    # Derive model prefix from CSV name: "v2_8192_d128_L3_hw_training_profile.csv"
+    # → prefix "v2_8192_d128_L3_hw", so we only pick up this model's step checkpoints.
+    _csv_stem = csv_path.stem  # e.g. "v2_8192_d128_L3_hw_training_profile"
+    _model_prefix = _csv_stem.replace("_training_profile", "")
+    ckpt_files = sorted(ckpts_dir.glob(f"{_model_prefix}_step*.bytes"))
     if not ckpt_files:
-        raise SystemExit(f"No *_step*.bytes checkpoint files found in {ckpts_dir}")
+        raise SystemExit(
+            f"No checkpoints matching '{_model_prefix}_step*.bytes' found in {ckpts_dir}"
+        )
 
     step_to_file = {}
     for f in ckpt_files:
@@ -184,7 +213,10 @@ def main():
     if args.data_folder:
         data_folder = Path(args.data_folder).expanduser().resolve()
     else:
-        data_folder = _scripts_dir.parent / "StreamingAssets" / "TestData"
+        raise SystemExit(
+            "Could not infer data folder from CSV name. "
+            "Pass --data-folder data/multiphase_v2_<scale>/test explicitly."
+        )
     dataset = FluidGraphDataset([data_folder])
     if len(dataset) == 0:
         raise SystemExit(f"No frames found in {data_folder}")
@@ -208,16 +240,18 @@ def main():
     num_leaves = viz_n // leaf_L
     print(f"Problem size: n={viz_n}, leaves={num_leaves}")
 
-    # --- Build A (sparse, float32) ---
     ei, ev = batch["edge_index"], batch["edge_values"]
     em = (ei[0] < viz_n) & (ei[1] < viz_n)
-    A_sparse = torch.sparse_coo_tensor(
-        ei[:, em], ev[em], (viz_n, viz_n)
-    ).coalesce().to(device=device, dtype=torch.float32)
 
-    # Frobenius norm: sqrt(sum of squared nonzero values)
-    a_frob_norm = float(ev[em].to(torch.float64).pow(2).sum().sqrt().item())
-    print(f"||A||_F = {a_frob_norm:.6f}")
+    # float64 for PCG (matches InspectModel default); float32 for SAI loss / precond apply
+    A_sparse_f64 = torch.sparse_coo_tensor(
+        ei[:, em], ev[em], (viz_n, viz_n)
+    ).coalesce().to(device=device, dtype=torch.float64)
+    A_sparse_f32 = A_sparse_f64.to(torch.float32)
+
+    # ||A|| per SAI paper: mean absolute value of nonzero entries (dimension-agnostic, scale-invariant)
+    a_norm = float(ev[em].abs().mean().item())
+    print(f"||A|| (mean |nonzero|) = {a_norm:.6f}")
 
     # Jacobi diagonal inverse
     A_diag_np = torch.sparse_coo_tensor(
@@ -239,6 +273,12 @@ def main():
     else:
         x_leaf = x_base
 
+    global_feat = batch.get("global_features")
+    if global_feat is not None:
+        global_feat = global_feat.to(device)
+        if global_feat.dim() == 1:
+            global_feat = global_feat.unsqueeze(0)
+
     edge_index_gpu = ei[:, em].to(device)
     edge_values_gpu = ev[em].to(device)
     positions = x_leaf[0, :, :3]
@@ -257,11 +297,11 @@ def main():
         t.contiguous() if isinstance(t, torch.Tensor) else t for t in pre_connectivity
     )
 
-    # --- Fixed PCG right-hand side (seeded, same as InspectModel) ---
+    # --- Fixed PCG right-hand side (seeded, float64 — matches InspectModel) ---
     np.random.seed(123)
-    b_np = np.random.randn(viz_n).astype(np.float32)
+    b_np = np.random.randn(viz_n).astype(np.float64)
     b_np /= np.linalg.norm(b_np) + 1e-12
-    b_gpu = torch.from_numpy(b_np).to(device=device, dtype=torch.float32).unsqueeze(-1)
+    b_gpu = torch.from_numpy(b_np).to(device=device, dtype=torch.float64).unsqueeze(-1)
 
     # --- Fixed SAI probe vectors (seeded) ---
     torch.manual_seed(777)
@@ -340,12 +380,15 @@ def main():
                     x_leaf,
                     edge_index=edge_index_gpu,
                     edge_values=edge_values_gpu,
+                    global_features=global_feat,
                     precomputed_leaf_connectivity=pre_connectivity,
                 )
             precond_s = precond_out.detach().contiguous()
 
-            # ---- PCG ----
+            # ---- PCG (float64 vectors; precond applied in float32 then cast back) ----
+            # Matches InspectModel's default --pcg-precision f64 path.
             def _apply_m(r_col, z_col):
+                # r_col / z_col are float64; precond buffers are float32
                 pcg_r_buf.copy_(r_col.reshape(1, viz_n, 1))
                 apply_block_diagonal_m_into(
                     precond_s,
@@ -360,28 +403,28 @@ def main():
                 z_col.copy_(pcg_z_buf.reshape(viz_n, 1))
                 return z_col
 
-            x_pcg = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
-            r = b_gpu - (A_sparse @ x_pcg.squeeze(-1)).unsqueeze(-1)
-            z = torch.empty_like(r)
+            x_pcg = torch.zeros(viz_n, 1, device=device, dtype=torch.float64)
+            r = b_gpu - (A_sparse_f64 @ x_pcg.squeeze(-1)).unsqueeze(-1)
+            z = torch.zeros_like(r)
             _apply_m(r, z)
             p = z.clone()
-            rho = (r * z).sum().to(torch.float64)
-            b_norm_sq = (b_gpu * b_gpu).sum().to(torch.float64)
+            rho = (r * z).sum()
+            b_norm_sq = (b_gpu * b_gpu).sum()
             tol_sq = args.pcg_tol ** 2 * b_norm_sq.item()
             iters = args.pcg_max_iter
             for k in range(args.pcg_max_iter):
-                Ap = (A_sparse @ p.squeeze(-1)).unsqueeze(-1)
-                pAp = (p * Ap).sum().to(torch.float64)
-                alpha = (rho / pAp).to(torch.float32)
+                Ap = (A_sparse_f64 @ p.squeeze(-1)).unsqueeze(-1)
+                pAp = (p * Ap).sum()
+                alpha = rho / pAp
                 x_pcg = x_pcg + alpha * p
                 r = r - alpha * Ap
                 _apply_m(r, z)
-                rho_new = (r * z).sum().to(torch.float64)
-                beta = (rho_new / rho).to(torch.float32)
+                rho_new = (r * z).sum()
+                beta = rho_new / rho
                 p = z + beta * p
                 rho = rho_new
                 if (k + 1) % 3 == 0:
-                    r_sq = (r * r).sum().to(torch.float64)
+                    r_sq = (r * r).sum()
                     if r_sq.item() <= tol_sq:
                         iters = k + 1
                         break
@@ -400,8 +443,8 @@ def main():
                 leaf_apply_off=leaf_apply_off_L,
             )
             Z_sq = Z_sai.squeeze(0)  # (viz_n, K)
-            AZ = A_sparse @ Z_sq     # (viz_n, K)
-            diff = AZ / a_frob_norm - W_sai_sq  # (viz_n, K)
+            AZ = A_sparse_f32 @ Z_sq     # (viz_n, K)
+            diff = AZ / a_norm - W_sai_sq  # (viz_n, K)
             sai_loss = float((diff * diff).sum(dim=0).mean().item())
             print(f"  SAI loss:  {sai_loss:.6f}")
 
