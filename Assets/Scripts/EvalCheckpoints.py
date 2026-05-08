@@ -346,7 +346,7 @@ def main():
     use_gcn_lo = bool(ckpt_arch["use_gcn"])
     ck_hw = int(ckpt_arch.get("highway_ffn_mlp", 0))
     ck_ffn = int(ckpt_arch.get("ffn_concat_width", 3 if ck_hw else 1))
-    use_highways = bool(args.use_highways)
+    use_highways = bool(ck_hw)  # read from checkpoint, not CLI — handles hw/nohw automatically
 
     model = LeafOnlyNet(
         input_dim=9,
