@@ -16,7 +16,7 @@ from .config import (
     MIN_MIXED_SIZE,
     OFF_DIAG_TOKEN_POOL,
 )
-from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
+from . import hmatrix as _hm_ctx
 
 CONTEXT_CACHE_VERSION = 14
 
@@ -55,7 +55,7 @@ def build_training_context_cache_meta(dataset, run_folder: Path, args, frame_ind
         "min_mixed": int(MIN_MIXED_SIZE),
         "max_mixed": int(MAX_MIXED_SIZE),
         "max_num_leaves": int(MAX_NUM_LEAVES),
-        "hmatrix_off_blocks": int(NUM_HMATRIX_OFF_BLOCKS),
+        "hmatrix_off_blocks": int(_hm_ctx.NUM_HMATRIX_OFF_BLOCKS),
         "off_diag_dense_attn": bool(getattr(args, "off_diag_dense_attn", True)),
         "diag_dense_attn": bool(getattr(args, "diag_dense_attn", True)),
         "dataset_len": int(len(dataset)),

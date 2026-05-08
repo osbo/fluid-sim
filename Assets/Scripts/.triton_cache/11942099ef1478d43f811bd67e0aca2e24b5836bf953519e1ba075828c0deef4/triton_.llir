@@ -1,0 +1,80 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+
+define void @triton_(ptr addrspace(1) %0, ptr addrspace(1) %1, i32 %2) local_unnamed_addr !dbg !7 {
+  %4 = tail call i32 asm "mov.u32 $0, %ctaid.x;", "=r"() #1, !dbg !10
+  %5 = shl i32 %4, 8, !dbg !11
+  %6 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x(), !dbg !12
+  %7 = shl i32 %6, 1, !dbg !12
+  %8 = and i32 %7, 254, !dbg !12
+  %9 = or disjoint i32 %5, %8, !dbg !13
+  %10 = icmp slt i32 %9, 256, !dbg !14
+  %11 = sext i32 %9 to i64, !dbg !15
+  %12 = getelementptr float, ptr addrspace(1) %0, i64 %11, !dbg !15
+  %13 = tail call { i32, i32 } asm sideeffect "mov.u32 $0, 0x0;\0A\09mov.u32 $1, 0x0;\0A\09@$3 ld.global.v2.b32 { $0, $1 }, [ $2 + 0 ];", "=r,=r,l,b"(ptr addrspace(1) %12, i1 %10) #1, !dbg !16
+  %14 = extractvalue { i32, i32 } %13, 0, !dbg !16
+  %15 = extractvalue { i32, i32 } %13, 1, !dbg !16
+  %16 = bitcast i32 %14 to float, !dbg !16
+  %17 = bitcast i32 %15 to float, !dbg !16
+  %18 = tail call i32 asm sideeffect "mov.u32 $0, 0x0;\0A\09@$2 ld.global.b32 { $0 }, [ $1 + 0 ];", "=r,l,b"(ptr addrspace(1) %1, i1 true) #1, !dbg !17
+  %19 = bitcast i32 %18 to float, !dbg !17
+  %20 = fadd float %16, %19, !dbg !18
+  %21 = fadd float %17, %19, !dbg !18
+  %22 = fsub float 0.000000e+00, %20, !dbg !19
+  %23 = fsub float 0.000000e+00, %21, !dbg !19
+  %24 = fmul float %22, 0x3FF7154760000000, !dbg !23
+  %25 = tail call float asm "ex2.approx.f32 $0, $1;", "=f,f"(float %24) #1, !dbg !23
+  %26 = fmul float %23, 0x3FF7154760000000, !dbg !23
+  %27 = tail call float asm "ex2.approx.f32 $0, $1;", "=f,f"(float %26) #1, !dbg !23
+  %28 = fadd float %25, 1.000000e+00, !dbg !24
+  %29 = fadd float %27, 1.000000e+00, !dbg !24
+  %30 = tail call float asm "div.full.f32 $0, $1, $2;", "=r,r,r"(float 1.000000e+00, float %28) #1, !dbg !25
+  %31 = tail call float asm "div.full.f32 $0, $1, $2;", "=r,r,r"(float 1.000000e+00, float %29) #1, !dbg !25
+  %32 = fmul float %30, 2.000000e+00, !dbg !26
+  %33 = fmul float %31, 2.000000e+00, !dbg !26
+  %34 = bitcast float %32 to i32, !dbg !27
+  %35 = bitcast float %33 to i32, !dbg !27
+  tail call void asm sideeffect "@$3 st.global.v2.b32 [ $2 + 0 ], { $0, $1 };", "r,r,l,b"(i32 %34, i32 %35, ptr addrspace(1) %12, i1 %10) #1, !dbg !27
+  ret void, !dbg !28
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.nvvm.read.ptx.sreg.tid.x() #0
+
+attributes #0 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #1 = { nounwind }
+
+!llvm.module.flags = !{!0, !1}
+!llvm.dbg.cu = !{!2}
+!nvvm.annotations = !{!4, !5}
+!llvm.ident = !{!6}
+
+!0 = !{i32 2, !"Debug Info Version", i32 3}
+!1 = !{i32 4, !"nvvm-reflect-ftz", i32 1}
+!2 = distinct !DICompileUnit(language: DW_LANG_C, file: !3, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!3 = !DIFile(filename: "cjnl65nhubvekomslfepkxwxwcsvienn2ep7oz74br5kkj2ox5ti.py", directory: "/orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/.torch_inductor_cache/jn")
+!4 = !{ptr @triton_, !"kernel", i32 1}
+!5 = !{ptr @triton_, !"maxntidx", i32 128}
+!6 = !{!"clang version 3.8.0 (tags/RELEASE_380/final)"}
+!7 = distinct !DISubprogram(name: "triton_", linkageName: "triton_", scope: !3, file: !3, line: 18, type: !8, scopeLine: 18, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !2)
+!8 = !DISubroutineType(cc: DW_CC_normal, types: !9)
+!9 = !{}
+!10 = !DILocation(line: 20, column: 28, scope: !7)
+!11 = !DILocation(line: 20, column: 33, scope: !7)
+!12 = !DILocation(line: 21, column: 36, scope: !7)
+!13 = !DILocation(line: 21, column: 23, scope: !7)
+!14 = !DILocation(line: 22, column: 21, scope: !7)
+!15 = !DILocation(line: 24, column: 34, scope: !7)
+!16 = !DILocation(line: 24, column: 39, scope: !7)
+!17 = !DILocation(line: 25, column: 19, scope: !7)
+!18 = !DILocation(line: 27, column: 18, scope: !7)
+!19 = !DILocation(line: 51, column: 30, scope: !20, inlinedAt: !22)
+!20 = distinct !DILexicalBlockFile(scope: !7, file: !21, discriminator: 0)
+!21 = !DIFile(filename: "standard.py", directory: "/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/triton/language")
+!22 = !DILocation(line: 28, column: 22, scope: !7)
+!23 = !DILocation(line: 51, column: 29, scope: !20, inlinedAt: !22)
+!24 = !DILocation(line: 51, column: 20, scope: !20, inlinedAt: !22)
+!25 = !DILocation(line: 51, column: 16, scope: !20, inlinedAt: !22)
+!26 = !DILocation(line: 30, column: 18, scope: !7)
+!27 = !DILocation(line: 31, column: 39, scope: !7)
+!28 = !DILocation(line: 31, column: 4, scope: !7)

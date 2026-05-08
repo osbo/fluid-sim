@@ -14,18 +14,8 @@ from .config import (
     OFF_DIAG_TOKEN_POOL,
 )
 from .data import build_leaf_block_connectivity
-from .hmatrix import (
-    HM_C0_CPU,
-    HM_PROLONG_COL_LEAF_IDX,
-    HM_PROLONG_GATHER_IDX,
-    HM_PROLONG_ROW_LEAF_IDX,
-    HM_R0_CPU,
-    HM_S_CPU,
-    HM_SUM_W_COL_CPU,
-    HM_SUM_W_ROW_CPU,
-    NUM_HMATRIX_OFF_BLOCKS,
-    hm_leaf_mean_pool_weights,
-)
+from . import hmatrix as _hm
+from .hmatrix import hm_leaf_mean_pool_weights
 
 # Prolongation indices live on CPU in hmatrix; copy once per device. CUDAGraph capture must not call .to().
 _HM_PROLONG_GPU: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -40,9 +30,9 @@ def _hm_prolong_scatter_indices(device: torch.device) -> tuple[torch.Tensor, tor
     if got is None:
         dt = torch.long
         _HM_PROLONG_GPU[key] = got = (
-            HM_PROLONG_ROW_LEAF_IDX.to(device=device, dtype=dt),
-            HM_PROLONG_COL_LEAF_IDX.to(device=device, dtype=dt),
-            HM_PROLONG_GATHER_IDX.to(device=device, dtype=dt),
+            _hm.HM_PROLONG_ROW_LEAF_IDX.to(device=device, dtype=dt),
+            _hm.HM_PROLONG_COL_LEAF_IDX.to(device=device, dtype=dt),
+            _hm.HM_PROLONG_GATHER_IDX.to(device=device, dtype=dt),
         )
     return got
 
@@ -780,16 +770,16 @@ class LeafOnlyNet(nn.Module):
         nn.init.constant_(self.jacobi_gate.bias, 0.0)
         self.use_jacobi = use_jacobi
 
-        self.register_buffer("h_block_r0", HM_R0_CPU.clone(), persistent=False)
-        self.register_buffer("h_block_c0", HM_C0_CPU.clone(), persistent=False)
-        self.register_buffer("h_block_S", HM_S_CPU.clone(), persistent=False)
+        self.register_buffer("h_block_r0", _hm.HM_R0_CPU.clone(), persistent=False)
+        self.register_buffer("h_block_c0", _hm.HM_C0_CPU.clone(), persistent=False)
+        self.register_buffer("h_block_S", _hm.HM_S_CPU.clone(), persistent=False)
         self.num_h_off = int(self.h_block_r0.shape[0])
         wr, wc = hm_leaf_mean_pool_weights(
             self.h_block_r0.cpu(), self.h_block_c0.cpu(), self.h_block_S.cpu(), MAX_NUM_LEAVES
         )
         self.register_buffer("hm_pool_w_row", wr, persistent=False)
         self.register_buffer("hm_pool_w_col", wc, persistent=False)
-        wr_sum, wc_sum = HM_SUM_W_ROW_CPU.clone(), HM_SUM_W_COL_CPU.clone()
+        wr_sum, wc_sum = _hm.HM_SUM_W_ROW_CPU.clone(), _hm.HM_SUM_W_COL_CPU.clone()
         self.register_buffer("hm_sum_w_row", wr_sum, persistent=False)
         self.register_buffer("hm_sum_w_col", wc_sum, persistent=False)
         self.register_buffer("leaf_idx_full", torch.arange(MAX_NUM_LEAVES, dtype=torch.long), persistent=False)
@@ -1383,7 +1373,7 @@ def unpack_precond(precond_packed, N, leaf_size=LEAF_SIZE, leaf_apply_size=None,
     La_d = leaf_apply_size
     La_o = leaf_apply_off
     diag_size = num_leaves * La_d * La_d
-    M_h = NUM_HMATRIX_OFF_BLOCKS
+    M_h = _hm.NUM_HMATRIX_OFF_BLOCKS
     off_size = M_h * La_o * La_o
     node_size = num_leaves * leaf_size * La_o
 
@@ -1439,7 +1429,7 @@ def build_sparse_bsr_preconditioner(
         raise ValueError(f"leaf_size {L} not divisible by leaf_apply_off {La_o}")
 
     diag_size_active = num_leaves * La_d * La_d
-    M_h = NUM_HMATRIX_OFF_BLOCKS
+    M_h = _hm.NUM_HMATRIX_OFF_BLOCKS
     off_size = M_h * La_o * La_o
     node_size_active = num_leaves * L * La_o
 
@@ -1482,9 +1472,9 @@ def build_sparse_bsr_preconditioner(
 
     if off_diag_blocks is not None and M_h > 0:
         for i in range(M_h):
-            r0i = int(HM_R0_CPU[i].item())
-            c0i = int(HM_C0_CPU[i].item())
-            si = int(HM_S_CPU[i].item())
+            r0i = int(_hm.HM_R0_CPU[i].item())
+            c0i = int(_hm.HM_C0_CPU[i].item())
+            si = int(_hm.HM_S_CPU[i].item())
             if r0i + si > num_leaves or c0i + si > num_leaves:
                 continue
 
@@ -1578,7 +1568,7 @@ def apply_block_diagonal_M(
         raise ValueError(f"leaf_size {leaf_size} not divisible by leaf_apply_off {La_o}")
 
     diag_size = num_leaves * La_d * La_d
-    M_h = NUM_HMATRIX_OFF_BLOCKS
+    M_h = _hm.NUM_HMATRIX_OFF_BLOCKS
     off_size = M_h * La_o * La_o
 
     diag_blocks = precond_packed[:, :diag_size].view(B, num_leaves, La_d, La_d)
@@ -1602,8 +1592,8 @@ def apply_block_diagonal_M(
         node_V = precond_packed[:, idx : idx + node_size].view(B, num_leaves, leaf_size, La_o)
         idx += node_size
 
-        Wr_sum = HM_SUM_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
-        Wc_sum = HM_SUM_W_COL_CPU.to(device=x.device, dtype=x.dtype)
+        Wr_sum = _hm.HM_SUM_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
+        Wc_sum = _hm.HM_SUM_W_COL_CPU.to(device=x.device, dtype=x.dtype)
 
         x_proj_U = torch.matmul(node_U.transpose(-1, -2), x_leaves)
         x_proj_V = torch.matmul(node_V.transpose(-1, -2), x_leaves)
@@ -1689,7 +1679,7 @@ def apply_block_diagonal_M_physical(
         raise ValueError(f"leaf_size {L} not divisible by leaf_apply_off {La_o}")
 
     diag_size_active = num_leaves_active * La_d * La_d
-    M_h = NUM_HMATRIX_OFF_BLOCKS
+    M_h = _hm.NUM_HMATRIX_OFF_BLOCKS
     off_size = M_h * La_o * La_o
     node_size_active = num_leaves_active * L * La_o
 
@@ -1713,7 +1703,7 @@ def apply_block_diagonal_M_physical(
         idx += node_size_active
 
         na = int(num_leaves_active)
-        valid = ((HM_R0_CPU + HM_S_CPU) <= na) & ((HM_C0_CPU + HM_S_CPU) <= na)
+        valid = ((_hm.HM_R0_CPU + _hm.HM_S_CPU) <= na) & ((_hm.HM_C0_CPU + _hm.HM_S_CPU) <= na)
         valid = valid.to(device=off_diag_blocks.device, dtype=off_diag_blocks.dtype).view(1, M_h, 1, 1)
         off_diag_blocks = off_diag_blocks * valid
 
@@ -1725,8 +1715,8 @@ def apply_block_diagonal_M_physical(
         x_full_U[:, :na] = x_proj_U
         x_full_V[:, :na] = x_proj_V
 
-        Wr_sum = HM_SUM_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
-        Wc_sum = HM_SUM_W_COL_CPU.to(device=x.device, dtype=x.dtype)
+        Wr_sum = _hm.HM_SUM_W_ROW_CPU.to(device=x.device, dtype=x.dtype)
+        Wc_sum = _hm.HM_SUM_W_COL_CPU.to(device=x.device, dtype=x.dtype)
         x_row_strips = torch.einsum("mk,bkld->bmld", Wr_sum, x_full_U)
         x_col_strips = torch.einsum("mk,bkld->bmld", Wc_sum, x_full_V)
 
@@ -1769,7 +1759,7 @@ def apply_block_diagonal_M_physical(
 
 def block_diagonal_m_apply_workspace(num_leaves: int, leaf_size: int, K_dim: int, M_h: int, La_o: int, device, dtype):
     la_c = La_o * K_dim
-    t_pro = int(HM_PROLONG_GATHER_IDX.shape[0])
+    t_pro = int(_hm.HM_PROLONG_GATHER_IDX.shape[0])
     n_flat = MAX_NUM_LEAVES if M_h > 0 else num_leaves
     out = {
         "x_proj_U_flat": torch.empty(n_flat, la_c, device=device, dtype=dtype),
@@ -1788,7 +1778,7 @@ def block_diagonal_m_apply_workspace(num_leaves: int, leaf_size: int, K_dim: int
         out["y_c_leaves_pad"] = torch.empty(1, MAX_NUM_LEAVES, La_o, K_dim, device=device, dtype=dtype)
         if num_leaves < MAX_NUM_LEAVES:
             na = int(num_leaves)
-            valid = ((HM_R0_CPU + HM_S_CPU) <= na) & ((HM_C0_CPU + HM_S_CPU) <= na)
+            valid = ((_hm.HM_R0_CPU + _hm.HM_S_CPU) <= na) & ((_hm.HM_C0_CPU + _hm.HM_S_CPU) <= na)
             out["off_valid"] = valid.to(device=device, dtype=dtype).view(1, M_h, 1, 1)
     return out
 
@@ -1824,7 +1814,7 @@ def apply_block_diagonal_m_into(
         raise ValueError(f"apply_block_diagonal_m_into expects B=1, got {B}")
     num_leaves = N // leaf_size
     La_d, La_o = leaf_apply_size, leaf_apply_off
-    M_h = NUM_HMATRIX_OFF_BLOCKS
+    M_h = _hm.NUM_HMATRIX_OFF_BLOCKS
 
     diag_size_active = num_leaves * La_d * La_d
     off_size = M_h * La_o * La_o

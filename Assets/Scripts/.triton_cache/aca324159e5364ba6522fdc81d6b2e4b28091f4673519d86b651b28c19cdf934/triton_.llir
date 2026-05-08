@@ -1,0 +1,122 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+
+define void @triton_(ptr addrspace(1) %0, i32 %1) local_unnamed_addr !dbg !7 {
+  %3 = tail call i32 asm "mov.u32 $0, %ctaid.x;", "=r"() #1, !dbg !10
+  %4 = shl i32 %3, 10, !dbg !11
+  %5 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x(), !dbg !12
+  %6 = and i32 %5, 127, !dbg !12
+  %7 = or disjoint i32 %4, %6, !dbg !13
+  %8 = or disjoint i32 %7, 128, !dbg !13
+  %9 = or disjoint i32 %7, 256, !dbg !13
+  %10 = or disjoint i32 %7, 384, !dbg !13
+  %11 = or disjoint i32 %7, 512, !dbg !13
+  %12 = or disjoint i32 %7, 640, !dbg !13
+  %13 = or disjoint i32 %7, 768, !dbg !13
+  %14 = or disjoint i32 %7, 896, !dbg !13
+  %.frozen = freeze i32 %7
+  %15 = sdiv i32 %.frozen, 3, !dbg !14
+  %16 = mul i32 %15, 3
+  %.decomposed = sub i32 %.frozen, %16
+  %.frozen1 = freeze i32 %8
+  %17 = sdiv i32 %.frozen1, 3, !dbg !14
+  %18 = mul i32 %17, 3
+  %.decomposed2 = sub i32 %.frozen1, %18
+  %.frozen3 = freeze i32 %9
+  %19 = sdiv i32 %.frozen3, 3, !dbg !14
+  %20 = mul i32 %19, 3
+  %.decomposed4 = sub i32 %.frozen3, %20
+  %.frozen5 = freeze i32 %10
+  %21 = sdiv i32 %.frozen5, 3, !dbg !14
+  %22 = mul i32 %21, 3
+  %.decomposed6 = sub i32 %.frozen5, %22
+  %.frozen7 = freeze i32 %11
+  %23 = sdiv i32 %.frozen7, 3, !dbg !14
+  %24 = mul i32 %23, 3
+  %.decomposed8 = sub i32 %.frozen7, %24
+  %.frozen9 = freeze i32 %12
+  %25 = sdiv i32 %.frozen9, 3, !dbg !14
+  %26 = mul i32 %25, 3
+  %.decomposed10 = sub i32 %.frozen9, %26
+  %.frozen11 = freeze i32 %13
+  %27 = sdiv i32 %.frozen11, 3, !dbg !14
+  %28 = mul i32 %27, 3
+  %.decomposed12 = sub i32 %.frozen11, %28
+  %.frozen13 = freeze i32 %14
+  %29 = sdiv i32 %.frozen13, 3, !dbg !14
+  %30 = mul i32 %29, 3
+  %.decomposed14 = sub i32 %.frozen13, %30
+  %31 = mul i32 %15, 36, !dbg !15
+  %32 = mul i32 %17, 36, !dbg !15
+  %33 = mul i32 %19, 36, !dbg !15
+  %34 = mul i32 %21, 36, !dbg !15
+  %35 = mul i32 %23, 36, !dbg !15
+  %36 = mul i32 %25, 36, !dbg !15
+  %37 = mul i32 %27, 36, !dbg !15
+  %38 = mul i32 %29, 36, !dbg !15
+  %39 = add i32 %31, %.decomposed, !dbg !16
+  %40 = add i32 %32, %.decomposed2, !dbg !16
+  %41 = add i32 %33, %.decomposed4, !dbg !16
+  %42 = add i32 %34, %.decomposed6, !dbg !16
+  %43 = add i32 %35, %.decomposed8, !dbg !16
+  %44 = add i32 %36, %.decomposed10, !dbg !16
+  %45 = add i32 %37, %.decomposed12, !dbg !16
+  %46 = add i32 %38, %.decomposed14, !dbg !16
+  %47 = sext i32 %39 to i64, !dbg !17
+  %48 = getelementptr float, ptr addrspace(1) %0, i64 %47, !dbg !17
+  %49 = sext i32 %40 to i64, !dbg !17
+  %50 = getelementptr float, ptr addrspace(1) %0, i64 %49, !dbg !17
+  %51 = sext i32 %41 to i64, !dbg !17
+  %52 = getelementptr float, ptr addrspace(1) %0, i64 %51, !dbg !17
+  %53 = sext i32 %42 to i64, !dbg !17
+  %54 = getelementptr float, ptr addrspace(1) %0, i64 %53, !dbg !17
+  %55 = sext i32 %43 to i64, !dbg !17
+  %56 = getelementptr float, ptr addrspace(1) %0, i64 %55, !dbg !17
+  %57 = sext i32 %44 to i64, !dbg !17
+  %58 = getelementptr float, ptr addrspace(1) %0, i64 %57, !dbg !17
+  %59 = sext i32 %45 to i64, !dbg !17
+  %60 = getelementptr float, ptr addrspace(1) %0, i64 %59, !dbg !17
+  %61 = sext i32 %46 to i64, !dbg !17
+  %62 = getelementptr float, ptr addrspace(1) %0, i64 %61, !dbg !17
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %48, i1 true) #1, !dbg !18
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %50, i1 true) #1, !dbg !18
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %52, i1 true) #1, !dbg !18
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %54, i1 true) #1, !dbg !18
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %56, i1 true) #1, !dbg !18
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %58, i1 true) #1, !dbg !18
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %60, i1 true) #1, !dbg !18
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %62, i1 true) #1, !dbg !18
+  ret void, !dbg !19
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.nvvm.read.ptx.sreg.tid.x() #0
+
+attributes #0 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #1 = { nounwind }
+
+!llvm.module.flags = !{!0, !1}
+!llvm.dbg.cu = !{!2}
+!nvvm.annotations = !{!4, !5}
+!llvm.ident = !{!6}
+
+!0 = !{i32 2, !"Debug Info Version", i32 3}
+!1 = !{i32 4, !"nvvm-reflect-ftz", i32 1}
+!2 = distinct !DICompileUnit(language: DW_LANG_C, file: !3, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!3 = !DIFile(filename: "cl5v74tndtrd36xs6mrpg2zvdmduknaoq45yrnnmqlqsq2g4eldo.py", directory: "/orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/.torch_inductor_cache/l5")
+!4 = !{ptr @triton_, !"kernel", i32 1}
+!5 = !{ptr @triton_, !"maxntidx", i32 128}
+!6 = !{!"clang version 3.8.0 (tags/RELEASE_380/final)"}
+!7 = distinct !DISubprogram(name: "triton_", linkageName: "triton_", scope: !3, file: !3, line: 18, type: !8, scopeLine: 18, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !2)
+!8 = !DISubroutineType(cc: DW_CC_normal, types: !9)
+!9 = !{}
+!10 = !DILocation(line: 20, column: 28, scope: !7)
+!11 = !DILocation(line: 20, column: 33, scope: !7)
+!12 = !DILocation(line: 21, column: 36, scope: !7)
+!13 = !DILocation(line: 21, column: 23, scope: !7)
+!14 = !DILocation(line: 24, column: 20, scope: !7)
+!15 = !DILocation(line: 26, column: 34, scope: !7)
+!16 = !DILocation(line: 26, column: 31, scope: !7)
+!17 = !DILocation(line: 26, column: 25, scope: !7)
+!18 = !DILocation(line: 26, column: 46, scope: !7)
+!19 = !DILocation(line: 26, column: 4, scope: !7)

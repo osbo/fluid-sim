@@ -1,3 +1,4 @@
+import csv
 import random
 import time
 from collections import deque
@@ -9,8 +10,15 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
+from . import hmatrix as _hm
 from .architecture import LeafOnlyNet, apply_block_diagonal_M
-from .checkpoint import apply_leaf_only_arch_from_checkpoint_args, load_leaf_only_weights, save_leaf_only_weights
+from .checkpoint import (
+    apply_leaf_only_arch_from_checkpoint_args,
+    apply_leaf_only_runtime_from_checkpoint,
+    build_leaf_only_checkpoint_metadata,
+    load_leaf_only_weights,
+    save_leaf_only_weights,
+)
 from .config import (
     LEAF_APPLY_SIZE,
     LEAF_APPLY_SIZE_OFF,
@@ -31,7 +39,6 @@ from .data import (
     most_recent_run_folder,
 )
 from .eval import leafonly_grad_norms_by_group
-from .hmatrix import NUM_HMATRIX_OFF_BLOCKS
 from .probe_z import jacobi_smooth_hutchinson_z_inplace
 from .sparse_operator import (
     diag_from_sparse_coo,
@@ -89,6 +96,9 @@ def _print_backward_cuda_bucket_summary(prof: Any) -> None:
 def train_leaf_only(args, runtime):
     data_folder = runtime["data_folder"]
     save_path = runtime["save_path"]
+    if getattr(args, "continue_training", False) and Path(save_path).exists():
+        apply_leaf_only_runtime_from_checkpoint(save_path)
+        apply_leaf_only_arch_from_checkpoint_args(args, save_path)
     runtime_use_gcn = runtime["use_gcn"]
     print_timing = runtime["print_timing"]
     max_grad_norm = runtime["max_grad_norm"]
@@ -246,9 +256,6 @@ def train_leaf_only(args, runtime):
     args.use_jacobi = True
     attention_layout = str(args.attention_layout)
 
-    if getattr(args, "continue_training", False) and save_path.exists():
-        apply_leaf_only_arch_from_checkpoint_args(args, save_path)
-
     torch.manual_seed(args.seed)
     max_n_pad = max(ctx["n_pad"] for ctx in training_contexts)
     if not runtime_use_gcn:
@@ -367,11 +374,19 @@ def train_leaf_only(args, runtime):
         min_lr=_min_lr_val,
     )
     _stop_at_min_lr = bool(getattr(args, "stop_at_min_lr", False))
+    _auto_stop = bool(getattr(args, "auto_stop", False))
+    # Auto-stop plateau tracker: same rel-threshold as scheduler (5e-3), 2× patience (10 log steps).
+    _auto_stop_patience = 10
+    _auto_stop_threshold = 5e-3
+    _auto_stop_best = float("inf")
+    _auto_stop_bad = 0
     ms_optim = (time.perf_counter() - t_seg) * 1000.0
+    _sched_flags = ", stop-at-min-lr" if _stop_at_min_lr else ""
+    _sched_flags += ", auto-stop (patience=10, threshold=5e-3 at min_lr)" if _auto_stop else ""
     print(
         "  [startup] LR scheduler: ReduceLROnPlateau"
         f" (factor=0.5, patience=5, threshold=5e-3, min_lr={_min_lr_val:.2e}"
-        f"{', stop-at-min-lr' if _stop_at_min_lr else ''})"
+        f"{_sched_flags})"
     )
     num_leaves_max = max_n_pad // LEAF_SIZE
     print(
@@ -443,6 +458,20 @@ def train_leaf_only(args, runtime):
     t_start_avg = None
     grad_mags = bool(getattr(args, "grad_mags", False))
 
+    _track_training = bool(getattr(args, "track_training", False))
+    _csv_file = None
+    _csv_writer = None
+    _ckpt_prefix = None
+    if _track_training:
+        _csv_path = save_path.parent / (save_path.stem + "_training_profile.csv")
+        _ckpt_prefix = save_path.parent / save_path.stem
+        _open_mode = "a" if (bool(getattr(args, "continue_training", False)) and _csv_path.exists()) else "w"
+        _csv_file = open(_csv_path, _open_mode, newline="")
+        _csv_writer = csv.writer(_csv_file)
+        if _open_mode == "w":
+            _csv_writer.writerow(["step", "loss_avg", "loss_std", "elapsed_s", "lr"])
+        print(f"  [track] Training profile CSV: {_csv_path}")
+
     def _cuda_sync():
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -483,7 +512,7 @@ def train_leaf_only(args, runtime):
         B_step = len(batch_ctx)
         max_n_pad_step = max(ctx["n_pad"] for ctx in batch_ctx)
         max_num_blocks = max_n_pad_step // LEAF_SIZE
-        max_M_off = NUM_HMATRIX_OFF_BLOCKS
+        max_M_off = int(_hm.NUM_HMATRIX_OFF_BLOCKS)
         use_dense_batch = bool(batch_ctx[0].get("use_dense_A", True))
         for _c in batch_ctx:
             if bool(_c.get("use_dense_A", True)) != use_dense_batch:
@@ -802,7 +831,16 @@ def train_leaf_only(args, runtime):
                     f" lr={lr_after:.2e}{log_grad_suffix}"
                 )
                 print(f"  [lr] reached min_lr={_min_lr_val:.2e}; stopping (--stop-at-min-lr).")
-                save_leaf_only_weights(model, str(save_path), input_dim=9)
+                if _csv_writer is not None:
+                    _loss_std_csv = loss_std if n > 0 else 0.0
+                    _csv_writer.writerow([step, f"{loss_avg:.6f}", f"{_loss_std_csv:.6f}", f"{elapsed:.4f}", f"{lr_after:.6e}"])
+                    _csv_file.close()
+                save_leaf_only_weights(
+                    model,
+                    str(save_path),
+                    input_dim=9,
+                    metadata=build_leaf_only_checkpoint_metadata(args, runtime),
+                )
                 print(f"Saved to {save_path}")
                 return {
                     "target_step": target_step,
@@ -814,6 +852,44 @@ def train_leaf_only(args, runtime):
                     "final_lr": lr_after,
                     "final_step": step,
                 }
+
+            if _auto_stop and lr_after <= _min_lr_val * 1.001:
+                # Plateau check at min_lr: same rel-threshold as scheduler, 2× patience.
+                if loss_avg < _auto_stop_best * (1.0 - _auto_stop_threshold):
+                    _auto_stop_best = loss_avg
+                    _auto_stop_bad = 0
+                else:
+                    _auto_stop_bad += 1
+                if _auto_stop_bad >= _auto_stop_patience:
+                    print(
+                        f"{step:05d}: {loss_str}  ({elapsed:.3f}s)"
+                        f" lr={lr_after:.2e}{log_grad_suffix}"
+                    )
+                    print(
+                        f"  [auto-stop] plateau at min_lr={_min_lr_val:.2e} "
+                        f"({_auto_stop_bad}/{_auto_stop_patience} steps without >{_auto_stop_threshold:.0e} improvement); stopping."
+                    )
+                    if _csv_writer is not None:
+                        _loss_std_csv = loss_std if n > 0 else 0.0
+                        _csv_writer.writerow([step, f"{loss_avg:.6f}", f"{_loss_std_csv:.6f}", f"{elapsed:.4f}", f"{lr_after:.6e}"])
+                        _csv_file.close()
+                    save_leaf_only_weights(
+                        model,
+                        str(save_path),
+                        input_dim=9,
+                        metadata=build_leaf_only_checkpoint_metadata(args, runtime),
+                    )
+                    print(f"Saved to {save_path}")
+                    return {
+                        "target_step": target_step,
+                        "loss_mean_at_target": target_loss_mean,
+                        "loss_std_at_target": target_loss_std,
+                        "lr_at_target": target_lr,
+                        "save_path": str(save_path),
+                        "stopped_auto": True,
+                        "final_lr": lr_after,
+                        "final_step": step,
+                    }
 
             if step >= TIMING_STEP:
                 now = time.perf_counter()
@@ -831,15 +907,35 @@ def train_leaf_only(args, runtime):
                     f"{step:05d}: {loss_str}  ({elapsed:.3f}s)"
                     f" lr={lr_after:.2e}{log_grad_suffix}"
                 )
+            if _csv_writer is not None:
+                _loss_std_csv = loss_std if n > 0 else 0.0
+                _csv_writer.writerow([step, f"{loss_avg:.6f}", f"{_loss_std_csv:.6f}", f"{elapsed:.4f}", f"{lr_after:.6e}"])
+                _csv_file.flush()
+            if _track_training and step % 2000 == 0:
+                _ckpt_bytes = _ckpt_prefix.parent / f"{_ckpt_prefix.name}_step{step:06d}.bytes"
+                save_leaf_only_weights(model, str(_ckpt_bytes), input_dim=9, metadata=build_leaf_only_checkpoint_metadata(args, runtime))
+                print(f"  [track] Checkpoint -> {_ckpt_bytes.name}")
             if step > 0 and step % (print_interval * 10) == 0:
-                save_leaf_only_weights(model, str(save_path), input_dim=9)
+                save_leaf_only_weights(
+                    model,
+                    str(save_path),
+                    input_dim=9,
+                    metadata=build_leaf_only_checkpoint_metadata(args, runtime),
+                )
             if step == target_step:
                 target_loss_mean = loss_avg
                 target_loss_std = loss_std if n > 0 else 0.0
                 target_lr = lr_after
             t_start = time.perf_counter()
 
-    save_leaf_only_weights(model, str(save_path), input_dim=9)
+    if _csv_file is not None:
+        _csv_file.close()
+    save_leaf_only_weights(
+        model,
+        str(save_path),
+        input_dim=9,
+        metadata=build_leaf_only_checkpoint_metadata(args, runtime),
+    )
     print(f"Saved to {save_path}")
     return {
         "target_step": target_step,

@@ -1,5 +1,7 @@
+import json
 import struct
 from pathlib import Path
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
@@ -19,6 +21,8 @@ CHECKPOINT_EDGE_GATE_EXT_MAGIC = 0x4544474D  # b"MDGE"
 CHECKPOINT_EDGE_GATE_EXT_VER = 1
 CHECKPOINT_HEAD_EXT_MAGIC = 0x48454144  # b"DAEH" little-endian
 CHECKPOINT_HEAD_EXT_VER = 1
+# Trailing JSON UTF-8 after fp16 tensor blob: ``<magic u32><json_len u32><json_bytes>`` (see ``read_checkpoint_meta_footer``).
+CHECKPOINT_JSON_META_FOOTER_MAGIC = 0x544D464C  # b"LFMT"
 
 
 def _validate_parsed_leaf_only_header(
@@ -289,6 +293,115 @@ def apply_leaf_only_arch_from_checkpoint_args(args, save_path) -> None:
         print(f"  [checkpoint] Using architecture from {name}: " + ", ".join(changed))
 
 
+def read_checkpoint_meta_footer(path: Path) -> dict[str, Any] | None:
+    """
+    Optional JSON metadata appended after the fp16 tensor blob (Unity / Python strip this tail).
+
+    Layout at end of file: ``CHECKPOINT_JSON_META_FOOTER_MAGIC`` (u32 LE), ``json_len`` (u32 LE),
+    ``json_len`` bytes UTF-8 JSON object.
+    """
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    L = len(data)
+    max_meta = min(512 * 1024, max(0, L - 8))
+    for meta_len in range(0, max_meta + 1):
+        if meta_len > L - 8:
+            break
+        S = L - 8 - meta_len
+        if S < 0:
+            continue
+        magic, ml = struct.unpack_from("<ii", data, S)
+        if int(magic) != int(CHECKPOINT_JSON_META_FOOTER_MAGIC) or int(ml) != int(meta_len):
+            continue
+        if S + 8 + meta_len != L:
+            continue
+        if meta_len == 0:
+            return {}
+        try:
+            return json.loads(data[S + 8 : L].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def _write_checkpoint_meta_footer(f, meta: Mapping[str, Any]) -> None:
+    raw = json.dumps(dict(meta), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    meta_len = len(raw)
+    if meta_len > 512 * 1024 - 1:
+        raise ValueError(f"checkpoint metadata JSON too large ({meta_len} bytes)")
+    f.write(struct.pack("<ii", int(CHECKPOINT_JSON_META_FOOTER_MAGIC), int(meta_len)))
+    f.write(raw)
+
+
+def build_leaf_only_checkpoint_metadata(args: Any, runtime: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Snapshot CLI + ``leafonly.config`` for the JSON footer (training / problem shape)."""
+    from . import config as cfg
+
+    r = dict(runtime) if runtime else {}
+    meta: dict[str, Any] = {
+        "format_version": 1,
+        "leaf_size": int(cfg.LEAF_SIZE),
+        "max_mixed_size": int(cfg.MAX_MIXED_SIZE),
+        "diag_token_pool": int(cfg.DIAG_TOKEN_POOL),
+        "off_diag_token_pool": int(cfg.OFF_DIAG_TOKEN_POOL),
+        "d_model": int(getattr(args, "d_model", 0)),
+        "num_layers": int(getattr(args, "num_layers", 0)),
+        "num_heads": int(getattr(args, "num_heads", 0)),
+        "num_gcn_layers": int(getattr(args, "num_gcn_layers", 2)),
+        "attention_layout": str(getattr(args, "attention_layout", "")),
+        "use_jacobi": bool(getattr(args, "use_jacobi", True)),
+        "use_highways": bool(getattr(args, "use_highways", True)),
+        "off_diag_dense_attention": bool(getattr(args, "off_diag_dense_attn", True)),
+        "diag_dense_attention": bool(getattr(args, "diag_dense_attn", True)),
+        "strip_build_mode": str(getattr(args, "strip_build_mode", "einsum")),
+        "leafonly_pcg": str(getattr(args, "leafonly_pcg", "matrix_free")),
+        "steps": int(getattr(args, "steps", 0)),
+        "lr": float(getattr(args, "lr", 0.0)),
+        "seed": int(getattr(args, "seed", 0)),
+        "contexts_per_step": int(getattr(args, "contexts_per_step", 1)),
+        "target_step": int(getattr(args, "target_step", 0)),
+        "loss_mode": str(getattr(args, "loss_mode", "hutchinson")),
+        "probe_vectors": int(getattr(args, "probe_vectors", -1)),
+        "data_folder": str(r.get("data_folder", "")),
+        "save_path": str(r.get("save_path", "")),
+    }
+    return meta
+
+
+def apply_leaf_only_runtime_from_checkpoint(path: Path | str) -> dict[str, Any] | None:
+    """
+    Set ``leafonly.config`` problem shape (``LEAF_SIZE``, ``MAX_MIXED_SIZE``, token pools) from the
+    checkpoint header plus optional JSON footer, then rebuild ``leafonly.hmatrix`` buffers.
+
+    Call before constructing ``LeafOnlyNet`` / reading tensors. Safe to call multiple times.
+    Returns merged header+footer dict for logging, or ``None`` if ``path`` is missing.
+    """
+    from . import config as cfg
+    from . import hmatrix as hmx
+
+    p = Path(path)
+    arch = leaf_only_arch_from_checkpoint(p)
+    if arch is None:
+        return None
+    meta = read_checkpoint_meta_footer(p) or {}
+    max_mix = int(meta.get("max_mixed_size", cfg.MAX_MIXED_SIZE))
+    cfg.apply_runtime_sizes(
+        int(arch["leaf_size"]),
+        max_mix,
+        leaf_apply_diag=int(arch["leaf_apply_diag"]),
+        leaf_apply_off=int(arch["leaf_apply_off"]),
+    )
+    hmx.rebuild_hmatrix_globals()
+    from . import architecture as arch_mod
+
+    arch_mod._HM_PROLONG_GPU.clear()
+    arch_mod._BSR_TOPOLOGY_CACHE.clear()
+    return {**arch, **meta}
+
+
 def _write_packed_tensor(f, param, transpose=False):
     import numpy as np
 
@@ -404,7 +517,7 @@ def _write_transformer_block(f, block, *, write_route_gates: bool = True):
     _write_packed_tensor(f, block.mlp[2].bias.detach().cpu().float(), False)
 
 
-def save_leaf_only_weights(model, path, input_dim=9):
+def save_leaf_only_weights(model, path, input_dim=9, *, metadata: Mapping[str, Any] | None = None):
     path = Path(path)
     d_model = model.embed.lift[0].weight.shape[0]
     num_heads = model.blocks[0].attn.num_heads if model.blocks else 4
@@ -492,6 +605,8 @@ def save_leaf_only_weights(model, path, input_dim=9):
         _write_packed_tensor(f, model.node_v.bias.detach().cpu().float(), transpose=False)
         _write_packed_tensor(f, model.jacobi_gate.weight.detach().cpu().float(), transpose=True)
         _write_packed_tensor(f, model.jacobi_gate.bias.detach().cpu().float(), transpose=False)
+        if metadata is not None:
+            _write_checkpoint_meta_footer(f, metadata)
 
 
 def _read_transformer_block_into(f, block, read_tensor, *, load_route_gates: bool = False, legacy_edge_gate_linear: bool = False):
@@ -521,6 +636,7 @@ def load_leaf_only_weights(model, path):
     import numpy as np
 
     path = Path(path)
+    apply_leaf_only_runtime_from_checkpoint(path)
     result = read_leaf_only_header(path)
     (
         d_model_lo,
@@ -638,5 +754,11 @@ def load_leaf_only_weights(model, path):
         _read_into(f, model.node_v.bias, read_tensor, transpose=False)
         _read_into(f, model.jacobi_gate.weight, read_tensor, transpose=True)
         _read_into(f, model.jacobi_gate.bias, read_tensor, transpose=False)
-        if f.read(1):
-            raise ValueError("Checkpoint has trailing bytes; unsupported legacy format.")
+        tail = f.read()
+        if not tail:
+            return
+        if read_checkpoint_meta_footer(path) is not None:
+            return
+        raise ValueError(
+            "Checkpoint has trailing bytes after tensor blob (not a recognized JSON metadata footer)."
+        )

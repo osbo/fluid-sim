@@ -1,0 +1,83 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+
+@assertFunc_0 = internal constant [7 x i8] c"unknown"
+@assertFile_0 = internal constant [7 x i8] c"unknown"
+@assertMessage_0 = internal constant [29 x i8] c"index out of bounds: x1 < ks0"
+
+; Function Attrs: noreturn
+declare !dbg !7 void @__assertfail(ptr, ptr, i32, ptr, i64) local_unnamed_addr #0
+
+define void @triton_(ptr addrspace(1) %0, i32 %1, i32 %2, i32 %3) local_unnamed_addr !dbg !11 {
+  %5 = tail call i32 asm "mov.u32 $0, %ctaid.x;", "=r"() #2, !dbg !12
+  %6 = shl i32 %5, 7, !dbg !13
+  %7 = tail call i32 @llvm.nvvm.read.ptx.sreg.tid.x(), !dbg !14
+  %8 = and i32 %7, 127, !dbg !14
+  %9 = or disjoint i32 %6, %8, !dbg !15
+  %10 = icmp slt i32 %9, %3, !dbg !16
+  %11 = icmp slt i32 %1, 0, !dbg !17
+  %.not1 = and i1 %11, %10, !dbg !18
+  br i1 %.not1, label %12, label %13, !dbg !18
+
+12:                                               ; preds = %4
+  tail call void @__assertfail(ptr nonnull @assertMessage_0, ptr nonnull @assertFile_0, i32 0, ptr nonnull @assertFunc_0, i64 1), !dbg !18
+  unreachable, !dbg !18
+
+13:                                               ; preds = %4
+  %.frozen = freeze i32 %9
+  %14 = sdiv i32 %.frozen, 4, !dbg !19
+  %15 = srem i32 %14, %1, !dbg !20
+  %16 = sdiv i32 %9, %2, !dbg !21
+  %17 = mul i32 %14, 4
+  %.decomposed = sub i32 %.frozen, %17
+  %18 = mul i32 %16, %1, !dbg !22
+  %reass.add3 = add i32 %18, %15
+  %reass.mul4 = mul i32 %reass.add3, %1
+  %reass.add2 = add i32 %reass.mul4, %15
+  %reass.mul = shl i32 %reass.add2, 2
+  %19 = add i32 %reass.mul, %.decomposed, !dbg !23
+  %20 = sext i32 %19 to i64, !dbg !24
+  %21 = getelementptr float, ptr addrspace(1) %0, i64 %20, !dbg !24
+  tail call void asm sideeffect "@$2 st.global.b32 [ $1 + 0 ], { $0 };", "r,l,b"(i32 0, ptr addrspace(1) %21, i1 %10) #2, !dbg !25
+  ret void, !dbg !26
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.nvvm.read.ptx.sreg.tid.x() #1
+
+attributes #0 = { noreturn }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nounwind }
+
+!llvm.module.flags = !{!0, !1}
+!llvm.dbg.cu = !{!2}
+!nvvm.annotations = !{!4, !5}
+!llvm.ident = !{!6}
+
+!0 = !{i32 2, !"Debug Info Version", i32 3}
+!1 = !{i32 4, !"nvvm-reflect-ftz", i32 1}
+!2 = distinct !DICompileUnit(language: DW_LANG_C, file: !3, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!3 = !DIFile(filename: "cplt6o2vf5ugb3sstx6y2vlxbk2z7sxczpaooyqciat2ijnw7fuz.py", directory: "/orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/.torch_inductor_cache/pl")
+!4 = !{ptr @triton_, !"kernel", i32 1}
+!5 = !{ptr @triton_, !"maxntidx", i32 128}
+!6 = !{!"clang version 3.8.0 (tags/RELEASE_380/final)"}
+!7 = !DISubprogram(name: "__assertfail", linkageName: "__assertfail", scope: !8, file: !8, type: !9, spFlags: DISPFlagOptimized)
+!8 = !DIFile(filename: "<unknown>", directory: "")
+!9 = !DISubroutineType(cc: DW_CC_normal, types: !10)
+!10 = !{}
+!11 = distinct !DISubprogram(name: "triton_", linkageName: "triton_", scope: !3, file: !3, line: 18, type: !9, scopeLine: 18, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !2)
+!12 = !DILocation(line: 19, column: 28, scope: !11)
+!13 = !DILocation(line: 19, column: 33, scope: !11)
+!14 = !DILocation(line: 20, column: 36, scope: !11)
+!15 = !DILocation(line: 20, column: 23, scope: !11)
+!16 = !DILocation(line: 21, column: 21, scope: !11)
+!17 = !DILocation(line: 25, column: 27, scope: !11)
+!18 = !DILocation(line: 25, column: 44, scope: !11)
+!19 = !DILocation(line: 22, column: 20, scope: !11)
+!20 = !DILocation(line: 22, column: 25, scope: !11)
+!21 = !DILocation(line: 24, column: 20, scope: !11)
+!22 = !DILocation(line: 27, column: 59, scope: !11)
+!23 = !DILocation(line: 27, column: 53, scope: !11)
+!24 = !DILocation(line: 27, column: 25, scope: !11)
+!25 = !DILocation(line: 27, column: 77, scope: !11)
+!26 = !DILocation(line: 27, column: 4, scope: !11)
