@@ -349,7 +349,8 @@ from leafonly import (
     warmup_hmatrix_prolong_gpu,
 )
 from leafonly.eval import _timed_ms
-from leafonly.checkpoint import leaf_only_arch_from_checkpoint
+from leafonly.checkpoint import apply_leaf_only_runtime_from_checkpoint, leaf_only_arch_from_checkpoint
+import leafonly.config as lo_config
 from leafonly.config import (
     DIAG_TOKEN_POOL,
     HMATRIX_ETA,
@@ -360,13 +361,8 @@ from leafonly.config import (
     OFF_DIAG_TOKEN_POOL,
     problem_padded_num_nodes,
 )
-from leafonly.hmatrix import (
-    HM_C0_CPU,
-    HM_R0_CPU,
-    HM_S_CPU,
-    NUM_HMATRIX_OFF_BLOCKS,
-    standard_admissible_unique_blocks,
-)
+from leafonly import hmatrix as _inspect_hm
+from leafonly.hmatrix import standard_admissible_unique_blocks
 
 
 def _torch_bsr_to_scipy_csr_cpu(M: torch.Tensor) -> csr_matrix:
@@ -662,10 +658,10 @@ def _hmatrix_rank_profiler_bands(
     )
 
     off_by_S: dict[int, list[tuple[int, int, int]]] = {}
-    for i in range(int(NUM_HMATRIX_OFF_BLOCKS)):
-        r0 = int(HM_R0_CPU[i].item())
-        c0 = int(HM_C0_CPU[i].item())
-        S = int(HM_S_CPU[i].item())
+    for i in range(int(_inspect_hm.NUM_HMATRIX_OFF_BLOCKS)):
+        r0 = int(_inspect_hm.HM_R0_CPU[i].item())
+        c0 = int(_inspect_hm.HM_C0_CPU[i].item())
+        S = int(_inspect_hm.HM_S_CPU[i].item())
         if r0 + S > nu or c0 + S > nu:
             continue
         off_by_S.setdefault(S, []).append((r0, c0, S))
@@ -2140,9 +2136,17 @@ def main():
 
     if not leaf_only_weights_path.exists():
         raise SystemExit(f"Leaf-only weights not found: {leaf_only_weights_path}. Run LeafOnly.py first.")
+    merged = apply_leaf_only_runtime_from_checkpoint(leaf_only_weights_path)
     ckpt_arch = leaf_only_arch_from_checkpoint(leaf_only_weights_path)
     if ckpt_arch is None:
         raise SystemExit(f"Could not read architecture from {leaf_only_weights_path}")
+    if merged is not None:
+        _ls = int(lo_config.LEAF_SIZE)
+        _mx = int(lo_config.MAX_MIXED_SIZE)
+        _info(
+            f"  Checkpoint runtime: LEAF_SIZE={_ls}, MAX_MIXED_SIZE={_mx}, "
+            f"MAX_NUM_LEAVES={_mx // _ls} (from header + optional JSON footer)"
+        )
     d_model_lo = ckpt_arch["d_model"]
     leaf_size_lo = ckpt_arch["leaf_size"]
     input_dim_lo = ckpt_arch["input_dim"]
@@ -2151,11 +2155,6 @@ def main():
     use_gcn_lo = ckpt_arch["use_gcn"]
     leaf_apply_diag_ckpt = ckpt_arch["leaf_apply_diag"]
     leaf_apply_off_ckpt = ckpt_arch["leaf_apply_off"]
-    if int(leaf_size_lo) != int(LEAF_SIZE):
-        raise ValueError(
-            f"Checkpoint leaf_size={leaf_size_lo} != leafonly.config.LEAF_SIZE={LEAF_SIZE}. "
-            "Set LEAF_SIZE in leafonly/config.py to match the weights header so MAX_MIXED_SIZE and MAX_NUM_LEAVES stay consistent."
-        )
     ck_hw = int(ckpt_arch.get("highway_ffn_mlp", 0))
     cli_hw = bool(getattr(args, "use_highways", _leaf_only_script.DEFAULT_USE_HIGHWAYS))
     if ck_hw == 1 and not cli_hw:
@@ -2165,19 +2164,20 @@ def main():
     ck_ffn = int(ckpt_arch.get("ffn_concat_width", 3 if ck_hw else 1))
     if cli_hw and ck_ffn not in (3, 4):
         raise SystemExit(f"Checkpoint ffn_concat_width={ck_ffn} invalid (expected 3 or 4 with highways).")
-    leaf_L = int(LEAF_SIZE)
+    leaf_L = int(lo_config.LEAF_SIZE)
     n_requested = problem_padded_num_nodes(num_nodes_real)
     n_pad = int(n_requested)
     # Physical linear system for PCG / baselines / plots (no identity tail): leaf-aligned, ≤ MAX_MIXED_SIZE.
     viz_n = n_requested
+    max_mixed = int(lo_config.MAX_MIXED_SIZE)
     if n_requested < num_nodes_real:
         _info(
             f"  Leaf-aligned subgraph: {n_requested} nodes (frame has {num_nodes_real}; "
             f"truncated to full {leaf_L}-node leaves); LeafOnly forward uses n_pad={n_pad} (no MAX_MIXED_SIZE tail)"
         )
-    elif num_nodes_real >= MAX_MIXED_SIZE and n_pad == MAX_MIXED_SIZE:
+    elif num_nodes_real >= max_mixed and n_pad == max_mixed:
         _info(
-            f"  Physical system {n_requested}×{n_requested} (capped at MAX_MIXED_SIZE={MAX_MIXED_SIZE}); "
+            f"  Physical system {n_requested}×{n_requested} (capped at MAX_MIXED_SIZE={max_mixed}); "
             f"LeafOnly forward n_pad={n_pad}"
         )
     else:
@@ -2215,18 +2215,17 @@ def main():
         raise RuntimeError(f"header leaf_apply_diag {leaf_apply_diag_ckpt} != model {leaf_apply_diag_L}")
     if leaf_apply_off_L != int(leaf_apply_off_ckpt):
         raise RuntimeError(f"header leaf_apply_off {leaf_apply_off_ckpt} != model {leaf_apply_off_L}")
-    if int(LEAF_APPLY_SIZE) != leaf_apply_diag_L or int(LEAF_APPLY_SIZE_OFF) != leaf_apply_off_L:
+    if int(lo_config.LEAF_APPLY_SIZE) != leaf_apply_diag_L or int(lo_config.LEAF_APPLY_SIZE_OFF) != leaf_apply_off_L:
         raise RuntimeError(
-            f"leafonly.config LEAF_APPLY_SIZE={LEAF_APPLY_SIZE}, LEAF_APPLY_SIZE_OFF={LEAF_APPLY_SIZE_OFF} "
-            f"do not match model leaf_apply_size={leaf_apply_diag_L}, leaf_apply_off={leaf_apply_off_L}. "
-            "Sync LEAF_SIZE, DIAG_TOKEN_POOL, and OFF_DIAG_TOKEN_POOL in leafonly/config.py with the checkpoint."
+            f"leafonly.config LEAF_APPLY_SIZE={lo_config.LEAF_APPLY_SIZE}, LEAF_APPLY_SIZE_OFF={lo_config.LEAF_APPLY_SIZE_OFF} "
+            f"do not match model leaf_apply_size={leaf_apply_diag_L}, leaf_apply_off={leaf_apply_off_L}."
         )
     pool_diag_to_full = int(leaf_L) // leaf_apply_diag_L
     pool_off_to_full = int(leaf_L) // leaf_apply_off_L
     if not test_only:
-        if int(DIAG_TOKEN_POOL) > 1:
+        if int(lo_config.DIAG_TOKEN_POOL) > 1:
             _info(
-                f"  On-diagonal path: DIAG_TOKEN_POOL={DIAG_TOKEN_POOL} → leaf_apply_diag={leaf_apply_diag_L} "
+                f"  On-diagonal path: DIAG_TOKEN_POOL={lo_config.DIAG_TOKEN_POOL} → leaf_apply_diag={leaf_apply_diag_L} "
                 f"(uniform mean-pool per leaf; Transformer+MLP at {leaf_apply_diag_L} tokens/leaf; "
                 f"packed cores {leaf_apply_diag_L}×{leaf_apply_diag_L})"
             )
@@ -2235,9 +2234,9 @@ def main():
                 f"  On-diagonal path: DIAG_TOKEN_POOL=1, leaf_apply_diag={leaf_apply_diag_L} "
                 f"(full leaf tokens; packed cores {leaf_apply_diag_L}×{leaf_apply_diag_L})"
             )
-        if int(OFF_DIAG_TOKEN_POOL) > 1:
+        if int(lo_config.OFF_DIAG_TOKEN_POOL) > 1:
             _info(
-                f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL={OFF_DIAG_TOKEN_POOL} → leaf_apply_off={leaf_apply_off_L} "
+                f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL={lo_config.OFF_DIAG_TOKEN_POOL} → leaf_apply_off={leaf_apply_off_L} "
                 f"(H strip + uniform mean-pool; Transformer+MLP at {leaf_apply_off_L} tokens/tile; "
                 f"packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
             )
@@ -2339,11 +2338,11 @@ def main():
                 blk = blk.repeat_interleave(pool_diag_to_full, dim=0).repeat_interleave(pool_diag_to_full, dim=1)
             M_neural_gpu[r0:r1, r0:r1] = blk
 
-        if NUM_HMATRIX_OFF_BLOCKS > 0 and off_diag_blocks is not None and node_U is not None and node_V is not None:
-            for i in range(NUM_HMATRIX_OFF_BLOCKS):
-                r0i = int(HM_R0_CPU[i].item())
-                c0i = int(HM_C0_CPU[i].item())
-                si = int(HM_S_CPU[i].item())
+        if _inspect_hm.NUM_HMATRIX_OFF_BLOCKS > 0 and off_diag_blocks is not None and node_U is not None and node_V is not None:
+            for i in range(_inspect_hm.NUM_HMATRIX_OFF_BLOCKS):
+                r0i = int(_inspect_hm.HM_R0_CPU[i].item())
+                c0i = int(_inspect_hm.HM_C0_CPU[i].item())
+                si = int(_inspect_hm.HM_S_CPU[i].item())
                 br0, br1 = r0i * leaf_L, (r0i + si) * leaf_L
                 bc0, bc1 = c0i * leaf_L, (c0i + si) * leaf_L
                 C_m = off_diag_blocks[0, i]
@@ -2589,7 +2588,7 @@ def main():
                 num_leaves=viz_n // leaf_L,
                 leaf_size=leaf_L,
                 K_dim=1,
-                M_h=NUM_HMATRIX_OFF_BLOCKS,
+                M_h=_inspect_hm.NUM_HMATRIX_OFF_BLOCKS,
                 La_o=leaf_apply_off_L,
                 device=device,
                 dtype=torch.float32,

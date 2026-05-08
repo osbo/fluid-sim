@@ -1,6 +1,64 @@
 import argparse
 from pathlib import Path
 
+_DEFAULT_CLI_LEAF_SIZE = 128
+_DEFAULT_CLI_MAX_MIXED_SIZE = 8192
+
+
+def _bootstrap_leafonly_problem_shape_from_argv():
+    """Apply ``--leaf-size`` / ``--max-mixed-size`` before leafonly imports when run as main."""
+    import importlib.util
+    import sys
+    import types
+    import warnings
+
+    # Same filter as ``leafonly/__init__.py`` (that __init__ is skipped when we stub the package below).
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*torch\._prims_common\.check.*",
+        category=FutureWarning,
+    )
+
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument(
+        "--max-mixed-size",
+        type=int,
+        default=_DEFAULT_CLI_MAX_MIXED_SIZE,
+        metavar="N",
+        help=argparse.SUPPRESS,
+    )
+    pre.add_argument(
+        "--leaf-size",
+        type=int,
+        default=_DEFAULT_CLI_LEAF_SIZE,
+        metavar="L",
+        help=argparse.SUPPRESS,
+    )
+    ns, _ = pre.parse_known_args()
+
+    scripts_dir = Path(__file__).resolve().parent
+    leafonly_dir = scripts_dir / "leafonly"
+    cfg_path = leafonly_dir / "config.py"
+
+    pkg = "leafonly"
+    if pkg not in sys.modules:
+        m_pkg = types.ModuleType(pkg)
+        m_pkg.__path__ = [str(leafonly_dir)]
+        sys.modules[pkg] = m_pkg
+
+    cfg_name = "leafonly.config"
+    spec = importlib.util.spec_from_file_location(cfg_name, cfg_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load LeafOnly config from {cfg_path}")
+    cfg_mod = importlib.util.module_from_spec(spec)
+    sys.modules[cfg_name] = cfg_mod
+    spec.loader.exec_module(cfg_mod)
+    cfg_mod.apply_runtime_sizes(ns.leaf_size, ns.max_mixed_size)
+
+
+if __name__ == "__main__":
+    _bootstrap_leafonly_problem_shape_from_argv()
+
 from leafonly.architecture import attention_layout_choices, default_attention_layout
 from leafonly.config import LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps_device
 from leafonly.eval import evaluate_estimator_variance, evaluate_gradient_interference
@@ -33,6 +91,26 @@ CHECKPOINT_ERR_NO_HIGHWAY_IN_FILE_NEED_CLI_OFF = (
 def _build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--max-mixed-size",
+        type=int,
+        default=_DEFAULT_CLI_MAX_MIXED_SIZE,
+        metavar="N",
+        help=(
+            "Upper bound on padded node count N (aligned to full leaves). Must be divisible by --leaf-size. "
+            "When running this script directly, applied before imports so MAX_NUM_LEAVES / H-matrix layout match."
+        ),
+    )
+    parser.add_argument(
+        "--leaf-size",
+        type=int,
+        default=_DEFAULT_CLI_LEAF_SIZE,
+        metavar="L",
+        help=(
+            "Leaf nodes per block (power of 2). Checkpoint leaf_size must match. "
+            "When running this script directly, applied before imports."
+        ),
+    )
+    parser.add_argument(
         "--data-folder",
         "--dataset-folders",
         type=str,
@@ -63,7 +141,7 @@ def _build_parser():
     parser.add_argument("--num-heads", type=int, default=8, help="LeafBlockAttention heads; must divide d_model")
     parser.add_argument("--frame", type=int, default=600, help="Frame index to use when --use-single-frame is True. Default: 600.")
     parser.add_argument("--use-single-frame", action="store_true", help="Train on a single frame (--frame) instead of random-frame sampling.")
-    parser.add_argument("--num-frames", type=int, default=50, help="When --use-single-frame False: number of frames to randomly sample; 0 = use all frames.")
+    parser.add_argument("--num-frames", type=int, default=100, help="When --use-single-frame False: number of frames to randomly sample; 0 = use all frames.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--contexts-per-step", type=int, default=4, help="Gradient accumulation: number of random cached contexts per optimizer step.")
     parser.add_argument("--continue-training", action="store_true", help="Load initial weights from the saved .bytes file and continue training from that state.")
@@ -199,6 +277,29 @@ def _build_parser():
             "Stop training early when the LR scheduler reaches min_lr (max(lr*1e-3, 1e-6)). "
             "Exits with code 0 and saves weights. Useful with --continue-training to pick up "
             "from the final LR of a prior run."
+        ),
+    )
+    parser.add_argument(
+        "--auto-stop",
+        action="store_true",
+        default=False,
+        help=(
+            "Stop training when the loss plateaus while already at min_lr. Uses the same relative "
+            "threshold as the LR scheduler (5e-3) but 2× the patience (10 vs 5 log steps = 1000 "
+            "training steps). Saves weights and exits with code 0. Unlike --stop-at-min-lr, which "
+            "stops immediately upon reaching min_lr, this waits for the loss to actually flatten."
+        ),
+    )
+    parser.add_argument(
+        "--track-training",
+        action="store_true",
+        default=False,
+        help=(
+            "Save a training profile CSV (<weights_stem>_training_profile.csv) with step, loss_avg, "
+            "loss_std, elapsed_s, and lr at every logged step (every 100 steps). Also saves weight "
+            "checkpoints every 2000 steps (starting from step 0) as <weights_stem>_step{N:06d}.bytes "
+            "beside the main weights file. Use EvalCheckpoints.py to evaluate those checkpoints and "
+            "append PCG iteration counts and SAI loss to the CSV."
         ),
     )
     return parser

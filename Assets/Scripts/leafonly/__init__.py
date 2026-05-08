@@ -21,7 +21,12 @@ from .architecture import (
     parse_attention_layout,
     unpack_precond,
 )
-from .checkpoint import load_leaf_only_weights, save_leaf_only_weights
+from .checkpoint import (
+    apply_leaf_only_runtime_from_checkpoint,
+    build_leaf_only_checkpoint_metadata,
+    load_leaf_only_weights,
+    save_leaf_only_weights,
+)
 from .config import (
     DIAG_TOKEN_POOL,
     LEAF_APPLY_SIZE,

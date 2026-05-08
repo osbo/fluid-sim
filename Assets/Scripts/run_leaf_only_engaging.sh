@@ -19,4 +19,4 @@ module load miniforge
 module load cuda
 source activate fluid
 
-python3 -u LeafOnly.py
+python3 -u LeafOnly.py --data-folder data/multiphase_v2_16384/train --leaf-size 256 --max-mixed-size 16384 --lr 2e-4

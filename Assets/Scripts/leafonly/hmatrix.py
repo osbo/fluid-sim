@@ -116,15 +116,6 @@ def num_hmatrix_off_blocks(num_units=None, eta=None) -> int:
     return int(r0.shape[0])
 
 
-# CPU indices for apply/unpack (static layout); import from here in InspectModel / tests.
-HM_R0_CPU, HM_C0_CPU, HM_S_CPU = precompute_hmatrix_off_buffers(device=torch.device("cpu"))
-NUM_HMATRIX_OFF_BLOCKS = int(HM_R0_CPU.shape[0])
-# Row/column strip mean weights for building pooled H off-diagonal token streams; sum weights below for FMM moments.
-HM_POOL_W_ROW_CPU, HM_POOL_W_COL_CPU = hm_leaf_mean_pool_weights(
-    HM_R0_CPU, HM_C0_CPU, HM_S_CPU, MAX_NUM_LEAVES
-)
-
-
 def hm_leaf_sum_pool_weights(
     r0: torch.Tensor, c0: torch.Tensor, S: torch.Tensor, num_leaves: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -140,23 +131,37 @@ def hm_leaf_sum_pool_weights(
     return W_row, W_col
 
 
-# Export sum weights for FMM-style pooling
-HM_SUM_W_ROW_CPU, HM_SUM_W_COL_CPU = hm_leaf_sum_pool_weights(
-    HM_R0_CPU, HM_C0_CPU, HM_S_CPU, MAX_NUM_LEAVES
-)
-# Plain Python ints for strip bounds (no Tensor.item / Dynamo graph breaks in apply).
-HM_R0_LIST = [int(x) for x in HM_R0_CPU.tolist()]
-HM_C0_LIST = [int(x) for x in HM_C0_CPU.tolist()]
-HM_S_LIST = [int(x) for x in HM_S_CPU.tolist()]
-# Vectorized prolongation: leaf indices and repeat counts (avoid M_h slice-+= autograd nodes).
-HM_PROLONG_ROW_LEAF_IDX = torch.cat(
-    [torch.arange(int(r0), int(r0) + int(s), dtype=torch.long) for r0, s in zip(HM_R0_LIST, HM_S_LIST)]
-)
-HM_PROLONG_COL_LEAF_IDX = torch.cat(
-    [torch.arange(int(c0), int(c0) + int(s), dtype=torch.long) for c0, s in zip(HM_C0_LIST, HM_S_LIST)]
-)
-HM_PROLONG_REPEAT_PER_BLOCK = torch.tensor(HM_S_LIST, dtype=torch.long)
-# For each prolongation slot t in 0..T-1, which off-block row (0..M_h-1) does y_r[:,i,:,:] come from?
-HM_PROLONG_GATHER_IDX = torch.cat(
-    [torch.full((int(s),), int(i), dtype=torch.long) for i, s in enumerate(HM_S_LIST)]
-)
+def rebuild_hmatrix_globals() -> None:
+    """
+    Recompute module-level H-matrix indices and pooling weights from ``leafonly.config.MAX_NUM_LEAVES``.
+
+    Call after ``config.apply_runtime_sizes`` when the leaf grid size changes at runtime (checkpoint load).
+    """
+    global HM_R0_CPU, HM_C0_CPU, HM_S_CPU, NUM_HMATRIX_OFF_BLOCKS
+    global HM_POOL_W_ROW_CPU, HM_POOL_W_COL_CPU, HM_SUM_W_ROW_CPU, HM_SUM_W_COL_CPU
+    global HM_R0_LIST, HM_C0_LIST, HM_S_LIST
+    global HM_PROLONG_ROW_LEAF_IDX, HM_PROLONG_COL_LEAF_IDX, HM_PROLONG_REPEAT_PER_BLOCK, HM_PROLONG_GATHER_IDX
+    from . import config as _cfg
+
+    nleaves = int(_cfg.MAX_NUM_LEAVES)
+    HM_R0_CPU, HM_C0_CPU, HM_S_CPU = precompute_hmatrix_off_buffers(num_units=nleaves, device=torch.device("cpu"))
+    NUM_HMATRIX_OFF_BLOCKS = int(HM_R0_CPU.shape[0])
+    HM_POOL_W_ROW_CPU, HM_POOL_W_COL_CPU = hm_leaf_mean_pool_weights(HM_R0_CPU, HM_C0_CPU, HM_S_CPU, nleaves)
+    HM_SUM_W_ROW_CPU, HM_SUM_W_COL_CPU = hm_leaf_sum_pool_weights(HM_R0_CPU, HM_C0_CPU, HM_S_CPU, nleaves)
+    HM_R0_LIST = [int(x) for x in HM_R0_CPU.tolist()]
+    HM_C0_LIST = [int(x) for x in HM_C0_CPU.tolist()]
+    HM_S_LIST = [int(x) for x in HM_S_CPU.tolist()]
+    HM_PROLONG_ROW_LEAF_IDX = torch.cat(
+        [torch.arange(int(r0), int(r0) + int(s), dtype=torch.long) for r0, s in zip(HM_R0_LIST, HM_S_LIST)]
+    )
+    HM_PROLONG_COL_LEAF_IDX = torch.cat(
+        [torch.arange(int(c0), int(c0) + int(s), dtype=torch.long) for c0, s in zip(HM_C0_LIST, HM_S_LIST)]
+    )
+    HM_PROLONG_REPEAT_PER_BLOCK = torch.tensor(HM_S_LIST, dtype=torch.long)
+    HM_PROLONG_GATHER_IDX = torch.cat(
+        [torch.full((int(s),), int(i), dtype=torch.long) for i, s in enumerate(HM_S_LIST)]
+    )
+
+
+# CPU indices for apply/unpack (static layout); import from here in InspectModel / tests.
+rebuild_hmatrix_globals()

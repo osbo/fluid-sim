@@ -84,7 +84,12 @@ from leafonly.architecture import (  # noqa: E402
     pool_leaf_edge_feats,
     unpack_precond,
 )
-from leafonly.checkpoint import leaf_only_arch_from_checkpoint, load_leaf_only_weights  # noqa: E402
+from leafonly.checkpoint import (  # noqa: E402
+    apply_leaf_only_runtime_from_checkpoint,
+    leaf_only_arch_from_checkpoint,
+    load_leaf_only_weights,
+)
+import leafonly.config as lo_cfg  # noqa: E402
 from leafonly.config import (  # noqa: E402
     HMATRIX_ETA,
     LEAF_SIZE,
@@ -96,7 +101,7 @@ from leafonly.config import (  # noqa: E402
 
 def _leaf_align_n(num_nodes_real: int, mode: str) -> int:
     """Unity buffers use ceil(numNodes/LEAF_SIZE) leaves; InspectModel uses floor (truncate)."""
-    L = int(LEAF_SIZE)
+    L = int(lo_cfg.LEAF_SIZE)
     n = int(num_nodes_real)
     if mode == "ceil":
         return ((n + L - 1) // L) * L
@@ -475,7 +480,7 @@ def _print_off_edge_feats_parity_lines(phase: str, flat: np.ndarray) -> None:
     m = int(HM_R0_CPU.shape[0])
     print(
         f"[LeafOnlyParity] phase={phase} tensor=off_edge_feats_meta M_off={m} "
-        f"L={int(LEAF_SIZE)} n={n}"
+        f"L={int(lo_cfg.LEAF_SIZE)} n={n}"
     )
     _parity_summarize_phase(phase, "off_edge_feats", x)
     _parity_head_phase(phase, "off_edge_feats", x, 32)
@@ -500,7 +505,7 @@ def print_off_edge_feats_parity_from_x_flat(
     from leafonly.data import build_hmatrix_off_dense_rpe_from_positions
     from leafonly.hmatrix import HM_C0_CPU, HM_R0_CPU, HM_S_CPU
 
-    k_leaves = n_pad // int(LEAF_SIZE)
+    k_leaves = n_pad // int(lo_cfg.LEAF_SIZE)
     n_edge_active = min(int(num_nodes_real), int(n_pad))
     em = (rows < n_edge_active) & (cols < n_edge_active)
     r_e = rows[em]
@@ -520,7 +525,7 @@ def print_off_edge_feats_parity_from_x_flat(
         HM_C0_CPU,
         HM_S_CPU,
         int(k_leaves),
-        int(LEAF_SIZE),
+        int(lo_cfg.LEAF_SIZE),
         torch.float32,
         edge_index=ei,
         edge_values=ev,
@@ -542,7 +547,7 @@ def print_hmatrix_static_parity_lines(phase: str) -> None:
     eta_s = f"{float(HMATRIX_ETA):.9g}"
     print(
         f"[LeafOnlyParity] phase={phase} tensor=hmatrix_meta M_off={m} "
-        f"MAX_NUM_LEAVES={MAX_NUM_LEAVES} ETA={eta_s}"
+        f"MAX_NUM_LEAVES={lo_cfg.MAX_NUM_LEAVES} ETA={eta_s}"
     )
     _parity_summarize_phase(phase, "hmatrix_off_r0_c0_s_flat", flat)
     _parity_head_phase(phase, "hmatrix_off_r0_c0_s_flat", flat, 48)
@@ -562,11 +567,11 @@ def print_unity_style_input_parity_lines(
     match_unity_shader: bool,
 ) -> None:
     """Emit the same [LeafOnlyParity] tensor lines as FluidLeafOnlyInputs.LogLeafOnlyParityToConsole."""
-    n_floor = (min(num_nodes_real, int(MAX_MIXED_SIZE)) // int(LEAF_SIZE)) * int(LEAF_SIZE)
+    n_floor = (min(num_nodes_real, int(lo_cfg.MAX_MIXED_SIZE)) // int(lo_cfg.LEAF_SIZE)) * int(lo_cfg.LEAF_SIZE)
     print(
         f"[LeafOnlyParity] phase={phase} num_nodes_real={num_nodes_real} align={align_label} n_pad={n_pad} "
-        f"n_take={n_take} num_leaves={n_pad // int(LEAF_SIZE)} problem_padded_floor={n_floor} "
-        f"MAX_MIXED_SIZE={MAX_MIXED_SIZE}"
+        f"n_take={n_take} num_leaves={n_pad // int(lo_cfg.LEAF_SIZE)} problem_padded_floor={n_floor} "
+        f"MAX_MIXED_SIZE={lo_cfg.MAX_MIXED_SIZE}"
     )
 
     scale_a, csr_scaled = _scale_a_and_csr_scaled(rows, cols, vals_raw, num_nodes_real)
@@ -732,6 +737,8 @@ def main() -> None:
         data_folder = _script_dir.parent / "StreamingAssets" / "TestData"
     data_folder = Path(data_folder).resolve()
     weights_path = Path(args.weights).resolve() if args.weights else _DEFAULT_WEIGHTS_PATH.resolve()
+    if weights_path.is_file() and not args.inputs_parity_only:
+        apply_leaf_only_runtime_from_checkpoint(weights_path)
 
     dataset = FluidGraphDataset([data_folder])
     if len(dataset) == 0:
@@ -744,7 +751,7 @@ def main() -> None:
         n_pad = int(problem_padded_num_nodes(num_nodes_real))
     else:
         n_pad = _leaf_align_n(num_nodes_real, "ceil")
-    n_pad = min(n_pad, int(MAX_MIXED_SIZE))
+    n_pad = min(n_pad, int(lo_cfg.MAX_MIXED_SIZE))
     n_inspect_floor = int(problem_padded_num_nodes(num_nodes_real))
     n_take = min(num_nodes_real, n_pad)
 
@@ -785,9 +792,6 @@ def main() -> None:
     ckpt = leaf_only_arch_from_checkpoint(weights_path)
     if ckpt is None:
         raise SystemExit(f"Bad checkpoint header: {weights_path}")
-    if int(ckpt["leaf_size"]) != int(LEAF_SIZE):
-        raise SystemExit(f"Checkpoint leaf_size {ckpt['leaf_size']} != LEAF_SIZE {LEAF_SIZE}")
-
     ck_hw = int(ckpt.get("highway_ffn_mlp", 0))
     cli_hw = bool(_leaf_only_script.DEFAULT_USE_HIGHWAYS)
     if ck_hw == 1 and not cli_hw:
@@ -800,7 +804,7 @@ def main() -> None:
     if not args.print_unity_inputs:
         print(
             f"[LeafOnlyParity] phase=pytorch num_nodes_real={num_nodes_real} align={args.align} n_pad={n_pad} "
-            f"num_leaves={n_pad // int(LEAF_SIZE)} problem_padded_floor={n_inspect_floor} MAX_MIXED_SIZE={MAX_MIXED_SIZE}"
+            f"num_leaves={n_pad // int(lo_cfg.LEAF_SIZE)} problem_padded_floor={n_inspect_floor} MAX_MIXED_SIZE={lo_cfg.MAX_MIXED_SIZE}"
         )
 
     x = batch["x"].unsqueeze(0).to(device).clone()
@@ -841,7 +845,7 @@ def main() -> None:
         edge_index_leaf,
         edge_values_leaf,
         x_leaf[0, :, :3],
-        int(LEAF_SIZE),
+        int(lo_cfg.LEAF_SIZE),
         device,
         x_leaf.dtype,
         off_diag_dense_attention=True,
@@ -886,9 +890,9 @@ def main() -> None:
 
     La_d = int(model.leaf_apply_size)
     La_o = int(model.leaf_apply_off)
-    num_leaves = n_pad // int(LEAF_SIZE)
+    num_leaves = n_pad // int(lo_cfg.LEAF_SIZE)
     diag_b, off_b, node_u, node_v, jac = unpack_precond(
-        packed, n_pad, leaf_size=LEAF_SIZE, leaf_apply_size=La_d, leaf_apply_off=La_o
+        packed, n_pad, leaf_size=lo_cfg.LEAF_SIZE, leaf_apply_size=La_d, leaf_apply_off=La_o
     )
     _summarize("precondDiag", diag_b)
     _head("precondDiag", diag_b, 16)
@@ -949,7 +953,7 @@ def main() -> None:
                 _parity_head_at("off_stream_after_layer0", flat_o, n_o // 2, 48)
         print(
             f"[LeafOnlyParity] phase=pytorch tensor=layer1_ref_meta eager_attention=1 "
-            f"K={n_pad // int(LEAF_SIZE)} L_diag={int(model.leaf_apply_size)} "
+            f"K={n_pad // int(lo_cfg.LEAF_SIZE)} L_diag={int(model.leaf_apply_size)} "
             f"L_off={int(model.leaf_apply_off)} M_off={int(model.num_h_off)}"
         )
 
@@ -978,7 +982,7 @@ def main() -> None:
             z = apply_block_diagonal_M_physical(
                 packed,
                 r,
-                leaf_size=LEAF_SIZE,
+                leaf_size=lo_cfg.LEAF_SIZE,
                 leaf_apply_size=La_d,
                 leaf_apply_off=La_o,
                 jacobi_inv_diag=jacobi_inv,

@@ -94,7 +94,10 @@ public partial class FluidSimulator : MonoBehaviour
     private void FinalizeLeafOnlyWeightUpload(byte[] bytes, string sourceLabel, int weightsByteOffset)
     {
 
-        int payloadBytes = bytes.Length - weightsByteOffset;
+        int weightsEnd = bytes.Length;
+        if (TryGetWeightsEndExcludingMetaFooter(bytes, weightsByteOffset, out int wEnd))
+            weightsEnd = wEnd;
+        int payloadBytes = weightsEnd - weightsByteOffset;
         if (payloadBytes < 0 || (payloadBytes & 1) != 0)
         {
             leafOnlyWeightsLoadError = "bad payload size";
@@ -142,6 +145,8 @@ public struct LeafOnlyCheckpointHeader
     private const int EdgeGateExtVer = 1;
     private const uint HeadExtMagic = 0x48454144; // "DAEH" LE
     private const int HeadExtVer = 1;
+    /// <summary>Trailing JSON metadata footer after fp16 weights (matches Python <c>CHECKPOINT_JSON_META_FOOTER_MAGIC</c>).</summary>
+    private const uint JsonMetaFooterMagic = 0x544D464C; // "LFMT" LE
 
     public int DModel;
     public int LeafSize;
@@ -443,6 +448,33 @@ public struct LeafOnlyCheckpointHeader
     }
 
     private static int ReadI32Le(byte[] b, int o) => BinaryPrimitives.ReadInt32LittleEndian(b.AsSpan(o, 4));
+
+    /// <summary>
+    /// If the file ends with <c>magic|json_len|json_utf8</c> and <paramref name="json_len"/> bytes of JSON,
+    /// returns <c>true</c> and sets <paramref name="weightsEndExclusive"/> to the byte offset where the footer starts
+    /// (so fp16 payload is <c>bytes[weightsByteOffset .. weightsEndExclusive)</c>).
+    /// </summary>
+    private static bool TryGetWeightsEndExcludingMetaFooter(byte[] bytes, int weightsByteOffset, out int weightsEndExclusive)
+    {
+        weightsEndExclusive = bytes.Length;
+        int L = bytes.Length;
+        if (L < weightsByteOffset + 8)
+            return false;
+        int maxMeta = System.Math.Min(512 * 1024, L - weightsByteOffset - 8);
+        for (int metaLen = 0; metaLen <= maxMeta; metaLen++)
+        {
+            int S = L - 8 - metaLen;
+            if (S < weightsByteOffset)
+                break;
+            uint magic = unchecked((uint)ReadI32Le(bytes, S));
+            int ml = ReadI32Le(bytes, S + 4);
+            if (magic != JsonMetaFooterMagic || ml != metaLen || S + 8 + metaLen != L)
+                continue;
+            weightsEndExclusive = S;
+            return true;
+        }
+        return false;
+    }
 
     /// <summary>Decode fp16 LE half word to float32 (matches NumPy float16 → float32 used in checkpoint load).</summary>
     internal static float HalfBitsToFloat(ushort h)
