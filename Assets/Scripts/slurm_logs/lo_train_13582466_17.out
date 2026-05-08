@@ -1,0 +1,270 @@
+================================================================
+Job 13582466, task 17 on node3100
+Started: Fri May  8 16:43:30 EDT 2026
+================================================================
+[17/19] v2_2048_d128_L3_nohw
+Using device: cuda
+  [startup] Random sample of 100 frames (--num-frames 100)
+  [startup] Loaded 100 training contexts from disk cache (1526.60 ms) → .leafonly_training_context_cache/
+  [startup] global_max_edges = 10058
+  [startup] contexts_per_step = 4 (gradient accumulation)
+  [startup] Ablation config: layers=3, gcn_layers=2, jacobi=True (node_scalar), attention_layout=128x129, off_diag_dense_attn=True, diag_dense_attn=True, use_highways=False
+  [startup] torch.compile(model): enabled (CUDA)
+  [startup] LR scheduler: ReduceLROnPlateau (factor=0.5, patience=5, threshold=5e-3, min_lr=1.00e-06, auto-stop (patience=10, threshold=5e-3 at min_lr))
+  Block preconditioner: 16 leaves, diag 128×128, off 32×32 (128 nodes/leaf)
+  Probe vectors (loss MC columns): auto max(64, ⌈√n_pad⌉) per step (override with --probe-vectors K)
+  Probe MAZ path: --leafonly-pcg=matrix_free (A@Z: sparse block-diagonal A@Z (all devices; dense bmm only if context cache has use_dense_A); apply_block_diagonal_M torch.compile (matrix_free))
+  Loss mode: hutchinson (cosine-similarity probe; --loss-mode hutchinson)
+
+=== Startup timing (wall clock, ms) ===
+  Dataset + run folder scan:         107.78
+  Load training contexts (disk→device):    1526.60 ms  (100 contexts)
+  LeafOnlyNet + .to(device):          16.06
+  torch.compile(model) call:        2283.91  (CUDA; Inductor runs on 1st forward/backward)
+  load_leaf_only_weights:         skipped
+  AdamW + ReduceLROnPlateau:           0.40
+  ---
+  Total before training loop:       3967.41
+  Note: First loss line’s (elapsed) is wall time for that step only (after startup); with torch.compile, the first forward+backward triggers Inductor codegen (often ~10–20s).
+  At step 299, a one-time detailed breakdown (zero_grad / forward / apply M / backward / …) is printed.
+
+  [track] Training profile CSV: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/weights/v2_2048_d128_L3_nohw_training_profile.csv
+00000: Loss avg=0.2508 ± 0.0000  (30.690s) lr=2.00e-04
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step000000.bytes
+00100: Loss avg=0.2433 ± 0.0020  (2.414s) lr=2.00e-04
+00200: Loss avg=0.2423 ± 0.0019  (1.300s) lr=2.00e-04
+
+--- Detailed timing for step 300 (contexts_per_step=4, batched forward) ---
+  batch: B=4, n_pad=2048, batch_vectors=256
+--- Step 300 detailed timing (ms) ---
+  zero_grad:            0.18
+  batch assembly:       0.19
+  model forward:        2.96
+  probe Z+Jacobi:       1.01
+  A @ Z (sparse block-mm):     0.41
+  apply M (MAZ):        0.48
+  residual + loss:      0.20
+  backward:             6.23
+  clip_grad_norm:       0.84
+  optimizer.step:       1.28
+  total:               13.79
+  full iter (wall):    13.96 ms  (Python / scheduler / print overhead ≈ +0.16 ms vs sum above)
+----------------------------------------
+
+00300: Loss avg=0.2431 ± 0.0020  (1.259s, avg: 1.259s) lr=2.00e-04
+00400: Loss avg=0.2413 ± 0.0023  (1.261s, avg: 1.261s) lr=2.00e-04
+00500: Loss avg=0.2390 ± 0.0017  (1.249s, avg: 1.255s) lr=2.00e-04
+00600: Loss avg=0.2384 ± 0.0016  (1.255s, avg: 1.255s) lr=2.00e-04
+00700: Loss avg=0.2365 ± 0.0019  (1.251s, avg: 1.254s) lr=2.00e-04
+00800: Loss avg=0.2342 ± 0.0017  (1.263s, avg: 1.256s) lr=2.00e-04
+00900: Loss avg=0.2324 ± 0.0020  (1.269s, avg: 1.258s) lr=2.00e-04
+01000: Loss avg=0.2297 ± 0.0023  (1.307s, avg: 1.265s) lr=2.00e-04
+01100: Loss avg=0.2265 ± 0.0029  (1.301s, avg: 1.272s) lr=2.00e-04
+01200: Loss avg=0.2230 ± 0.0042  (1.299s, avg: 1.275s) lr=2.00e-04
+01300: Loss avg=0.2170 ± 0.0035  (1.315s, avg: 1.279s) lr=2.00e-04
+01400: Loss avg=0.2113 ± 0.0036  (1.308s, avg: 1.282s) lr=2.00e-04
+01500: Loss avg=0.2044 ± 0.0033  (1.298s, avg: 1.283s) lr=2.00e-04
+01600: Loss avg=0.2007 ± 0.0036  (1.306s, avg: 1.285s) lr=2.00e-04
+01700: Loss avg=0.1970 ± 0.0036  (1.304s, avg: 1.286s) lr=2.00e-04
+01800: Loss avg=0.1924 ± 0.0040  (1.293s, avg: 1.287s) lr=2.00e-04
+01900: Loss avg=0.1847 ± 0.0049  (1.293s, avg: 1.287s) lr=2.00e-04
+02000: Loss avg=0.1802 ± 0.0052  (1.306s, avg: 1.288s) lr=2.00e-04
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step002000.bytes
+02100: Loss avg=0.1735 ± 0.0059  (1.303s, avg: 1.291s) lr=2.00e-04
+02200: Loss avg=0.1650 ± 0.0051  (1.306s, avg: 1.292s) lr=2.00e-04
+02300: Loss avg=0.1549 ± 0.0049  (1.293s, avg: 1.292s) lr=2.00e-04
+02400: Loss avg=0.1453 ± 0.0048  (1.295s, avg: 1.292s) lr=2.00e-04
+02500: Loss avg=0.1400 ± 0.0049  (1.299s, avg: 1.293s) lr=2.00e-04
+02600: Loss avg=0.1370 ± 0.0050  (1.312s, avg: 1.294s) lr=2.00e-04
+02700: Loss avg=0.1347 ± 0.0069  (1.306s, avg: 1.294s) lr=2.00e-04
+02800: Loss avg=0.1294 ± 0.0064  (1.299s, avg: 1.294s) lr=2.00e-04
+02900: Loss avg=0.1223 ± 0.0050  (1.297s, avg: 1.294s) lr=2.00e-04
+03000: Loss avg=0.1203 ± 0.0048  (1.288s, avg: 1.294s) lr=2.00e-04
+03100: Loss avg=0.1207 ± 0.0064  (1.296s, avg: 1.295s) lr=2.00e-04
+03200: Loss avg=0.1143 ± 0.0051  (1.297s, avg: 1.295s) lr=2.00e-04
+03300: Loss avg=0.1114 ± 0.0056  (1.309s, avg: 1.295s) lr=2.00e-04
+03400: Loss avg=0.1135 ± 0.0111  (1.312s, avg: 1.296s) lr=2.00e-04
+03500: Loss avg=0.1071 ± 0.0061  (1.312s, avg: 1.297s) lr=2.00e-04
+03600: Loss avg=0.1061 ± 0.0077  (1.322s, avg: 1.297s) lr=2.00e-04
+03700: Loss avg=0.0995 ± 0.0045  (1.297s, avg: 1.297s) lr=2.00e-04
+03800: Loss avg=0.1001 ± 0.0057  (1.311s, avg: 1.298s) lr=2.00e-04
+03900: Loss avg=0.0967 ± 0.0051  (1.313s, avg: 1.298s) lr=2.00e-04
+04000: Loss avg=0.0971 ± 0.0078  (1.310s, avg: 1.298s) lr=2.00e-04
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step004000.bytes
+04100: Loss avg=0.0966 ± 0.0059  (1.310s, avg: 1.300s) lr=2.00e-04
+04200: Loss avg=0.0926 ± 0.0049  (1.301s, avg: 1.300s) lr=2.00e-04
+04300: Loss avg=0.0941 ± 0.0080  (1.304s, avg: 1.300s) lr=2.00e-04
+04400: Loss avg=0.0920 ± 0.0062  (1.302s, avg: 1.300s) lr=2.00e-04
+04500: Loss avg=0.0918 ± 0.0068  (1.298s, avg: 1.300s) lr=2.00e-04
+04600: Loss avg=0.0898 ± 0.0054  (1.311s, avg: 1.300s) lr=2.00e-04
+04700: Loss avg=0.0849 ± 0.0050  (1.306s, avg: 1.300s) lr=2.00e-04
+04800: Loss avg=0.0933 ± 0.0137  (1.309s, avg: 1.300s) lr=2.00e-04
+04900: Loss avg=0.0866 ± 0.0051  (1.310s, avg: 1.301s) lr=2.00e-04
+05000: Loss avg=0.0820 ± 0.0048  (1.310s, avg: 1.301s) lr=2.00e-04
+05100: Loss avg=0.0814 ± 0.0061  (1.311s, avg: 1.301s) lr=2.00e-04
+05200: Loss avg=0.0809 ± 0.0045  (1.302s, avg: 1.301s) lr=2.00e-04
+05300: Loss avg=0.0839 ± 0.0082  (1.305s, avg: 1.302s) lr=2.00e-04
+05400: Loss avg=0.0791 ± 0.0065  (1.296s, avg: 1.301s) lr=2.00e-04
+05500: Loss avg=0.0755 ± 0.0048  (1.304s, avg: 1.301s) lr=2.00e-04
+05600: Loss avg=0.0746 ± 0.0040  (1.308s, avg: 1.302s) lr=2.00e-04
+05700: Loss avg=0.0757 ± 0.0067  (1.308s, avg: 1.302s) lr=2.00e-04
+05800: Loss avg=0.0761 ± 0.0063  (1.307s, avg: 1.302s) lr=2.00e-04
+05900: Loss avg=0.0717 ± 0.0047  (1.326s, avg: 1.302s) lr=2.00e-04
+06000: Loss avg=0.0726 ± 0.0046  (1.301s, avg: 1.302s) lr=2.00e-04
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step006000.bytes
+06100: Loss avg=0.0740 ± 0.0061  (1.302s, avg: 1.303s) lr=2.00e-04
+06200: Loss avg=0.0732 ± 0.0066  (1.305s, avg: 1.303s) lr=2.00e-04
+06300: Loss avg=0.0705 ± 0.0046  (1.318s, avg: 1.303s) lr=2.00e-04
+06400: Loss avg=0.0737 ± 0.0099  (1.301s, avg: 1.303s) lr=2.00e-04
+06500: Loss avg=0.0701 ± 0.0048  (1.309s, avg: 1.303s) lr=2.00e-04
+06600: Loss avg=0.0699 ± 0.0056  (1.297s, avg: 1.303s) lr=2.00e-04
+06700: Loss avg=0.0705 ± 0.0071  (1.309s, avg: 1.303s) lr=2.00e-04
+06800: Loss avg=0.0675 ± 0.0048  (1.296s, avg: 1.303s) lr=2.00e-04
+06900: Loss avg=0.0669 ± 0.0047  (1.294s, avg: 1.303s) lr=2.00e-04
+07000: Loss avg=0.0691 ± 0.0056  (1.317s, avg: 1.303s) lr=2.00e-04
+07100: Loss avg=0.0666 ± 0.0057  (1.311s, avg: 1.304s) lr=2.00e-04
+07200: Loss avg=0.0640 ± 0.0046  (1.302s, avg: 1.304s) lr=2.00e-04
+07300: Loss avg=0.0669 ± 0.0062  (1.308s, avg: 1.304s) lr=2.00e-04
+07400: Loss avg=0.0645 ± 0.0050  (1.300s, avg: 1.304s) lr=2.00e-04
+07500: Loss avg=0.0637 ± 0.0042  (1.314s, avg: 1.304s) lr=2.00e-04
+07600: Loss avg=0.0633 ± 0.0040  (1.311s, avg: 1.304s) lr=2.00e-04
+07700: Loss avg=0.0632 ± 0.0062  (1.303s, avg: 1.304s) lr=2.00e-04
+07800: Loss avg=0.0638 ± 0.0048  (1.304s, avg: 1.304s) lr=2.00e-04
+07900: Loss avg=0.0635 ± 0.0050  (1.307s, avg: 1.304s) lr=2.00e-04
+08000: Loss avg=0.0653 ± 0.0084  (1.308s, avg: 1.304s) lr=2.00e-04
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step008000.bytes
+08100: Loss avg=0.0597 ± 0.0037  (1.298s, avg: 1.304s) lr=2.00e-04
+08200: Loss avg=0.0641 ± 0.0067  (1.330s, avg: 1.305s) lr=2.00e-04
+08300: Loss avg=0.0634 ± 0.0075  (1.311s, avg: 1.305s) lr=2.00e-04
+08400: Loss avg=0.0600 ± 0.0046  (1.319s, avg: 1.305s) lr=2.00e-04
+08500: Loss avg=0.0654 ± 0.0131  (1.297s, avg: 1.305s) lr=2.00e-04
+08600: Loss avg=0.0617 ± 0.0051  (1.314s, avg: 1.305s) lr=2.00e-04
+08700: Loss avg=0.0592 ± 0.0039  (1.305s, avg: 1.305s) lr=2.00e-04
+08800: Loss avg=0.0577 ± 0.0039  (1.305s, avg: 1.305s) lr=2.00e-04
+08900: Loss avg=0.0589 ± 0.0049  (1.309s, avg: 1.305s) lr=2.00e-04
+09000: Loss avg=0.0601 ± 0.0048  (1.312s, avg: 1.305s) lr=2.00e-04
+09100: Loss avg=0.0558 ± 0.0042  (1.298s, avg: 1.305s) lr=2.00e-04
+09200: Loss avg=0.0647 ± 0.0089  (1.312s, avg: 1.305s) lr=2.00e-04
+09300: Loss avg=0.0576 ± 0.0045  (1.306s, avg: 1.305s) lr=2.00e-04
+09400: Loss avg=0.0568 ± 0.0042  (1.305s, avg: 1.305s) lr=2.00e-04
+09500: Loss avg=0.0559 ± 0.0039  (1.290s, avg: 1.305s) lr=2.00e-04
+09600: Loss avg=0.0566 ± 0.0049  (1.280s, avg: 1.305s) lr=2.00e-04
+  [lr] plateau detected: lr 2.00e-04 -> 1.00e-04
+09700: Loss avg=0.0567 ± 0.0044  (1.282s, avg: 1.305s) lr=1.00e-04
+09800: Loss avg=0.0536 ± 0.0048  (1.287s, avg: 1.304s) lr=1.00e-04
+09900: Loss avg=0.0524 ± 0.0030  (1.291s, avg: 1.304s) lr=1.00e-04
+10000: Loss avg=0.0577 ± 0.0077  (1.281s, avg: 1.304s) lr=1.00e-04
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step010000.bytes
+10100: Loss avg=0.0532 ± 0.0029  (1.282s, avg: 1.304s) lr=1.00e-04
+10200: Loss avg=0.0516 ± 0.0036  (1.297s, avg: 1.304s) lr=1.00e-04
+10300: Loss avg=0.0567 ± 0.0081  (1.280s, avg: 1.304s) lr=1.00e-04
+10400: Loss avg=0.0519 ± 0.0040  (1.284s, avg: 1.304s) lr=1.00e-04
+10500: Loss avg=0.0517 ± 0.0038  (1.304s, avg: 1.304s) lr=1.00e-04
+10600: Loss avg=0.0503 ± 0.0031  (1.283s, avg: 1.304s) lr=1.00e-04
+10700: Loss avg=0.0508 ± 0.0032  (1.294s, avg: 1.303s) lr=1.00e-04
+10800: Loss avg=0.0509 ± 0.0038  (1.277s, avg: 1.303s) lr=1.00e-04
+10900: Loss avg=0.0504 ± 0.0033  (1.287s, avg: 1.303s) lr=1.00e-04
+11000: Loss avg=0.0508 ± 0.0037  (1.294s, avg: 1.303s) lr=1.00e-04
+11100: Loss avg=0.0521 ± 0.0037  (1.296s, avg: 1.303s) lr=1.00e-04
+11200: Loss avg=0.0496 ± 0.0032  (1.279s, avg: 1.303s) lr=1.00e-04
+11300: Loss avg=0.0498 ± 0.0029  (1.282s, avg: 1.303s) lr=1.00e-04
+11400: Loss avg=0.0507 ± 0.0033  (1.286s, avg: 1.302s) lr=1.00e-04
+11500: Loss avg=0.0501 ± 0.0032  (1.280s, avg: 1.302s) lr=1.00e-04
+11600: Loss avg=0.0513 ± 0.0044  (1.273s, avg: 1.302s) lr=1.00e-04
+11700: Loss avg=0.0481 ± 0.0028  (1.276s, avg: 1.302s) lr=1.00e-04
+11800: Loss avg=0.0488 ± 0.0032  (1.287s, avg: 1.302s) lr=1.00e-04
+11900: Loss avg=0.0490 ± 0.0033  (1.275s, avg: 1.301s) lr=1.00e-04
+12000: Loss avg=0.0498 ± 0.0036  (1.283s, avg: 1.301s) lr=1.00e-04
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step012000.bytes
+12100: Loss avg=0.0489 ± 0.0035  (1.281s, avg: 1.301s) lr=1.00e-04
+12200: Loss avg=0.0481 ± 0.0034  (1.284s, avg: 1.301s) lr=1.00e-04
+  [lr] plateau detected: lr 1.00e-04 -> 5.00e-05
+12300: Loss avg=0.0483 ± 0.0030  (1.274s, avg: 1.301s) lr=5.00e-05
+12400: Loss avg=0.0479 ± 0.0031  (1.275s, avg: 1.301s) lr=5.00e-05
+12500: Loss avg=0.0472 ± 0.0026  (1.274s, avg: 1.301s) lr=5.00e-05
+12600: Loss avg=0.0478 ± 0.0029  (1.280s, avg: 1.300s) lr=5.00e-05
+12700: Loss avg=0.0467 ± 0.0035  (1.283s, avg: 1.300s) lr=5.00e-05
+12800: Loss avg=0.0471 ± 0.0033  (1.295s, avg: 1.300s) lr=5.00e-05
+12900: Loss avg=0.0466 ± 0.0032  (1.276s, avg: 1.300s) lr=5.00e-05
+13000: Loss avg=0.0461 ± 0.0028  (1.293s, avg: 1.300s) lr=5.00e-05
+13100: Loss avg=0.0462 ± 0.0029  (1.286s, avg: 1.300s) lr=5.00e-05
+13200: Loss avg=0.0487 ± 0.0062  (1.280s, avg: 1.300s) lr=5.00e-05
+13300: Loss avg=0.0469 ± 0.0030  (1.277s, avg: 1.300s) lr=5.00e-05
+13400: Loss avg=0.0471 ± 0.0030  (1.292s, avg: 1.300s) lr=5.00e-05
+13500: Loss avg=0.0468 ± 0.0032  (1.283s, avg: 1.300s) lr=5.00e-05
+  [lr] plateau detected: lr 5.00e-05 -> 2.50e-05
+13600: Loss avg=0.0462 ± 0.0033  (1.302s, avg: 1.300s) lr=2.50e-05
+13700: Loss avg=0.0457 ± 0.0030  (1.293s, avg: 1.300s) lr=2.50e-05
+13800: Loss avg=0.0449 ± 0.0030  (1.305s, avg: 1.300s) lr=2.50e-05
+13900: Loss avg=0.0453 ± 0.0034  (1.291s, avg: 1.300s) lr=2.50e-05
+14000: Loss avg=0.0456 ± 0.0032  (1.295s, avg: 1.299s) lr=2.50e-05
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step014000.bytes
+14100: Loss avg=0.0453 ± 0.0030  (1.292s, avg: 1.300s) lr=2.50e-05
+14200: Loss avg=0.0449 ± 0.0028  (1.288s, avg: 1.300s) lr=2.50e-05
+14300: Loss avg=0.0449 ± 0.0029  (1.275s, avg: 1.299s) lr=2.50e-05
+  [lr] plateau detected: lr 2.50e-05 -> 1.25e-05
+14400: Loss avg=0.0448 ± 0.0034  (1.285s, avg: 1.299s) lr=1.25e-05
+14500: Loss avg=0.0449 ± 0.0029  (1.274s, avg: 1.299s) lr=1.25e-05
+14600: Loss avg=0.0444 ± 0.0029  (1.276s, avg: 1.299s) lr=1.25e-05
+14700: Loss avg=0.0447 ± 0.0032  (1.279s, avg: 1.299s) lr=1.25e-05
+14800: Loss avg=0.0445 ± 0.0031  (1.276s, avg: 1.299s) lr=1.25e-05
+14900: Loss avg=0.0450 ± 0.0030  (1.279s, avg: 1.299s) lr=1.25e-05
+15000: Loss avg=0.0451 ± 0.0030  (1.269s, avg: 1.298s) lr=1.25e-05
+15100: Loss avg=0.0442 ± 0.0029  (1.293s, avg: 1.299s) lr=1.25e-05
+  [lr] plateau detected: lr 1.25e-05 -> 6.25e-06
+15200: Loss avg=0.0445 ± 0.0031  (1.398s, avg: 1.299s) lr=6.25e-06
+15300: Loss avg=0.0441 ± 0.0025  (1.298s, avg: 1.299s) lr=6.25e-06
+15400: Loss avg=0.0447 ± 0.0026  (1.278s, avg: 1.299s) lr=6.25e-06
+15500: Loss avg=0.0439 ± 0.0028  (1.267s, avg: 1.299s) lr=6.25e-06
+15600: Loss avg=0.0441 ± 0.0032  (1.271s, avg: 1.299s) lr=6.25e-06
+15700: Loss avg=0.0440 ± 0.0027  (1.255s, avg: 1.298s) lr=6.25e-06
+15800: Loss avg=0.0437 ± 0.0028  (1.269s, avg: 1.298s) lr=6.25e-06
+15900: Loss avg=0.0437 ± 0.0030  (1.269s, avg: 1.298s) lr=6.25e-06
+16000: Loss avg=0.0441 ± 0.0029  (1.269s, avg: 1.298s) lr=6.25e-06
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step016000.bytes
+16100: Loss avg=0.0439 ± 0.0030  (1.264s, avg: 1.298s) lr=6.25e-06
+16200: Loss avg=0.0440 ± 0.0030  (1.273s, avg: 1.298s) lr=6.25e-06
+16300: Loss avg=0.0438 ± 0.0029  (1.283s, avg: 1.298s) lr=6.25e-06
+  [lr] plateau detected: lr 6.25e-06 -> 3.13e-06
+16400: Loss avg=0.0439 ± 0.0030  (1.272s, avg: 1.297s) lr=3.13e-06
+16500: Loss avg=0.0437 ± 0.0027  (1.284s, avg: 1.297s) lr=3.13e-06
+16600: Loss avg=0.0444 ± 0.0029  (1.266s, avg: 1.297s) lr=3.13e-06
+16700: Loss avg=0.0441 ± 0.0026  (1.269s, avg: 1.297s) lr=3.13e-06
+16800: Loss avg=0.0436 ± 0.0026  (1.282s, avg: 1.297s) lr=3.13e-06
+16900: Loss avg=0.0441 ± 0.0025  (1.279s, avg: 1.297s) lr=3.13e-06
+17000: Loss avg=0.0443 ± 0.0030  (1.267s, avg: 1.297s) lr=3.13e-06
+  [lr] plateau detected: lr 3.13e-06 -> 1.56e-06
+17100: Loss avg=0.0440 ± 0.0029  (1.275s, avg: 1.297s) lr=1.56e-06
+17200: Loss avg=0.0441 ± 0.0028  (1.275s, avg: 1.296s) lr=1.56e-06
+17300: Loss avg=0.0436 ± 0.0028  (1.275s, avg: 1.296s) lr=1.56e-06
+17400: Loss avg=0.0441 ± 0.0028  (1.288s, avg: 1.296s) lr=1.56e-06
+17500: Loss avg=0.0436 ± 0.0027  (1.319s, avg: 1.296s) lr=1.56e-06
+17600: Loss avg=0.0439 ± 0.0027  (1.267s, avg: 1.296s) lr=1.56e-06
+17700: Loss avg=0.0442 ± 0.0031  (1.266s, avg: 1.296s) lr=1.56e-06
+17800: Loss avg=0.0433 ± 0.0028  (1.250s, avg: 1.296s) lr=1.56e-06
+17900: Loss avg=0.0436 ± 0.0029  (1.252s, avg: 1.296s) lr=1.56e-06
+18000: Loss avg=0.0436 ± 0.0032  (1.261s, avg: 1.295s) lr=1.56e-06
+  [track] Checkpoint -> v2_2048_d128_L3_nohw_step018000.bytes
+18100: Loss avg=0.0434 ± 0.0028  (1.258s, avg: 1.295s) lr=1.56e-06
+18200: Loss avg=0.0434 ± 0.0032  (1.271s, avg: 1.295s) lr=1.56e-06
+18300: Loss avg=0.0436 ± 0.0031  (1.281s, avg: 1.295s) lr=1.56e-06
+  [lr] plateau detected: lr 1.56e-06 -> 1.00e-06
+18400: Loss avg=0.0434 ± 0.0030  (1.274s, avg: 1.295s) lr=1.00e-06
+18500: Loss avg=0.0442 ± 0.0030  (1.280s, avg: 1.295s) lr=1.00e-06
+18600: Loss avg=0.0441 ± 0.0032  (1.278s, avg: 1.295s) lr=1.00e-06
+18700: Loss avg=0.0430 ± 0.0029  (1.276s, avg: 1.295s) lr=1.00e-06
+18800: Loss avg=0.0439 ± 0.0030  (1.279s, avg: 1.295s) lr=1.00e-06
+18900: Loss avg=0.0436 ± 0.0031  (1.274s, avg: 1.295s) lr=1.00e-06
+19000: Loss avg=0.0433 ± 0.0032  (1.279s, avg: 1.295s) lr=1.00e-06
+19100: Loss avg=0.0433 ± 0.0030  (1.279s, avg: 1.295s) lr=1.00e-06
+19200: Loss avg=0.0437 ± 0.0030  (1.274s, avg: 1.294s) lr=1.00e-06
+19300: Loss avg=0.0438 ± 0.0031  (1.278s, avg: 1.294s) lr=1.00e-06
+19400: Loss avg=0.0438 ± 0.0028  (1.283s, avg: 1.294s) lr=1.00e-06
+19500: Loss avg=0.0440 ± 0.0028  (1.287s, avg: 1.294s) lr=1.00e-06
+19600: Loss avg=0.0438 ± 0.0026  (1.277s, avg: 1.294s) lr=1.00e-06
+19700: Loss avg=0.0433 ± 0.0029  (1.279s) lr=1.00e-06
+  [auto-stop] plateau at min_lr=1.00e-06 (10/10 steps without >5e-03 improvement); stopping.
+Saved to /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/weights/v2_2048_d128_L3_nohw.bytes
+================================================================
+Finished: Fri May  8 16:48:25 EDT 2026
+================================================================
