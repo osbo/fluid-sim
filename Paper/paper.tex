@@ -3,7 +3,8 @@
 % Requires acmart.cls version 2.16 or newer (ACM Primary Article Template).
 %
 % Length policy: 7 pages excluding references and up to 2 figures-only pages.
-% No appendices in the main document; supplementary material handles those.
+% Detailed tables and dataset construction live in supplementary.tex; the main
+% body links to them via xr-hyper (same submission bundle).
 \documentclass[acmtog,anonymous,review]{acmart}
 
 \citestyle{acmauthoryear}
@@ -32,6 +33,12 @@
 \usepackage{booktabs}
 % NB: do not load amssymb; acmart + newtxmath already define AMS symbols, and loading
 % amssymb triggers "Command \Bbbk already defined" and aborts pdflatex.
+
+% Cross-document \ref{} to labels in supplementary.tex (requires supplementary.aux;
+% build with: latexmk supplementary.tex && latexmk paper.tex).
+\usepackage{xr-hyper}
+% Prefix required: both documents use acmart and share internal labels (e.g. tocindent-*).
+\externaldocument[SX-]{supplementary}
 
 \begin{document}
 
@@ -649,7 +656,7 @@ projection, modulo boundary-condition specifics.
 
 \paragraph{Per-frame randomization.}
 Each frame independently randomizes three axes designed to stress an
-$\mathcal{H}$-matrix-style preconditioner (full generation script in Appendix~\ref{app:dataset}):
+$\mathcal{H}$-matrix-style preconditioner (full generation procedure in Supplementary Material, \S\ref{SX-supp:dataset}):
 \begin{itemize}
 \item \emph{Density contrast.} $\rho_{\text{light}}\!=\!1$ everywhere outside barriers;
 inside barriers, $\rho_{\text{heavy}}$ is drawn log-uniformly from $[5,100]$ each frame, so
@@ -710,7 +717,7 @@ Section~\ref{sec:results:generalization}.
 \centering
 \caption{Per-frame mean$\pm$std end-to-end PCG time (ms) on \textsf{multiphase\_v2} ($20$
 frames per scale, $\mathrm{rtol}\!=\!10^{-8}$). ``$\dagger$''~=~CUDA Graph not supported.
-Best per scale in \textbf{bold}. Iteration counts in Appendix~\ref{app:full_perf_table}.}
+Best per scale in \textbf{bold}. Iteration counts in Supplementary Material, Table~\ref{SX-tab:full_perf_table}.}
 \label{tab:main:perf}
 \footnotesize\setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}l ccccc@{}}
@@ -927,7 +934,8 @@ $\mathrm{median}(\lambda(MA))$ for each loss.
 % ---------------------------------------------------------------------------
 
 We additionally evaluate three secondary axes whose detailed results we defer to the
-supplementary material in the interest of space:
+supplementary material in the interest of space (Supplementary \S\ref{SX-supp:generalization}
+and \S\ref{SX-supp:precision}):
 (i)~\emph{Out-of-distribution generalization}---models trained at one scale evaluated at
 larger and smaller $N$, and at contrast ratios outside the training range $[5,100]$;
 (ii)~\emph{Precision sensitivity}---float32 vs.\ mixed-precision vs.\ float64 in the apply

@@ -17,6 +17,8 @@
 
 \usepackage{amsmath}
 \usepackage{graphicx}
+% Same figure search paths as paper.tex (latexmk from Paper/ or repo root).
+\graphicspath{{figures/}{Paper/figures/}}
 \usepackage{booktabs}
 
 \begin{document}
@@ -34,6 +36,8 @@
 This document collects implementation-level details, dataset construction, and additional
 tables that support the main paper but cannot fit within the SIGGRAPH Asia 2026 page budget.
 Section numbering here is independent of the main paper.
+Cross-references from the main PDF use the \texttt{xr-hyper} package with prefix \texttt{SX-};
+build this file before \texttt{paper.tex} so \texttt{supplementary.aux} is current.
 
 % ===========================================================================
 \section{Full Performance Table with Iteration Counts}
