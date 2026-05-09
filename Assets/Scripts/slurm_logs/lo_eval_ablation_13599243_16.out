@@ -1,0 +1,34 @@
+================================================================
+Job 13599243, task 16 on node3300
+Started: Fri May  8 21:11:23 EDT 2026
+================================================================
+Task 16: v2_8192_d128_L2_hw → /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/ablation_sweep_task_016.csv
+
+[1/1] v2_8192_d128_L2_hw  (scale=8192)
+  Frames: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  [1/20] frame 0  → LeafOnly 183 iters  inf=2.24 ms  solve=15.49 ms
+  [2/20] frame 1  → LeafOnly 174 iters  inf=2.24 ms  solve=14.82 ms
+  [3/20] frame 2  → LeafOnly 240 iters  inf=2.24 ms  solve=20.28 ms
+  [4/20] frame 3  → LeafOnly 189 iters  inf=2.24 ms  solve=16.05 ms
+  [5/20] frame 4  → LeafOnly 240 iters  inf=2.24 ms  solve=20.35 ms
+  [6/20] frame 5  → LeafOnly 264 iters  inf=2.24 ms  solve=22.35 ms
+  [7/20] frame 6  → LeafOnly 177 iters  inf=2.25 ms  solve=15.04 ms
+  [8/20] frame 7  → LeafOnly 429 iters  inf=2.24 ms  solve=36.33 ms
+  [9/20] frame 8  → LeafOnly 192 iters  inf=2.26 ms  solve=16.35 ms
+  [10/20] frame 9  → LeafOnly 177 iters  inf=2.26 ms  solve=15.09 ms
+  [11/20] frame 10  → LeafOnly 210 iters  inf=2.27 ms  solve=17.85 ms
+  [12/20] frame 11  → LeafOnly 258 iters  inf=2.27 ms  solve=21.82 ms
+  [13/20] frame 12  → LeafOnly 207 iters  inf=2.26 ms  solve=17.50 ms
+  [14/20] frame 13  → LeafOnly 195 iters  inf=2.27 ms  solve=16.54 ms
+  [15/20] frame 14  → LeafOnly 180 iters  inf=2.27 ms  solve=15.39 ms
+  [16/20] frame 15  → LeafOnly 207 iters  inf=2.26 ms  solve=17.52 ms
+  [17/20] frame 16  → LeafOnly 156 iters  inf=2.27 ms  solve=13.22 ms
+  [18/20] frame 17  → LeafOnly 228 iters  inf=2.28 ms  solve=19.36 ms
+  [19/20] frame 18  → LeafOnly 267 iters  inf=2.27 ms  solve=22.79 ms
+  [20/20] frame 19  → LeafOnly 192 iters  inf=2.27 ms  solve=16.37 ms
+  → Avg LeafOnly: 218.2500 iters (±59.1803), total=20.7810 ms (±4.9950 ms) over 20 frames
+
+Results written to: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/ablation_sweep_task_016.csv
+================================================================
+Finished: Fri May  8 21:19:21 EDT 2026
+================================================================

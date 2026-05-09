@@ -1,0 +1,34 @@
+================================================================
+Job 13599243, task 9 on node3000
+Started: Fri May  8 20:45:23 EDT 2026
+================================================================
+Task 9: v2_4096_d256_L3_hw → /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/ablation_sweep_task_009.csv
+
+[1/1] v2_4096_d256_L3_hw  (scale=4096)
+  Frames: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  [1/20] frame 0  → LeafOnly 90 iters  inf=2.64 ms  solve=7.43 ms
+  [2/20] frame 1  → LeafOnly 51 iters  inf=2.62 ms  solve=4.21 ms
+  [3/20] frame 2  → LeafOnly 66 iters  inf=2.88 ms  solve=5.48 ms
+  [4/20] frame 3  → LeafOnly 84 iters  inf=2.81 ms  solve=6.94 ms
+  [5/20] frame 4  → LeafOnly 54 iters  inf=2.89 ms  solve=4.41 ms
+  [6/20] frame 5  → LeafOnly 54 iters  inf=2.67 ms  solve=4.47 ms
+  [7/20] frame 6  → LeafOnly 48 iters  inf=2.59 ms  solve=3.89 ms
+  [8/20] frame 7  → LeafOnly 99 iters  inf=2.60 ms  solve=7.99 ms
+  [9/20] frame 8  → LeafOnly 54 iters  inf=2.77 ms  solve=4.48 ms
+  [10/20] frame 9  → LeafOnly 51 iters  inf=2.84 ms  solve=4.24 ms
+  [11/20] frame 10  → LeafOnly 75 iters  inf=2.84 ms  solve=6.14 ms
+  [12/20] frame 11  → LeafOnly 54 iters  inf=2.79 ms  solve=4.48 ms
+  [13/20] frame 12  → LeafOnly 63 iters  inf=2.74 ms  solve=5.19 ms
+  [14/20] frame 13  → LeafOnly 57 iters  inf=2.75 ms  solve=4.63 ms
+  [15/20] frame 14  → LeafOnly 51 iters  inf=2.73 ms  solve=4.15 ms
+  [16/20] frame 15  → LeafOnly 57 iters  inf=2.79 ms  solve=4.66 ms
+  [17/20] frame 16  → LeafOnly 63 iters  inf=2.92 ms  solve=5.21 ms
+  [18/20] frame 17  → LeafOnly 99 iters  inf=2.60 ms  solve=8.24 ms
+  [19/20] frame 18  → LeafOnly 54 iters  inf=2.60 ms  solve=4.46 ms
+  [20/20] frame 19  → LeafOnly 57 iters  inf=2.83 ms  solve=4.68 ms
+  → Avg LeafOnly: 64.0500 iters (±16.3239), total=8.0165 ms (±1.3207 ms) over 20 frames
+
+Results written to: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/ablation_sweep_task_009.csv
+================================================================
+Finished: Fri May  8 20:52:19 EDT 2026
+================================================================

@@ -1,0 +1,34 @@
+================================================================
+Job 13599244, task 3 on node3000
+Started: Fri May  8 21:38:23 EDT 2026
+================================================================
+Task 3: v2_8192_d128_L3_hw → /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/scale_sweep_task_003.csv
+
+[1/1] v2_8192_d128_L3_hw  (scale=8192)
+  Frames: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  [1/20] frame 0  → LeafOnly 159 iters  inf=3.20 ms  solve=13.45 ms
+  [2/20] frame 1  → LeafOnly 195 iters  inf=3.24 ms  solve=16.47 ms
+  [3/20] frame 2  → LeafOnly 192 iters  inf=3.21 ms  solve=16.25 ms
+  [4/20] frame 3  → LeafOnly 171 iters  inf=3.21 ms  solve=14.51 ms
+  [5/20] frame 4  → LeafOnly 162 iters  inf=3.24 ms  solve=13.68 ms
+  [6/20] frame 5  → LeafOnly 225 iters  inf=3.25 ms  solve=19.08 ms
+  [7/20] frame 6  → LeafOnly 156 iters  inf=3.21 ms  solve=13.15 ms
+  [8/20] frame 7  → LeafOnly 183 iters  inf=3.25 ms  solve=15.54 ms
+  [9/20] frame 8  → LeafOnly 162 iters  inf=3.23 ms  solve=13.75 ms
+  [10/20] frame 9  → LeafOnly 159 iters  inf=3.21 ms  solve=13.46 ms
+  [11/20] frame 10  → LeafOnly 141 iters  inf=3.25 ms  solve=11.98 ms
+  [12/20] frame 11  → LeafOnly 147 iters  inf=3.25 ms  solve=12.60 ms
+  [13/20] frame 12  → LeafOnly 177 iters  inf=3.20 ms  solve=17.08 ms
+  [14/20] frame 13  → LeafOnly 168 iters  inf=3.25 ms  solve=14.30 ms
+  [15/20] frame 14  → LeafOnly 147 iters  inf=3.20 ms  solve=12.33 ms
+  [16/20] frame 15  → LeafOnly 159 iters  inf=3.25 ms  solve=13.55 ms
+  [17/20] frame 16  → LeafOnly 138 iters  inf=3.21 ms  solve=11.72 ms
+  [18/20] frame 17  → LeafOnly 201 iters  inf=3.24 ms  solve=17.22 ms
+  [19/20] frame 18  → LeafOnly 228 iters  inf=3.20 ms  solve=19.32 ms
+  [20/20] frame 19  → LeafOnly 216 iters  inf=3.21 ms  solve=18.27 ms
+  → Avg LeafOnly: 174.3000 iters (±27.1818), total=18.1100 ms (±2.3631 ms) over 20 frames
+
+Results written to: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/scale_sweep_task_003.csv
+================================================================
+Finished: Fri May  8 21:47:18 EDT 2026
+================================================================
