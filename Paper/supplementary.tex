@@ -1,0 +1,169 @@
+% Supplementary material for "Hierarchical Transformer Preconditioning for Interactive Physics Simulation"
+% Per SIGGRAPH Asia 2026 rules, appendices must be standalone supplementary documents,
+% not part of the main paper.tex.
+\documentclass[acmtog,anonymous,review]{acmart}
+
+\citestyle{acmauthoryear}
+\acmSubmissionID{0000}
+\setcopyright{none}
+\copyrightyear{2026}
+\acmYear{2026}
+\acmDOI{10.1145/nnnnnnn.nnnnnnn}
+\acmJournal{TOG}
+\acmVolume{45}
+\acmNumber{6}
+\acmArticle{1}
+\acmMonth{12}
+
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+
+\begin{document}
+
+\title{Supplementary Material: Hierarchical Transformer Preconditioning for Interactive Physics Simulation}
+
+\author{Anonymous Author(s)}
+\affiliation{%
+  \institution{Paper under double-blind review}
+  \country{}}
+\renewcommand{\shortauthors}{Anonymous Author(s)}
+
+\maketitle
+
+This document collects implementation-level details, dataset construction, and additional
+tables that support the main paper but cannot fit within the SIGGRAPH Asia 2026 page budget.
+Section numbering here is independent of the main paper.
+
+% ===========================================================================
+\section{Full Performance Table with Iteration Counts}
+\label{supp:full_perf_table}
+% ===========================================================================
+
+Table~2 in the main paper omits PCG iteration counts to fit a single column.
+Table~\ref{tab:full_perf_table} reports them here for completeness.
+
+\begin{table}[h]
+\centering
+\caption{Per-frame mean$\pm$std PCG iterations on \textsf{multiphase\_v2}
+($\mathrm{rtol}\!=\!10^{-8}$, $20$ frames per scale).}
+\label{tab:full_perf_table}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}l ccccc@{}}
+\toprule
+Method & $N{=}1024$ & $N{=}2048$ & $N{=}4096$ & $N{=}8192$ & $N{=}16384$ \\
+\midrule
+Unprec.~CG (GPU)             & $497\!\pm\!144$ & $650\!\pm\!240$ & $1153\!\pm\!434$ & $1765\!\pm\!1744$ & $2002\!\pm\!921$ \\
+Jacobi (GPU)                 & $325\!\pm\!83$  & $429\!\pm\!112$ & $839\!\pm\!476$  & $968\!\pm\!261$   & $1480\!\pm\!913$ \\
+IC (CPU)                     & $59\!\pm\!18$   & $96\!\pm\!23$   & $113\!\pm\!31$   & $170\!\pm\!47$    & $254\!\pm\!61$ \\
+IC / DILU (GPU)              & $11\!\pm\!1$    & $15\!\pm\!1$    & $22\!\pm\!4$     & $30\!\pm\!5$      & $40\!\pm\!3$ \\
+AMG (CPU)                    & $5\!\pm\!6$     & $9\!\pm\!6$     & $5\!\pm\!7$      & $7\!\pm\!8$       & $10\!\pm\!8$ \\
+AMG / AMGX (GPU)             & $1\!\pm\!0$     & $1\!\pm\!0$     & $1\!\pm\!1$      & $2\!\pm\!0$       & $3\!\pm\!0$ \\
+\textbf{Ours (GPU)}          & $\mathbf{50\!\pm\!11}$ & $\mathbf{66\!\pm\!16}$ & $\mathbf{83\!\pm\!24}$ & $\mathbf{174\!\pm\!27}$ & $\mathbf{386\!\pm\!69}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===========================================================================
+\section{Multiphase\_v2 Benchmark Generation}
+\label{supp:dataset}
+% ===========================================================================
+
+This appendix gives the precise procedure for generating each frame of
+\textsf{multiphase\_v2}, the benchmark used throughout the main paper. The full generator
+is \verb|generate_dataset.py| in the released code (configurable via
+\verb|--dataset-type multiphase-v2|).
+
+\paragraph{Grid and ordering.}
+Each frame targets $N$ degrees of freedom on a 2D structured grid of dimensions
+$W\!\times\!H$ with $W\!\cdot\!H\!\ge\!N$ and $W$, $H$ chosen as close to square as
+possible. After construction, all $W\!\cdot\!H$ cells are sorted by Morton (Z-order) code
+and truncated to the first $N$ cells, giving a contiguous Morton-ordered index set. Edges
+and density values follow the same ordering. We use a structured grid (rather than a
+particle cloud) so that the assembled $A$ has the canonical 5-point Laplacian sparsity
+pattern, isolating the effect of the heterogeneous coefficient field on conditioning.
+
+\paragraph{Density field.}
+Per-frame the heavy density $\rho_{\text{heavy}}$ is drawn log-uniformly from $[5, 100]$
+with $\rho_{\text{light}}\!=\!1$. We then sample $n_b\!\sim\!\mathrm{Uniform}\{1,2,3\}$
+\emph{barriers}; each barrier is independently
+\begin{enumerate}
+\item assigned an orientation (vertical or horizontal, equiprobable);
+\item given a center coordinate drawn uniformly from $[0.2, 0.8]$ along the cross axis,
+in normalized grid coordinates;
+\item given a thickness drawn uniformly from $[0.05, 0.20]$;
+\item given a gap topology drawn uniformly from $\{\text{top}, \text{bottom},
+\text{middle\_hole}, \text{closed}\}$.
+\end{enumerate}
+A cell is heavy iff it lies in the heavy region of \emph{any} barrier, so multiple
+barriers can overlap to form cross- or L-shaped inclusions. Each cell's density is
+finally multiplied by $1\!+\!\mathcal{N}(0, 0.05^2)$ for fine-grain symmetry breaking.
+
+\paragraph{Operator assembly.}
+$A$ is the standard 5-point pressure-Poisson Laplacian with harmonic-mean face
+conductance $w_{ij}=2\rho_i\rho_j/(\rho_i+\rho_j)$, evaluated on cell-cell faces.
+Boundary cells use zero-flux (Neumann) boundary conditions, as is standard for
+incompressible pressure-projection in graphics-grade fluid simulators. We do \emph{not}
+apply a zero-mean constraint to the resulting null-space mode; CG handles it implicitly
+when the right-hand side is consistent.
+
+\paragraph{Right-hand side.}
+For each frame we draw $\mathbf{b}\!\sim\!\mathcal{N}(0, I)$ projected onto the orthogonal
+complement of the constant vector ($\mathbf{1}^\top\mathbf{b}\!=\!0$ to ensure
+consistency with the Neumann null-space). This is a worst-case-equivalent right-hand-side
+distribution: it weights all spatial frequencies equally, including the low ones that are
+hardest for local preconditioners.
+
+\paragraph{Per-scale dataset sizes.}
+For each of the five scales $N\in\{1024, 2048, 4096, 8192, 16384\}$, we generate $100$
+training frames and $20$ test frames with disjoint seeds. Training and test split the same
+generator distribution.
+
+\paragraph{Why this benchmark stresses the architecture.}
+Three axes of randomization---contrast, topology, and orientation---combine to make
+\textsf{multiphase\_v2} a stress test for any preconditioner with a fixed structural prior.
+Closed barriers in particular produce sub-domains coupled \emph{only} through near-zero
+conductance, which is the precise regime in which an $\mathcal{H}$-matrix's far-block
+representation should out-perform a sparsity-restricted approximate inverse: information
+about the pressure jump must travel from one chamber to the other in a single step, a
+requirement that local message passing on $\text{nnz}(A)$ cannot satisfy with the depths
+typical of practical neural preconditioners.
+
+% ===========================================================================
+\section{Out-of-Distribution Generalization}
+\label{supp:generalization}
+% ===========================================================================
+
+% TODO: Fill in once OOD experiments are complete.
+This section will be expanded once the OOD evaluation runs complete; placeholders for
+expected sub-sections:
+\begin{itemize}
+\item OOD scale: train at $N\!=\!8192$, evaluate at $N\!\in\!\{2048, 4096, 16384, 32768\}$
+without retraining (currently requires retraining since the partition is keyed to $N$;
+this section will explore a fine-tune-only protocol).
+\item OOD contrast: train at $\rho_{\text{heavy}}\!\in\![5,100]$, evaluate at
+$\rho_{\text{heavy}}\!\in\![100, 1000]$ and at $\rho_{\text{heavy}}\!\in\![1, 5]$.
+\item OOD topology: train with $1\!\le\!n_b\!\le\!3$ barriers, evaluate with $n_b\!\ge\!4$
+and on the alternative ``fractured-media'' problem class generated by the same
+generator script.
+\end{itemize}
+
+% ===========================================================================
+\section{Precision and Hardware Efficiency}
+\label{supp:precision}
+% ===========================================================================
+
+% TODO: Fill in once measurements are taken.
+This section will report:
+\begin{itemize}
+\item Sensitivity to apply-path precision (float32, mixed-precision, float64), with PCG
+scalar accumulators held at float64 throughout. Expected: float32 stable up to
+$N\!\approx\!16384$ at $\mathrm{rtol}\!=\!10^{-8}$; mixed precision needs an outer
+refinement loop at the largest scales.
+\item Achieved Tensor Core utilization and DRAM bandwidth (via Nsight Compute) for the
+inner PCG loop, contrasted with the bandwidth-bound Jacobi and SpMV-bound IC kernels
+on the same hardware.
+\item Memory footprint of the packed factor tensor as a function of $N$, $L$, and $L_s$.
+\end{itemize}
+
+\end{document}

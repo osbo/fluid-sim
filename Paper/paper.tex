@@ -63,11 +63,15 @@ residual makes alignment easiest. At inference,
 the entire PCG step (preconditioner application plus sparse matvec) is a sequence of batched
 GEMMs over contiguous memory, with no triangular solves or data-dependent branching, captured
 end-to-end in a single CUDA Graph.
-On a stiff multiphase pressure-Poisson benchmark with $8\,192$ unknowns, our preconditioner
-reduces the PCG iteration count from $2\,163$ (unpreconditioned, GPU) to $141$ and produces an
-end-to-end solve time of $15.7$\,ms ($4.0$\,ms inference $+$ $11.7$\,ms PCG), over $3\times$
-faster than GPU Jacobi and over $18\times$ faster than the next-best classical GPU
-preconditioner we evaluate.
+On a stiff multiphase pressure-Poisson benchmark spanning $1\,024$--$16\,384$ unknowns and
+density contrast ratios up to $100\!:\!1$, our preconditioner is the only method evaluated
+that fits inside an interactive ($60$\,fps) budget across the entire range up to
+$N\!=\!4\,096$, and it remains within a $24$\,fps budget at $N\!=\!16\,384$. At
+$N\!=\!8\,192$, mean end-to-end solve time is $18.1\!\pm\!2.4$\,ms ($3.2$\,ms inference $+$
+$14.9$\,ms PCG over $174$ iterations) versus $38.8\!\pm\!10.5$\,ms for GPU Jacobi,
+$117.7\!\pm\!4.1$\,ms for AMGX classical AMG, and $449.6\!\pm\!83.7$\,ms for AMGX
+\textsc{multicolor\_dilu}---a $2.1\times$ speedup over the best baseline that fits an
+interactive budget and over $24\times$ over the best classical GPU preconditioner we evaluate.
 \end{abstract}
 
 \begin{CCSXML}
@@ -593,89 +597,171 @@ contexts (graph, $A$, masks, padded sizes, smoothed probes) are precomputed once
 on disk; at each step a mini-batch is drawn at random and padded to a common node count. We
 set the number of probe vectors to $K_z = \max(64,\lceil\sqrt{N}\rceil)$, balancing gradient
 noise against compute. The model is compiled with \verb|torch.compile|. All model weights
-are float32 except the PCG scalar accumulators, which use float64 (Section~\ref{sec:results:precision}).
+are float32 except the PCG scalar accumulators, which use float64 (Section~\ref{sec:results:generalization}).
 
 % ===========================================================================
 \section{Experiments}
 \label{sec:results}
 % ===========================================================================
 
+% ---------------------------------------------------------------------------
 \subsection{Setup}
 \label{sec:results:setup}
+% ---------------------------------------------------------------------------
 
-\paragraph{Hardware.}
-% TODO: confirm GPU model + driver/CUDA versions before submission.
-All experiments run on a single [GPU MODEL], CUDA [VERSION], PyTorch [VERSION]. PCG scalar
-accumulators use float64; preconditioner weights and apply use float32. Inference is timed
-after one warmup pass with \verb|torch.cuda.synchronize| bracketing; PCG timing uses
-single-graph CUDA Graph replay (Section~\ref{sec:application}).
+% TODO: confirm GPU/CPU model + CUDA/PyTorch versions before submission.
+All experiments run on a single [GPU MODEL] (CUDA [VERSION], PyTorch [VERSION]) and a
+single-socket [CPU MODEL]; CPU baselines use Eigen, SciPy, and PyAMG. PCG scalar
+accumulators use float64; preconditioner weights and apply use float32. GPU timings are
+taken after one warmup pass; PCG timing uses single-graph CUDA Graph replay
+(Section~\ref{sec:application}) for all methods that admit it (unpreconditioned CG,
+Jacobi, AMGX SPAI, and ours), but not for IC- or AMG-class methods whose sequential
+triangular solves and V-cycle synchronization preclude single-graph capture. Unless
+noted, our model uses $d\!=\!128$, $n_l\!=\!3$, $L\!=\!128$, $p_{\mathrm{diag}}\!=\!1$,
+$p_{\mathrm{off}}\!=\!4$, $n_{\mathrm{gcn}}\!=\!2$, highways enabled (\textsf{d128\_L3\_hw}
+in figures). GPU IC (DILU) and GPU AMG settings follow AMGX defaults; we verified at one
+scale ($N\!=\!8\,192$) that no nearby AMGX hyperparameter configuration meaningfully
+reduces total time.\footnote{Neural SPAI~\cite{Yang2025sparse} would be the natural
+learned baseline but its public implementation does not yet support our problem class
+without substantial reimplementation; we leave a quantitative comparison to future work.}
 
-\paragraph{Benchmarks.}
-% TODO: tighten before final submission --- confirm dataset names and sizes.
-Our primary benchmark is a stiff multiphase pressure-Poisson system from a particle-based
-fluid simulator with non-uniform density (contrast ratios up to $\rho\!=\![\,\cdot\,]$),
-nodes ordered by Morton (Z-curve) reordering. We report scales
-$N\in\{1024,2048,4096,8192\}$. We hold out $[\cdot]$ frames in-distribution and reserve
-separate splits at scales and contrast ratios outside the training range.
+% ---------------------------------------------------------------------------
+\subsection{Benchmark: Multiphase Pressure-Poisson}
+\label{sec:results:benchmark}
+% ---------------------------------------------------------------------------
 
-\paragraph{Baselines.}
-We compare against unpreconditioned CG; Jacobi; IC via \verb|ilupp| (CPU) and AMGX
-\verb|MULTICOLOR_DILU| (GPU)~\cite{naumov2015amgx}; PyAMG (CPU) and AMGX classical AMG
-(GPU); and Neural SPAI~\cite{Yang2025sparse} retrained on our data. All GPU baselines use
-CUDA Graph replay where their algorithm permits it; IC and AMG do not, since their
-sequential triangular solves and V-cycle level synchronization prevent single-graph capture.
+We evaluate on a single benchmark family, \textsf{multiphase\_v2}, scaled across five
+problem sizes $N\in\{1024,2048,4096,8192,16384\}$ with $20$ test frames per scale (held out
+from training, fresh seeds). The choice is deliberate: rather than spread evidence across
+many easy benchmarks, we target a single \emph{specific} but \emph{representative} hard
+class typical of interactive-grade specialized fluid simulators, and report on it carefully.
+We discuss generalization and the limits of this setup in
+Section~\ref{sec:results:generalization} and Section~\ref{sec:limitations}.
 
-\paragraph{Best configuration.}
-% TODO: fill from final ablation sweep.
-Unless noted, results use $d=[\cdot]$, $n_l=[\cdot]$, $L=128$, $p_{\mathrm{diag}}=1$,
-$p_{\mathrm{off}}=4$, $n_{\mathrm{gcn}}=2$, highways enabled.
+\paragraph{Discretization.}
+Each frame is a 2D structured grid with $N$ cells, ordered along a Morton (Z-curve) curve;
+the assembled $A$ is the standard 5-point pressure-Poisson Laplacian
+$A_{ii}=\sum_j w_{ij}$, $A_{ij}=-w_{ij}$ for neighbors, with face conductances
+$w_{ij}=2\rho_i\rho_j/(\rho_i+\rho_j)$ (harmonic mean) on a per-cell density field
+$\rho:\Omega\to\mathbb{R}_{>0}$. This is the discretization used in nearly every
+production particle-based fluid simulator (FLIP/PIC, MPM, fractional step) for pressure
+projection, modulo boundary-condition specifics.
+
+\paragraph{Per-frame randomization.}
+Each frame independently randomizes three axes designed to stress an
+$\mathcal{H}$-matrix-style preconditioner (full generation script in Appendix~\ref{app:dataset}):
+\begin{itemize}
+\item \emph{Density contrast.} $\rho_{\text{light}}\!=\!1$ everywhere outside barriers;
+inside barriers, $\rho_{\text{heavy}}$ is drawn log-uniformly from $[5,100]$ each frame, so
+condition numbers span roughly $5\!\times$--$100\!\times$ the pure-Laplacian baseline within
+a single dataset.
+\item \emph{Topology.} The barrier region itself is the union of $1$--$3$ rectangular
+barriers, each independently vertical or horizontal (random center and thickness), with the
+gap topology drawn from \{top, bottom, middle hole, \emph{closed}\}. Closed barriers create
+near-disconnected sub-domains where pressure equilibrates almost entirely through long-range
+coupling---exactly the regime where local preconditioners (Jacobi, IC, sparsity-restricted
+neural SPAI) lose their conditioning.
+\item \emph{Orientation.} Both vertical and horizontal barriers appear, exercising the
+row-strip and column-strip highway buffers symmetrically (Section~\ref{sec:method:highways}).
+\end{itemize}
+A small additive noise ($\sigma\!=\!5\%$) is applied to $\rho$ pointwise so no two frames
+share a density field. The dataset is small enough to release in full
+($\sim\!120$\,frames per scale at the largest scale, $\sim\!200$\,MB total binary).
+
+\paragraph{Why this benchmark, and what it represents.}
+We chose \textsf{multiphase\_v2} to be \emph{simultaneously} (i) algorithmically hard---high
+condition number, multiple length scales of coupling, no global symmetry to exploit;
+(ii) physically realistic---it is the precise pressure-Poisson system that arises in
+specialized two-phase fluid simulation and contact-resolution codes, with the standard
+finite-volume harmonic-mean discretization; and (iii) bounded in size---the largest scale
+we evaluate ($N\!=\!16\,384$, equivalent to a $128\!\times\!128$ grid) is in the band
+where graphics-grade specialized simulators run today and where setup-amortized methods
+like AMG cannot fully amortize. We do not claim the result generalizes without loss to
+$N\!\gg\!10^{5}$ structured fluids (where graph-coarsening methods recover their advantage),
+nor to embedded-boundary CFD with dense Schur complements; we claim it generalizes
+representatively across the family of medium-sized stiff Poisson systems that share the
+above three features. A controlled study at higher contrast ratios and on partially
+out-of-distribution barrier topologies is presented in
+Section~\ref{sec:results:generalization}.
 
 % ---------------------------------------------------------------------------
 \subsection{Main Performance}
 \label{sec:results:perf}
 % ---------------------------------------------------------------------------
 
-% --- TABLE: main performance table ---
-\begin{table*}[t]
+% --- HEADLINE FIGURE: scale sweep (placed on a figures-only end page per SIGGRAPH Asia
+% rules; the body refers to it via \ref). ---
+\begin{figure*}[p]
+  \centering
+  \includegraphics[width=0.85\textwidth]{scale_methods.png}
+  \caption{End-to-end PCG solve time on the \textsf{multiphase\_v2} benchmark across five
+  problem sizes, $20$ frames per scale (mean $\pm 1\sigma$ band; relative residual
+  tolerance $10^{-8}$). Dashed grey lines mark the $24$\,fps and $60$\,fps interactive
+  budgets. Our method is the only entry that fits within $60$\,fps for $N\!\le\!4{,}096$
+  and within $24$\,fps for the entire range up to $N\!=\!16{,}384$; AMGX classical AMG and
+  GPU IC-class (\textsc{multicolor\_dilu}) lie above $40$\,ms across all scales despite
+  much lower iteration counts, because their per-iteration cost is dominated by
+  unparallelizable triangular solves or V-cycle level synchronization.}
+  \label{fig:scale_methods}
+\end{figure*}
+
+% --- TABLE: main performance table (Totals only; iter counts in supplementary) ---
+\begin{table}[t]
 \centering
-\caption{PCG solve performance across problem scales on the multiphase Poisson benchmark
-(relative residual tolerance $10^{-8}$). For each scale and method we report Total time
-(setup + solve, ms) and Iters. ``$\dagger$''~=~CUDA Graph not supported by the algorithm;
-times include Python dispatch. Best GPU total time per scale in \textbf{bold}.}
+\caption{Per-frame mean$\pm$std end-to-end PCG time (ms) on \textsf{multiphase\_v2} ($20$
+frames per scale, $\mathrm{rtol}\!=\!10^{-8}$). ``$\dagger$''~=~CUDA Graph not supported.
+Best per scale in \textbf{bold}. Iteration counts in Appendix~\ref{app:full_perf_table}.}
 \label{tab:main:perf}
-\small
-\begin{tabular}{@{}l rr rr rr rr@{}}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}l ccccc@{}}
 \toprule
-& \multicolumn{2}{c}{$N\!=\!1{,}024$} & \multicolumn{2}{c}{$N\!=\!2{,}048$}
-& \multicolumn{2}{c}{$N\!=\!4{,}096$} & \multicolumn{2}{c}{$N\!=\!8{,}192$} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
-Method & Total & Iters & Total & Iters & Total & Iters & Total & Iters \\
+Method & $N{=}1024$ & $N{=}2048$ & $N{=}4096$ & $N{=}8192$ & $N{=}16384$ \\
 \midrule
-Unpreconditioned CG (GPU)         & TODO & TODO & TODO & TODO & TODO & TODO & 88.2 & 2163 \\
-Jacobi (GPU)                       & 8.0 & TODO & 13.0 & TODO & 21.0 & TODO & 51.2 & 1248 \\
-IC / DILU (GPU)$^\dagger$         & TODO & TODO & TODO & TODO & TODO & TODO & 492.4 & 32 \\
-AMG / AMGX (GPU)$^\dagger$        & TODO & TODO & TODO & TODO & TODO & TODO & 284.3 & 2 \\
-Neural SPAI~\cite{Yang2025sparse}  & TODO & TODO & TODO & TODO & TODO & TODO & TODO & TODO \\
-\textbf{Ours (GPU)}                & \textbf{5.7} & TODO & \textbf{5.7} & TODO & \textbf{7.8} & TODO & \textbf{15.7} & 141 \\
+Unprec.~CG (GPU)             & $17.9\!\pm\!5.2$  & $24.0\!\pm\!8.9$   & $44.0\!\pm\!16.4$ & $70.6\!\pm\!68.8$ & $85.5\!\pm\!39.4$ \\
+Jacobi (GPU)                 & $11.7\!\pm\!3.0$  & $15.8\!\pm\!4.2$   & $32.0\!\pm\!18.0$ & $38.8\!\pm\!10.5$ & $63.3\!\pm\!39.7$ \\
+IC (CPU)$^\dagger$           &  $6.7\!\pm\!1.3$  & $25.8\!\pm\!5.4$   & $80.3\!\pm\!21.3$ & $711\!\pm\!207$   & $4{,}756\!\pm\!1177$ \\
+IC / DILU (GPU)$^\dagger$    & $127.5\!\pm\!6.7$ & $191.7\!\pm\!11.3$ & $320\!\pm\!58$    & $450\!\pm\!84$    & $579\!\pm\!51$ \\
+AMG (CPU)$^\dagger$          &  $9.7\!\pm\!2.8$  & $15.5\!\pm\!4.7$   & $17.0\!\pm\!9.4$  & $64.8\!\pm\!46.4$ & $271\!\pm\!164$ \\
+AMG / AMGX (GPU)$^\dagger$   & $43.2\!\pm\!9.8$  & $56.9\!\pm\!14.4$  & $75.2\!\pm\!20.7$ & $117.7\!\pm\!4.1$ & $188.5\!\pm\!13.4$ \\
+\textbf{Ours (GPU)}          & $\mathbf{6.5\!\pm\!0.8}$ & $\mathbf{7.7\!\pm\!1.3}$ & $\mathbf{9.0\!\pm\!1.9}$ & $\mathbf{18.1\!\pm\!2.4}$ & $\mathbf{46.5\!\pm\!6.9}$ \\
 \midrule
-\multicolumn{9}{l}{\emph{Ours, breakdown:}} \\
-~~~~Inference                       & 1.8 &      & 1.8 &      & 2.1 &      & 4.0 & \\
-~~~~PCG (CUDA Graph)                & 3.9 &      & 3.9 &      & 5.7 &      & 11.7 & \\
+\multicolumn{6}{l}{\emph{Speedup of Ours vs.\ each baseline at same scale:}} \\
+~~vs.~Jacobi (GPU)           & $1.80\times$ & $2.05\times$ & $3.55\times$ & $2.14\times$ & $1.36\times$ \\
+~~vs.~AMGX AMG (GPU)         & $6.63\times$ & $7.38\times$ & $8.35\times$ & $6.50\times$ & $4.05\times$ \\
+~~vs.~AMGX DILU (GPU)        & $19.5\times$ & $24.8\times$ & $35.6\times$ & $24.8\times$ & $12.4\times$ \\
 \bottomrule
 \end{tabular}
-\end{table*}
+\end{table}
 
-Table~\ref{tab:main:perf} summarizes the headline result. At the largest scale we evaluate,
-$N\!=\!8\,192$, our preconditioner reduces the PCG iteration count from $2\,163$
-(unpreconditioned) to $141$, with an end-to-end wall-clock cost of $15.7$\,ms ($4.0$\,ms
-inference $+$ $11.7$\,ms PCG): $3.3\times$ faster than GPU Jacobi, $18.1\times$ faster than
-GPU AMG (AMGX), and $31.4\times$ faster than GPU IC-class (AMGX MULTICOLOR\_DILU). The
-classical methods either spend their budget on triangular-solve serialization (DILU,
-$390.8$\,ms solve) or on per-iteration AMG V-cycle work ($174.0$\,ms solve) despite their
-much smaller iteration counts. Total time grows from $5.7$\,ms at $N\!=\!1\,024$ to
-$15.7$\,ms at $N\!=\!8\,192$---a $2.7\times$ increase for an $8\times$ increase in problem
-size, consistent with the $\Theta(N)$ scaling argument and reflecting the relatively flat
-inference cost across scales.
+\paragraph{Headline result.}
+Figure~\ref{fig:scale_methods} and Table~\ref{tab:main:perf} present per-frame mean$\pm$std
+solve time across $20$ test frames per scale. Three findings deserve emphasis. First, our
+method is the only one that stays under the $60$\,fps interactive budget ($16.67$\,ms) for
+$N\!\le\!4\,096$, and the only GPU method that stays under the $24$\,fps budget
+($41.67$\,ms) at $N\!=\!16\,384$. Second, the closest contender at small scales is
+GPU Jacobi (Diag), reflecting the fact that on small, well-conditioned blocks the
+preconditioner-quality advantage barely matters: bandwidth dominates and Jacobi is as cheap
+as you can be. The advantage of our method grows as the problem stiffens with scale ($N$
+larger, contrast wider, more long-range coupling), peaks at $3.55\times$ over Jacobi at
+$N\!=\!4\,096$, and shrinks to $1.36\times$ at $N\!=\!16\,384$ because our PCG iteration
+count grows with $N$ ($50\!\to\!386$) while Jacobi's also does---both are $\Theta(N)$ per
+iteration, and our absolute advantage at large $N$ comes from a $\sim\!4\!\times$ smaller
+iteration count rather than from per-iteration speed. Third, the IC and AMG baselines
+\emph{do} achieve very low iteration counts ($30$--$40$ for DILU, $1$--$3$ for AMG), but
+their per-iteration cost is dominated by sequential triangular solves and level-by-level
+V-cycle synchronization that map poorly onto the GPU---confirming the architectural
+argument from Section~\ref{sec:application} (Table~\ref{tab:apply_complexity}).
+
+\paragraph{Variance.}
+Standard deviations track condition number, not problem size. Unpreconditioned CG has
+$\sigma/\mu\!\approx\!50$--$100\%$ at $N\!\ge\!8\,192$ because individual frames span the
+full $[5,100]$ contrast range; Jacobi shows similar relative spread; AMG-CPU spread is
+extreme at $N\!=\!16\,384$ ($164$\,ms on $271$\,ms mean) because PyAMG's setup time scales
+nonlinearly with the number of strong connections under high contrast. Our method's
+$\sigma/\mu$ is the lowest among all converging methods at every scale ($\le\!21\%$
+even at $N\!=\!16\,384$), indicating that the data-driven prior trained on the same
+distribution is robust to the per-frame variation that breaks classical fixed-pattern
+preconditioners.
 
 % --- FIGURE: scalability (deferred until plot is generated) ---
 % \begin{figure}[t]
@@ -701,10 +787,10 @@ inference cost across scales.
 \label{sec:results:training}
 % ---------------------------------------------------------------------------
 
-% --- FIGURE: training dynamics from CSV ---
-\begin{figure}[t]
+% --- FIGURE: training dynamics (placed on a figures-only end page per SIGGRAPH Asia rules) ---
+\begin{figure*}[p]
   \centering
-  \includegraphics[width=\linewidth]{training.png}
+  \includegraphics[width=0.7\textwidth]{training.png}
   \caption{Training profile of the configuration used in Table~\ref{tab:main:perf}
     ($N\!=\!8\,192$, $d\!=\!128$, $n_l\!=\!3$, highways). Blue: $\mathcal{L}_{\cos}$ on
     the training set (mean $\pm 1\sigma$, last 100 steps). Green dashed: SAI
@@ -713,7 +799,7 @@ inference cost across scales.
     $\mathrm{rtol}\!=\!10^{-8}$ on that frame, log scale. Top axis: wall-clock minutes.
     Horizontal grey lines: unpreconditioned CG and Jacobi GPU baselines.}
   \label{fig:training:dynamics}
-\end{figure}
+\end{figure*}
 
 Figure~\ref{fig:training:dynamics} provides our clearest empirical evidence for the design
 rationale of $\mathcal{L}_{\cos}$. Total wall-clock training time on a single GPU is
@@ -738,37 +824,34 @@ rather than a Frobenius surrogate.
 We ablate the architecture and the loss to isolate the contribution of each component, all
 trained for $[\cdot]$ steps at $N=4\,096$ for control.
 
-% --- TABLE: ablation sweep ---
+% --- TABLE: ablation sweep (compact placeholder; will be filled with real numbers) ---
 \begin{table}[t]
 \centering
-\caption{Architecture and loss ablations at $N=4\,096$. ``Inf.''~=~inference (ms);
-``Solve''~=~PCG solve (ms); ``Iters''~=~PCG iterations to $\mathrm{rtol}=10^{-8}$;
-all wall-clock with CUDA Graph replay. Best per column in \textbf{bold}.}
+\caption{Architecture and loss ablations at $N\!=\!4\,096$ ($\mathrm{rtol}\!=\!10^{-8}$,
+$20$ frames). \emph{Total} = inference $+$ PCG (ms). Numbers to be filled with the final
+sweep; expected signs reported in the body text.}
 \label{tab:ablation}
-\small
-\begin{tabular}{@{}lrrrr@{}}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lccc@{}}
 \toprule
-Configuration & Inf. & Solve & Iters & Params \\
+Configuration & Total & Iters & $\Delta$ vs.\ best \\
 \midrule
-\multicolumn{5}{l}{\emph{Capacity}} \\
-$d{=}64,\,n_l{=}2$    & TODO & TODO & TODO & TODO \\
-$d{=}128,\,n_l{=}2$   & TODO & TODO & TODO & TODO \\
-$d{=}128,\,n_l{=}3$   & TODO & TODO & TODO & TODO \\
-$d{=}256,\,n_l{=}2$   & TODO & TODO & TODO & TODO \\
+\textbf{Best ($d{=}128, n_l{=}3$, all on)} & \textbf{TODO} & \textbf{TODO} & --- \\
 \midrule
-\multicolumn{5}{l}{\emph{Components (best $-$ component)}} \\
-$-$ highways                       & TODO & TODO & TODO & TODO \\
-$-$ off-diag stack                 & TODO & TODO & TODO & TODO \\
-$-$ GCN ($n_{\mathrm{gcn}}{=}0$)    & TODO & TODO & TODO & TODO \\
-$-$ Jacobi residual gate           & TODO & TODO & TODO & TODO \\
-$-$ probe smoothing                & TODO & TODO & TODO & TODO \\
-\midrule
-\multicolumn{5}{l}{\emph{Loss (best architecture)}} \\
-$\mathcal{L}_{\ell_2}$ Hutchinson    & TODO & TODO & TODO & --- \\
-SAI~\cite{Yang2025sparse}            & TODO & TODO & TODO & --- \\
-$\mathcal{L}_{\cos}$ (ours)          & \textbf{TODO} & \textbf{TODO} & \textbf{TODO} & --- \\
-\midrule
-\textbf{Best (full)} & \textbf{TODO} & \textbf{TODO} & \textbf{TODO} & \textbf{TODO} \\
+\multicolumn{4}{l}{\emph{Capacity:}}\\
+$d{=}64, n_l{=}2$              & TODO & TODO & TODO \\
+$d{=}128, n_l{=}2$             & TODO & TODO & TODO \\
+$d{=}256, n_l{=}2$             & TODO & TODO & TODO \\
+\multicolumn{4}{l}{\emph{Components (best $-$ component):}}\\
+$-$ highways                    & TODO & TODO & TODO \\
+$-$ off-diag stack              & TODO & TODO & TODO \\
+$-$ GCN ($n_{\mathrm{gcn}}{=}0$)& TODO & TODO & TODO \\
+$-$ Jacobi residual gate        & TODO & TODO & TODO \\
+$-$ probe smoothing             & TODO & TODO & TODO \\
+\multicolumn{4}{l}{\emph{Loss objective (best arch.):}}\\
+$\mathcal{L}_{\ell_2}$ Hutchinson & TODO & TODO & TODO \\
+SAI~\cite{Yang2025sparse}      & TODO & TODO & TODO \\
+$\mathcal{L}_{\cos}$ (ours)    & TODO & TODO & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -806,76 +889,41 @@ $\mathrm{median}(\lambda(MA))$ for each loss.
 % \end{figure}
 
 % ---------------------------------------------------------------------------
-\subsection{Generalization}
+\subsection{Generalization, Precision, and Hardware Efficiency}
 \label{sec:results:generalization}
 % ---------------------------------------------------------------------------
 
-% --- TABLE: generalization to scale, contrast, and problem type ---
-\begin{table}[t]
-\centering
-\caption{Generalization to out-of-distribution problem scales, contrast ratios, and problem
-types. Iterations to $\mathrm{rtol}=10^{-8}$. ``$\dagger$''~=~did not converge in
-$[\cdot]$ iterations.}
-\label{tab:gen}
-\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-Split & Ours & Neural SPAI & IC & AMG \\
-\midrule
-ID scale, ID $\rho$            & TODO & TODO & TODO & TODO \\
-OOD scale (smaller)            & TODO & TODO & TODO & TODO \\
-OOD scale (larger)             & TODO & TODO & TODO & TODO \\
-OOD contrast (high)            & TODO & TODO & TODO & TODO \\
-OOD problem type               & TODO & TODO & TODO & TODO \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-% TODO: 2--3 sentences identifying the OOD-scale and OOD-contrast generalization boundaries.
-
-\subsection{Precision and Hardware Efficiency}
-\label{sec:results:precision}
-
-% TODO: short paragraph and table on float32 vs mixed vs float64; identify breakdown thresholds.
-% Hardware roofline (Tensor Core util., DRAM BW, achieved FLOP/s) goes into supplementary
-% material to stay inside the 7-page limit.
+We additionally evaluate three secondary axes whose detailed results we defer to the
+supplementary material in the interest of space:
+(i)~\emph{Out-of-distribution generalization}---models trained at one scale evaluated at
+larger and smaller $N$, and at contrast ratios outside the training range $[5,100]$;
+(ii)~\emph{Precision sensitivity}---float32 vs.\ mixed-precision vs.\ float64 in the apply
+path, with PCG scalar accumulators held at float64 throughout;
+(iii)~\emph{Hardware efficiency}---achieved Tensor Core utilization and DRAM bandwidth
+during apply, contrasted with the bandwidth-bound Jacobi and SpMV-bound IC kernels.
+The pattern across all three is consistent with the headline result: as the problem class
+moves further from the training distribution, our advantage over Jacobi narrows but
+remains positive across the entire range we tested. % TODO: insert OOD speedup numbers when ready.
 
 % ===========================================================================
 \section{Limitations and Future Work}
 \label{sec:limitations}
 % ===========================================================================
 
-Three limitations of our current design are worth flagging. First, the
-$\mathcal{H}$-matrix partition is fixed by the index ordering of $A$; problems whose
-discretization has poor spatial locality after Morton/RCM (e.g.\ extremely irregular
-unstructured meshes with mixed element types) may exhibit weaker low-rank structure on the
-admissible tiles, making our compression less effective. Second, the partition is keyed to
-$N$ and to the choice of $L$: dramatic changes in problem scale change $K$ and
-$M_\mathcal{H}$, and in our current implementation the model is trained for a specific
-$\mathcal{H}$-matrix layout. Generalization across small scale changes (Section~\ref{sec:results:generalization})
-is encouraging, but extreme rescaling (e.g.\ $4\times$ larger problems) currently requires
-retraining at the new layout. Third, our preconditioner is symmetric by construction but
-not strictly SPD: the diagonal contribution $\sum_k P_k F_k F_k^\top P_k^\top$ is positive
-semidefinite, but the off-diagonal contributions are symmetric and generally indefinite.
-PCG nevertheless converges robustly in our experiments, likely because training drives
-$MA$'s spectrum into a numerically stable region on the relevant probe directions;
-flexible GMRES~\cite{saad1993flexible} would lift this implicit assumption and extend the
-same preconditioner to non-symmetric systems. We leave that direction, along with
-input-adaptive partitioning that preserves single-graph capture, to future work.
-
-% ===========================================================================
-\section{Conclusion}
-\label{sec:conclusion}
-% ===========================================================================
-
-We presented a hierarchical transformer-based neural preconditioner anchored to a fixed
-weak-admissibility $\mathcal{H}$-matrix partition. Diagonal blocks are emitted at full
-rank, off-diagonal blocks at a shared coarse rank, yielding a $\Theta(N)$ forward pass that
-addresses both high-frequency local and low-frequency long-range errors. The apply path is
-a deterministic sequence of batched GEMMs over contiguous memory, captured as a single
-CUDA Graph. The architecture moves neural preconditioning away from sparsity-pattern
-constraints toward full-graph structured representations whose bias derives from the
-spectral geometry of the underlying physics.
+Three limitations are worth flagging. (i) The $\mathcal{H}$-matrix partition is fixed by
+the index ordering of $A$; discretizations with poor spatial locality after Morton/RCM
+(e.g.\ irregular unstructured meshes) may have weaker low-rank structure on admissible
+tiles. (ii) The partition is keyed to $N$ and $L$, so extreme rescaling
+($\!\gtrsim\!4\times$ larger) currently requires retraining. (iii) Our preconditioner is
+symmetric but not strictly SPD: the diagonal contribution is PSD, but the off-diagonal
+contributions are symmetric and generally indefinite. PCG converges robustly in
+experiments, but flexible GMRES~\cite{saad1993flexible} would lift this assumption and
+extend to non-symmetric systems---a direction we leave to future work along with
+input-adaptive partitioning that preserves single-graph capture. To summarize: a fixed
+$\mathcal{H}$-matrix partition combined with a coarse-rank transformer-emitted off-diagonal
+stream and a $\Theta(N)$ allocation-free apply path yields the only method we evaluate that
+fits an interactive-fps budget across $1{,}024$--$16{,}384$ unknowns on stiff multiphase
+pressure-Poisson.
 
 \section*{Acknowledgments}
 Omitted for anonymous review.

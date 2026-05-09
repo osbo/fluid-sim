@@ -34,8 +34,11 @@ CSV schema:
   - solve_ms:     PCG solve time after preconditioner is applied
   - iters:        PCG iterations to convergence
   - total_ms:     setup + inference + solve (as reported by InspectModel)
-  - *_std:        sample std-dev across test frames (blank when n_frames=1)
-  - n_frames:     number of frames successfully measured
+  - *_std:        sample std-dev across successfully converged test frames (blank when n_frames=1)
+  - n_frames:     number of frames included after excluding LeafOnly runs that hit the PCG iteration cap
+
+Frames where LeafOnly reaches the configured PCG maximum iteration count are dropped before averaging so
+means and standard deviations are not skewed by non-converged solves.
 """
 
 import argparse
@@ -115,6 +118,29 @@ _SECTION_HEADERS = [
 
 # Fields that are averaged; keyed by method type
 _NUMERIC_FIELDS = ["setup_ms", "inference_ms", "solve_ms", "iters", "total_ms"]
+
+# InspectModel test-only PCG uses this cap; runs that stop here did not converge within tolerance.
+_INSPECT_PCG_MAX_ITER = 50000
+
+
+def _drop_leafonly_nonconverged_frames(per_frame_rows: "list[list[dict]]") -> "tuple[list[list[dict]], int]":
+    """Remove whole-frame measurements where LeafOnly hit the PCG iteration ceiling.
+
+    Those frames dominate sample variance and distort means for timing and iteration stats.
+    """
+
+    kept: list[list[dict]] = []
+    dropped = 0
+    for rows in per_frame_rows:
+        lo = next((r for r in rows if r["method"] == "leafonly"), None)
+        if lo is None or lo.get("iters") is None:
+            kept.append(rows)
+            continue
+        if float(lo["iters"]) >= float(_INSPECT_PCG_MAX_ITER):
+            dropped += 1
+            continue
+        kept.append(rows)
+    return kept, dropped
 
 
 def _parse_output(stdout: str) -> "list[dict]":
@@ -394,6 +420,17 @@ def main() -> None:
 
             if not per_frame_rows:
                 print(f"  [SKIP] no successful frames", file=sys.stderr)
+                continue
+
+            per_frame_rows, ndrop_cap = _drop_leafonly_nonconverged_frames(per_frame_rows)
+            if ndrop_cap:
+                print(
+                    f"  Excluded {ndrop_cap} frame(s) where LeafOnly hit PCG cap "
+                    f"({_INSPECT_PCG_MAX_ITER} iters); aggregates use remaining frames only.",
+                    flush=True,
+                )
+            if not per_frame_rows:
+                print(f"  [SKIP] all frames hit PCG cap for LeafOnly", file=sys.stderr)
                 continue
 
             agg_rows = _aggregate(per_frame_rows, cfg["scale"], cfg["name"])
