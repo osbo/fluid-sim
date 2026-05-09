@@ -91,12 +91,6 @@
 \newlabel{eq:loss}{{7}{5}{Cosine Hutchinson Probe Loss}{equation.7}{}}
 \@writefile{toc}{\contentsline {paragraph}{Why cosine.}{5}{section*.19}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Spectrally Biased Probe Vectors}{5}{subsection.6.2}\protected@file@percent }
-\citation{naumov2015amgx}
-\citation{Yang2025sparse}
-\citation{Yang2025sparse}
-\citation{Yang2025sparse}
-\citation{Yang2025sparse}
-\citation{Yang2025sparse}
 \citation{Yang2025sparse}
 \newlabel{eq:jacobi_smooth}{{8}{6}{Spectrally Biased Probe Vectors}{equation.8}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Training Setup}{6}{subsection.6.3}\protected@file@percent }
@@ -104,36 +98,39 @@
 \newlabel{sec:results}{{7}{6}{Experiments}{section.7}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Setup}{6}{subsection.7.1}\protected@file@percent }
 \newlabel{sec:results:setup}{{7.1}{6}{Setup}{subsection.7.1}{}}
-\@writefile{toc}{\contentsline {paragraph}{Hardware.}{6}{section*.20}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Benchmarks.}{6}{section*.21}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Baselines.}{6}{section*.22}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Best configuration.}{6}{section*.23}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Main Performance}{6}{subsection.7.2}\protected@file@percent }
-\newlabel{sec:results:perf}{{7.2}{6}{Main Performance}{subsection.7.2}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Training profile of the configuration used in Table\nonbreakingspace \ref {tab:main:perf} ($N\!=\!8\,192$, $d\!=\!128$, $n_l\!=\!3$, highways). Blue: $\mathcal  {L}_{\cos }$ on the training set (mean $\pm 1\sigma $, last 100 steps). Green dashed: SAI loss\nonbreakingspace \citep  {Yang2025sparse} computed on a held-out validation frame at the same checkpoints (\emph  {not} used for training). Orange: PCG iteration count to $\mathrm  {rtol}\!=\!10^{-8}$ on that frame, log scale. Top axis: wall-clock minutes. Horizontal grey lines: unpreconditioned CG and Jacobi GPU baselines.}}{6}{figure.caption.25}\protected@file@percent }
-\newlabel{fig:training:dynamics}{{3}{6}{Training profile of the configuration used in Table~\ref {tab:main:perf} ($N\!=\!8\,192$, $d\!=\!128$, $n_l\!=\!3$, highways). Blue: $\mathcal {L}_{\cos }$ on the training set (mean $\pm 1\sigma $, last 100 steps). Green dashed: SAI loss~\cite {Yang2025sparse} computed on a held-out validation frame at the same checkpoints (\emph {not} used for training). Orange: PCG iteration count to $\mathrm {rtol}\!=\!10^{-8}$ on that frame, log scale. Top axis: wall-clock minutes. Horizontal grey lines: unpreconditioned CG and Jacobi GPU baselines}{figure.caption.25}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Training Dynamics}{6}{subsection.7.3}\protected@file@percent }
-\newlabel{sec:results:training}{{7.3}{6}{Training Dynamics}{subsection.7.3}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Ablations}{6}{subsection.7.4}\protected@file@percent }
-\newlabel{sec:ablation}{{7.4}{6}{Ablations}{subsection.7.4}{}}
-\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.4.1}Architecture}{6}{subsubsection.7.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Benchmark: Multiphase Pressure-Poisson}{6}{subsection.7.2}\protected@file@percent }
+\newlabel{sec:results:benchmark}{{7.2}{6}{Benchmark: Multiphase Pressure-Poisson}{subsection.7.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Discretization.}{6}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Per-frame randomization.}{6}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why this benchmark, and what it represents.}{6}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Main Performance}{6}{subsection.7.3}\protected@file@percent }
+\newlabel{sec:results:perf}{{7.3}{6}{Main Performance}{subsection.7.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Headline result.}{6}{section*.25}\protected@file@percent }
+\citation{Yang2025sparse}
+\citation{Yang2025sparse}
+\citation{Yang2025sparse}
+\citation{Yang2025sparse}
 \citation{saad1993flexible}
-\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces PCG solve performance across problem scales on the multiphase Poisson benchmark (relative residual tolerance $10^{-8}$). For each scale and method we report Total time (setup + solve, ms) and Iters. ``$\dagger $''\nonbreakingspace =\nonbreakingspace CUDA Graph not supported by the algorithm; times include Python dispatch. Best GPU total time per scale in \textbf  {bold}.}}{7}{table.caption.24}\protected@file@percent }
-\newlabel{tab:main:perf}{{2}{7}{PCG solve performance across problem scales on the multiphase Poisson benchmark (relative residual tolerance $10^{-8}$). For each scale and method we report Total time (setup + solve, ms) and Iters. ``$\dagger $''~=~CUDA Graph not supported by the algorithm; times include Python dispatch. Best GPU total time per scale in \textbf {bold}}{table.caption.24}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Architecture and loss ablations at $N=4\,096$. ``Inf.''\nonbreakingspace =\nonbreakingspace inference (ms); ``Solve''\nonbreakingspace =\nonbreakingspace PCG solve (ms); ``Iters''\nonbreakingspace =\nonbreakingspace PCG iterations to $\mathrm  {rtol}=10^{-8}$; all wall-clock with CUDA Graph replay. Best per column in \textbf  {bold}.}}{7}{table.caption.26}\protected@file@percent }
-\newlabel{tab:ablation}{{3}{7}{Architecture and loss ablations at $N=4\,096$. ``Inf.''~=~inference (ms); ``Solve''~=~PCG solve (ms); ``Iters''~=~PCG iterations to $\mathrm {rtol}=10^{-8}$; all wall-clock with CUDA Graph replay. Best per column in \textbf {bold}}{table.caption.26}{}}
-\newlabel{sec:ablation:loss}{{7.4.2}{7}{Loss}{subsubsection.7.4.2}{}}
-\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.4.2}Loss}{7}{subsubsection.7.4.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Generalization}{7}{subsection.7.5}\protected@file@percent }
-\newlabel{sec:results:generalization}{{7.5}{7}{Generalization}{subsection.7.5}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Precision and Hardware Efficiency}{7}{subsection.7.6}\protected@file@percent }
-\newlabel{sec:results:precision}{{7.6}{7}{Precision and Hardware Efficiency}{subsection.7.6}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Per-frame mean$\pm $std end-to-end PCG time (ms) on \textsf  {multiphase\_v2} ($20$ frames per scale, $\mathrm  {rtol}\!=\!10^{-8}$). ``$\dagger $''\nonbreakingspace =\nonbreakingspace CUDA Graph not supported. Best per scale in \textbf  {bold}. Iteration counts in Appendix\nonbreakingspace \ref {app:full_perf_table}.}}{7}{table.caption.24}\protected@file@percent }
+\newlabel{tab:main:perf}{{2}{7}{Per-frame mean$\pm $std end-to-end PCG time (ms) on \textsf {multiphase\_v2} ($20$ frames per scale, $\mathrm {rtol}\!=\!10^{-8}$). ``$\dagger $''~=~CUDA Graph not supported. Best per scale in \textbf {bold}. Iteration counts in Appendix~\ref {app:full_perf_table}}{table.caption.24}{}}
+\@writefile{toc}{\contentsline {paragraph}{Variance.}{7}{section*.26}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Training Dynamics}{7}{subsection.7.4}\protected@file@percent }
+\newlabel{sec:results:training}{{7.4}{7}{Training Dynamics}{subsection.7.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Architecture and loss ablations at $N\!=\!4\,096$ ($\mathrm  {rtol}\!=\!10^{-8}$, $20$ frames). \emph  {Total} = inference $+$ PCG (ms). Numbers to be filled with the final sweep; expected signs reported in the body text.}}{7}{table.caption.28}\protected@file@percent }
+\newlabel{tab:ablation}{{3}{7}{Architecture and loss ablations at $N\!=\!4\,096$ ($\mathrm {rtol}\!=\!10^{-8}$, $20$ frames). \emph {Total} = inference $+$ PCG (ms). Numbers to be filled with the final sweep; expected signs reported in the body text}{table.caption.28}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Ablations}{7}{subsection.7.5}\protected@file@percent }
+\newlabel{sec:ablation}{{7.5}{7}{Ablations}{subsection.7.5}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.1}Architecture}{7}{subsubsection.7.5.1}\protected@file@percent }
+\newlabel{sec:ablation:loss}{{7.5.2}{7}{Loss}{subsubsection.7.5.2}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.2}Loss}{7}{subsubsection.7.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Generalization, Precision, and Hardware Efficiency}{7}{subsection.7.6}\protected@file@percent }
+\newlabel{sec:results:generalization}{{7.6}{7}{Generalization, Precision, and Hardware Efficiency}{subsection.7.6}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {8}Limitations and Future Work}{7}{section.8}\protected@file@percent }
 \newlabel{sec:limitations}{{8}{7}{Limitations and Future Work}{section.8}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Generalization to out-of-distribution problem scales, contrast ratios, and problem types. Iterations to $\mathrm  {rtol}=10^{-8}$. ``$\dagger $''\nonbreakingspace =\nonbreakingspace did not converge in $[\cdot ]$ iterations.}}{7}{table.caption.27}\protected@file@percent }
-\newlabel{tab:gen}{{4}{7}{Generalization to out-of-distribution problem scales, contrast ratios, and problem types. Iterations to $\mathrm {rtol}=10^{-8}$. ``$\dagger $''~=~did not converge in $[\cdot ]$ iterations}{table.caption.27}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {9}Conclusion}{7}{section.9}\protected@file@percent }
-\newlabel{sec:conclusion}{{9}{7}{Conclusion}{section.9}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces End-to-end PCG solve time on the \textsf  {multiphase\_v2} benchmark across five problem sizes, $20$ frames per scale (mean $\pm 1\sigma $ band; relative residual tolerance $10^{-8}$). Dashed grey lines mark the $24$\,fps and $60$\,fps interactive budgets. Our method is the only entry that fits within $60$\,fps for $N\!\le \!4{,}096$ and within $24$\,fps for the entire range up to $N\!=\!16{,}384$; AMGX classical AMG and GPU IC-class (\textsc  {multicolor\_dilu}) lie above $40$\,ms across all scales despite much lower iteration counts, because their per-iteration cost is dominated by unparallelizable triangular solves or V-cycle level synchronization.}}{8}{figure.caption.23}\protected@file@percent }
+\newlabel{fig:scale_methods}{{3}{8}{End-to-end PCG solve time on the \textsf {multiphase\_v2} benchmark across five problem sizes, $20$ frames per scale (mean $\pm 1\sigma $ band; relative residual tolerance $10^{-8}$). Dashed grey lines mark the $24$\,fps and $60$\,fps interactive budgets. Our method is the only entry that fits within $60$\,fps for $N\!\le \!4{,}096$ and within $24$\,fps for the entire range up to $N\!=\!16{,}384$; AMGX classical AMG and GPU IC-class (\textsc {multicolor\_dilu}) lie above $40$\,ms across all scales despite much lower iteration counts, because their per-iteration cost is dominated by unparallelizable triangular solves or V-cycle level synchronization}{figure.caption.23}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Training profile of the configuration used in Table\nonbreakingspace \ref {tab:main:perf} ($N\!=\!8\,192$, $d\!=\!128$, $n_l\!=\!3$, highways). Blue: $\mathcal  {L}_{\cos }$ on the training set (mean $\pm 1\sigma $, last 100 steps). Green dashed: SAI loss\nonbreakingspace \citep  {Yang2025sparse} computed on a held-out validation frame at the same checkpoints (\emph  {not} used for training). Orange: PCG iteration count to $\mathrm  {rtol}\!=\!10^{-8}$ on that frame, log scale. Top axis: wall-clock minutes. Horizontal grey lines: unpreconditioned CG and Jacobi GPU baselines.}}{8}{figure.caption.27}\protected@file@percent }
+\newlabel{fig:training:dynamics}{{4}{8}{Training profile of the configuration used in Table~\ref {tab:main:perf} ($N\!=\!8\,192$, $d\!=\!128$, $n_l\!=\!3$, highways). Blue: $\mathcal {L}_{\cos }$ on the training set (mean $\pm 1\sigma $, last 100 steps). Green dashed: SAI loss~\cite {Yang2025sparse} computed on a held-out validation frame at the same checkpoints (\emph {not} used for training). Orange: PCG iteration count to $\mathrm {rtol}\!=\!10^{-8}$ on that frame, log scale. Top axis: wall-clock minutes. Horizontal grey lines: unpreconditioned CG and Jacobi GPU baselines}{figure.caption.27}{}}
 \bibstyle{ACM-Reference-Format}
 \bibdata{references}
 \bibcite{benzi1996sparse}{{1}{1996}{{Benzi et~al\mbox  {.}}}{{}}}
@@ -179,6 +176,6 @@
 \newlabel{tocindent3}{18.198pt}
 \newlabel{tocindent4}{0pt}
 \newlabel{tocindent5}{0pt}
-\@writefile{toc}{\contentsline {section}{References}{8}{section*.30}\protected@file@percent }
-\newlabel{TotPages}{{8}{8}{}{page.8}{}}
-\gdef \@abspage@last{8}
+\@writefile{toc}{\contentsline {section}{References}{9}{section*.31}\protected@file@percent }
+\newlabel{TotPages}{{9}{9}{}{page.9}{}}
+\gdef \@abspage@last{9}

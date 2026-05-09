@@ -38,38 +38,26 @@
 
 \bibitem[Benzi et~al\mbox{.}(1996)]%
         {benzi1996sparse}
-\bibfield{author}{\bibinfo{person}{Michele Benzi}, \bibinfo{person}{Carl~D.
-  Meyer}, {and} \bibinfo{person}{Miroslav T{\u{u}}ma}.}
-  \bibinfo{year}{1996}\natexlab{}.
-\newblock \showarticletitle{A Sparse Approximate Inverse Preconditioner for the
-  Conjugate Gradient Method}.
-\newblock \bibinfo{journal}{\emph{SIAM Journal on Scientific Computing}}
-  \bibinfo{volume}{17}, \bibinfo{number}{5} (\bibinfo{year}{1996}),
-  \bibinfo{pages}{1135--1149}.
+\bibfield{author}{\bibinfo{person}{Michele Benzi}, \bibinfo{person}{Carl~D. Meyer}, {and} \bibinfo{person}{Miroslav T{\u{u}}ma}.} \bibinfo{year}{1996}\natexlab{}.
+\newblock \showarticletitle{A Sparse Approximate Inverse Preconditioner for the Conjugate Gradient Method}.
+\newblock \bibinfo{journal}{\emph{SIAM Journal on Scientific Computing}} \bibinfo{volume}{17}, \bibinfo{number}{5} (\bibinfo{year}{1996}), \bibinfo{pages}{1135--1149}.
 \newblock
 
 
 \bibitem[B{\"o}rm et~al\mbox{.}(2003)]%
         {borm2003introduction}
-\bibfield{author}{\bibinfo{person}{Steffen B{\"o}rm}, \bibinfo{person}{Lars
-  Grasedyck}, {and} \bibinfo{person}{Wolfgang Hackbusch}.}
-  \bibinfo{year}{2003}\natexlab{}.
-\newblock \bibinfo{booktitle}{\emph{Introduction to Hierarchical Matrices with
-  Applications}}.
+\bibfield{author}{\bibinfo{person}{Steffen B{\"o}rm}, \bibinfo{person}{Lars Grasedyck}, {and} \bibinfo{person}{Wolfgang Hackbusch}.} \bibinfo{year}{2003}\natexlab{}.
+\newblock \bibinfo{booktitle}{\emph{Introduction to Hierarchical Matrices with Applications}}.
 \newblock \bibinfo{publisher}{Engineering Analysis with Boundary Elements}.
 \newblock
 \newblock
-\shownote{Survey/textbook treatment of $\mathcal{H}$-matrices and
-  $\mathcal{H}^2$-matrices.}.
+\shownote{Survey/textbook treatment of $\mathcal{H}$-matrices and $\mathcal{H}^2$-matrices.}.
 
 
 \bibitem[Briggs et~al\mbox{.}(2000)]%
         {briggs2000multigrid}
-\bibfield{author}{\bibinfo{person}{William~L. Briggs},
-  \bibinfo{person}{Van~Emden Henson}, {and} \bibinfo{person}{Steve~F.
-  McCormick}.} \bibinfo{year}{2000}\natexlab{}.
-\newblock \bibinfo{booktitle}{\emph{A Multigrid Tutorial} (\bibinfo{edition}{2}
-  ed.)}.
+\bibfield{author}{\bibinfo{person}{William~L. Briggs}, \bibinfo{person}{Van~Emden Henson}, {and} \bibinfo{person}{Steve~F. McCormick}.} \bibinfo{year}{2000}\natexlab{}.
+\newblock \bibinfo{booktitle}{\emph{A Multigrid Tutorial} (\bibinfo{edition}{2} ed.)}.
 \newblock \bibinfo{publisher}{SIAM}, \bibinfo{address}{Philadelphia, PA}.
 \newblock
 
@@ -77,29 +65,22 @@
 \bibitem[Chen(2024)]%
         {chen2024gnp}
 \bibfield{author}{\bibinfo{person}{Jie Chen}.} \bibinfo{year}{2024}\natexlab{}.
-\newblock \showarticletitle{Graph Neural Preconditioners for Iterative
-  Solutions of Sparse Linear Systems}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2406.00809}}
-  (\bibinfo{year}{2024}).
+\newblock \showarticletitle{Graph Neural Preconditioners for Iterative Solutions of Sparse Linear Systems}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2406.00809}} (\bibinfo{year}{2024}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2406.00809}
 \showURL{%
 \tempurl}
 \newblock
-\shownote{Published at {ICLR} 2025; see also {Chen2025graph} entry in this
-  file.}.
+\shownote{Published at {ICLR} 2025; see also {Chen2025graph} entry in this file.}.
 
 
 \bibitem[Fan et~al\mbox{.}(2019)]%
         {Fan2019multiscale}
-\bibfield{author}{\bibinfo{person}{Yuwei Fan}, \bibinfo{person}{Lin Lin},
-  \bibinfo{person}{Lexing Ying}, {and} \bibinfo{person}{Leonardo
-  Zepeda-N{\'u}{\~n}ez}.} \bibinfo{year}{2019}\natexlab{}.
-\newblock \showarticletitle{A Multiscale Neural Network Based on Hierarchical
-  Matrices}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:1807.01883}}
-  (\bibinfo{year}{2019}).
+\bibfield{author}{\bibinfo{person}{Yuwei Fan}, \bibinfo{person}{Lin Lin}, \bibinfo{person}{Lexing Ying}, {and} \bibinfo{person}{Leonardo Zepeda-N{\'u}{\~n}ez}.} \bibinfo{year}{2019}\natexlab{}.
+\newblock \showarticletitle{A Multiscale Neural Network Based on Hierarchical Matrices}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:1807.01883}} (\bibinfo{year}{2019}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/1807.01883}
@@ -109,13 +90,9 @@
 
 \bibitem[Fognini et~al\mbox{.}(2025)]%
         {Fognini2025neural}
-\bibfield{author}{\bibinfo{person}{Emilio~McAllister Fognini},
-  \bibinfo{person}{Marta~M. Betcke}, {and} \bibinfo{person}{Ben~T. Cox}.}
-  \bibinfo{year}{2025}\natexlab{}.
-\newblock \showarticletitle{Learning {Green's} Operators through Hierarchical
-  Neural Networks Inspired by the Fast Multipole Method}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2509.20591}}
-  (\bibinfo{year}{2025}).
+\bibfield{author}{\bibinfo{person}{Emilio~McAllister Fognini}, \bibinfo{person}{Marta~M. Betcke}, {and} \bibinfo{person}{Ben~T. Cox}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Learning {Green's} Operators through Hierarchical Neural Networks Inspired by the Fast Multipole Method}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2509.20591}} (\bibinfo{year}{2025}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2509.20591}
@@ -125,23 +102,18 @@
 
 \bibitem[Hackbusch(1999)]%
         {hackbusch1999sparse}
-\bibfield{author}{\bibinfo{person}{Wolfgang Hackbusch}.}
-  \bibinfo{year}{1999}\natexlab{}.
-\newblock \bibinfo{booktitle}{\emph{A Sparse Matrix Arithmetic Based on
-  $\mathcal{H}$-Matrices. {Part I}: Introduction to $\mathcal{H}$-Matrices}}.
+\bibfield{author}{\bibinfo{person}{Wolfgang Hackbusch}.} \bibinfo{year}{1999}\natexlab{}.
+\newblock \bibinfo{booktitle}{\emph{A Sparse Matrix Arithmetic Based on $\mathcal{H}$-Matrices. {Part I}: Introduction to $\mathcal{H}$-Matrices}}.
 \newblock \bibinfo{publisher}{Springer}, \bibinfo{address}{Berlin}.
 \newblock
 \newblock
-\shownote{Computing 62(2):89--108. Often cited as hierarchical matrix
-  foundations.}.
+\shownote{Computing 62(2):89--108. Often cited as hierarchical matrix foundations.}.
 
 
 \bibitem[Hackbusch and Khoromskij(2002)]%
         {hackbusch2002adaptive}
-\bibfield{author}{\bibinfo{person}{Wolfgang Hackbusch} {and}
-  \bibinfo{person}{Boris~N. Khoromskij}.} \bibinfo{year}{2002}\natexlab{}.
-\newblock \bibinfo{booktitle}{\emph{Adaptive $\mathcal{H}$-Matrix Approximation
-  on General Domains}}.
+\bibfield{author}{\bibinfo{person}{Wolfgang Hackbusch} {and} \bibinfo{person}{Boris~N. Khoromskij}.} \bibinfo{year}{2002}\natexlab{}.
+\newblock \bibinfo{booktitle}{\emph{Adaptive $\mathcal{H}$-Matrix Approximation on General Domains}}.
 \newblock \bibinfo{publisher}{Springer}.
 \newblock
 \newblock
@@ -150,14 +122,9 @@
 
 \bibitem[Hartland et~al\mbox{.}(2023)]%
         {Hartland2023hodlr}
-\bibfield{author}{\bibinfo{person}{Tucker Hartland}, \bibinfo{person}{Georg
-  Stadler}, \bibinfo{person}{Mauro Perego}, \bibinfo{person}{Kim Liegeois},
-  {and} \bibinfo{person}{No{\'e}mi Petra}.} \bibinfo{year}{2023}\natexlab{}.
-\newblock \showarticletitle{Hierarchical Off-Diagonal Low-Rank Approximation of
-  Hessians in Inverse Problems, with Application to Ice Sheet Model
-  Initialization}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2301.03644}}
-  (\bibinfo{year}{2023}).
+\bibfield{author}{\bibinfo{person}{Tucker Hartland}, \bibinfo{person}{Georg Stadler}, \bibinfo{person}{Mauro Perego}, \bibinfo{person}{Kim Liegeois}, {and} \bibinfo{person}{No{\'e}mi Petra}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Hierarchical Off-Diagonal Low-Rank Approximation of Hessians in Inverse Problems, with Application to Ice Sheet Model Initialization}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2301.03644}} (\bibinfo{year}{2023}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2301.03644}
@@ -167,13 +134,9 @@
 
 \bibitem[H{\"a}usner et~al\mbox{.}(2023)]%
         {hausner2023neural}
-\bibfield{author}{\bibinfo{person}{Paul H{\"a}usner}, \bibinfo{person}{Ozan
-  {\"O}ktem}, {and} \bibinfo{person}{Jens Sj{\"o}lund}.}
-  \bibinfo{year}{2023}\natexlab{}.
-\newblock \showarticletitle{Neural Incomplete Factorization: Learning
-  Preconditioners for the Conjugate Gradient Method}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2305.16368}}
-  (\bibinfo{year}{2023}).
+\bibfield{author}{\bibinfo{person}{Paul H{\"a}usner}, \bibinfo{person}{Ozan {\"O}ktem}, {and} \bibinfo{person}{Jens Sj{\"o}lund}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Neural Incomplete Factorization: Learning Preconditioners for the Conjugate Gradient Method}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2305.16368}} (\bibinfo{year}{2023}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2305.16368}
@@ -183,47 +146,32 @@
 
 \bibitem[Hutchinson(1989)]%
         {hutchinson1989stochastic}
-\bibfield{author}{\bibinfo{person}{Michael~F. Hutchinson}.}
-  \bibinfo{year}{1989}\natexlab{}.
-\newblock \showarticletitle{A Stochastic Estimator of the Trace of the
-  Influence Matrix for {Laplacian} Smoothing Splines}.
-\newblock \bibinfo{journal}{\emph{Communications in Statistics---Simulation and
-  Computation}} \bibinfo{volume}{18}, \bibinfo{number}{3}
-  (\bibinfo{year}{1989}), \bibinfo{pages}{1059--1076}.
+\bibfield{author}{\bibinfo{person}{Michael~F. Hutchinson}.} \bibinfo{year}{1989}\natexlab{}.
+\newblock \showarticletitle{A Stochastic Estimator of the Trace of the Influence Matrix for {Laplacian} Smoothing Splines}.
+\newblock \bibinfo{journal}{\emph{Communications in Statistics---Simulation and Computation}} \bibinfo{volume}{18}, \bibinfo{number}{3} (\bibinfo{year}{1989}), \bibinfo{pages}{1059--1076}.
 \newblock
 
 
 \bibitem[Kipf and Welling(2017)]%
         {kipf2017semi}
-\bibfield{author}{\bibinfo{person}{Thomas~N. Kipf} {and} \bibinfo{person}{Max
-  Welling}.} \bibinfo{year}{2017}\natexlab{}.
-\newblock \showarticletitle{Semi-Supervised Classification with Graph
-  Convolutional Networks}. In \bibinfo{booktitle}{\emph{International
-  Conference on Learning Representations (ICLR)}}.
+\bibfield{author}{\bibinfo{person}{Thomas~N. Kipf} {and} \bibinfo{person}{Max Welling}.} \bibinfo{year}{2017}\natexlab{}.
+\newblock \showarticletitle{Semi-Supervised Classification with Graph Convolutional Networks}. In \bibinfo{booktitle}{\emph{International Conference on Learning Representations (ICLR)}}.
 \newblock
 
 
 \bibitem[Kolotilina and Yeremin(1993)]%
         {kolotilina1993factorized}
-\bibfield{author}{\bibinfo{person}{L.~Yu. Kolotilina} {and}
-  \bibinfo{person}{A.~Yu. Yeremin}.} \bibinfo{year}{1993}\natexlab{}.
-\newblock \showarticletitle{Factorized Sparse Approximate Inverse
-  Preconditionings {I}: Theory}.
-\newblock \bibinfo{journal}{\emph{SIAM J. Matrix Anal. Appl.}}
-  \bibinfo{volume}{14}, \bibinfo{number}{1} (\bibinfo{year}{1993}),
-  \bibinfo{pages}{45--58}.
+\bibfield{author}{\bibinfo{person}{L.~Yu. Kolotilina} {and} \bibinfo{person}{A.~Yu. Yeremin}.} \bibinfo{year}{1993}\natexlab{}.
+\newblock \showarticletitle{Factorized Sparse Approximate Inverse Preconditionings {I}: Theory}.
+\newblock \bibinfo{journal}{\emph{SIAM J. Matrix Anal. Appl.}} \bibinfo{volume}{14}, \bibinfo{number}{1} (\bibinfo{year}{1993}), \bibinfo{pages}{45--58}.
 \newblock
 
 
 \bibitem[Li et~al\mbox{.}(2023)]%
         {Li2023learning}
-\bibfield{author}{\bibinfo{person}{Yichen Li}, \bibinfo{person}{Peter~Yichen
-  Chen}, \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Wojciech Matusik}.}
-  \bibinfo{year}{2023}\natexlab{}.
-\newblock \showarticletitle{Learning Preconditioners for Conjugate Gradient
-  {PDE} Solvers}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2305.16432}}
-  (\bibinfo{year}{2023}).
+\bibfield{author}{\bibinfo{person}{Yichen Li}, \bibinfo{person}{Peter~Yichen Chen}, \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Wojciech Matusik}.} \bibinfo{year}{2023}\natexlab{}.
+\newblock \showarticletitle{Learning Preconditioners for Conjugate Gradient {PDE} Solvers}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2305.16432}} (\bibinfo{year}{2023}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2305.16432}
@@ -235,29 +183,17 @@
 
 \bibitem[Li et~al\mbox{.}(2020a)]%
         {li2020multipole}
-\bibfield{author}{\bibinfo{person}{Zongyi Li}, \bibinfo{person}{Nikola
-  Kovachki}, \bibinfo{person}{Kamyar Azizzadenesheli},
-  \bibinfo{person}{Burigede Liu}, \bibinfo{person}{Kaushik Bhattacharya},
-  \bibinfo{person}{Andrew Stuart}, {and} \bibinfo{person}{Anima Anandkumar}.}
-  \bibinfo{year}{2020}\natexlab{a}.
-\newblock \showarticletitle{Multipole Graph Neural Operator for Parametric
-  Partial Differential Equations}.
-\newblock \bibinfo{journal}{\emph{Advances in Neural Information Processing
-  Systems}}  \bibinfo{volume}{33} (\bibinfo{year}{2020}).
+\bibfield{author}{\bibinfo{person}{Zongyi Li}, \bibinfo{person}{Nikola Kovachki}, \bibinfo{person}{Kamyar Azizzadenesheli}, \bibinfo{person}{Burigede Liu}, \bibinfo{person}{Kaushik Bhattacharya}, \bibinfo{person}{Andrew Stuart}, {and} \bibinfo{person}{Anima Anandkumar}.} \bibinfo{year}{2020}\natexlab{a}.
+\newblock \showarticletitle{Multipole Graph Neural Operator for Parametric Partial Differential Equations}.
+\newblock \bibinfo{journal}{\emph{Advances in Neural Information Processing Systems}}  \bibinfo{volume}{33} (\bibinfo{year}{2020}).
 \newblock
 
 
 \bibitem[Li et~al\mbox{.}(2020b)]%
         {li2020neural}
-\bibfield{author}{\bibinfo{person}{Zongyi Li}, \bibinfo{person}{Nikola
-  Kovachki}, \bibinfo{person}{Kamyar Azizzadenesheli},
-  \bibinfo{person}{Burigede Liu}, \bibinfo{person}{Kaushik Bhattacharya},
-  \bibinfo{person}{Andrew Stuart}, {and} \bibinfo{person}{Anima Anandkumar}.}
-  \bibinfo{year}{2020}\natexlab{b}.
-\newblock \showarticletitle{Neural Operator: Graph Kernel Network for Partial
-  Differential Equations}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2003.03485}}
-  (\bibinfo{year}{2020}).
+\bibfield{author}{\bibinfo{person}{Zongyi Li}, \bibinfo{person}{Nikola Kovachki}, \bibinfo{person}{Kamyar Azizzadenesheli}, \bibinfo{person}{Burigede Liu}, \bibinfo{person}{Kaushik Bhattacharya}, \bibinfo{person}{Andrew Stuart}, {and} \bibinfo{person}{Anima Anandkumar}.} \bibinfo{year}{2020}\natexlab{b}.
+\newblock \showarticletitle{Neural Operator: Graph Kernel Network for Partial Differential Equations}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2003.03485}} (\bibinfo{year}{2020}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2003.03485}
@@ -267,14 +203,8 @@
 
 \bibitem[Li et~al\mbox{.}(2021)]%
         {li2021fourier}
-\bibfield{author}{\bibinfo{person}{Zongyi Li}, \bibinfo{person}{Nikola
-  Kovachki}, \bibinfo{person}{Kamyar Azizzadenesheli},
-  \bibinfo{person}{Burigede Liu}, \bibinfo{person}{Kaushik Bhattacharya},
-  \bibinfo{person}{Andrew Stuart}, {and} \bibinfo{person}{Anima Anandkumar}.}
-  \bibinfo{year}{2021}\natexlab{}.
-\newblock \showarticletitle{{Fourier} Neural Operator for Parametric Partial
-  Differential Equations}. In \bibinfo{booktitle}{\emph{International
-  Conference on Learning Representations}}.
+\bibfield{author}{\bibinfo{person}{Zongyi Li}, \bibinfo{person}{Nikola Kovachki}, \bibinfo{person}{Kamyar Azizzadenesheli}, \bibinfo{person}{Burigede Liu}, \bibinfo{person}{Kaushik Bhattacharya}, \bibinfo{person}{Andrew Stuart}, {and} \bibinfo{person}{Anima Anandkumar}.} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{{Fourier} Neural Operator for Parametric Partial Differential Equations}. In \bibinfo{booktitle}{\emph{International Conference on Learning Representations}}.
 \newblock
 \urldef\tempurl%
 \url{https://openreview.net/forum?id=c8P9NQVtmnO}
@@ -284,52 +214,33 @@
 
 \bibitem[Lin and Mor{\'e}(1999)]%
         {lin1999incomplete}
-\bibfield{author}{\bibinfo{person}{Chih-Jen Lin} {and}
-  \bibinfo{person}{Jorge~J. Mor{\'e}}.} \bibinfo{year}{1999}\natexlab{}.
-\newblock \showarticletitle{Incomplete {Cholesky} Factorizations with Limited
-  Memory}.
-\newblock \bibinfo{journal}{\emph{SIAM Journal on Scientific Computing}}
-  \bibinfo{volume}{21}, \bibinfo{number}{1} (\bibinfo{year}{1999}),
-  \bibinfo{pages}{24--45}.
+\bibfield{author}{\bibinfo{person}{Chih-Jen Lin} {and} \bibinfo{person}{Jorge~J. Mor{\'e}}.} \bibinfo{year}{1999}\natexlab{}.
+\newblock \showarticletitle{Incomplete {Cholesky} Factorizations with Limited Memory}.
+\newblock \bibinfo{journal}{\emph{SIAM Journal on Scientific Computing}} \bibinfo{volume}{21}, \bibinfo{number}{1} (\bibinfo{year}{1999}), \bibinfo{pages}{24--45}.
 \newblock
 
 
 \bibitem[Liu et~al\mbox{.}(2016)]%
         {liu2016synchronization}
-\bibfield{author}{\bibinfo{person}{Lijun Liu}, \bibinfo{person}{Shengguo Li},
-  \bibinfo{person}{Xiangke Hu}, \bibinfo{person}{Yutong Wang},
-  \bibinfo{person}{Xuejun Liu}, {and} \bibinfo{person}{Jingling Xue}.}
-  \bibinfo{year}{2016}\natexlab{}.
-\newblock \showarticletitle{Exploring {Data} {Level} {Parallelism} in
-  {Incomplete} {LU} Factorization on {GPUs}}.
-\newblock \bibinfo{journal}{\emph{IEEE Transactions on Parallel and Distributed
-  Systems}} \bibinfo{volume}{27}, \bibinfo{number}{12} (\bibinfo{year}{2016}),
-  \bibinfo{pages}{3397--3410}.
+\bibfield{author}{\bibinfo{person}{Lijun Liu}, \bibinfo{person}{Shengguo Li}, \bibinfo{person}{Xiangke Hu}, \bibinfo{person}{Yutong Wang}, \bibinfo{person}{Xuejun Liu}, {and} \bibinfo{person}{Jingling Xue}.} \bibinfo{year}{2016}\natexlab{}.
+\newblock \showarticletitle{Exploring {Data} {Level} {Parallelism} in {Incomplete} {LU} Factorization on {GPUs}}.
+\newblock \bibinfo{journal}{\emph{IEEE Transactions on Parallel and Distributed Systems}} \bibinfo{volume}{27}, \bibinfo{number}{12} (\bibinfo{year}{2016}), \bibinfo{pages}{3397--3410}.
 \newblock
 
 
 \bibitem[Lu et~al\mbox{.}(2021)]%
         {lu2021learning}
-\bibfield{author}{\bibinfo{person}{Lu Lu}, \bibinfo{person}{Pengzhan Jin},
-  \bibinfo{person}{Guofei Pang}, \bibinfo{person}{Zhongqiang Zhang}, {and}
-  \bibinfo{person}{George~Em Karniadakis}.} \bibinfo{year}{2021}\natexlab{}.
-\newblock \showarticletitle{Learning Nonlinear Operators via {DeepONet} Based
-  on the Universal Approximation Theorem of Operators}.
-\newblock \bibinfo{journal}{\emph{Nature Machine Intelligence}}
-  \bibinfo{volume}{3}, \bibinfo{number}{3} (\bibinfo{year}{2021}),
-  \bibinfo{pages}{218--229}.
+\bibfield{author}{\bibinfo{person}{Lu Lu}, \bibinfo{person}{Pengzhan Jin}, \bibinfo{person}{Guofei Pang}, \bibinfo{person}{Zhongqiang Zhang}, {and} \bibinfo{person}{George~Em Karniadakis}.} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{Learning Nonlinear Operators via {DeepONet} Based on the Universal Approximation Theorem of Operators}.
+\newblock \bibinfo{journal}{\emph{Nature Machine Intelligence}} \bibinfo{volume}{3}, \bibinfo{number}{3} (\bibinfo{year}{2021}), \bibinfo{pages}{218--229}.
 \newblock
 
 
 \bibitem[Luz et~al\mbox{.}(2020)]%
         {Luz2020learning}
-\bibfield{author}{\bibinfo{person}{Ilay Luz}, \bibinfo{person}{Meirav Galun},
-  \bibinfo{person}{Haggai Maron}, \bibinfo{person}{Ronen Basri}, {and}
-  \bibinfo{person}{Irad Yavneh}.} \bibinfo{year}{2020}\natexlab{}.
-\newblock \showarticletitle{Learning Algebraic Multigrid Using Graph Neural
-  Networks}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2003.05744}}
-  (\bibinfo{year}{2020}).
+\bibfield{author}{\bibinfo{person}{Ilay Luz}, \bibinfo{person}{Meirav Galun}, \bibinfo{person}{Haggai Maron}, \bibinfo{person}{Ronen Basri}, {and} \bibinfo{person}{Irad Yavneh}.} \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Learning Algebraic Multigrid Using Graph Neural Networks}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2003.05744}} (\bibinfo{year}{2020}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2003.05744}
@@ -339,13 +250,9 @@
 
 \bibitem[Lyu et~al\mbox{.}(2026)]%
         {Lyu2026multigrid}
-\bibfield{author}{\bibinfo{person}{Kangbo Lyu}, \bibinfo{person}{Ruihong Cen},
-  \bibinfo{person}{Yushen Wu}, {and} \bibinfo{person}{Tao Du}.}
-  \bibinfo{year}{2026}\natexlab{}.
-\newblock \bibinfo{title}{A Multigrid-Inspired Neural Iterative Solver for
-  Poisson Equations on Large Voxel Grids}.
-\newblock
-  \bibinfo{howpublished}{\url{https://openreview.net/forum?id=lNcbGSWhJo}}.
+\bibfield{author}{\bibinfo{person}{Kangbo Lyu}, \bibinfo{person}{Ruihong Cen}, \bibinfo{person}{Yushen Wu}, {and} \bibinfo{person}{Tao Du}.} \bibinfo{year}{2026}\natexlab{}.
+\newblock \bibinfo{title}{A Multigrid-Inspired Neural Iterative Solver for Poisson Equations on Large Voxel Grids}.
+\newblock \bibinfo{howpublished}{\url{https://openreview.net/forum?id=lNcbGSWhJo}}.
 \newblock
 \newblock
 \shownote{OpenReview workshop/conference submission.}.
@@ -353,39 +260,26 @@
 
 \bibitem[Naumov et~al\mbox{.}(2015)]%
         {naumov2015amgx}
-\bibfield{author}{\bibinfo{person}{Maxim Naumov}, \bibinfo{person}{Michael
-  Chien}, \bibinfo{person}{Paul Vandermersch}, \bibinfo{person}{Ujval Kapasi},
-  \bibinfo{person}{Boris Catanzaro}, {and} \bibinfo{person}{Michael Garland}.}
-  \bibinfo{year}{2015}\natexlab{}.
-\newblock \showarticletitle{{cuSPARSE} Library}. In
-  \bibinfo{booktitle}{\emph{GPU Technology Conference ({GTC})}}.
+\bibfield{author}{\bibinfo{person}{Maxim Naumov}, \bibinfo{person}{Michael Chien}, \bibinfo{person}{Paul Vandermersch}, \bibinfo{person}{Ujval Kapasi}, \bibinfo{person}{Boris Catanzaro}, {and} \bibinfo{person}{Michael Garland}.} \bibinfo{year}{2015}\natexlab{}.
+\newblock \showarticletitle{{cuSPARSE} Library}. In \bibinfo{booktitle}{\emph{GPU Technology Conference ({GTC})}}.
 \newblock
 \newblock
-\shownote{NVIDIA {AMGX} / sparse linear algebra stack; widely referenced for
-  GPU AMG and sparse solvers.}.
+\shownote{NVIDIA {AMGX} / sparse linear algebra stack; widely referenced for GPU AMG and sparse solvers.}.
 
 
 \bibitem[Raissi et~al\mbox{.}(2019)]%
         {raissi2019physics}
-\bibfield{author}{\bibinfo{person}{Maziar Raissi}, \bibinfo{person}{Paris
-  Perdikaris}, {and} \bibinfo{person}{George~Em Karniadakis}.}
-  \bibinfo{year}{2019}\natexlab{}.
-\newblock \showarticletitle{Physics-Informed Neural Networks: A Deep Learning
-  Framework for Solving Forward and Inverse Problems Involving Nonlinear
-  Partial Differential Equations}.
-\newblock \bibinfo{journal}{\emph{J. Comput. Phys.}}  \bibinfo{volume}{378}
-  (\bibinfo{year}{2019}), \bibinfo{pages}{686--707}.
+\bibfield{author}{\bibinfo{person}{Maziar Raissi}, \bibinfo{person}{Paris Perdikaris}, {and} \bibinfo{person}{George~Em Karniadakis}.} \bibinfo{year}{2019}\natexlab{}.
+\newblock \showarticletitle{Physics-Informed Neural Networks: A Deep Learning Framework for Solving Forward and Inverse Problems Involving Nonlinear Partial Differential Equations}.
+\newblock \bibinfo{journal}{\emph{J. Comput. Phys.}}  \bibinfo{volume}{378} (\bibinfo{year}{2019}), \bibinfo{pages}{686--707}.
 \newblock
 
 
 \bibitem[Rudikov et~al\mbox{.}(2024)]%
         {rudikov2024neural}
-\bibfield{author}{\bibinfo{person}{Kirill Rudikov}, \bibinfo{person}{Anastasia
-  Markeeva}, \bibinfo{person}{Vasily Bulatov}, {and} \bibinfo{person}{Dmitry
-  Vetrov}.} \bibinfo{year}{2024}\natexlab{}.
+\bibfield{author}{\bibinfo{person}{Kirill Rudikov}, \bibinfo{person}{Anastasia Markeeva}, \bibinfo{person}{Vasily Bulatov}, {and} \bibinfo{person}{Dmitry Vetrov}.} \bibinfo{year}{2024}\natexlab{}.
 \newblock \showarticletitle{Neural Functional Operator for Parametric {PDEs}}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2402.01030}}
-  (\bibinfo{year}{2024}).
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2402.01030}} (\bibinfo{year}{2024}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2402.01030}
@@ -395,46 +289,33 @@
 
 \bibitem[Ruge and St{\"u}ben(1987)]%
         {ruge1987algebraic}
-\bibfield{author}{\bibinfo{person}{John~W. Ruge} {and} \bibinfo{person}{Klaus
-  St{\"u}ben}.} \bibinfo{year}{1987}\natexlab{}.
+\bibfield{author}{\bibinfo{person}{John~W. Ruge} {and} \bibinfo{person}{Klaus St{\"u}ben}.} \bibinfo{year}{1987}\natexlab{}.
 \newblock \showarticletitle{Algebraic Multigrid ({AMG})}.
-\newblock \bibinfo{journal}{\emph{Multigrid Methods}}  \bibinfo{volume}{3}
-  (\bibinfo{year}{1987}), \bibinfo{pages}{73--130}.
+\newblock \bibinfo{journal}{\emph{Multigrid Methods}}  \bibinfo{volume}{3} (\bibinfo{year}{1987}), \bibinfo{pages}{73--130}.
 \newblock
 
 
 \bibitem[Saad(1993)]%
         {saad1993flexible}
-\bibfield{author}{\bibinfo{person}{Yousef Saad}.}
-  \bibinfo{year}{1993}\natexlab{}.
-\newblock \showarticletitle{A Flexible Inner-Outer Preconditioned {GMRES}
-  Algorithm}.
-\newblock \bibinfo{journal}{\emph{SIAM Journal on Scientific Computing}}
-  \bibinfo{volume}{14}, \bibinfo{number}{2} (\bibinfo{year}{1993}),
-  \bibinfo{pages}{461--469}.
+\bibfield{author}{\bibinfo{person}{Yousef Saad}.} \bibinfo{year}{1993}\natexlab{}.
+\newblock \showarticletitle{A Flexible Inner-Outer Preconditioned {GMRES} Algorithm}.
+\newblock \bibinfo{journal}{\emph{SIAM Journal on Scientific Computing}} \bibinfo{volume}{14}, \bibinfo{number}{2} (\bibinfo{year}{1993}), \bibinfo{pages}{461--469}.
 \newblock
 
 
 \bibitem[Saad(2003)]%
         {saad2003iterative}
-\bibfield{author}{\bibinfo{person}{Yousef Saad}.}
-  \bibinfo{year}{2003}\natexlab{}.
-\newblock \bibinfo{booktitle}{\emph{Iterative Methods for Sparse Linear
-  Systems} (\bibinfo{edition}{2} ed.)}.
+\bibfield{author}{\bibinfo{person}{Yousef Saad}.} \bibinfo{year}{2003}\natexlab{}.
+\newblock \bibinfo{booktitle}{\emph{Iterative Methods for Sparse Linear Systems} (\bibinfo{edition}{2} ed.)}.
 \newblock \bibinfo{publisher}{SIAM}, \bibinfo{address}{Philadelphia, PA}.
 \newblock
 
 
 \bibitem[Sittoni et~al\mbox{.}(2026)]%
         {Sittoni2026neural}
-\bibfield{author}{\bibinfo{person}{Pietro Sittoni}, \bibinfo{person}{Emanuele
-  Zangrando}, \bibinfo{person}{Angelo~Alberto Casulli}, \bibinfo{person}{Nicola
-  Guglielmi}, {and} \bibinfo{person}{Francesco Tudisco}.}
-  \bibinfo{year}{2026}\natexlab{}.
-\newblock \showarticletitle{{Neural-HSS}: Hierarchical Semi-Separable Neural
-  {PDE} Solver}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2602.18248}}
-  (\bibinfo{year}{2026}).
+\bibfield{author}{\bibinfo{person}{Pietro Sittoni}, \bibinfo{person}{Emanuele Zangrando}, \bibinfo{person}{Angelo~Alberto Casulli}, \bibinfo{person}{Nicola Guglielmi}, {and} \bibinfo{person}{Francesco Tudisco}.} \bibinfo{year}{2026}\natexlab{}.
+\newblock \showarticletitle{{Neural-HSS}: Hierarchical Semi-Separable Neural {PDE} Solver}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2602.18248}} (\bibinfo{year}{2026}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2602.18248}
@@ -444,10 +325,8 @@
 
 \bibitem[Trifonov et~al\mbox{.}(2025)]%
         {trifonov2025gnn}
-\bibfield{author}{\bibinfo{person}{Konstantin Trifonov} {et~al\mbox{.}}}
-  \bibinfo{year}{2025}\natexlab{}.
-\newblock \showarticletitle{Graph Neural Networks for Preconditioning Linear
-  Systems}.
+\bibfield{author}{\bibinfo{person}{Konstantin Trifonov} {et~al\mbox{.}}} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Graph Neural Networks for Preconditioning Linear Systems}.
 \newblock \bibinfo{journal}{\emph{arXiv preprint}} (\bibinfo{year}{2025}).
 \newblock
 \newblock
@@ -456,12 +335,9 @@
 
 \bibitem[Trifonov and G{\"u}ttel(2024)]%
         {trifonov2024linear}
-\bibfield{author}{\bibinfo{person}{Konstantin Trifonov} {and}
-  \bibinfo{person}{Stefan G{\"u}ttel}.} \bibinfo{year}{2024}\natexlab{}.
-\newblock \showarticletitle{Linear Algebraic Preconditioning using Machine
-  Learning}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2403.11463}}
-  (\bibinfo{year}{2024}).
+\bibfield{author}{\bibinfo{person}{Konstantin Trifonov} {and} \bibinfo{person}{Stefan G{\"u}ttel}.} \bibinfo{year}{2024}\natexlab{}.
+\newblock \showarticletitle{Linear Algebraic Preconditioning using Machine Learning}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2403.11463}} (\bibinfo{year}{2024}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2403.11463}
@@ -473,28 +349,15 @@
 
 \bibitem[Vaswani et~al\mbox{.}(2017)]%
         {vaswani2017attention}
-\bibfield{author}{\bibinfo{person}{Ashish Vaswani}, \bibinfo{person}{Noam
-  Shazeer}, \bibinfo{person}{Niki Parmar}, \bibinfo{person}{Jakob Uszkoreit},
-  \bibinfo{person}{Llion Jones}, \bibinfo{person}{Aidan~N. Gomez},
-  \bibinfo{person}{{\L}ukasz Kaiser}, {and} \bibinfo{person}{Illia
-  Polosukhin}.} \bibinfo{year}{2017}\natexlab{}.
-\newblock \showarticletitle{Attention Is All You Need}. In
-  \bibinfo{booktitle}{\emph{Advances in Neural Information Processing Systems
-  30 (NIPS 2017)}}. \bibinfo{pages}{5998--6008}.
+\bibfield{author}{\bibinfo{person}{Ashish Vaswani}, \bibinfo{person}{Noam Shazeer}, \bibinfo{person}{Niki Parmar}, \bibinfo{person}{Jakob Uszkoreit}, \bibinfo{person}{Llion Jones}, \bibinfo{person}{Aidan~N. Gomez}, \bibinfo{person}{{\L}ukasz Kaiser}, {and} \bibinfo{person}{Illia Polosukhin}.} \bibinfo{year}{2017}\natexlab{}.
+\newblock \showarticletitle{Attention Is All You Need}. In \bibinfo{booktitle}{\emph{Advances in Neural Information Processing Systems 30 (NIPS 2017)}}. \bibinfo{pages}{5998--6008}.
 \newblock
 
 
 \bibitem[Wu et~al\mbox{.}(2019)]%
         {chen2020simple}
-\bibfield{author}{\bibinfo{person}{Felix Wu}, \bibinfo{person}{Amauri Souza},
-  \bibinfo{person}{Tianyi Zhang}, \bibinfo{person}{Christopher Fifty},
-  \bibinfo{person}{Tao Yu}, {and} \bibinfo{person}{Kilian Weinberger}.}
-  \bibinfo{year}{2019}\natexlab{}.
-\newblock \showarticletitle{Simplifying Graph Convolutional Networks}. In
-  \bibinfo{booktitle}{\emph{Proceedings of the 36th International Conference on
-  Machine Learning}} \emph{(\bibinfo{series}{Proceedings of Machine Learning
-  Research}, Vol.~\bibinfo{volume}{97})}. \bibinfo{publisher}{PMLR},
-  \bibinfo{pages}{6861--6871}.
+\bibfield{author}{\bibinfo{person}{Felix Wu}, \bibinfo{person}{Amauri Souza}, \bibinfo{person}{Tianyi Zhang}, \bibinfo{person}{Christopher Fifty}, \bibinfo{person}{Tao Yu}, {and} \bibinfo{person}{Kilian Weinberger}.} \bibinfo{year}{2019}\natexlab{}.
+\newblock \showarticletitle{Simplifying Graph Convolutional Networks}. In \bibinfo{booktitle}{\emph{Proceedings of the 36th International Conference on Machine Learning}} \emph{(\bibinfo{series}{Proceedings of Machine Learning Research}, Vol.~\bibinfo{volume}{97})}. \bibinfo{publisher}{PMLR}, \bibinfo{pages}{6861--6871}.
 \newblock
 \urldef\tempurl%
 \url{http://proceedings.mlr.press/v97/wu19e.html}
@@ -504,11 +367,9 @@
 
 \bibitem[Xu et~al\mbox{.}(2025)]%
         {Xu2025neural}
-\bibfield{author}{\bibinfo{person}{Tianshi Xu}, \bibinfo{person}{Rui~Peng Li},
-  {and} \bibinfo{person}{Yuanzhe Xi}.} \bibinfo{year}{2025}\natexlab{}.
+\bibfield{author}{\bibinfo{person}{Tianshi Xu}, \bibinfo{person}{Rui~Peng Li}, {and} \bibinfo{person}{Yuanzhe Xi}.} \bibinfo{year}{2025}\natexlab{}.
 \newblock \showarticletitle{Neural Approximate Inverse Preconditioners}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2510.13034}}
-  (\bibinfo{year}{2025}).
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2510.13034}} (\bibinfo{year}{2025}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2510.13034}
@@ -518,26 +379,17 @@
 
 \bibitem[Yamazaki et~al\mbox{.}(2020)]%
         {yamazaki2020performance}
-\bibfield{author}{\bibinfo{person}{Ichitaro Yamazaki},
-  \bibinfo{person}{Stanimire Tomov}, {and} \bibinfo{person}{Jack Dongarra}.}
-  \bibinfo{year}{2020}\natexlab{}.
-\newblock \showarticletitle{Mixed-Precision {Cholesky} {QR} Factorization and
-  Its Parallelization on {GPUs}}.
-\newblock \bibinfo{journal}{\emph{Parallel Comput.}}  \bibinfo{volume}{99}
-  (\bibinfo{year}{2020}), \bibinfo{pages}{102693}.
+\bibfield{author}{\bibinfo{person}{Ichitaro Yamazaki}, \bibinfo{person}{Stanimire Tomov}, {and} \bibinfo{person}{Jack Dongarra}.} \bibinfo{year}{2020}\natexlab{}.
+\newblock \showarticletitle{Mixed-Precision {Cholesky} {QR} Factorization and Its Parallelization on {GPUs}}.
+\newblock \bibinfo{journal}{\emph{Parallel Comput.}}  \bibinfo{volume}{99} (\bibinfo{year}{2020}), \bibinfo{pages}{102693}.
 \newblock
 
 
 \bibitem[Yang et~al\mbox{.}(2025)]%
         {Yang2025sparse}
-\bibfield{author}{\bibinfo{person}{Zherui Yang}, \bibinfo{person}{Zhehao Li},
-  \bibinfo{person}{Kangbo Lyu}, \bibinfo{person}{Yixuan Li},
-  \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Ligang Liu}.}
-  \bibinfo{year}{2025}\natexlab{}.
-\newblock \showarticletitle{Learning Sparse Approximate Inverse Preconditioners
-  for Conjugate Gradient Solvers on {GPUs}}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2510.27517}}
-  (\bibinfo{year}{2025}).
+\bibfield{author}{\bibinfo{person}{Zherui Yang}, \bibinfo{person}{Zhehao Li}, \bibinfo{person}{Kangbo Lyu}, \bibinfo{person}{Yixuan Li}, \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Ligang Liu}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Learning Sparse Approximate Inverse Preconditioners for Conjugate Gradient Solvers on {GPUs}}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2510.27517}} (\bibinfo{year}{2025}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2510.27517}
