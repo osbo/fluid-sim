@@ -1,14 +1,14 @@
 # Fdb version 4
-["bibtex paper"] 1778305423.44909 "paper.aux" "paper.bbl" "paper" 1778305425.80647 0
+["bibtex paper"] 1778351351.59834 "paper.aux" "paper.bbl" "paper" 1778351354.01724 0
   "./references.bib" 1778319680 14824 845dd3f5e693497961880b4dbba05126 ""
   "/usr/local/texlive/2025/texmf-dist/bibtex/bst/acmart/ACM-Reference-Format.bst" 1735764768 90749 48abc1cbed6fafc6fc31528e3aa606ca ""
-  "paper.aux" 1778305425.43359 18332 eb4f02902e9ec902e82476bd7cf5da59 "pdflatex"
+  "paper.aux" 1778351353.65046 19137 d9e4ad02cece1d707be48009a729bcc3 "pdflatex"
   (generated)
   "paper.bbl"
   "paper.blg"
   (rewritten before read)
-["pdflatex"] 1778305423.55271 "/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/paper.tex" "paper.pdf" "paper" 1778305425.80662 0
-  "/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/paper.tex" 1778319680 57638 f44c1163fa08ae326556febac063317c ""
+["pdflatex"] 1778351351.70485 "/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/paper.tex" "paper.pdf" "paper" 1778351354.01739 0
+  "/Users/carlosborne/Documents/MIT/UROP/Fluid Sim/Paper/paper.tex" 1778351348.80801 59690 9e993aa0cf3b26e6c2209c80811f48da ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/inconsolata/i4-t1-4.enc" 1558214095 7693 0f2dce6d313c82989ec3a67fc24df2a0 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/libertine/lbtn_25tcsq.enc" 1490131464 2921 8ca0eb0831f9bc5da080d3697cfe67bf ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/libertine/lbtn_76gpa5.enc" 1490131464 2933 9ad527ce78d7c5fa0a642dead095f172 ""
@@ -255,10 +255,10 @@
   "figures/hmatrixgraphic.png" 1777694024.8069 1505892 ba372809ce0ec18a359a9f1c110fea6d ""
   "figures/scale_methods.png" 1778297866.89485 380523 40db9a08f961b5ff3cbdec9bbd2d6fbe ""
   "figures/training.png" 1778289592.93426 286862 94d3003821fa11c94b34e9d125dfa6af ""
-  "paper.aux" 1778305425.43359 18332 eb4f02902e9ec902e82476bd7cf5da59 "pdflatex"
-  "paper.bbl" 1778305423.54986 20540 b499289f6b4b4589327ee2e9f4077960 "bibtex paper"
-  "paper.out" 1778305425.4348 4147 2f600eb4a2ff4be7911bcf414d49db06 "pdflatex"
-  "paper.tex" 1778319680 57638 f44c1163fa08ae326556febac063317c ""
+  "paper.aux" 1778351353.65046 19137 d9e4ad02cece1d707be48009a729bcc3 "pdflatex"
+  "paper.bbl" 1778351351.7017 20540 b499289f6b4b4589327ee2e9f4077960 "bibtex paper"
+  "paper.out" 1778351353.65204 4147 5c0e72dc55f65157dafbed5dda01d239 "pdflatex"
+  "paper.tex" 1778351348.80801 59690 9e993aa0cf3b26e6c2209c80811f48da ""
   (generated)
   "paper.aux"
   "paper.log"

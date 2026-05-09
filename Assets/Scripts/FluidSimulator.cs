@@ -521,7 +521,7 @@ public partial class FluidSimulator : MonoBehaviour
         // Auto-find recorder if not assigned
         if (recorder == null)
         {
-            recorder = FindFirstObjectByType<TrainingDataRecorder>();
+            recorder = FindAnyObjectByType<TrainingDataRecorder>();
             if (recorder == null)
             {
                 Debug.LogWarning("TrainingDataRecorder is not assigned and not found in scene. No training data will be recorded.");

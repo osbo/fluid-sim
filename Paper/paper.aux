@@ -108,29 +108,25 @@
 \@writefile{toc}{\contentsline {paragraph}{Headline result.}{6}{section*.25}\protected@file@percent }
 \citation{Yang2025sparse}
 \citation{Yang2025sparse}
-\citation{Yang2025sparse}
-\citation{Yang2025sparse}
-\citation{saad1993flexible}
 \@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Per-frame mean$\pm $std end-to-end PCG time (ms) on \textsf  {multiphase\_v2} ($20$ frames per scale, $\mathrm  {rtol}\!=\!10^{-8}$). ``$\dagger $''\nonbreakingspace =\nonbreakingspace CUDA Graph not supported. Best per scale in \textbf  {bold}. Iteration counts in Appendix\nonbreakingspace \ref {app:full_perf_table}.}}{7}{table.caption.24}\protected@file@percent }
 \newlabel{tab:main:perf}{{2}{7}{Per-frame mean$\pm $std end-to-end PCG time (ms) on \textsf {multiphase\_v2} ($20$ frames per scale, $\mathrm {rtol}\!=\!10^{-8}$). ``$\dagger $''~=~CUDA Graph not supported. Best per scale in \textbf {bold}. Iteration counts in Appendix~\ref {app:full_perf_table}}{table.caption.24}{}}
 \@writefile{toc}{\contentsline {paragraph}{Variance.}{7}{section*.26}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.4}Training Dynamics}{7}{subsection.7.4}\protected@file@percent }
 \newlabel{sec:results:training}{{7.4}{7}{Training Dynamics}{subsection.7.4}{}}
-\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Architecture and loss ablations at $N\!=\!4\,096$ ($\mathrm  {rtol}\!=\!10^{-8}$, $20$ frames). \emph  {Total} = inference $+$ PCG (ms). Numbers to be filled with the final sweep; expected signs reported in the body text.}}{7}{table.caption.28}\protected@file@percent }
-\newlabel{tab:ablation}{{3}{7}{Architecture and loss ablations at $N\!=\!4\,096$ ($\mathrm {rtol}\!=\!10^{-8}$, $20$ frames). \emph {Total} = inference $+$ PCG (ms). Numbers to be filled with the final sweep; expected signs reported in the body text}{table.caption.28}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Hyperparameter ablations on \textsf  {multiphase\_v2} ($\mathrm  {rtol}\!=\!10^{-8}$, $20$\nonbreakingspace frames per scale, neural preconditioner only). \emph  {Train}\nonbreakingspace =\nonbreakingspace wall-clock time to convergence (min); \emph  {Infer.}\nonbreakingspace =\nonbreakingspace preconditioner forward pass (ms); \emph  {Iters}\nonbreakingspace =\nonbreakingspace mean PCG iterations; \emph  {Total}\nonbreakingspace =\nonbreakingspace inference $+$ PCG solve (ms); $\Delta $ solve time\nonbreakingspace =\nonbreakingspace fractional change in Total vs.\ the ``---'' row.}}{7}{table.caption.28}\protected@file@percent }
+\newlabel{tab:ablation}{{3}{7}{Hyperparameter ablations on \textsf {multiphase\_v2} ($\mathrm {rtol}\!=\!10^{-8}$, $20$~frames per scale, neural preconditioner only). \emph {Train}~=~wall-clock time to convergence (min); \emph {Infer.}~=~preconditioner forward pass (ms); \emph {Iters}~=~mean PCG iterations; \emph {Total}~=~inference $+$ PCG solve (ms); $\Delta $ solve time~=~fractional change in Total vs.\ the ``---'' row}{table.caption.28}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {7.5}Ablations}{7}{subsection.7.5}\protected@file@percent }
 \newlabel{sec:ablation}{{7.5}{7}{Ablations}{subsection.7.5}{}}
 \@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.1}Architecture}{7}{subsubsection.7.5.1}\protected@file@percent }
-\newlabel{sec:ablation:loss}{{7.5.2}{7}{Loss}{subsubsection.7.5.2}{}}
-\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.2}Loss}{7}{subsubsection.7.5.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Generalization, Precision, and Hardware Efficiency}{7}{subsection.7.6}\protected@file@percent }
-\newlabel{sec:results:generalization}{{7.6}{7}{Generalization, Precision, and Hardware Efficiency}{subsection.7.6}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Limitations and Future Work}{7}{section.8}\protected@file@percent }
-\newlabel{sec:limitations}{{8}{7}{Limitations and Future Work}{section.8}{}}
+\@writefile{toc}{\contentsline {paragraph}{Width.}{7}{section*.29}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Depth.}{7}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Highways.}{7}{section*.31}\protected@file@percent }
 \@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces End-to-end PCG solve time on the \textsf  {multiphase\_v2} benchmark across five problem sizes, $20$ frames per scale (mean $\pm 1\sigma $ band; relative residual tolerance $10^{-8}$). Dashed grey lines mark the $24$\,fps and $60$\,fps interactive budgets. Our method is the only entry that fits within $60$\,fps for $N\!\le \!4{,}096$ and within $24$\,fps for the entire range up to $N\!=\!16{,}384$; AMGX classical AMG and GPU IC-class (\textsc  {multicolor\_dilu}) lie above $40$\,ms across all scales despite much lower iteration counts, because their per-iteration cost is dominated by unparallelizable triangular solves or V-cycle level synchronization.}}{8}{figure.caption.23}\protected@file@percent }
 \newlabel{fig:scale_methods}{{3}{8}{End-to-end PCG solve time on the \textsf {multiphase\_v2} benchmark across five problem sizes, $20$ frames per scale (mean $\pm 1\sigma $ band; relative residual tolerance $10^{-8}$). Dashed grey lines mark the $24$\,fps and $60$\,fps interactive budgets. Our method is the only entry that fits within $60$\,fps for $N\!\le \!4{,}096$ and within $24$\,fps for the entire range up to $N\!=\!16{,}384$; AMGX classical AMG and GPU IC-class (\textsc {multicolor\_dilu}) lie above $40$\,ms across all scales despite much lower iteration counts, because their per-iteration cost is dominated by unparallelizable triangular solves or V-cycle level synchronization}{figure.caption.23}{}}
 \@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Training profile of the configuration used in Table\nonbreakingspace \ref {tab:main:perf} ($N\!=\!8\,192$, $d\!=\!128$, $n_l\!=\!3$, highways). Blue: $\mathcal  {L}_{\cos }$ on the training set (mean $\pm 1\sigma $, last 100 steps). Green dashed: SAI loss\nonbreakingspace \citep  {Yang2025sparse} computed on a held-out validation frame at the same checkpoints (\emph  {not} used for training). Orange: PCG iteration count to $\mathrm  {rtol}\!=\!10^{-8}$ on that frame, log scale. Top axis: wall-clock minutes. Horizontal grey lines: unpreconditioned CG and Jacobi GPU baselines.}}{8}{figure.caption.27}\protected@file@percent }
 \newlabel{fig:training:dynamics}{{4}{8}{Training profile of the configuration used in Table~\ref {tab:main:perf} ($N\!=\!8\,192$, $d\!=\!128$, $n_l\!=\!3$, highways). Blue: $\mathcal {L}_{\cos }$ on the training set (mean $\pm 1\sigma $, last 100 steps). Green dashed: SAI loss~\cite {Yang2025sparse} computed on a held-out validation frame at the same checkpoints (\emph {not} used for training). Orange: PCG iteration count to $\mathrm {rtol}\!=\!10^{-8}$ on that frame, log scale. Top axis: wall-clock minutes. Horizontal grey lines: unpreconditioned CG and Jacobi GPU baselines}{figure.caption.27}{}}
+\citation{Yang2025sparse}
+\citation{saad1993flexible}
 \bibstyle{ACM-Reference-Format}
 \bibdata{references}
 \bibcite{benzi1996sparse}{{1}{1996}{{Benzi et~al\mbox  {.}}}{{}}}
@@ -159,6 +155,13 @@
 \bibcite{raissi2019physics}{{24}{2019}{{Raissi et~al\mbox  {.}}}{{}}}
 \bibcite{rudikov2024neural}{{25}{2024}{{Rudikov et~al\mbox  {.}}}{{}}}
 \bibcite{ruge1987algebraic}{{26}{1987}{{Ruge and St{\"u}ben}}{{}}}
+\newlabel{sec:ablation:loss}{{7.5.2}{9}{Loss}{subsubsection.7.5.2}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {7.5.2}Loss}{9}{subsubsection.7.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.6}Generalization, Precision, and Hardware Efficiency}{9}{subsection.7.6}\protected@file@percent }
+\newlabel{sec:results:generalization}{{7.6}{9}{Generalization, Precision, and Hardware Efficiency}{subsection.7.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Limitations and Future Work}{9}{section.8}\protected@file@percent }
+\newlabel{sec:limitations}{{8}{9}{Limitations and Future Work}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{References}{9}{section*.34}\protected@file@percent }
 \bibcite{saad1993flexible}{{27}{1993}{{Saad}}{{}}}
 \bibcite{saad2003iterative}{{28}{2003}{{Saad}}{{}}}
 \bibcite{Sittoni2026neural}{{29}{2026}{{Sittoni et~al\mbox  {.}}}{{}}}
@@ -174,8 +177,7 @@
 \newlabel{tocindent1}{4.185pt}
 \newlabel{tocindent2}{10.34999pt}
 \newlabel{tocindent3}{18.198pt}
-\newlabel{tocindent4}{0pt}
+\newlabel{tocindent4}{18.198pt}
 \newlabel{tocindent5}{0pt}
-\@writefile{toc}{\contentsline {section}{References}{9}{section*.31}\protected@file@percent }
-\newlabel{TotPages}{{9}{9}{}{page.9}{}}
-\gdef \@abspage@last{9}
+\newlabel{TotPages}{{10}{10}{}{page.10}{}}
+\gdef \@abspage@last{10}

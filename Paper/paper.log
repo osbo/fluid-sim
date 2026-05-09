@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.3.8)  9 MAY 2026 01:43
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.3.8)  9 MAY 2026 14:29
 entering extended mode
  restricted \write18 enabled.
  file:line:error style messages enabled.
@@ -1136,10 +1136,11 @@ Class acmart Warning: A possible image without description on input line 802.
 
 
 LaTeX Font Info:    Font shape `T1/LinuxBiolinumT-TLF/m/it' will be
-(Font)              scaled to size 9.0pt on input line 860.
+(Font)              scaled to size 9.0pt on input line 869.
 
 
 [7.7] [8.8{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/libertine/lbtn_omcwp2.enc} <./figures/scale_methods.png> <./figures/training.png>] (./paper.bbl
+
 LaTeX Info: Redefining \tempurl on input line 86.
 LaTeX Info: Redefining \tempurl on input line 98.
 LaTeX Info: Redefining \tempurl on input line 130.
@@ -1147,13 +1148,14 @@ LaTeX Info: Redefining \tempurl on input line 142.
 LaTeX Info: Redefining \tempurl on input line 177.
 LaTeX Info: Redefining \tempurl on input line 199.
 LaTeX Info: Redefining \tempurl on input line 210.
-
-Underfull \vbox (badness 3668) has occurred while \output is active []
-
-
-
 LaTeX Info: Redefining \tempurl on input line 246.
 LaTeX Info: Redefining \tempurl on input line 285.
+
+Underfull \vbox (badness 10000) has occurred while \output is active []
+
+
+
+[9.9]
 LaTeX Info: Redefining \tempurl on input line 321.
 LaTeX Info: Redefining \tempurl on input line 343.
 LaTeX Info: Redefining \tempurl on input line 363.
@@ -1164,19 +1166,17 @@ LaTeX Info: Redefining \tempurl on input line 395.
 Class acmart Warning: Some images may lack descriptions.
 
 
-Class acmart Warning: \vspace should only be used to provide space above/below surrounding objects on input line 934.
+Class acmart Warning: \vspace should only be used to provide space above/below surrounding objects on input line 967.
 
 
 
 
-Package balance Warning: You have called \balance in second column
-(balance)                Columns might not be balanced.
 
 (/usr/local/texlive/2025/texmf-dist/tex/generic/stringenc/se-pdfdoc.def
 File: se-pdfdoc.def 2019/11/29 v1.12 stringenc: PDFDocEncoding
 ) (/usr/local/texlive/2025/texmf-dist/tex/generic/stringenc/se-utf8.def
 File: se-utf8.def 2019/11/29 v1.12 stringenc: UTF-8
-) [9.9] (./paper.aux)
+) [10.10] (./paper.aux)
  ***********
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
@@ -1186,21 +1186,21 @@ L3 programming layer <2025-01-18>
 LaTeX Warning: There were undefined references.
 
 Package rerunfilecheck Info: File `paper.out' has not changed.
-(rerunfilecheck)             Checksum: 2F600EB4A2FF4BE7911BCF414D49DB06;4147.
+(rerunfilecheck)             Checksum: 5C0E72DC55F65157DAFBED5DDA01D239;4147.
  ) 
 Here is how much of TeX's memory you used:
- 22061 strings out of 473190
- 363134 string characters out of 5715801
- 848658 words of memory out of 5000000
+ 22068 strings out of 473190
+ 363255 string characters out of 5715801
+ 844052 words of memory out of 5000000
  43811 multiletter control sequences out of 15000+600000
- 829220 words of font info for 692 fonts, out of 8000000 for 9000
+ 829368 words of font info for 694 fonts, out of 8000000 for 9000
  1302 hyphenation exceptions out of 8191
- 90i,17n,131p,1058b,632s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 90i,17n,131p,1058b,845s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/local/texlive/2025/texmf-dist/fonts/type1/public/inconsolata/Inconsolata-zi4r.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/LibertineMathBMI.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/LibertineMathMI.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/LibertineMathMI5.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/LibertineMathMI7.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/LibertineMathRM.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/libertine/LinBiolinumT.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/libertine/LinBiolinumTB.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/libertine/LinBiolinumTI.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/libertine/LinLibertineT.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/libertine/LinLibertineTB.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/libertine/LinLibertineTI.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/libertine/LinLibertineTZ.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/NewTXMI.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/NewTXMI7.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/txexs.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/txmiaX.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/txsym.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/newtx/txsys.pfb>
-Output written on paper.pdf (9 pages, 3151982 bytes).
+Output written on paper.pdf (10 pages, 3155737 bytes).
 PDF statistics:
- 551 PDF objects out of 1000 (max. 8388607)
- 477 compressed objects within 5 object streams
- 111 named destinations out of 1000 (max. 500000)
+ 560 PDF objects out of 1000 (max. 8388607)
+ 485 compressed objects within 5 object streams
+ 115 named destinations out of 1000 (max. 500000)
  154349 words of extra memory for PDF output out of 184870 (max. 10000000)
 
