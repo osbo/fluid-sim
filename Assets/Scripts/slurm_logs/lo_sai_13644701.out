@@ -1,0 +1,30 @@
+================================================================
+Job 13644701 on node4100
+Started: Sat May  9 14:29:56 EDT 2026
+================================================================
+Using device: cuda
+  [startup] Random sample of 100 frames (--num-frames 100)
+  [startup] Loaded 100 training contexts from disk cache (24576.03 ms) → .leafonly_training_context_cache/
+  [startup] global_max_edges = 40596
+  [startup] contexts_per_step = 4 (gradient accumulation)
+  [startup] Ablation config: layers=3, gcn_layers=2, jacobi=True (node_scalar), attention_layout=128x129, off_diag_dense_attn=True, diag_dense_attn=True, use_highways=True
+  [startup] torch.compile(model): enabled (CUDA)
+  [startup] LR scheduler: ReduceLROnPlateau (factor=0.5, patience=5, threshold=5e-3, min_lr=1.00e-06, auto-stop (patience=10, threshold=5e-3 at min_lr))
+  Block preconditioner: 64 leaves, diag 128×128, off 32×32 (128 nodes/leaf)
+  Probe vectors (loss MC columns): auto max(64, ⌈√n_pad⌉) per step (override with --probe-vectors K)
+  Probe MAZ path: --leafonly-pcg=matrix_free (A@Z: sparse block-diagonal A@Z (all devices; dense bmm only if context cache has use_dense_A); apply_block_diagonal_M torch.compile (matrix_free))
+  Loss mode: sai (mean_k ||A M^{-1} w_k / ||A|| - w_k||^2; --loss-mode sai)
+
+=== Startup timing (wall clock, ms) ===
+  Dataset + run folder scan:         125.82
+  Load training contexts (disk→device):   24576.03 ms  (100 contexts)
+  LeafOnlyNet + .to(device):          22.11
+  torch.compile(model) call:        2041.03  (CUDA; Inductor runs on 1st forward/backward)
+  load_leaf_only_weights:         skipped
+  AdamW + ReduceLROnPlateau:           0.37
+  ---
+  Total before training loop:      26781.57
+  Note: First loss line’s (elapsed) is wall time for that step only (after startup); with torch.compile, the first forward+backward triggers Inductor codegen (often ~10–20s).
+  At step 299, a one-time detailed breakdown (zero_grad / forward / apply M / backward / …) is printed.
+
+  [track] Training profile CSV: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/weights/v2_8192_d128_L3_hw_sai_training_profile.csv

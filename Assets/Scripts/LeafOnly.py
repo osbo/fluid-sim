@@ -217,10 +217,11 @@ def _build_parser():
     parser.add_argument(
         "--loss-mode",
         type=str,
-        choices=("hutchinson",),
+        choices=("hutchinson", "sai"),
         default="hutchinson",
         help=(
-            "Training loss. Only hutchinson is supported: cosine-similarity Hutchinson probe loss."
+            "Training loss. hutchinson (default): cosine-similarity Hutchinson probe, 1 - cos(M A Z, Z). "
+            "sai: Sparse Approximate Inverse loss, mean_k ||A M^{-1} w_k / ||A|| - w_k||^2."
         ),
     )
     parser.add_argument(
