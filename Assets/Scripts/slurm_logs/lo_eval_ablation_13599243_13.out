@@ -1,0 +1,34 @@
+================================================================
+Job 13599243, task 13 on node3000
+Started: Fri May  8 21:02:22 EDT 2026
+================================================================
+Task 13: v2_8192_d128_L1_hw → /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/ablation_sweep_task_013.csv
+
+[1/1] v2_8192_d128_L1_hw  (scale=8192)
+  Frames: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  [1/20] frame 0  → LeafOnly 582 iters  inf=1.37 ms  solve=49.48 ms
+  [2/20] frame 1  → LeafOnly 282 iters  inf=1.28 ms  solve=23.55 ms
+  [3/20] frame 2  → LeafOnly 411 iters  inf=1.34 ms  solve=34.77 ms
+  [4/20] frame 3  → LeafOnly 309 iters  inf=1.36 ms  solve=26.28 ms
+  [5/20] frame 4  → LeafOnly 390 iters  inf=1.34 ms  solve=33.07 ms
+  [6/20] frame 5  → LeafOnly 489 iters  inf=1.31 ms  solve=41.42 ms
+  [7/20] frame 6  → LeafOnly 303 iters  inf=1.33 ms  solve=25.61 ms
+  [8/20] frame 7  → LeafOnly 1269 iters  inf=1.30 ms  solve=107.42 ms
+  [9/20] frame 8  → LeafOnly 306 iters  inf=1.29 ms  solve=25.91 ms
+  [10/20] frame 9  → LeafOnly 300 iters  inf=1.32 ms  solve=25.37 ms
+  [11/20] frame 10  → LeafOnly 402 iters  inf=1.28 ms  solve=33.69 ms
+  [12/20] frame 11  → LeafOnly 567 iters  inf=1.31 ms  solve=48.18 ms
+  [13/20] frame 12  → LeafOnly 276 iters  inf=1.33 ms  solve=23.49 ms
+  [14/20] frame 13  → LeafOnly 318 iters  inf=1.28 ms  solve=26.63 ms
+  [15/20] frame 14  → LeafOnly 312 iters  inf=1.35 ms  solve=26.45 ms
+  [16/20] frame 15  → LeafOnly 462 iters  inf=1.35 ms  solve=38.99 ms
+  [17/20] frame 16  → LeafOnly 270 iters  inf=1.39 ms  solve=22.91 ms
+  [18/20] frame 17  → LeafOnly 357 iters  inf=1.31 ms  solve=30.26 ms
+  [19/20] frame 18  → LeafOnly 345 iters  inf=1.34 ms  solve=29.16 ms
+  [20/20] frame 19  → LeafOnly 462 iters  inf=1.31 ms  solve=39.20 ms
+  → Avg LeafOnly: 420.6000 iters (±220.7152), total=36.9155 ms (±18.7049 ms) over 20 frames
+
+Results written to: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/ablation_sweep_task_013.csv
+================================================================
+Finished: Fri May  8 21:10:54 EDT 2026
+================================================================

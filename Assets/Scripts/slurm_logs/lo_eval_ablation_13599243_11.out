@@ -1,0 +1,34 @@
+================================================================
+Job 13599243, task 11 on node3300
+Started: Fri May  8 20:54:24 EDT 2026
+================================================================
+Task 11: v2_2048_d128_L1_hw → /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/ablation_sweep_task_011.csv
+
+[1/1] v2_2048_d128_L1_hw  (scale=2048)
+  Frames: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+  [1/20] frame 0  → LeafOnly 159 iters  inf=1.02 ms  solve=12.63 ms
+  [2/20] frame 1  → LeafOnly 96 iters  inf=1.11 ms  solve=7.42 ms
+  [3/20] frame 2  → LeafOnly 99 iters  inf=1.02 ms  solve=7.65 ms
+  [4/20] frame 3  → LeafOnly 120 iters  inf=1.13 ms  solve=9.46 ms
+  [5/20] frame 4  → LeafOnly 105 iters  inf=1.36 ms  solve=8.24 ms
+  [6/20] frame 5  → LeafOnly 114 iters  inf=1.02 ms  solve=8.87 ms
+  [7/20] frame 6  → LeafOnly 117 iters  inf=1.05 ms  solve=9.03 ms
+  [8/20] frame 7  → LeafOnly 471 iters  inf=1.04 ms  solve=36.67 ms
+  [9/20] frame 8  → LeafOnly 111 iters  inf=1.11 ms  solve=8.59 ms
+  [10/20] frame 9  → LeafOnly 138 iters  inf=1.16 ms  solve=10.67 ms
+  [11/20] frame 10  → LeafOnly 126 iters  inf=1.02 ms  solve=9.83 ms
+  [12/20] frame 11  → LeafOnly 111 iters  inf=1.04 ms  solve=8.56 ms
+  [13/20] frame 12  → LeafOnly 90 iters  inf=1.03 ms  solve=6.99 ms
+  [14/20] frame 13  → LeafOnly 50000 iters  inf=1.11 ms  solve=3854.68 ms
+  [15/20] frame 14  → LeafOnly 156 iters  inf=1.03 ms  solve=12.20 ms
+  [16/20] frame 15  → LeafOnly 111 iters  inf=1.08 ms  solve=8.60 ms
+  [17/20] frame 16  → LeafOnly 96 iters  inf=1.04 ms  solve=7.53 ms
+  [18/20] frame 17  → LeafOnly 138 iters  inf=1.03 ms  solve=10.78 ms
+  [19/20] frame 18  → LeafOnly 117 iters  inf=1.10 ms  solve=9.20 ms
+  [20/20] frame 19  → LeafOnly 111 iters  inf=1.07 ms  solve=8.57 ms
+  → Avg LeafOnly: 2629.3000 iters (±11150.2005), total=203.8875 ms (±859.5918 ms) over 20 frames
+
+Results written to: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/ablation_sweep_task_011.csv
+================================================================
+Finished: Fri May  8 20:59:12 EDT 2026
+================================================================
