@@ -12,70 +12,88 @@ Reallocated global_strs (elt_size=200001) to 20 items from 10.
 Reallocated glb_str_end (elt_size=4) to 20 items from 10.
 Reallocated singl_function (elt_size=4) to 100 items from 50.
 Reallocated wiz_functions (elt_size=4) to 9000 items from 6000.
+Warning--empty address in borm2003introduction
 Warning--no number and no volume in chen2024gnp
 Warning--page numbers missing in both pages and numpages fields in chen2024gnp
+Warning--no number and no volume in Fan2019multiscale
+Warning--page numbers missing in both pages and numpages fields in Fan2019multiscale
+Warning--no number and no volume in Fognini2025neural
+Warning--page numbers missing in both pages and numpages fields in Fognini2025neural
 Warning--empty address in hackbusch2002adaptive
+Warning--no number and no volume in Hartland2023hodlr
+Warning--page numbers missing in both pages and numpages fields in Hartland2023hodlr
 Warning--no number and no volume in hausner2023neural
 Warning--page numbers missing in both pages and numpages fields in hausner2023neural
-Warning--no number and no volume in li2023learning
-Warning--page numbers missing in both pages and numpages fields in li2023learning
+Warning--empty publisher in kipf2017semi
+Warning--empty address in kipf2017semi
+Warning--page numbers missing in both pages and numpages fields in kipf2017semi
+Warning--no number and no volume in Li2023learning
+Warning--page numbers missing in both pages and numpages fields in Li2023learning
 Warning--page numbers missing in both pages and numpages fields in li2020multipole
 Warning--no number and no volume in li2020neural
 Warning--page numbers missing in both pages and numpages fields in li2020neural
 Warning--empty publisher in li2021fourier
 Warning--empty address in li2021fourier
 Warning--page numbers missing in both pages and numpages fields in li2021fourier
+Warning--no number and no volume in Luz2020learning
+Warning--page numbers missing in both pages and numpages fields in Luz2020learning
 Warning--empty publisher in naumov2015amgx
 Warning--empty address in naumov2015amgx
 Warning--page numbers missing in both pages and numpages fields in naumov2015amgx
 Warning--no number and no volume in rudikov2024neural
 Warning--page numbers missing in both pages and numpages fields in rudikov2024neural
+Warning--no number and no volume in Sittoni2026neural
+Warning--page numbers missing in both pages and numpages fields in Sittoni2026neural
 Warning--no number and no volume in trifonov2025gnn
 Warning--page numbers missing in both pages and numpages fields in trifonov2025gnn
 Warning--no number and no volume in trifonov2024linear
 Warning--page numbers missing in both pages and numpages fields in trifonov2024linear
+Warning--empty publisher in vaswani2017attention
+Warning--empty address in vaswani2017attention
 Warning--empty address in chen2020simple
-Warning--no number and no volume in yang2025sparse
-Warning--page numbers missing in both pages and numpages fields in yang2025sparse
-You've used 26 entries,
+Warning--no number and no volume in Xu2025neural
+Warning--page numbers missing in both pages and numpages fields in Xu2025neural
+Warning--no number and no volume in Yang2025sparse
+Warning--page numbers missing in both pages and numpages fields in Yang2025sparse
+You've used 36 entries,
             6056 wiz_defined-function locations,
-            1634 strings with 23089 characters,
-and the built_in function-call counts, 29317 in all, are:
-= -- 4179
-> -- 959
+            1692 strings with 25544 characters,
+and the built_in function-call counts, 39630 in all, are:
+= -- 5518
+> -- 1373
 < -- 0
-+ -- 332
-- -- 343
-* -- 2074
-:= -- 2779
-add.period$ -- 138
-call.type$ -- 26
-change.case$ -- 193
-chr.to.int$ -- 25
-cite$ -- 51
-duplicate$ -- 2441
-empty$ -- 1744
-format.name$ -- 422
-if$ -- 7425
++ -- 475
+- -- 472
+* -- 2876
+:= -- 3796
+add.period$ -- 191
+call.type$ -- 36
+change.case$ -- 277
+chr.to.int$ -- 35
+cite$ -- 79
+duplicate$ -- 3292
+empty$ -- 2357
+format.name$ -- 591
+if$ -- 9977
 int.to.chr$ -- 3
 int.to.str$ -- 1
-missing$ -- 101
-newline$ -- 295
-num.names$ -- 181
-pop$ -- 984
+missing$ -- 135
+newline$ -- 400
+num.names$ -- 251
+pop$ -- 1388
 preamble$ -- 1
-purify$ -- 398
+purify$ -- 561
 quote$ -- 0
-skip$ -- 809
+skip$ -- 1079
 stack$ -- 0
-substring$ -- 1985
-swap$ -- 218
+substring$ -- 2533
+swap$ -- 267
 text.length$ -- 0
 text.prefix$ -- 0
 top$ -- 0
-type$ -- 452
-warning$ -- 25
-while$ -- 160
+type$ -- 652
+warning$ -- 43
+while$ -- 190
 width$ -- 0
-write$ -- 573
-(There were 25 warnings)
+write$ -- 781
+(There were 43 warnings)
