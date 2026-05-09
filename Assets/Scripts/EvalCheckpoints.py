@@ -96,6 +96,8 @@ def main():
     )
     from leafonly.checkpoint import leaf_only_arch_from_checkpoint, load_leaf_only_weights
     from leafonly.config import (
+        HUTCHINSON_PROBE_JACOBI_OMEGA,
+        HUTCHINSON_PROBE_JACOBI_STEPS,
         LEAF_APPLY_SIZE,
         LEAF_APPLY_SIZE_OFF,
         LEAF_SIZE,
@@ -166,6 +168,18 @@ def main():
         default=True,
         help="Must match the --use-highways flag used during training.",
     )
+    parser.add_argument(
+        "--loss-mode",
+        type=str,
+        choices=("sai", "cosine_hutchinson"),
+        default="sai",
+        help=(
+            "Which loss to evaluate at each checkpoint. "
+            "sai (default): SAI loss, mean_k ||A M^{-1} w_k / ||A|| - w_k||^2. "
+            "cosine_hutchinson: cosine-Hutchinson loss, 1 - cos(M A Z, Z) with Jacobi-smoothed probes. "
+            "Use cosine_hutchinson when evaluating checkpoints from a model trained with --loss-mode sai."
+        ),
+    )
     args = parser.parse_args()
 
     csv_path = Path(args.csv).expanduser().resolve()
@@ -206,7 +220,8 @@ def main():
         old_fieldnames = list(reader.fieldnames or [])
         rows = list(reader)
 
-    new_cols = ["pcg_iters", "sai_loss"]
+    _eval_loss_col = "cos_hutch_loss" if args.loss_mode == "cosine_hutchinson" else "sai_loss"
+    new_cols = ["pcg_iters", _eval_loss_col]
     fieldnames = old_fieldnames + [c for c in new_cols if c not in old_fieldnames]
 
     # --- Dataset ---
@@ -309,6 +324,16 @@ def main():
     col_norms = W_sai.norm(dim=1, keepdim=True).clamp(min=1e-12)
     W_sai = W_sai / col_norms  # shape (1, viz_n, K)
     W_sai_sq = W_sai.squeeze(0)  # (viz_n, K)
+
+    # --- Fixed cosine-Hutchinson probe vectors (seeded; used when --loss-mode cosine_hutchinson) ---
+    # Jacobi smoothing applied once here (fixed A, fixed seed) so probes are consistent across checkpoints.
+    torch.manual_seed(888)
+    Z_hutch = torch.randn(1, viz_n, args.num_probes, device=device, dtype=torch.float32)
+    with torch.no_grad():
+        for _ in range(int(HUTCHINSON_PROBE_JACOBI_STEPS)):
+            AZ_s = A_sparse_f32 @ Z_hutch.squeeze(0)  # (viz_n, K)
+            Z_hutch -= float(HUTCHINSON_PROBE_JACOBI_OMEGA) * jacobi_s_phys.unsqueeze(-1) * AZ_s.unsqueeze(0)
+    Z_hutch_sq = Z_hutch.squeeze(0)  # (viz_n, K)
 
     # --- Workspaces (reused across checkpoints) ---
     pcg_ws = block_diagonal_m_apply_workspace(
@@ -430,25 +455,47 @@ def main():
                         break
             print(f"  PCG iters: {iters}")
 
-            # ---- SAI loss: mean_k ||(A/||A||_F) M^{-1} w_k - w_k||_2^2 ----
-            Z_sai = torch.empty_like(W_sai)
-            apply_block_diagonal_m_into(
-                precond_s,
-                W_sai,
-                Z_sai,
-                jacobi_s_phys,
-                sai_ws,
-                leaf_size=leaf_L,
-                leaf_apply_size=leaf_apply_diag_L,
-                leaf_apply_off=leaf_apply_off_L,
-            )
-            Z_sq = Z_sai.squeeze(0)  # (viz_n, K)
-            AZ = A_sparse_f32 @ Z_sq     # (viz_n, K)
-            diff = AZ / a_norm - W_sai_sq  # (viz_n, K)
-            sai_loss = float((diff * diff).sum(dim=0).mean().item())
-            print(f"  SAI loss:  {sai_loss:.6f}")
+            # ---- eval loss ----
+            if args.loss_mode == "cosine_hutchinson":
+                # Cosine-Hutchinson loss: 1 - cos_sim(M A Z, Z) with pre-smoothed fixed probes.
+                AZ_hutch = A_sparse_f32 @ Z_hutch_sq          # (viz_n, K)
+                AZ_for_m = AZ_hutch.unsqueeze(0)               # (1, viz_n, K)
+                MAZ_hutch = torch.empty_like(AZ_for_m)
+                apply_block_diagonal_m_into(
+                    precond_s,
+                    AZ_for_m,
+                    MAZ_hutch,
+                    jacobi_s_phys,
+                    sai_ws,
+                    leaf_size=leaf_L,
+                    leaf_apply_size=leaf_apply_diag_L,
+                    leaf_apply_off=leaf_apply_off_L,
+                )
+                import torch.nn.functional as _F
+                MAZ_flat = MAZ_hutch.reshape(1, -1)
+                Z_flat = Z_hutch.reshape(1, -1)
+                eval_loss = float((1.0 - _F.cosine_similarity(MAZ_flat, Z_flat, dim=1)).mean().item())
+                print(f"  Cos-Hutch loss: {eval_loss:.6f}")
+            else:
+                # SAI loss: mean_k ||(A/||A||) M^{-1} w_k - w_k||_2^2
+                Z_sai = torch.empty_like(W_sai)
+                apply_block_diagonal_m_into(
+                    precond_s,
+                    W_sai,
+                    Z_sai,
+                    jacobi_s_phys,
+                    sai_ws,
+                    leaf_size=leaf_L,
+                    leaf_apply_size=leaf_apply_diag_L,
+                    leaf_apply_off=leaf_apply_off_L,
+                )
+                Z_sq = Z_sai.squeeze(0)  # (viz_n, K)
+                AZ = A_sparse_f32 @ Z_sq
+                diff = AZ / a_norm - W_sai_sq
+                eval_loss = float((diff * diff).sum(dim=0).mean().item())
+                print(f"  SAI loss:  {eval_loss:.6f}")
 
-        results[step] = {"pcg_iters": iters, "sai_loss": sai_loss}
+        results[step] = {"pcg_iters": iters, _eval_loss_col: eval_loss}
 
     # --- Update CSV ---
     checkpoint_steps = set(results.keys())
@@ -456,10 +503,10 @@ def main():
         step = int(row["step"])
         if step in checkpoint_steps:
             row["pcg_iters"] = str(results[step]["pcg_iters"])
-            row["sai_loss"] = f"{results[step]['sai_loss']:.6f}"
+            row[_eval_loss_col] = f"{results[step][_eval_loss_col]:.6f}"
         else:
             row.setdefault("pcg_iters", "")
-            row.setdefault("sai_loss", "")
+            row.setdefault(_eval_loss_col, "")
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")

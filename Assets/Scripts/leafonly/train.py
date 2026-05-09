@@ -415,7 +415,11 @@ def train_leaf_only(args, runtime):
     )
     _az_desc = "sparse block-diagonal A@Z (all devices; dense bmm only if context cache has use_dense_A)"
     print(f"  Probe MAZ path: --leafonly-pcg={leafonly_pcg} (A@Z: {_az_desc}; {_pcg_tail})")
-    print(f"  Loss mode: hutchinson (cosine-similarity probe; --loss-mode hutchinson)")
+    _loss_mode = str(getattr(args, "loss_mode", "hutchinson"))
+    if _loss_mode == "sai":
+        print(f"  Loss mode: sai (mean_k ||A M^{{-1}} w_k / ||A|| - w_k||^2; --loss-mode sai)")
+    else:
+        print(f"  Loss mode: hutchinson (cosine-similarity probe; --loss-mode hutchinson)")
     ms_startup_to_loop = (time.perf_counter() - t_wall0) * 1000.0
     if print_timing:
         print("\n=== Startup timing (wall clock, ms) ===")
@@ -654,56 +658,94 @@ def train_leaf_only(args, runtime):
                 device=device,
             )
 
-        Z = torch.randn(B_step, max_n_pad_step, batch_vectors, device=device, dtype=x_batched.dtype)
-        for b_idx, n_orig_ctx in enumerate(n_orig_list):
-            if n_orig_ctx < max_n_pad_step:
-                Z[b_idx, n_orig_ctx:, :] = 0.0
-
-        def _az_probe(Zt: torch.Tensor) -> torch.Tensor:
-            return _az_call(Zt)
-
-        jacobi_smooth_hutchinson_z_inplace(
-            Z,
-            jacobi_inv_diag_batched,
-            n_orig_list,
-            max_n_pad_step,
-            _az_probe,
-        )
-
-        if do_detailed:
-            _cuda_sync()
-            t_z = time.perf_counter() - t_mark
-            t_mark = time.perf_counter()
-
-        AZ = _az_call(Z)
-
-        if do_detailed:
-            _cuda_sync()
-            t_az = time.perf_counter() - t_mark
-            t_mark = time.perf_counter()
-
-        if leafonly_pcg == "matrix_free":
-            assert compiled_probe_apply_m is not None
-            MAZ = compiled_probe_apply_m(precond_out, AZ, jacobi_inv_diag_batched)
+        if _loss_mode == "sai":
+            # SAI loss: mean_k ||A M^{-1} w_k / ||A|| - w_k||^2
+            # a_norm = mean |nonzero entries of A| (per context, from stored edge_values)
+            W = torch.randn(B_step, max_n_pad_step, batch_vectors, device=device, dtype=x_batched.dtype)
+            for b_idx, n_orig_ctx in enumerate(n_orig_list):
+                if n_orig_ctx < max_n_pad_step:
+                    W[b_idx, n_orig_ctx:, :] = 0.0
+            a_norms = torch.stack([
+                ctx["edge_values"].abs().mean() for ctx in batch_ctx
+            ]).to(device=device, dtype=x_batched.dtype).view(B_step, 1, 1)
+            if do_detailed:
+                _cuda_sync()
+                t_z = time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
+            if leafonly_pcg == "matrix_free":
+                assert compiled_probe_apply_m is not None
+                MW = compiled_probe_apply_m(precond_out, W, jacobi_inv_diag_batched)
+            else:
+                MW = _probe_apply_m(precond_out, W, jacobi_inv_diag_batched)
+            if do_detailed:
+                _cuda_sync()
+                t_az = time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
+            AMW = _az_call(MW)
+            if do_detailed:
+                _cuda_sync()
+                t_apply = time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
+            diff = AMW / a_norms - W
+            raw_loss = (diff * diff).sum(dim=1).mean()
+            step_loss_sum += raw_loss.item()
+            loss = raw_loss
+            if do_detailed:
+                _cuda_sync()
+                t_loss = time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
         else:
-            MAZ = _probe_apply_m(precond_out, AZ, jacobi_inv_diag_batched)
+            # Cosine-Hutchinson loss: 1 - cos_sim(M A Z, Z) with Jacobi-smoothed probes
+            Z = torch.randn(B_step, max_n_pad_step, batch_vectors, device=device, dtype=x_batched.dtype)
+            for b_idx, n_orig_ctx in enumerate(n_orig_list):
+                if n_orig_ctx < max_n_pad_step:
+                    Z[b_idx, n_orig_ctx:, :] = 0.0
 
-        if do_detailed:
-            _cuda_sync()
-            t_apply = time.perf_counter() - t_mark
-            t_mark = time.perf_counter()
+            def _az_probe(Zt: torch.Tensor) -> torch.Tensor:
+                return _az_call(Zt)
 
-        MAZ_flat = MAZ.view(B_step, -1)
-        Z_flat = Z.view(B_step, -1)
-        cos_sim = F.cosine_similarity(MAZ_flat, Z_flat, dim=1)
-        raw_loss = (1.0 - cos_sim).mean()
-        step_loss_sum += raw_loss.item()
-        loss = raw_loss
+            jacobi_smooth_hutchinson_z_inplace(
+                Z,
+                jacobi_inv_diag_batched,
+                n_orig_list,
+                max_n_pad_step,
+                _az_probe,
+            )
 
-        if do_detailed:
-            _cuda_sync()
-            t_loss = time.perf_counter() - t_mark
-            t_mark = time.perf_counter()
+            if do_detailed:
+                _cuda_sync()
+                t_z = time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
+
+            AZ = _az_call(Z)
+
+            if do_detailed:
+                _cuda_sync()
+                t_az = time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
+
+            if leafonly_pcg == "matrix_free":
+                assert compiled_probe_apply_m is not None
+                MAZ = compiled_probe_apply_m(precond_out, AZ, jacobi_inv_diag_batched)
+            else:
+                MAZ = _probe_apply_m(precond_out, AZ, jacobi_inv_diag_batched)
+
+            if do_detailed:
+                _cuda_sync()
+                t_apply = time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
+
+            MAZ_flat = MAZ.view(B_step, -1)
+            Z_flat = Z.view(B_step, -1)
+            cos_sim = F.cosine_similarity(MAZ_flat, Z_flat, dim=1)
+            raw_loss = (1.0 - cos_sim).mean()
+            step_loss_sum += raw_loss.item()
+            loss = raw_loss
+
+            if do_detailed:
+                _cuda_sync()
+                t_loss = time.perf_counter() - t_mark
+                t_mark = time.perf_counter()
 
         prof: Optional[Any] = None
         profile_bw = (
