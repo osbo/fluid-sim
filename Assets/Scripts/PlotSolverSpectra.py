@@ -3,8 +3,8 @@
 Plot 1D spectral clustering for four solver variants on one test frame:
   1) Unpreconditioned CG operator (A)
   2) Jacobi-left-preconditioned operator (D^{-1}A)
-  3) Baseline neural preconditioner operator (M_base A)
-  4) SAI-trained neural preconditioner operator (M_sai A)
+  3) Cosine-Hutchinson neural preconditioner operator (M_cos A)
+  4) SAI neural preconditioner operator (M_sai A)
 
 Condition number is printed below each subplot.
 
@@ -24,7 +24,6 @@ import torch
 from matplotlib.ticker import MaxNLocator
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import LinearOperator, eigs, eigsh
-from scipy.stats import gaussian_kde
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -171,98 +170,181 @@ def _neural_M_apply_fn(
     return apply
 
 
-def _operator_and_spectrum(
-    A: csr_matrix,
-    M_apply: Callable[[np.ndarray], np.ndarray] | None,
-    k_eigs: int,
-) -> tuple[np.ndarray, float]:
+def _sample_eigenvalues_symmetric(A: csr_matrix, k: int) -> np.ndarray:
+    """Sample eigenvalues from both spectral ends of a symmetric SPD matrix."""
     n = A.shape[0]
-    k = max(8, min(k_eigs, n - 2))
+    k = max(8, min(k, n - 2))
+    lin = LinearOperator((n, n), matvec=lambda x: A @ x, dtype=np.float64)
+    vals = eigsh(lin, k=k, which="BE", return_eigenvectors=False, tol=1e-4)
+    return np.sort(vals.real)
 
-    if M_apply is None:
-        lin = LinearOperator((n, n), matvec=lambda x: A @ x, dtype=np.float64)
-        # eigsh with "BE" (both ends) gives the k/2 smallest and k/2 largest eigenvalues
-        vals = eigsh(lin, k=k, which="BE", return_eigenvectors=False, tol=1e-3)
-        vals = np.sort(vals.real)
-        pos = vals[vals > 1e-12]
-        kappa = float(vals[-1] / pos[0]) if pos.size >= 2 else float("nan")
-        return vals, kappa
+
+def _sample_eigenvalues_jacobi(A: csr_matrix, inv_diag: np.ndarray, k: int) -> np.ndarray:
+    """Sample eigenvalues of D^{-1}A via the symmetric similarity D^{-1/2} A D^{-1/2}."""
+    n = A.shape[0]
+    k = max(8, min(k, n - 2))
+    d_isqrt = np.sqrt(np.clip(inv_diag.astype(np.float64, copy=False), 0.0, None))
+    lin = LinearOperator((n, n), matvec=lambda x: d_isqrt * (A @ (d_isqrt * x)), dtype=np.float64)
+    vals = eigsh(lin, k=k, which="BE", return_eigenvectors=False, tol=1e-4)
+    return np.sort(vals.real)
+
+
+def _sample_eigenvalues_nonsym(
+    A: csr_matrix,
+    M_apply: Callable[[np.ndarray], np.ndarray],
+    k: int,
+) -> np.ndarray:
+    """Sample complex eigenvalues of M·A from both real ends (LR and SR)."""
+    n = A.shape[0]
+    k_each = max(4, min(k // 2, n - 2))
 
     def matvec(x: np.ndarray) -> np.ndarray:
         return M_apply(A @ x)
 
     lin = LinearOperator((n, n), matvec=matvec, dtype=np.float64)
-    try:
-        vals = eigs(
-            lin, k=k, which="LM", return_eigenvectors=False, tol=1e-3, maxiter=max(2000, 20 * n)
-        ).real
-    except Exception:
-        return np.array([float("nan")]), float("nan")
+    parts: list[np.ndarray] = []
+    for which in ("LR", "SR"):
+        try:
+            v = eigs(lin, k=k_each, which=which, return_eigenvectors=False,
+                     tol=1e-3, maxiter=max(3000, 30 * n))
+            finite = v[np.isfinite(v.real) & np.isfinite(v.imag)]
+            if finite.size > 0:
+                parts.append(finite)
+        except Exception:
+            continue
+    if not parts:
+        try:
+            v = eigs(lin, k=k_each, which="LM", return_eigenvectors=False, tol=1e-3)
+            finite = v[np.isfinite(v.real) & np.isfinite(v.imag)]
+            if finite.size > 0:
+                parts = [finite]
+        except Exception:
+            return np.array([float("nan") + 0j])
+    return np.concatenate(parts)
 
-    vals = np.sort(vals[np.isfinite(vals)])
-    # Condition number from sampled eigenvalue range; underestimate when smallest
-    # eigenvalues fall outside the sampled k largest, but reliable for clustered spectra.
+
+def _kappa_symmetric(A: csr_matrix) -> float:
+    """Condition number of symmetric SPD A from dedicated SA+LA eigsh calls."""
+    n = A.shape[0]
+    lin = LinearOperator((n, n), matvec=lambda x: A @ x, dtype=np.float64)
+    lam_min = float(eigsh(lin, k=1, which="SA", return_eigenvectors=False, tol=1e-4)[0])
+    lam_max = float(eigsh(lin, k=1, which="LA", return_eigenvectors=False, tol=1e-4)[0])
+    return float(lam_max / max(lam_min, 1e-12))
+
+
+def _kappa_jacobi(A: csr_matrix, inv_diag: np.ndarray) -> float:
+    """Condition number of D^{-1}A via symmetric similarity D^{-1/2} A D^{-1/2}."""
+    n = A.shape[0]
+    d_isqrt = np.sqrt(np.clip(inv_diag.astype(np.float64, copy=False), 0.0, None))
+    lin = LinearOperator((n, n), matvec=lambda x: d_isqrt * (A @ (d_isqrt * x)), dtype=np.float64)
+    lam_min = float(eigsh(lin, k=1, which="SA", return_eigenvectors=False, tol=1e-4)[0])
+    lam_max = float(eigsh(lin, k=1, which="LA", return_eigenvectors=False, tol=1e-4)[0])
+    return float(lam_max / max(lam_min, 1e-12))
+
+
+def _kappa_nonsym(A: csr_matrix, M_apply: Callable[[np.ndarray], np.ndarray], k: int) -> float:
+    """Condition number estimate for M·A using LR+SR eigs with abs-value thresholding."""
+    n = A.shape[0]
+    k_each = max(4, min(k // 2, n - 2))
+
+    def matvec(x: np.ndarray) -> np.ndarray:
+        return M_apply(A @ x)
+
+    lin = LinearOperator((n, n), matvec=matvec, dtype=np.float64)
+    parts: list[np.ndarray] = []
+    for which in ("LR", "SR"):
+        try:
+            v = eigs(lin, k=k_each, which=which, return_eigenvectors=False,
+                     tol=1e-3, maxiter=max(3000, 30 * n))
+            parts.append(v.real)
+        except Exception:
+            continue
+    if not parts:
+        return float("nan")
+    vals = np.concatenate(parts)
+    vals = vals[np.isfinite(vals)]
     pos = np.abs(vals[np.abs(vals) > 1e-10])
-    kappa = float(pos.max() / pos.min()) if pos.size >= 2 else float("nan")
-    return vals, kappa
+    return float(pos.max() / pos.min()) if pos.size >= 2 else float("nan")
 
 
-def _plot_kde(ax: plt.Axes, vals: np.ndarray, color: str, title: str, cond_num: float) -> None:
-    vals = np.asarray(vals, dtype=np.float64)
-    finite = vals[np.isfinite(vals)]
-    if finite.size == 0:
+
+def _plot_eigenvalue_scatter(
+    ax: plt.Axes,
+    vals: np.ndarray,
+    color: str,
+    title: str,
+    ref_x: float | None = None,
+    kappa_this: float | None = None,
+    kappa_ref: float | None = None,
+    reduction_green: bool = False,
+) -> None:
+    """Scatter plot of eigenvalues in the complex plane with rug marks along the real axis.
+
+    kappa_this: condition number of this operator (pre-computed externally).
+    kappa_ref:  condition number of the unpreconditioned A.  When both are supplied the
+                annotation shows the improvement factor kappa_ref / kappa_this.
+    """
+    c = np.asarray(vals, dtype=np.complex128)
+    ok = np.isfinite(c.real) & np.isfinite(c.imag)
+    c = c[ok]
+    if c.size == 0:
         ax.text(0.5, 0.5, "No finite eigenvalues", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title, fontsize=10.5, fontweight="bold")
         return
 
-    span = float(finite.max() - finite.min())
-    pad = max(span * 0.06, 1e-10)
-    x_lo = finite.min() - pad
-    x_hi = finite.max() + pad
-    x_grid = np.linspace(x_lo, x_hi, 600)
+    re, im = c.real, c.imag
+    im_max = float(np.abs(im).max())
+    is_real = im_max < 1e-8  # symmetric operator — eigenvalues are numerically real
 
-    # Gaussian KDE with Silverman bandwidth
-    try:
-        kde = gaussian_kde(finite, bw_method="silverman")
-        density = kde(x_grid)
-    except Exception:
-        # Degenerate data (all values identical) — draw a spike
-        density = np.zeros_like(x_grid)
-        density[len(x_grid) // 2] = 1.0
+    if is_real:
+        rng = np.random.default_rng(42)
+        jitter_scale = max((re.max() - re.min()) * 0.012, 1e-12)
+        im_plot = rng.normal(0.0, jitter_scale, size=re.size)
+        y_half = float(np.abs(im_plot).max()) * 3.0
+    else:
+        im_plot = im
+        y_half = max(im_max * 1.35, float(np.sqrt(np.mean(im**2))) * 4.0)
 
-    # Normalize so peak = 1 for a clean relative-density read
-    peak = density.max()
-    if peak > 0:
-        density = density / peak
+    ax.scatter(re, im_plot, c=color, alpha=0.65, s=22, edgecolors="none", zorder=3, rasterized=True)
+    ax.axhline(0.0, color="#aaaaaa", lw=0.6, alpha=0.55, zorder=1)
 
-    # Filled area + curve
-    ax.fill_between(x_grid, density, alpha=0.22, color=color, lw=0, zorder=2)
-    ax.plot(x_grid, density, color=color, lw=1.8, zorder=3)
+    if ref_x is not None:
+        ax.axvline(ref_x, color="#333333", lw=0.9, ls="--", alpha=0.5, zorder=2)
 
-    # Subtle rug marks along x-axis
-    rug_y = np.full_like(finite, -0.04)
-    ax.plot(finite, rug_y, "|", color=color, alpha=0.28, markersize=7, markeredgewidth=0.7, zorder=4, clip_on=False)
+    ax.set_ylim(-y_half, y_half)
 
-    ax.set_ylim(-0.10, 1.18)
-    ax.set_yticks([0.0, 0.5, 1.0])
-    ax.set_yticklabels(["0", "0.5", "1"])
-    ax.axhline(0.0, color="#bbbbbb", lw=0.6, zorder=1)
-    ax.grid(True, axis="x", color="#d8d8d8", alpha=0.7, lw=0.5, zorder=0)
-    ax.grid(True, axis="y", color="#efefef", alpha=0.7, lw=0.5, zorder=0)
-    ax.set_xlim(x_lo, x_hi)
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=5, prune="both"))
-    ax.set_ylabel("rel. density")
+    # Rug marks — tick marks projected onto the real axis at the bottom of the plot
+    rug_y = -y_half * 0.88
+    ax.plot(re, np.full_like(re, rug_y), "|", color=color, alpha=0.5,
+            markersize=7, markeredgewidth=0.8, zorder=4)
+
+    x_span = float(re.max() - re.min()) if re.size > 1 else 1.0
+    x_pad = max(x_span * 0.08, 1e-10)
+    ax.set_xlim(float(re.min()) - x_pad, float(re.max()) + x_pad)
+
+    ax.set_xlabel(r"$\mathrm{Re}(\lambda)$")
+    if is_real:
+        ax.set_ylabel("jittered", fontsize=7.5, color="#999999")
+        ax.tick_params(axis="y", labelsize=0, length=0)
+    else:
+        ax.set_ylabel(r"$\mathrm{Im}(\lambda)$")
     ax.set_title(title, fontsize=10.5, fontweight="bold")
+    ax.grid(True, alpha=0.18, lw=0.45, zorder=0)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=5, prune="both"))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=3, prune="both"))
 
-    cond_str = f"{cond_num:.3g}" if np.isfinite(cond_num) else "n/a"
-    ax.text(
-        0.5,
-        -0.22,
-        rf"$\kappa \approx {cond_str}$",
-        ha="center",
-        va="top",
-        transform=ax.transAxes,
-        fontsize=9,
-    )
+    # Condition number annotation (kappa_this and kappa_ref computed externally)
+    if kappa_this is not None and np.isfinite(kappa_this):
+        if kappa_ref is not None and np.isfinite(kappa_ref) and kappa_ref > 0:
+            impr = kappa_ref / kappa_this
+            ann = rf"${impr:.0f}\times$ $\kappa$ reduction"
+            ann_color = "#1a6b1a" if reduction_green else "#444444"
+        else:
+            ann = rf"$\tilde{{\kappa}} \approx {kappa_this:.2g}$"
+            ann_color = "#444444"
+        ax.text(0.5, 0.96, ann,
+                ha="center", va="top", transform=ax.transAxes,
+                fontsize=11.5, fontweight="bold", color=ann_color)
 
 
 def main() -> None:
@@ -349,35 +431,38 @@ def main() -> None:
     def M_jac(v: np.ndarray) -> np.ndarray:
         return jacobi_inv_diag * v
 
-    eig_unpre, cond_unpre = _operator_and_spectrum(A, None,    args.eig_count)
-    eig_jac,   cond_jac   = _operator_and_spectrum(A, M_jac,  args.eig_count)
-    eig_base,  cond_base  = _operator_and_spectrum(A, M_base, args.eig_count)
-    eig_sai,   cond_sai   = _operator_and_spectrum(A, M_sai,  args.eig_count)
+    print(f"[spectra] sampling eigenvalues …")
+    eig_unpre = _sample_eigenvalues_symmetric(A, args.eig_count)
+    eig_jac   = _sample_eigenvalues_jacobi(A, jacobi_inv_diag, args.eig_count)
+    eig_base  = _sample_eigenvalues_nonsym(A, M_base, args.eig_count)
+    eig_sai   = _sample_eigenvalues_nonsym(A, M_sai, args.eig_count)
+
+    print(f"[spectra] computing condition numbers …")
+    kappa_A    = _kappa_symmetric(A)
+    kappa_jac  = _kappa_jacobi(A, jacobi_inv_diag)
+    kappa_base = _kappa_nonsym(A, M_base, args.eig_count)
+    kappa_sai  = _kappa_nonsym(A, M_sai, args.eig_count)
+    print(f"[spectra] κ̃: A={kappa_A:.3g}  jac={kappa_jac:.3g}  base={kappa_base:.3g}  sai={kappa_sai:.3g}")
 
     fig, axs = plt.subplots(2, 2, figsize=(11.0, 7.2))
-    fig.subplots_adjust(left=0.09, right=0.97, top=0.88, bottom=0.14, wspace=0.32, hspace=0.52)
+    fig.subplots_adjust(left=0.10, right=0.97, top=0.88, bottom=0.11, wspace=0.38, hspace=0.50)
 
-    _plot_kde(axs[0, 0], eig_unpre, _C_UNPRE, r"Unpreconditioned CG  ($A$)",              cond_unpre)
-    _plot_kde(axs[0, 1], eig_jac,   _C_JAC,   r"Jacobi-Preconditioned  ($D^{-1}A$)",      cond_jac)
-    _plot_kde(axs[1, 0], eig_base,  _C_BASE,  r"Baseline Neural  ($M_\mathrm{base}\,A$)", cond_base)
-    _plot_kde(axs[1, 1], eig_sai,   _C_SAI,   r"SAI-Trained Neural  ($M_\mathrm{sai}\,A$)", cond_sai)
+    _plot_eigenvalue_scatter(axs[0, 0], eig_unpre, _C_UNPRE, r"Unpreconditioned CG  ($A$)",
+                             kappa_this=kappa_A)
+    _plot_eigenvalue_scatter(axs[0, 1], eig_jac,   _C_JAC,   r"Jacobi-Preconditioned  ($D^{-1}A$)",
+                             kappa_this=kappa_jac,  kappa_ref=kappa_A)
+    # Bottom-left: SAI Neural
+    _plot_eigenvalue_scatter(axs[1, 0], eig_sai,   _C_SAI,   r"SAI Neural  ($M_\mathrm{sai}\,A$)",
+                             ref_x=1.0, kappa_this=kappa_sai,  kappa_ref=kappa_A, reduction_green=False)
+    # Bottom-right: Cosine-Hutchinson Neural (baseline)
+    _plot_eigenvalue_scatter(axs[1, 1], eig_base,  _C_BASE,  r"Cosine-Hutchinson Neural  ($M_\mathrm{cos}\,A$)",
+                             ref_x=1.0, kappa_this=kappa_base, kappa_ref=kappa_A, reduction_green=True)
 
-    for ax in axs.flat:
-        ax.set_xlabel("eigenvalue (real part)")
-
-    fig.suptitle(
-        rf"Eigenvalue Spectra — solver preconditioners  (frame={frame_idx}, $n={n}$)",
-        fontsize=11,
-        fontweight="bold",
-    )
+    fig.suptitle("Eigenvalue spectra - solver preconditioners (multiphase Poisson).", fontsize=11, fontweight="bold")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[spectra] wrote {out_path}")
-    print(
-        "[spectra] condition numbers: "
-        f"unpre={cond_unpre:.3g}, jacobi={cond_jac:.3g}, baseline={cond_base:.3g}, sai={cond_sai:.3g}"
-    )
 
 
 if __name__ == "__main__":
