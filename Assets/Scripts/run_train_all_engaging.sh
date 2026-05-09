@@ -1,9 +1,16 @@
 #!/bin/bash
+# ORCD Engaging (MIT): GPU partition, one array task = one node.
+#   GPU:   1× NVIDIA H200  (-G h200:1)
+#   CPU:   8 cores         (--cpus-per-task)
+#   RAM:   32 GiB           (--mem)
+#   Node:  1 node, 1 task per array index
 #SBATCH -J lo_train
 #SBATCH --array=0-19
 #SBATCH -p mit_normal_gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH -G h200:1
-#SBATCH -c 8
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH -t 6:00:00
 #SBATCH -o slurm_logs/lo_train_%A_%a.out

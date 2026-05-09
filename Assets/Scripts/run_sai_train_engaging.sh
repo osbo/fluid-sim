@@ -1,8 +1,15 @@
 #!/bin/bash
+# ORCD Engaging (MIT): GPU partition, single-node job.
+#   GPU:   1× NVIDIA H200  (Slurm generic resource: -G h200:1)
+#   CPU:   8 cores         (--cpus-per-task; PyTorch / dataloader)
+#   RAM:   32 GiB          (--mem; system RAM for the step, not HBM)
+#   Node:  1 node, 1 Slurm task (one training process per array slot / job)
 #SBATCH -J lo_sai
 #SBATCH -p mit_normal_gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH -G h200:1
-#SBATCH -c 8
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH -t 6:00:00
 #SBATCH -o slurm_logs/lo_sai_%j.out
