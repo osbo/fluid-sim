@@ -417,7 +417,7 @@ def train_leaf_only(args, runtime):
     print(f"  Probe MAZ path: --leafonly-pcg={leafonly_pcg} (A@Z: {_az_desc}; {_pcg_tail})")
     _loss_mode = str(getattr(args, "loss_mode", "hutchinson"))
     if _loss_mode == "sai":
-        print(f"  Loss mode: sai (mean_k ||A M^{{-1}} w_k / ||A|| - w_k||^2; --loss-mode sai)")
+        print(f"  Loss mode: sai (mean_k ||M(A w_k) - w_k||^2 = Hutchinson ||MA-I||_F^2; --loss-mode sai)")
     else:
         print(f"  Loss mode: hutchinson (cosine-similarity probe; --loss-mode hutchinson)")
     ms_startup_to_loop = (time.perf_counter() - t_wall0) * 1000.0
@@ -659,34 +659,31 @@ def train_leaf_only(args, runtime):
             )
 
         if _loss_mode == "sai":
-            # SAI loss: mean_k ||A M^{-1} w_k / ||A|| - w_k||^2
-            # a_norm = mean |nonzero entries of A| (per context, from stored edge_values)
+            # SAI loss: mean_k ||M(A w_k) - w_k||^2  (Hutchinson estimator of ||MA - I||_F^2)
+            # Raw random probes — no Jacobi smoothing. Enforces eigenvalues of MA near 1.
             W = torch.randn(B_step, max_n_pad_step, batch_vectors, device=device, dtype=x_batched.dtype)
             for b_idx, n_orig_ctx in enumerate(n_orig_list):
                 if n_orig_ctx < max_n_pad_step:
                     W[b_idx, n_orig_ctx:, :] = 0.0
-            a_norms = torch.stack([
-                ctx["edge_values"].abs().mean() for ctx in batch_ctx
-            ]).to(device=device, dtype=x_batched.dtype).view(B_step, 1, 1)
             if do_detailed:
                 _cuda_sync()
                 t_z = time.perf_counter() - t_mark
                 t_mark = time.perf_counter()
-            if leafonly_pcg == "matrix_free":
-                assert compiled_probe_apply_m is not None
-                MW = compiled_probe_apply_m(precond_out, W, jacobi_inv_diag_batched)
-            else:
-                MW = _probe_apply_m(precond_out, W, jacobi_inv_diag_batched)
+            AW = _az_call(W)
             if do_detailed:
                 _cuda_sync()
                 t_az = time.perf_counter() - t_mark
                 t_mark = time.perf_counter()
-            AMW = _az_call(MW)
+            if leafonly_pcg == "matrix_free":
+                assert compiled_probe_apply_m is not None
+                MAW = compiled_probe_apply_m(precond_out, AW, jacobi_inv_diag_batched)
+            else:
+                MAW = _probe_apply_m(precond_out, AW, jacobi_inv_diag_batched)
             if do_detailed:
                 _cuda_sync()
                 t_apply = time.perf_counter() - t_mark
                 t_mark = time.perf_counter()
-            diff = AMW / a_norms - W
+            diff = MAW - W
             raw_loss = (diff * diff).sum(dim=1).mean()
             step_loss_sum += raw_loss.item()
             loss = raw_loss
