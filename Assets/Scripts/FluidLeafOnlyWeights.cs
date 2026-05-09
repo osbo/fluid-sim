@@ -95,7 +95,7 @@ public partial class FluidSimulator : MonoBehaviour
     {
 
         int weightsEnd = bytes.Length;
-        if (TryGetWeightsEndExcludingMetaFooter(bytes, weightsByteOffset, out int wEnd))
+        if (LeafOnlyCheckpointHeader.TryGetWeightsEndExcludingMetaFooter(bytes, weightsByteOffset, out int wEnd))
             weightsEnd = wEnd;
         int payloadBytes = weightsEnd - weightsByteOffset;
         if (payloadBytes < 0 || (payloadBytes & 1) != 0)
@@ -454,7 +454,7 @@ public struct LeafOnlyCheckpointHeader
     /// returns <c>true</c> and sets <paramref name="weightsEndExclusive"/> to the byte offset where the footer starts
     /// (so fp16 payload is <c>bytes[weightsByteOffset .. weightsEndExclusive)</c>).
     /// </summary>
-    private static bool TryGetWeightsEndExcludingMetaFooter(byte[] bytes, int weightsByteOffset, out int weightsEndExclusive)
+    internal static bool TryGetWeightsEndExcludingMetaFooter(byte[] bytes, int weightsByteOffset, out int weightsEndExclusive)
     {
         weightsEndExclusive = bytes.Length;
         int L = bytes.Length;

@@ -821,48 +821,81 @@ rather than a Frobenius surrogate.
 \label{sec:ablation}
 % ---------------------------------------------------------------------------
 
-We ablate the architecture and the loss to isolate the contribution of each component, all
-trained for $[\cdot]$ steps at $N=4\,096$ for control.
+We ablate model width~$d$, transformer depth~$n_l$, and highway connections.  Each
+configuration is trained independently to convergence on the same dataset.  Because not
+every variant was evaluated at every problem size, the three groups in
+Table~\ref{tab:ablation} report results at different scale sets; within each group all
+variants share the same scale(s)---same held-out 20-frame test set, same convergence
+criterion---and averages are taken across scales where more than one is available.
+Section~\ref{sec:ablation:loss} and Figure~\ref{fig:training:dynamics} address the loss
+objective separately.
 
-% --- TABLE: ablation sweep (compact placeholder; will be filled with real numbers) ---
+% --- TABLE: ablation sweep ---
 \begin{table}[t]
 \centering
-\caption{Architecture and loss ablations at $N\!=\!4\,096$ ($\mathrm{rtol}\!=\!10^{-8}$,
-$20$ frames). \emph{Total} = inference $+$ PCG (ms). Numbers to be filled with the final
-sweep; expected signs reported in the body text.}
+\caption{Hyperparameter ablations on \textsf{multiphase\_v2} ($\mathrm{rtol}\!=\!10^{-8}$,
+$20$~frames per scale, neural preconditioner only).
+\emph{Train}~=~wall-clock time to convergence (min);
+\emph{Infer.}~=~preconditioner forward pass (ms);
+\emph{Iters}~=~mean PCG iterations;
+\emph{Total}~=~inference $+$ PCG solve (ms);
+$\Delta$ solve time~=~fractional change in Total vs.\ the ``---'' row.}
 \label{tab:ablation}
-\footnotesize\setlength{\tabcolsep}{4pt}
-\begin{tabular}{@{}lccc@{}}
+\footnotesize\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}l rr rr r@{}}
 \toprule
-Configuration & Total & Iters & $\Delta$ vs.\ best \\
+Configuration & Train & Infer. & Iters & Total & $\Delta$ solve \\
+              & (min) & (ms)   &       & (ms)  & time \\
 \midrule
-\textbf{Best ($d{=}128, n_l{=}3$, all on)} & \textbf{TODO} & \textbf{TODO} & --- \\
+\multicolumn{6}{l}{\emph{Width} (avg.\ $N\!\in\!\{2048,4096,8192\}$):}\\
+$d{=}64,\;n_l{=}3$, hw     &  9.5 & 3.0 & 147 & 15.4 & $+28\%$  \\
+$d{=}128,\;n_l{=}3$, hw    & 10.7 & 3.1 & 105 & 12.0 & ---      \\
+$d{=}256,\;n_l{=}3$, hw    & 12.3 & 3.2 & 191 & 19.3 & $+61\%$  \\
 \midrule
-\multicolumn{4}{l}{\emph{Capacity:}}\\
-$d{=}64, n_l{=}2$              & TODO & TODO & TODO \\
-$d{=}128, n_l{=}2$             & TODO & TODO & TODO \\
-$d{=}256, n_l{=}2$             & TODO & TODO & TODO \\
-\multicolumn{4}{l}{\emph{Components (best $-$ component):}}\\
-$-$ highways                    & TODO & TODO & TODO \\
-$-$ off-diag stack              & TODO & TODO & TODO \\
-$-$ GCN ($n_{\mathrm{gcn}}{=}0$)& TODO & TODO & TODO \\
-$-$ Jacobi residual gate        & TODO & TODO & TODO \\
-$-$ probe smoothing             & TODO & TODO & TODO \\
-\multicolumn{4}{l}{\emph{Loss objective (best arch.):}}\\
-$\mathcal{L}_{\ell_2}$ Hutchinson & TODO & TODO & TODO \\
-SAI~\cite{Yang2025sparse}      & TODO & TODO & TODO \\
-$\mathcal{L}_{\cos}$ (ours)    & TODO & TODO & --- \\
+\multicolumn{6}{l}{\emph{Depth} ($N\!=\!8192$):}\\
+$d{=}128,\;n_l{=}1$, hw    &  6.1 & 1.3 & 421 & 36.9 & $+106\%$ \\
+$d{=}128,\;n_l{=}2$, hw    &  9.6 & 2.3 & 218 & 20.8 & $+16\%$  \\
+$d{=}128,\;n_l{=}3$, hw    & 16.2 & 3.4 & 168 & 17.9 & ---      \\
+\midrule
+\multicolumn{6}{l}{\emph{Highways} ($N\!=\!2048$):}\\
+$d{=}128,\;n_l{=}3$, hw    &  6.0 & 3.3 &  66 &  8.8 & ---      \\
+$d{=}128,\;n_l{=}3$, no-hw &  4.8 & 2.2 & 149 & 13.8 & $+58\%$  \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsubsection{Architecture}
-The component ablations remove each design element in turn from the best configuration.
-% TODO: write 1--2 sentences per ablation row once filled in. Expected sign:
-% --- removing highways: iterations grow most for low-frequency-dominated cases;
-% --- removing off-diag stack: degenerates to block-Jacobi behavior;
-% --- removing GCN: loses physics-aware features, modest iteration increase;
-% --- removing Jacobi gate: training is slower to escape its initial plateau.
+
+\paragraph{Width.}
+$d\!=\!256$ is competitive at small scales---fewer iterations than $d\!=\!128$ at
+$N\!\in\!\{2048,4096\}$---but its iteration count nearly triples at $N\!=\!8\,192$
+($454$ vs.\ $168$), so averaged across all three scales it is $61\%$ slower in total
+solve time and $15\%$ more expensive to train.  A likely cause is that the larger
+parameter count makes optimisation harder on the bigger graphs, where the training
+signal per parameter is sparser and the loss landscape less well-conditioned; with
+more careful tuning $d\!=\!256$ may well recover its small-scale advantage at larger
+$N$.  $d\!=\!64$ is $28\%$ slower overall with only a modest training-time saving.
+$d\!=\!128$ gave the most reliable behaviour across scales and was therefore chosen
+as the default.
+
+\paragraph{Depth.}
+Depth has a larger and more monotone effect on both training cost and solve quality.
+At $N\!=\!8\,192$, reducing from $n_l\!=\!3$ to $n_l\!=\!1$ cuts training time
+$2.7\!\times$ ($16.2\!\to\!6.1$\,min) and inference cost $2.6\!\times$
+($3.4\!\to\!1.3$\,ms), but increases PCG iterations $2.5\!\times$ and more than
+doubles total solve time ($17.9\!\to\!36.9$\,ms)---the inference saving is consumed
+many times over by extra CG work.  Depth $n_l\!=\!2$ still incurs a $16\%$
+solve-time overhead despite only a $40\%$ training-time reduction.  The pattern
+confirms that additional layers are needed to compose information routed through the
+axial and global highway tokens.
+
+\paragraph{Highways.}
+Removing highway connections saves $20\%$ of training time ($6.0\!\to\!4.8$\,min) but
+raises PCG iterations $2.3\!\times$ and total solve time $+58\%$ at $N\!=\!2\,048$,
+and the solve-time penalty grows with problem size.  The highway buffers are the
+mechanism by which independently processed transformer blocks exchange global spectral
+context; without them, each block optimises a purely local factor with no awareness of
+the bulk spectral shift required for effective long-range preconditioning.
 
 \subsubsection{Loss}
 \label{sec:ablation:loss}
