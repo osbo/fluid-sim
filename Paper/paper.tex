@@ -381,6 +381,32 @@ the rank fraction $L_s/(SL)$ shrinks automatically as $S$ grows---exactly the pr
 makes $\mathcal{H}$-matrix compression effective: distant tiles, encoding smoother
 low-frequency couplings, are compressed more aggressively than near tiles.
 
+This prior is not just structurally appealing---it is quantitatively sufficient for the
+problem class we target. Figure~\ref{fig:rank-headroom} plots the constant rank
+$L_s\!=\!32$ emitted by the architecture against the numerical rank required to capture
+the corresponding off-diagonal block of $A^{-1}$ at three truncation tolerances
+($\varepsilon\!\in\!\{10^{-3},10^{-6},10^{-9}\}$), measured on representative
+\textsf{multiphase\_v2} frames across tile sizes $SL\!\in\![128,2048]$. Even at the
+strictest tolerance $\varepsilon\!=\!10^{-9}$, the provided rank exceeds the required rank
+by $2.6\times$ at the largest tile size and the gap widens monotonically as $S$ grows.
+The architecture's structural bias (constant $L_s$ across tile sizes) is therefore
+matched, with headroom, to the actual low-rank structure of $A^{-1}$ for the elliptic
+operators of interest---a precondition for the claim that long-range couplings can be
+represented faithfully by a single fixed-width off-diagonal token budget.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\linewidth]{rank_provided_vs_needed.png}
+  \caption{Off-diagonal rank emitted by the architecture (constant $L_s\!=\!32$, red)
+    versus numerical rank required to capture the corresponding tile of $A^{-1}$ to
+    relative error $\varepsilon\!\in\!\{10^{-3},10^{-6},10^{-9}\}$ (dashed), reported as
+    a fraction of tile size on \textsf{multiphase\_v2} frames with leaf $L\!=\!128$.
+    Shaded bands: $\pm 1\sigma$ across tiles in the same size class. The provided rank
+    sits above the required rank at every tile size and every tolerance, with
+    $2.6\times$ headroom at the largest tile under the strictest tolerance.}
+  \label{fig:rank-headroom}
+\end{figure}
+
 \subsection{Highway Connections}
 \label{sec:method:highways}
 
