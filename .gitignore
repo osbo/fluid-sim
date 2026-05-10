@@ -51,8 +51,11 @@ Assets/Scripts/data/
 Assets/Scripts/.triton_cache/
 Assets/Scripts/.torch_inductor_cache/
 
-# Intermediate training checkpoints (large; regenerate with LeafOnly.py --track-training)
-Assets/Scripts/weights/*_step*.bytes
+# Trained weights, checkpoints, exports (large; regenerate locally or store elsewhere)
+Assets/Scripts/weights/
+Assets/Scripts/leafonly_ablation_weights/
+Assets/Scripts/*.bytes
+Assets/Scripts/*.pt
 
 # LaTeX build products (regenerate with latexmk)
 Paper/paper.aux
@@ -62,8 +65,14 @@ Paper/paper.fdb_latexmk
 Paper/paper.fls
 Paper/paper.log
 Paper/paper.out
+Paper/paper.pdf
 Paper/paper.synctex.gz
 Paper/supplementary.aux
+Paper/supplementary.bbl
+Paper/supplementary.blg
+Paper/supplementary.fdb_latexmk
+Paper/supplementary.fls
 Paper/supplementary.log
 Paper/supplementary.out
+Paper/supplementary.pdf
 Paper/supplementary.synctex.gz
