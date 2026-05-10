@@ -24,7 +24,9 @@ import torch
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as path_effects
 
 _script_dir = Path(__file__).resolve().parent
 if str(_script_dir) not in sys.path:
@@ -99,7 +101,9 @@ def main():
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--output", type=str,
-                        default=str(_script_dir.parent.parent / "Paper" / "figures" / "freq_rank_by_distance.png"))
+                        default=str(_script_dir.parent.parent / "Paper" / "figures" / "rank_provided_vs_needed.png"))
+    parser.add_argument("--multi-panel", action="store_true",
+                        help="Also emit the wide three-panel debugging figure to <output>_3panel.png")
     args = parser.parse_args()
 
     data_folder = Path(args.data_folder)
@@ -206,26 +210,129 @@ def main():
         print(f"  S={S} ({S*leaf_L}x{S*leaf_L}, {spec_cnt[S]} tiles): "
               f"L_s={L_s} of {S*leaf_L} provided ({100.0*L_s/(S*leaf_L):.2f}% rank-fraction); rank {rs}")
 
-    # ---- Plot ----
-    plt.rcParams.update({
-        "font.size": 11,
-        "axes.titlesize": 12.5,
-        "axes.labelsize": 11.5,
-        "legend.fontsize": 9.0,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-        "axes.titlepad": 8,
+    # ---- Plot (style mirrors plot_eval_results.py / plot_training.py) ----
+    mpl.rcParams.update({
+        "font.family": "serif",
+        "font.size": 9,
+        "axes.labelsize": 10,
+        "axes.titlesize": 10.5,
+        "legend.fontsize": 8.5,
+        "xtick.labelsize": 8.5,
+        "ytick.labelsize": 8.5,
+        "axes.linewidth": 0.8,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
+        "grid.linewidth": 0.45,
+        "lines.linewidth": 1.8,
+        "figure.dpi": 180,
+        "savefig.dpi": 300,
     })
-    fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(17.5, 5.2), constrained_layout=True)
+    GRID_MAJOR = "#d8d8d8"
+    GRID_MINOR = "#efefef"
+    LEGEND_EDGE = "#cccccc"
+    REF_LINE = "#555555"
+    HALO = [path_effects.withStroke(linewidth=2.4, foreground="white", alpha=1.0)]
     cmap = plt.get_cmap("viridis")
     n_S = len(S_values)
-    # Wider lightness range so smallest and largest S are clearly distinct;
-    # avoid the brightest yellow at the top end.
-    colors = [cmap(0.08 + 0.70 * i / max(1, n_S - 1)) for i in range(n_S)]
+    colors = [cmap(0.10 + 0.70 * i / max(1, n_S - 1)) for i in range(n_S)]
+
+    def _grid(ax):
+        ax.grid(True, which="major", color=GRID_MAJOR, zorder=0)
+        ax.grid(True, which="minor", color=GRID_MINOR, zorder=0)
+        ax.set_axisbelow(True)
+
+    # ---- Single-panel figure (sized to match scale_methods.png / training.png:
+    # ~6.5"x4.0" so that when LaTeX scales it to \linewidth, fonts/markers end
+    # up the same physical size as in the rest of the paper). ----
+    fig_c, axC = plt.subplots(figsize=(6.5, 4.0), constrained_layout=True)
+
+    S_arr = np.array(S_values, dtype=float)
+    block_dim = S_arr * leaf_L  # tile side length in NODES
+    provided_frac = L_s / block_dim
+    eps_styles = [
+        (1e-3, "s--", "#1f9d4d"),
+        (1e-6, "^--", "#197aa6"),
+        (1e-9, "d--", "#3b1da6"),
+    ]
+    needed_means = {}
+    for eps, marker, color in eps_styles:
+        means = np.array([rank_eps[S][eps][0] for S in S_values])
+        stds = np.array([rank_eps[S][eps][1] for S in S_values])
+        frac = means / block_dim
+        frac_lo = np.maximum(means - stds, 0.5) / block_dim
+        frac_hi = (means + stds) / block_dim
+        axC.loglog(block_dim, frac, marker, color=color, lw=1.6, markersize=5.5, zorder=3)
+        axC.fill_between(block_dim, frac_lo, frac_hi, color=color, alpha=0.16, zorder=2)
+        needed_means[eps] = frac
+
+    axC.loglog(block_dim, provided_frac, "o-", color="#b03030", lw=2.2, markersize=6.5, zorder=4)
+    axC.fill_between(block_dim, needed_means[1e-9], provided_frac,
+                     where=(provided_frac > needed_means[1e-9]),
+                     color="#b03030", alpha=0.07, zorder=1)
+
+    def _ilbl(x, y, text, color, ha="left", va="center", weight="normal", size=9.0):
+        t = axC.text(x, y, text, color=color, fontsize=size, ha=ha, va=va,
+                     zorder=6, fontweight=weight)
+        t.set_path_effects(HALO)
+        return t
+
+    # Curve labels stacked at the LEFT edge (above their first marker).
+    x_lbl = block_dim[0] * 1.12
+    _ilbl(x_lbl, provided_frac[0] * 1.20,
+          r"provided rank: $L_s\,{=}\,32$  (constant, regardless of tile size)",
+          "#b03030", ha="left", va="bottom", weight="bold")
+    _ilbl(x_lbl, needed_means[1e-9][0] * 1.20,
+          r"rank required to capture $A^{-1}$ tile to  $\epsilon\,{=}\,10^{-9}$",
+          "#3b1da6", ha="left", va="bottom")
+    _ilbl(x_lbl, needed_means[1e-6][0] * 1.32,
+          r"$\dots$ to  $\epsilon\,{=}\,10^{-6}$", "#197aa6", ha="left", va="bottom")
+    _ilbl(x_lbl, needed_means[1e-3][0] * 0.55,
+          r"$\dots$ to  $\epsilon\,{=}\,10^{-3}$", "#1f9d4d", ha="left", va="top")
+
+    # Headroom callout in the right-side gap (S=8 in default config).
+    s_idx = len(S_arr) - 2
+    hr_mid = provided_frac[s_idx] / max(needed_means[1e-9][s_idx], 1e-30)
+    y_mid = np.sqrt(provided_frac[s_idx] * needed_means[1e-9][s_idx])
+    t = axC.text(block_dim[s_idx], y_mid, f"{hr_mid:.1f}$\\times$ headroom",
+                 color="#1a1a1a", fontsize=9.5, ha="center", va="center", zorder=6,
+                 bbox=dict(boxstyle="round,pad=0.26", fc="white",
+                           ec="#b03030", lw=0.8, alpha=0.95))
+    t.set_path_effects(HALO)
+
+    # Note explaining the shaded bands.
+    axC.text(0.985, 0.025,
+             r"shaded bands: $\pm\,1\sigma$ across tiles in the same size class",
+             transform=axC.transAxes, fontsize=8, color="#555555",
+             ha="right", va="bottom",
+             bbox=dict(boxstyle="round,pad=0.20", fc="white",
+                       ec=LEGEND_EDGE, lw=0.5, alpha=0.92))
+
+    axC.set_xlabel(r"Off-diagonal tile size  (nodes per side, $\,=S\!\cdot\!L$ with leaf $L\,{=}\,128$)")
+    axC.set_ylabel(r"Numerical rank, as fraction of tile size")
+    axC.set_title(r"Off-diagonal rank: emitted by architecture vs required to capture $A^{-1}$")
+    axC.set_xticks(block_dim)
+    axC.set_xticklabels([f"{int(b):,}" for b in block_dim])
+    axC.set_xlim(block_dim[0] * 0.88, block_dim[-1] * 1.12)
+
+    y_top = max(provided_frac.max() * 2.4, needed_means[1e-9].max() * 3.0)
+    y_bot = min(needed_means[1e-3].min() * 0.30, 4e-4)
+    axC.set_ylim(y_bot, y_top)
+    _grid(axC)
+
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig_c.savefig(out, dpi=300, bbox_inches="tight")
+    print(f"Saved single-panel figure -> {out}")
+
+    if not args.multi_panel:
+        return
+
+    # ---- Optional 3-panel (debug / supplementary) ----
+    fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(15.5, 4.4), constrained_layout=True)
 
     # ---- Panel A ----
     bin_widths = edges[1:] - edges[:-1]
-    F_REF = 1e-2  # cycles/node — about one cycle per 100 nodes
+    F_REF = 1e-2  # cycles/node
     cdf_at_fref = {}
     for color, S in zip(colors, S_values):
         p_density = spectra[S]
@@ -234,67 +341,69 @@ def main():
         cdf = cdf / max(cdf[-1], 1e-300)
         f_min = 1.0 / (S * leaf_L)
         m = centers >= f_min
-        axA.semilogx(centers[m], cdf[m], "-", color=color, lw=2.4,
-                     label=f"S={S}  ({S*leaf_L}×{S*leaf_L})")
-        # cdf at F_REF
-        cdf_interp = np.interp(np.log(F_REF), np.log(centers), cdf)
-        cdf_at_fref[S] = float(cdf_interp)
-        # Mark each curve's intersection with the F_REF vertical line
-        axA.plot(F_REF, cdf_interp, "o", color=color, markersize=8,
-                 markeredgecolor="black", markeredgewidth=0.8, zorder=5)
-    axA.axvline(F_REF, color="black", linestyle=":", lw=1.1, alpha=0.8)
-    # Annotation: fraction of energy below F_REF for the extremes
+        axA.semilogx(centers[m], cdf[m], "-", color=color, lw=1.8,
+                     label=f"$S\\,{{=}}\\,{S}$  (${S*leaf_L}\\!\\times\\!{S*leaf_L}$)", zorder=3)
+        cdf_interp = float(np.interp(np.log(F_REF), np.log(centers), cdf))
+        cdf_at_fref[S] = cdf_interp
+        axA.plot(F_REF, cdf_interp, "o", color=color, markersize=5.5,
+                 markeredgecolor="black", markeredgewidth=0.6, zorder=5)
+    axA.axvline(F_REF, color=REF_LINE, ls=(0, (4, 2)), lw=0.85, alpha=0.7, zorder=1)
     s_lo, s_hi = S_values[0], S_values[-1]
     c_lo, c_hi = cdf_at_fref[s_lo], cdf_at_fref[s_hi]
-    axA.annotate(
-        "",
-        xy=(F_REF, c_hi), xytext=(F_REF, c_lo),
-        arrowprops=dict(arrowstyle="<->", color="black", lw=1.6),
-    )
-    axA.text(F_REF * 1.6, 0.5 * (c_lo + c_hi),
-             f"S={s_lo}: {100*c_lo:.0f}% of energy\n"
-             f"S={s_hi}: {100*c_hi:.0f}% of energy\n"
-             f"below f={F_REF:g} cyc/node",
-             color="black", fontsize=9.5, ha="left", va="center",
-             bbox=dict(boxstyle="round,pad=0.30", fc="white", ec="black", lw=0.8))
-    axA.set_xlabel("Spatial radial frequency  $f$  (cycles / node)")
-    axA.set_ylabel(r"Cumulative spectral energy  $\Pr[f' \leq f]$")
+    axA.annotate("", xy=(F_REF, c_hi), xytext=(F_REF, c_lo),
+                 arrowprops=dict(arrowstyle="<->", color="#1a1a1a", lw=1.0),
+                 zorder=4)
+    txt_a = axA.text(F_REF * 1.35, 0.5 * (c_lo + c_hi),
+                     f"at $f\\,{{=}}\\,{F_REF:g}$ cyc/node:\n"
+                     f"$S\\,{{=}}\\,{s_lo}$: {100*c_lo:.0f}% energy\n"
+                     f"$S\\,{{=}}\\,{s_hi}$: {100*c_hi:.0f}% energy",
+                     color="#1a1a1a", fontsize=8.5, ha="left", va="center",
+                     bbox=dict(boxstyle="round,pad=0.28", fc="white",
+                               ec=LEGEND_EDGE, lw=0.6, alpha=0.95))
+    txt_a.set_path_effects(HALO)
+
+    axA.set_xlabel(r"Spatial radial frequency  $f$  (cycles / node)")
+    axA.set_ylabel(r"Cumulative spectral energy  $\Pr[\,f' \leq f\,]$")
     axA.set_title(r"(A)  Long-range tiles concentrate energy at lower frequencies")
-    axA.set_xlim(centers[0], 0.5)
-    axA.set_ylim(0.0, 1.06)
-    axA.grid(True, which="both", alpha=0.22)
-    axA.legend(title="distance  (=tile size in leaves)", loc="lower right")
+    axA.set_xlim(3e-4, 0.5)
+    axA.set_ylim(0.20, 1.02)
+    _grid(axA)
+    axA.legend(title="distance ($=$ tile size in leaves)",
+               loc="lower right", framealpha=0.9, edgecolor=LEGEND_EDGE,
+               title_fontsize=8.5)
 
     # ---- Panel B ----
     for color, S in zip(colors, S_values):
         s_mean = svals[S]
         k = np.arange(1, len(s_mean) + 1)
-        rk6, _ = rank_eps[S][1e-6]
-        axB.semilogy(k, s_mean + 1e-16, "-", color=color, lw=2.4,
-                     label=f"S={S}: rank @1e-6 ≈ {rk6:.1f}")
-    axB.axvline(L_s, color="crimson", linestyle="--", lw=2.0,
-                label=f"$L_s={L_s}$  (rank emitted per tile)")
+        axB.semilogy(k, s_mean + 1e-16, "-", color=color, lw=1.8,
+                     label=f"$S\\,{{=}}\\,{S}$", zorder=3)
+    axB.axvline(L_s, color="#b03030", linestyle="--", lw=1.4, zorder=4,
+                label=f"$L_s\\,{{=}}\\,{L_s}\\,({{=}}\\,L/p_{{\\mathrm{{off}}}})$, rank emitted per tile")
     for eps in (1e-3, 1e-6, 1e-9):
-        axB.axhline(eps, color="grey", linestyle=":", lw=0.8)
-        axB.text(0.3, eps * 1.4, f" $\\epsilon={eps:g}$",
-                 color="grey", fontsize=9, va="bottom", ha="left")
-    axB.set_xlabel("Singular value index  $k$")
+        axB.axhline(eps, color=REF_LINE, ls=":", lw=0.7, alpha=0.7, zorder=1)
+        t = axB.text(int(1.4 * L_s) - 0.6, eps * 1.6,
+                     f"$\\epsilon{{=}}10^{{{int(np.log10(eps))}}}$",
+                     color=REF_LINE, fontsize=8, va="bottom", ha="right", zorder=2)
+        t.set_path_effects(HALO)
+
+    axB.set_xlabel(r"Singular value index  $k$")
     axB.set_ylabel(r"$\sigma_k / \sigma_1$  (mean over tiles)")
-    axB.set_title("(B)  Every tile is essentially low-rank, well below $L_s$")
-    axB.set_ylim(1e-12, 2.0)
+    axB.set_title(r"(B)  Every $A^{-1}$ tile is essentially low-rank, well below $L_s$")
+    axB.set_ylim(1e-11, 2.0)
     axB.set_xlim(0, int(1.4 * L_s))
-    axB.grid(True, which="both", alpha=0.22)
-    axB.legend(loc="lower left")
+    _grid(axB)
+    axB.legend(loc="upper right", ncol=2, framealpha=0.9, edgecolor=LEGEND_EDGE,
+               columnspacing=1.0, handlelength=1.4)
 
     # ---- Panel C ----
     S_arr = np.array(S_values, dtype=float)
     block_dim = S_arr * leaf_L
     provided_frac = L_s / block_dim
-    # mean and per-tile std for needed-rank (in absolute rank units)
     eps_styles = [
-        (1e-3, "s--", "#1f9d4d", r"needed for $\epsilon=10^{-3}$"),
-        (1e-6, "^--", "#197aa6", r"needed for $\epsilon=10^{-6}$"),
-        (1e-9, "d--", "#3b1da6", r"needed for $\epsilon=10^{-9}$"),
+        (1e-3, "s--", "#1f9d4d", r"$\epsilon\,{=}\,10^{-3}$"),
+        (1e-6, "^--", "#197aa6", r"$\epsilon\,{=}\,10^{-6}$"),
+        (1e-9, "d--", "#3b1da6", r"$\epsilon\,{=}\,10^{-9}$"),
     ]
     needed_means = {}
     for eps, marker, color, label in eps_styles:
@@ -303,35 +412,53 @@ def main():
         frac = means / block_dim
         frac_lo = np.maximum(means - stds, 0.5) / block_dim
         frac_hi = (means + stds) / block_dim
-        axC.loglog(S_arr, frac, marker, color=color, lw=1.7, markersize=8, label=label)
-        axC.fill_between(S_arr, frac_lo, frac_hi, color=color, alpha=0.12)
+        axC.loglog(S_arr, frac, marker, color=color, lw=1.4, markersize=6, zorder=3)
+        axC.fill_between(S_arr, frac_lo, frac_hi, color=color, alpha=0.15, zorder=2)
         needed_means[eps] = frac
 
-    axC.loglog(S_arr, provided_frac, "o-", color="crimson", lw=2.6, markersize=10,
-               label=f"provided by architecture  ($L_s/(SL)$,  $L_s\\!=\\!{L_s}$)")
+    axC.loglog(S_arr, provided_frac, "o-", color="#b03030", lw=2.0, markersize=7, zorder=4)
     axC.fill_between(S_arr, needed_means[1e-9], provided_frac,
                      where=(provided_frac > needed_means[1e-9]),
-                     color="crimson", alpha=0.10,
-                     label="headroom (provided $-$ needed @ $10^{-9}$)")
-    # Annotate headroom factor at the largest S
-    hr = provided_frac[-1] / max(needed_means[1e-9][-1], 1e-30)
-    axC.annotate(f"{hr:.1f}× headroom",
-                 xy=(S_arr[-1], np.sqrt(provided_frac[-1] * needed_means[1e-9][-1])),
-                 xytext=(S_arr[-1] * 0.95, np.sqrt(provided_frac[-1] * needed_means[1e-9][-1]) * 0.6),
-                 ha="right", va="top", fontsize=10,
-                 bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="crimson", lw=0.8))
-    axC.set_xlabel("Distance class  $S$  (tile size in leaves)")
+                     color="#b03030", alpha=0.08, zorder=1)
+
+    # Inline curve labels (match plot_training.py style — no boxed legend).
+    def _label(ax, x, y, text, color, dy=1.0, ha="left", va="center"):
+        t = ax.text(x, y * dy, text, color=color, fontsize=8.5, ha=ha, va=va, zorder=6)
+        t.set_path_effects(HALO)
+
+    _label(axC, S_arr[1] * 1.05, provided_frac[1] * 1.18,
+           r"provided $L_s/(SL)$,  $L_s\,{=}\,32\,{=}\,L/p_{\mathrm{off}}$",
+           "#b03030", ha="left", va="bottom")
+    # Needed labels at the right end of each curve
+    for eps, _marker, color, lab in eps_styles:
+        y_end = needed_means[eps][-1]
+        _label(axC, S_arr[-1] * 1.04, y_end, f"needed  {lab}",
+               color, ha="left", va="center")
+
+    # Headroom callout in the shaded gap (at S=4, where the gap is widest).
+    s_idx = len(S_arr) // 2
+    hr_mid = provided_frac[s_idx] / max(needed_means[1e-9][s_idx], 1e-30)
+    y_mid = np.sqrt(provided_frac[s_idx] * needed_means[1e-9][s_idx])
+    t = axC.text(S_arr[s_idx], y_mid, f"{hr_mid:.1f}$\\times$ headroom",
+                 color="#1a1a1a", fontsize=9, ha="center", va="center", zorder=6,
+                 bbox=dict(boxstyle="round,pad=0.22", fc="white",
+                           ec="#b03030", lw=0.7, alpha=0.95))
+    t.set_path_effects(HALO)
+
+    axC.set_xlabel(r"Distance class  $S$  (tile size in leaves)")
     axC.set_ylabel(r"Rank fraction  $r/(SL)$")
-    axC.set_title(r"(C)  Architecture-provided rank exceeds what's needed at every distance")
+    axC.set_title(r"(C)  Architecture-provided rank exceeds what's needed at every $S$")
     axC.set_xticks(S_arr)
     axC.set_xticklabels([str(int(s)) for s in S_arr])
-    axC.grid(True, which="both", alpha=0.22)
-    axC.legend(loc="lower left")
+    # Extra right-side margin for inline labels
+    axC.set_xlim(S_arr[0] * 0.85, S_arr[-1] * 1.55)
+    _grid(axC)
 
     out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=170, bbox_inches="tight")
-    print(f"Saved figure -> {out}")
+    out_3p = out.with_name(out.stem + "_3panel" + out.suffix)
+    out_3p.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_3p, dpi=170, bbox_inches="tight")
+    print(f"Saved 3-panel debug figure -> {out_3p}")
 
 
 if __name__ == "__main__":
