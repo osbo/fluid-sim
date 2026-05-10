@@ -572,8 +572,8 @@ $\alpha\!>\!0$ leaves the angle of $\hat{\mathbf{z}}_k$ unchanged. This matches 
 scale-invariance of PCG convergence, which depends only on the relative spread of
 eigenvalues of $MA$, not their absolute location. Frobenius-style objectives---including the
 SAI loss $\bigl\|\frac{1}{\|A\|}AM-I\bigr\|_F^2$ used by~\cite{Yang2025sparse}---instead
-penalize deviations from $MA\!=\!I$ pointwise, implicitly demanding that the eigenvalues of
-$MA$ cluster near $1$, even though PCG converges as fast on any tight cluster.
+penalize deviations from $\frac{1}{\|A\|}AM\!=\!I$ pointwise, implicitly demanding that the eigenvalues of
+$AM$ cluster near $\|A\|$, even though PCG converges as fast on any tight cluster.
 $\mathcal{L}_{\cos}$ removes that location prior, freeing the network to cluster eigenvalues
 wherever the current preconditioner makes alignment easiest---a behavior we observe directly
 in Section~\ref{sec:results:training} (Fig.~\ref{fig:training:dynamics}) and ablate against
@@ -821,7 +821,7 @@ $\sim\!12{,}000$ ($\sim\!8$\,min). The structural finding is in the relationship
 together. After that, the SAI loss plateaus and then \emph{rises}, from $\sim\!10^{-3}$
 at step $10\,000$ to $\sim\!0.5$ by step $24\,000$, even as $\mathcal{L}_{\cos}$ continues
 to decrease smoothly and PCG iteration count continues to fall in lockstep with it. The
-model is moving the eigenvalues of $MA$ \emph{away} from $\lambda\!=\!1$ in pointwise
+model is moving the eigenvalues of $MA$ \emph{away} from $\lambda\!=\!\|A\|$ in pointwise
 terms, but \emph{toward} a tighter relative cluster wherever that turns out to be---the
 exact behavior we predicted analytically in Section~\ref{sec:training:loss}, and the
 single strongest argument for using a scale- and location-invariant cosine objective
@@ -914,7 +914,7 @@ We compare $\mathcal{L}_{\cos}$ against the SAI loss of~\cite{Yang2025sparse} on
 architecture and training budget; Fig.~\ref{fig:loss:eigenvalues} shows the resulting
 eigenvalue spectra of $MA$ at $N\!=\!1024$, the scale at which a full eigendecomposition is
 tractable.  The training-curve argument from Section~\ref{sec:results:training} is confirmed
-directly: SAI constrains eigenvalues to cluster near $\lambda\!=\!1$ and achieves a
+directly: SAI constrains eigenvalues to cluster near $\lambda\!=\!\|A\|$ and achieves a
 $16\!\times$ condition-number reduction; $\mathcal{L}_{\cos}$ allows the cluster to settle
 wherever the residual makes alignment easiest---here near $\lambda\!\approx\!0.08$---and
 achieves a $68\!\times$ reduction, a $4.3\!\times$ better-conditioned system despite
@@ -930,7 +930,7 @@ induce two eigenvalue groups whose relative spread sets the condition number.
     \emph{Top row}: unpreconditioned $A$ ($\tilde\kappa\!\approx\!5\!\times\!10^9$) and
     Jacobi ($1\!\times$ $\kappa$ reduction).
     \emph{Bottom row}: SAI-trained neural preconditioner ($16\!\times$ reduction,
-    cluster anchored near $\lambda\!=\!1$ as required by the Frobenius objective) vs.\
+    cluster anchored near $\lambda\!=\!\|A\|$ as required by the Frobenius objective) vs.\
     cosine-Hutchinson ($68\!\times$ reduction, cluster near $\lambda\!\approx\!0.08$,
     unconstrained by any location prior).  Both neural preconditioners share an identical
     architecture; the $4.3\!\times$ gap in $\kappa$ reduction is attributable entirely to
