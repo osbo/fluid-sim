@@ -56,7 +56,7 @@ Neural preconditioners promise data-driven priors for the linear systems that do
 real-time physics simulation, but existing graph-neural designs struggle with long-range
 couplings: their nonzero pattern is constrained to that of the system matrix, and information
 between distant degrees of freedom must traverse many message-passing layers. We introduce a
-neural preconditioner anchored to a fixed weak-admissibility $\mathcal{H}$-matrix partition.
+neural preconditioner anchored to a weak-admissibility $\mathcal{H}$-matrix partition.
 The partition is computed analytically and reused for all inputs, giving the network a strong
 multiscale structural bias: a transformer stack handles dense diagonal blocks at full rank,
 and a second stack emits low-rank factors for off-diagonal tiles at a single coarse resolution
@@ -108,16 +108,25 @@ neural operators, physics simulation, real-time graphics}
 \label{sec:intro}
 % ===========================================================================
 
-Real-time simulation of fluids, soft bodies, and coupled multiphysics systems requires
-solving a large sparse linear system $A\mathbf{x} = \mathbf{b}$ at every time step, almost
-always with preconditioned conjugate gradient (PCG). The preconditioner $M\!\approx\!A^{-1}$
-is the dominant design variable: it must be cheap to apply and must cluster the eigenvalues
-of $MA$ tightly enough to drive PCG to its tolerance in a few dozen iterations. In an
-interactive budget of a few milliseconds per frame, classical preconditioners that
-re-amortize a heavy setup at every frame---incomplete Cholesky (IC) and algebraic multigrid
-(AMG) above all---become impractical, both because their setup costs are unpredictable and
-because their application is dominated by sequential triangular solves or level-by-level
-synchronization that map poorly onto modern GPUs~\cite{Yang2025sparse,naumov2015amgx}.
+Real-time simulation of fluids, soft bodies, and coupled multiphysics systems often reduces,
+at every time step, to solving a large sparse linear system $A\mathbf{x} = \mathbf{b}$ --
+most commonly a symmetric positive-definite (SPD) pressure or stress system attacked with a
+Krylov method such as preconditioned conjugate gradient (PCG)~\cite{saad2003iterative}. Many
+simulation pipelines bypass this entirely (position-based dynamics, explicit SPH) or use
+nonsymmetric Krylov variants and direct solvers, but for the SPD systems that dominate
+incompressible-fluid and elastic-solid pipelines, PCG remains the workhorse. The
+preconditioner $M\!\approx\!A^{-1}$ is the dominant design variable: it must be cheap to
+apply and must cluster the eigenvalues of $MA$ tightly enough to drive PCG to its tolerance
+in a few dozen iterations. Classical preconditioners --- Jacobi, incomplete Cholesky/LU
+(IC/ILU)~\cite{lin1999incomplete}, sparse approximate inverses (SPAI)
+\cite{kolotilina1993factorized,benzi1996sparse}, and algebraic multigrid
+(AMG)~\cite{ruge1987algebraic} --- are well-understood and excel in many regimes,
+particularly when the matrix is reused across many solves so a heavy setup amortizes. In an
+interactive setting, however, $A$ changes at every frame, so any preconditioner whose setup
+cost approaches the per-frame budget cannot amortize; this affects IC and AMG most because
+their setup is sequential and irregular~\cite{naumov2015amgx}, and IC application is further
+bottlenecked on triangular solves whose data hazards resist GPU
+parallelization~\cite{liu2016synchronization,yamazaki2020performance}.
 
 Machine learning offers an appealing alternative: given a distribution of simulation states,
 a neural preconditioner can be trained once and amortized across frames at near-constant,
@@ -132,60 +141,88 @@ convolutions, which require many layers to propagate long-range information and 
 oversmooth local detail along the way~\cite{chen2020simple,trifonov2025gnn}. Second, the
 dominant operations at apply time---triangular solves on a learned IC factor, or sparse
 matrix-vector products on a learned SPAI---are bandwidth-bound and either serialize on data
-hazards or scatter through irregular memory access~\cite{Yang2025sparse}.
+hazards~\cite{liu2016synchronization} or scatter through irregular memory access.
 
-We propose a different architecture that targets both limitations simultaneously. Our
-starting observation is structural: simulation codes routinely reorder degrees of freedom
-along a space-filling curve (Morton/Z) or a bandwidth-reducing permutation (reverse
-Cuthill--McKee), so under such orderings near-diagonal entries of $A$ describe spatially
-local interactions while far-diagonal entries describe distant ones. This is the
-$\mathcal{H}$-matrix-compatible banded structure familiar from hierarchical
-matrices~\cite{hackbusch1999sparse,hackbusch2002adaptive}: well-separated index ranges admit
-low-rank approximation, and the rank decreases with separation. The same hierarchy underlies
-multigrid analysis: high-frequency residual components are local and require dense corrections,
-while low-frequency components---bulk pressure shifts, large-scale stress modes---are
-nonlocal and require correspondingly nonlocal corrections~\cite{briggs2000multigrid}.
-The upshot is that a banded $A$ already encodes the spectral hierarchy its inverse needs to
-respect.
+\paragraph{From PCG geometry to hierarchical structure.}
+PCG's convergence rate is governed by the spectrum of $MA$, so the ideal preconditioner is
+$M\!=\!A^{-1}$; any practical alternative trades approximation quality for cheapness of
+representation and application. Although $A$ is sparse, $A^{-1}$ is generally dense, so the
+relevant question is what \emph{structure} makes $A^{-1}$ cheap to store and apply
+approximately. That structure is determined by the index ordering of $A$. In modern
+simulation codes, degrees of freedom are commonly already arranged along a space-filling
+curve (Morton/Z, Hilbert) or a bandwidth-reducing permutation (reverse Cuthill--McKee), not
+because the linear solver wants it but because the surrounding pipeline does: spatial-hash
+and BVH data structures used for neighbor search, broad-phase collision, and parallel
+particle access build their indices from exactly these
+orderings~\cite{karras2012maximizing,teschner2003optimized,ihmsen2011parallel}. Under such
+orderings, the nonzeros of $A$ cluster near the main diagonal: near-diagonal entries describe
+spatially local interactions, while far-diagonal entries, when they exist, describe distant
+ones.
+
+The corresponding inverse $A^{-1}$ is dense, but it inherits a softer form of this geometry:
+sub-blocks of $A^{-1}$ associated with index ranges that are well-separated along the
+ordering have rapidly decaying singular values, with the numerical rank shrinking as the
+separation grows. \emph{Hierarchical matrices}, or
+$\mathcal{H}$-matrices~\cite{hackbusch1999sparse,hackbusch2002adaptive,borm2003introduction},
+are the data structure that exploits this prior: they represent $A$ or $A^{-1}$ as a
+recursive partition into dense diagonal blocks plus low-rank off-diagonal blocks, with the
+admissible rank shrinking as off-diagonal tiles move further from the main diagonal. The
+fast multipole method (FMM)~\cite{greengard1987fast} exploits the same prior more
+aggressively for translation-invariant kernels, factoring far-field interactions through
+coarse low-dimensional surrogates; an $\mathcal{H}$-matrix preconditioner is, architecturally,
+an FMM-shaped operator on the assembled system. Multigrid analysis~\cite{briggs2000multigrid}
+relies on a related hierarchy, but interleaves smoothing with restriction/prolongation across
+levels, whereas FMM and $\mathcal{H}$-matrix application has the flat one-pass structure
+(coarse summary, far-field broadcast, local correction) that we adopt below.
 
 \paragraph{Approach.}
 We anchor the preconditioner to a weak-admissibility $\mathcal{H}$-matrix
-partition~\cite{hackbusch2002adaptive}, computed analytically and held fixed throughout
-training and inference. With minimum block size $L$ and $K = N/L$ leaves, the partition
-consists of $K$ dense diagonal blocks of size $L\times L$ (one per leaf) and a static set of
+partition~\cite{hackbusch2002adaptive}, computed analytically from the leaf-index geometry
+and reused for every frame. With minimum block size $L$ and $K = N/L$ leaves, the partition
+consists of $K$ dense diagonal blocks of size $L\!\times\!L$ (one per leaf) and a set of
 off-diagonal tiles, each spanning $S\!\times\!S$ leaves with $S\!=\!2^{j}$, indexed by leaf
 coordinates. A two-stream transformer (\textsc{LeafOnlyNet}) operates on this layout: a
-\emph{diagonal} stream emits one factor matrix per leaf, and an \emph{off-diagonal} stream
-emits one factor matrix per tile. Crucially, every off-diagonal tile is processed at the
-\emph{same} coarse token count $L_s\!=\!L/p$, regardless of $S$; the implied full-resolution
-block then has rank at most $L_s$ on a $SL\!\times\!SL$ region, so the rank fraction
-$L_s/(SL)$ decreases automatically as $S$ grows---the structural bias appropriate for
-$\mathcal{H}$-matrix compression. To break the locality of within-block attention without
-giving up the $\Theta(N)$ budget, we route information between layers through \emph{highway}
-buffers organized as axial (row/column-band) buffers and a single global summary token
+\emph{diagonal} stream emits one factor matrix per leaf at full rank, and an
+\emph{off-diagonal} stream emits one factor matrix per tile at a constant coarse token count
+$L_s\!=\!L/p$, regardless of $S$. The implied full-resolution block then has rank at most
+$L_s$ on a $SL\!\times\!SL$ region, so the rank fraction $L_s/(SL)$ shrinks automatically as
+$S$ grows---exactly the structural bias $\mathcal{H}$-matrix compression already calls for.
+To break the locality of within-block attention without giving up the $\Theta(N)$ budget, we
+route information between layers through \emph{highway} buffers organized as axial
+(row/column-band) buffers and a single global summary token
 (Section~\ref{sec:method:highways}).
 
-The resulting system addresses each of the limitations above. (i) \emph{Full-graph coverage}:
-long-range couplings are represented explicitly by the off-diagonal stream rather than
-filtered through repeated message passing on a fixed sparsity pattern. (ii) \emph{No
-triangular solves}: preconditioner application is a fixed sequence of batched matrix
-multiplications on contiguous tensors. (iii) \emph{Predictable cost}: the partition is static,
-so FLOP count and memory traffic are data-independent and the entire PCG inner loop
-(preconditioner apply $+$ sparse matvec $+$ scalar updates) captures cleanly into a single
-CUDA Graph. (iv) \emph{Linear scaling}: both forward inference and per-iteration application
-are $\Theta(N)$, with leading constants set by hyperparameters $L,L_s,d,n_l$ rather than by
-problem-dependent fill-in.
+\paragraph{A loss with no preferred eigenvalue location.}
+We train this network self-supervised with a cosine-similarity Hutchinson probe loss on the
+preconditioned image $MA\mathbf{z}$ of random probes $\mathbf{z}$. Compared to Frobenius- or
+SAI-style objectives~\cite{Yang2025sparse}, the cosine objective is invariant to both the
+scale and the absolute location of the eigenvalues of $MA$: it imposes no preferred location
+or scale for the eigenvalue cluster, only that the preconditioned probe align angularly with
+its source. The network is free to be \emph{lazy} -- to cluster the spectrum wherever doing
+so minimizes the angular gap between $\mathbf{z}$ and $MA\mathbf{z}$ the most, without paying
+for the wrong overall scale or center. This matters for stiff multiphase systems whose
+spectra do not naturally cluster around $1$.
 
-\paragraph{Contributions.} (1) A neural preconditioner anchored to a fixed
-weak-admissibility $\mathcal{H}$-matrix partition, with a uniform-resolution off-diagonal
-stream that yields $\Theta(N)$ inference and apply, unlike classical $\mathcal{H}$-matrix
-arithmetic. (2) Multiscale highway connections that propagate axial and global context
-between transformer layers without breaking the linear budget. (3) A scale- and
-location-invariant cosine Hutchinson loss that, unlike Frobenius- or SAI-style
-objectives~\cite{Yang2025sparse}, is invariant to both the scale and the absolute location
-of the eigenvalues of $MA$---a property that matters for stiff, multiphase systems whose
-spectra do not naturally cluster around $1$. (4) An end-to-end allocation-free apply path
-that captures into a single CUDA Graph, giving zero CPU dispatch overhead per PCG iteration.
+\paragraph{One CUDA Graph for the whole iteration.}
+Every preceding choice -- analytically determined partition, fixed coarse rank, no
+triangular solves, allocation-free apply -- cooperates to remove the data dependencies that
+would normally fragment a CG iteration into separately dispatched kernels. The full PCG
+inner loop -- preconditioner apply, sparse matvec, residual update, scalar reductions --
+becomes a single fixed sequence of batched GEMMs and reductions over preallocated contiguous
+tensors with no data-dependent branching. We capture it end-to-end as a single CUDA Graph
+and replay it once per iteration, eliminating CPU dispatch overhead between every kernel of
+every iteration. This is, in our measurements, the largest single source of the speedup we
+report against classical GPU preconditioners.
+
+\paragraph{Contributions.} (1) A neural preconditioner anchored to a weak-admissibility
+$\mathcal{H}$-matrix partition, with a uniform-resolution off-diagonal stream that yields
+$\Theta(N)$ inference and apply, in contrast to the $O(N\log N)$ of classical
+$\mathcal{H}$-matrix arithmetic. (2) Multiscale highway connections that propagate axial and
+global context between transformer layers without breaking the linear budget. (3) A
+scale- and location-invariant cosine Hutchinson training objective that drops the implicit
+eigenvalue-location prior of Frobenius- and SAI-style losses, letting the network choose
+where in the spectrum to cluster $MA$. (4) An end-to-end allocation-free apply path that
+captures into a single CUDA Graph, giving zero CPU dispatch overhead per PCG iteration.
 
 % ===========================================================================
 \section{Related Work}
@@ -194,68 +231,79 @@ that captures into a single CUDA Graph, giving zero CPU dispatch overhead per PC
 
 \paragraph{Classical iterative solvers.}
 Preconditioning sparse SPD systems is a textbook concern of scientific
-computing~\cite{saad2003iterative}. Widely used algebraic preconditioners include Jacobi,
+computing~\cite{saad2003iterative}. The canonical algebraic preconditioners --- Jacobi,
 incomplete Cholesky/LU (IC/ILU)~\cite{lin1999incomplete}, sparse approximate inverses
-(SPAI)~\cite{kolotilina1993factorized,benzi1996sparse}, and algebraic
-multigrid (AMG)~\cite{ruge1987algebraic}. Each trades approximation quality against
-arithmetic and memory cost. IC achieves strong spectral approximation but requires
-triangular solves whose data hazards resist GPU
-parallelization~\cite{liu2016synchronization,yamazaki2020performance}; SPAI avoids these
-solves but its construction is a pattern-by-pattern least-squares optimization that often
-yields suboptimal condition numbers~\cite{Yang2025sparse}; AMG offers excellent convergence
-on elliptic problems but requires sensitive setup and irregular V-cycle
-communication~\cite{naumov2015amgx}. In an interactive setting, setup cost alone often
-exceeds the per-frame budget; our amortized neural construction inverts this trade-off.
+(SPAI)~\cite{kolotilina1993factorized,benzi1996sparse}, and algebraic multigrid
+(AMG)~\cite{ruge1987algebraic} --- are mature, well-analyzed, and remain the default choice
+across most of scientific computing. IC and ILU mirror the elimination structure of $A$
+within a chosen sparsity pattern, giving strong spectral approximation per unit memory.
+SPAI methods approximate $A^{-1}$ directly as a sparse matrix, exposing parallelism by
+replacing triangular solves with a sparse matvec at apply time, with the choice of sparsity
+pattern controlling the approximation/cost trade-off. AMG constructs a hierarchy of
+coarsened operators algebraically and achieves near-optimal convergence on elliptic
+problems~\cite{ruge1987algebraic,naumov2015amgx}. These methods are at their best when the
+system is reused across many solves so a careful setup amortizes; the regime we target ---
+$A$ changing every frame at interactive rates --- sits outside that comfort zone, which is
+what motivates the amortized neural alternative pursued in this paper. The known GPU costs
+of triangular solves~\cite{liu2016synchronization,yamazaki2020performance} and of AMG
+setup/V-cycle communication~\cite{naumov2015amgx} bear directly on this regime rather than
+on the methods themselves.
 
 \paragraph{Neural operators and learned PDE solvers.}
 Neural operators including Fourier-based~\cite{li2021fourier},
 DeepONet-based~\cite{lu2021learning}, and graph-based~\cite{li2020neural,li2020multipole}
-variants learn function-space mappings and have been used both as PDE surrogates and as
-preconditioners inside flexible Krylov solvers~\cite{rudikov2024neural}. Physics-informed
-networks~\cite{raissi2019physics} embed PDE residuals directly into the loss. Our approach
-is complementary and purely algebraic: we operate on the assembled sparse matrix and
-simulation-state node features, with no reference to an underlying PDE or coordinate system
-beyond the (already-required) spatial node positions, so the same model applies to
-non-uniform materials and irregular discretizations.
+variants learn function-space mappings between coefficient and solution fields and
+generalize across coefficient distributions, and have been deployed both as PDE surrogates
+and as inner preconditioners for flexible Krylov solvers~\cite{rudikov2024neural}.
+Physics-informed networks~\cite{raissi2019physics} embed PDE residuals directly into the
+loss to enforce equation consistency without labeled solutions. Together these works
+establish that neural networks can capture the global solution behavior of an operator
+family from data; the present paper shares the broader ambition of replacing analytical work
+with learned components, but operates one rung lower in the stack, on the assembled
+algebraic system rather than the underlying PDE.
 
 \paragraph{Learning-based preconditioners.}
-A line of work trains GNNs to predict the nonzeros of an incomplete factor of
-$A$~\cite{Li2023learning,hausner2023neural,trifonov2024linear}, replacing classical fill-in
-heuristics with a learned forward pass but inheriting the triangular-solve bottleneck at
-apply time and requiring local message passing to capture a global elimination
-tree~\cite{trifonov2025gnn}. Yang \emph{et al.}~\cite{Yang2025sparse} sidestep the apply-time
-issue by having a GNN emit a sparse $GG^\top$ approximate inverse evaluated as two SpMVs;
-their scale-invariant Frobenius (``SAI'') loss enables training without solution vectors.
-Chen~\cite{chen2024gnp} reports strong results across the SuiteSparse collection on
-ill-conditioned problems where classical IC and AMG fail. We extend the SPAI direction along
-a different axis: rather than restricting the preconditioner to the sparsity pattern of $A$,
-we structure it as an $\mathcal{H}$-matrix that explicitly represents long-range couplings,
-trade SpMV bandwidth-bound apply for compute-bound batched GEMM, and replace the SAI loss
-with a cosine objective that drops the implicit eigenvalue-location prior.
+A productive line of work trains GNNs to produce a learned incomplete factorization of $A$:
+the network emits the nonzero values of a triangular factor on a chosen sparsity pattern,
+replacing the heuristic fill-in and ordering choices of classical IC with a forward pass
+trained on a distribution of matrices~\cite{Li2023learning,hausner2023neural,trifonov2024linear}.
+Yang \emph{et al.}~\cite{Yang2025sparse} develop a complementary direction in which a GNN
+emits a sparse approximate inverse in factored $GG^\top$ form, evaluated as two SpMVs at
+apply time, and show that a scale-invariant Frobenius (``SAI'') loss enables effective
+self-supervised training without ever forming a solution vector --- an idea our own
+self-supervised objective builds on. Chen~\cite{chen2024gnp} reports strong performance
+across the SuiteSparse collection on ill-conditioned problems where classical IC and AMG
+struggle, demonstrating the breadth of the GNN preconditioner approach.
+Trifonov~\emph{et al.}~\cite{trifonov2025gnn} analyze how local message passing relates to
+the global elimination tree, clarifying when GNN architectures suffice for matrix-level
+tasks. The present paper is in this lineage, and our point of departure is structural ---
+described in the next section --- rather than a critique of the algorithmic choices these
+works make.
 
 \paragraph{Hierarchical neural architectures for PDEs.}
-Multiscale neural networks~\cite{Fan2019multiscale}, multipole graph neural
-operators~\cite{li2020multipole}, neural-FMM Green's-function networks~\cite{Fognini2025neural},
-and neural-HSS solvers~\cite{Sittoni2026neural} embed FMM- or $\mathcal{H}$-matrix-style
-hierarchical structure into neural networks, but as forward surrogates that \emph{replace}
-the numerical solve. Closer to our setting, neural approximate inverse
-preconditioners~\cite{Xu2025neural} and multigrid-inspired neural iterative
-solvers~\cite{Lyu2026multigrid,Luz2020learning} learn operators that accelerate an outer
-iteration. Compared with these, we differ in three ways: (i) we use a static
-weak-admissibility $\mathcal{H}$-matrix partition rather than a multigrid hierarchy or a
-learned partition, (ii) the apply path is allocation-free and captures into a single
-CUDA Graph, and (iii) the cosine Hutchinson training objective, which to our knowledge
-has not appeared in the prior literature on learned preconditioners.
+A parallel line of work embeds FMM- or $\mathcal{H}$-matrix-style hierarchical structure
+directly into neural network architectures. $\mathcal{H}$-matrix-shaped multiscale
+networks~\cite{Fan2019multiscale}, multipole graph neural operators~\cite{li2020multipole},
+neural FMM/Green's-function operators~\cite{Fognini2025neural}, and neural-HSS
+solvers~\cite{Sittoni2026neural} each demonstrate that hierarchical inductive biases let a
+network represent long-range couplings without relying on fully connected attention or deep
+stacks of purely local message passing. In a setting closer to ours, neural approximate
+inverse preconditioners~\cite{Xu2025neural} and multigrid-inspired neural iterative
+solvers~\cite{Lyu2026multigrid,Luz2020learning} use related structure to accelerate an
+outer iteration. Collectively, this literature makes a strong case that an explicit
+hierarchical/coarsening prior is a productive way to scale neural PDE machinery, and our
+work adopts the same prior.
 
 \paragraph{Hierarchical matrix techniques.}
-Classical $\mathcal{H}$-matrix and $\mathcal{H}^2$-matrix arithmetic exploits low-rank
-structure in well-separated sub-blocks~\cite{hackbusch1999sparse,hackbusch2002adaptive,borm2003introduction};
-HODLR variants~\cite{Hartland2023hodlr} apply the same structural prior to Hessians in
-inverse problems. We retain the partition and the weak admissibility framework, but replace
-classical analytical low-rank approximations of fixed off-diagonal blocks with
-transformer-generated factors at a uniform coarse rank---letting the network discover, from
-simulation-state features, which entries of the inverse the local low-rank approximation
-should resolve.
+Classical $\mathcal{H}$- and $\mathcal{H}^2$-matrix
+arithmetic~\cite{hackbusch1999sparse,hackbusch2002adaptive,borm2003introduction} gives a
+near-linear-cost framework for storing and applying operators whose well-separated
+sub-blocks are low-rank, with mature machinery for adaptive partitioning, low-rank
+truncation, and approximate factorization. HODLR variants~\cite{Hartland2023hodlr} apply the
+same structural prior to dense Hessians in PDE-constrained inverse problems. The
+partitioning machinery developed in this body of work is what we instantiate; the
+contribution of the present paper lies in how the off-diagonal factors are produced and
+applied, which is the subject of Section~\ref{sec:method}.
 
 % ===========================================================================
 \section{Background}
