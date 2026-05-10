@@ -76,3 +76,10 @@ Paper/supplementary.log
 Paper/supplementary.out
 Paper/supplementary.pdf
 Paper/supplementary.synctex.gz
+
+# Large dev / asset blobs (not for version control; were removed from history)
+Assets/Scripts/Octree
+Assets/Scripts/inspect_model_plot.png
+Assets/Meshes/bunny.obj
+Assets/Meshes/stanford-bunny.obj
+Assets/Shaders/*.exr
