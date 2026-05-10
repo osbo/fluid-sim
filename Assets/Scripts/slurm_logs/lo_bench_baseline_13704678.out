@@ -1,0 +1,61 @@
+================================================================
+Job 13704678 on node3001
+Started: Sun May 10 18:10:27 EDT 2026
+GPU info:
+NVIDIA H200, 590.48.01, 143771 MiB
+ncu: /orcd/software/core/001/pkg/cuda/13.1.0/bin/ncu
+================================================================
+Device: cuda
+Weights: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/StreamingAssets/leaf_only_weights_sim_8192.bytes
+Data: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/multiphase_v2_8192/test
+Output: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/baseline_benchmark
+Arch: d_model=64 leaf_size=128 L=1 hw=0 input_dim=9
+Frames: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+Loaded 20 frames (N range 8192..8192).
+
+=== Pass 1: per-component CUDA timing ===
+  [pass1] frame  0/20  fwd=  2.003 ms
+  [pass1] frame  1/20  fwd=  1.986 ms
+  [pass1] frame  2/20  fwd=  1.986 ms
+  [pass1] frame  3/20  fwd=  1.977 ms
+  [pass1] frame  4/20  fwd=  1.971 ms
+  [pass1] frame  5/20  fwd=  1.977 ms
+  [pass1] frame  6/20  fwd=  1.973 ms
+  [pass1] frame  7/20  fwd=  1.971 ms
+  [pass1] frame  8/20  fwd=  1.976 ms
+  [pass1] frame  9/20  fwd=  1.973 ms
+  [pass1] frame 10/20  fwd=  1.978 ms
+  [pass1] frame 11/20  fwd=  1.983 ms
+  [pass1] frame 12/20  fwd=  1.979 ms
+  [pass1] frame 13/20  fwd=  1.979 ms
+  [pass1] frame 14/20  fwd=  1.978 ms
+  [pass1] frame 15/20  fwd=  1.980 ms
+  [pass1] frame 16/20  fwd=  1.980 ms
+  [pass1] frame 17/20  fwd=  2.048 ms
+  [pass1] frame 18/20  fwd=  1.989 ms
+  [pass1] frame 19/20  fwd=  1.984 ms
+
+=== Pass 2: torch.profiler ===
+  [pass2] frame  0  wall=41.31 ms
+  [pass2] frame  1  wall=16.40 ms
+  [pass2] frame  2  wall=16.33 ms
+  [pass2] frame  3  wall=16.33 ms
+  [pass2] frame  4  wall=17.94 ms
+  [pass2] frame  5  wall=16.44 ms
+  [pass2] frame  6  wall=16.44 ms
+  [pass2] frame  7  wall=16.46 ms
+  [pass2] frame  8  wall=16.43 ms
+  [pass2] frame  9  wall=18.03 ms
+  [pass2] frame 10  wall=16.29 ms
+  [pass2] frame 11  wall=16.38 ms
+  [pass2] frame 12  wall=16.35 ms
+  [pass2] frame 13  wall=16.30 ms
+  [pass2] frame 14  wall=17.90 ms
+  [pass2] frame 15  wall=16.34 ms
+  [pass2] frame 16  wall=16.35 ms
+  [pass2] frame 17  wall=16.29 ms
+  [pass2] frame 18  wall=16.21 ms
+  [pass2] frame 19  wall=17.66 ms
+
+=== Pass 3: Nsight Compute ===
+[ncu] frame 0: /orcd/software/core/001/pkg/cuda/13.1.0/bin/ncu --target-processes application-only --replay-mode kernel --cache-control … --export /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/baseline_benchmark/ncu/frame_00

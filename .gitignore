@@ -83,3 +83,20 @@ Assets/Scripts/inspect_model_plot.png
 Assets/Meshes/bunny.obj
 Assets/Meshes/stanford-bunny.obj
 Assets/Shaders/*.exr
+
+# Benchmark / profiler / Nsight (GitHub rejects >100 MB; warns >50 MB)
+# — Nsight Compute exports and imports (any benchmark subfolder under results/)
+Assets/Scripts/results/**/ncu/
+# — torch.profiler Chrome trace (50–500+ MB); name is fixed in BenchmarkBaseline.py
+Assets/Scripts/results/**/torch_profiler_trace.json
+# — Nsight Systems / Nsight Graphics / other vendor trace blobs (any path)
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.nvpayload
+# — PyTorch / tooling trace JSON variants (often huge)
+*.pt.trace.json
+# — FreqRankByDistance disk cache (can grow with grid size)
+Assets/Scripts/.freq_rank_cache.npz
+# — LeafOnly training context shards (often multi-GB; regenerate locally)
+**/.leafonly_training_context_cache/
