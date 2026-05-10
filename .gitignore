@@ -41,8 +41,12 @@ __pycache__/
 .Python
 *.so
 
-# Optional: uncomment to avoid committing large training runs
-# Assets/StreamingAssets/TestData/Run_*/
+# Large Unity streaming test assets (regenerate locally)
+Assets/StreamingAssets/TestData/
 
 # Local datasets and training caches under Scripts (often >100MB; regenerate locally)
 Assets/Scripts/data/
+
+# PyTorch compile caches (torch.compile / Inductor / Triton; regenerate locally)
+Assets/Scripts/.triton_cache/
+Assets/Scripts/.torch_inductor_cache/
