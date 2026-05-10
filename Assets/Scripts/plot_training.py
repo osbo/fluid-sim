@@ -1,5 +1,5 @@
 """
-Training profile figure for LeafOnlyNet (d=128, L=3, hw, N=8192).
+Training profile figure for the default trained checkpoint (d=128, L=3, hw, N=8192).
 
 Single plot, three y-axes:
   Left  (primary)   – cosine Hutchinson loss  L_cos  (mean ± 1σ ribbon)

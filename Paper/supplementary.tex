@@ -20,6 +20,7 @@
 % Same figure search paths as paper.tex (latexmk from Paper/ or repo root).
 \graphicspath{{figures/}{Paper/figures/}}
 \usepackage{booktabs}
+\usepackage{float}
 
 \begin{document}
 
@@ -47,9 +48,9 @@ build this file before \texttt{paper.tex} so \texttt{supplementary.aux} is curre
 Table~2 in the main paper omits PCG iteration counts to fit a single column.
 Table~\ref{tab:full_perf_table} reports them here for completeness.
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
-\caption{Per-frame mean$\pm$std PCG iterations on \textsf{multiphase\_v2}
+\caption{Per-frame mean$\pm$std PCG iterations on the multiphase Poisson benchmark
 ($\mathrm{rtol}\!=\!10^{-8}$, $20$ frames per scale).}
 \label{tab:full_perf_table}
 \footnotesize\setlength{\tabcolsep}{4pt}
@@ -69,14 +70,13 @@ AMG / AMGX (GPU)             & $1\!\pm\!0$     & $1\!\pm\!0$     & $1\!\pm\!1$  
 \end{table}
 
 % ===========================================================================
-\section{Multiphase\_v2 Benchmark Generation}
+\section{Multiphase Poisson Benchmark Generation}
 \label{supp:dataset}
 % ===========================================================================
 
 This appendix gives the precise procedure for generating each frame of
-\textsf{multiphase\_v2}, the benchmark used throughout the main paper. The full generator
-is \verb|generate_dataset.py| in the released code (configurable via
-\verb|--dataset-type multiphase-v2|).
+the multiphase Poisson benchmark used throughout the main paper. The full generator
+is \verb|generate_dataset.py| in the released code (see that script for dataset-type flags).
 
 \paragraph{Grid and ordering.}
 Each frame targets $N$ degrees of freedom on a 2D structured grid of dimensions
@@ -125,7 +125,7 @@ generator distribution.
 
 \paragraph{Why this benchmark stresses the architecture.}
 Three axes of randomization---contrast, topology, and orientation---combine to make
-\textsf{multiphase\_v2} a stress test for any preconditioner with a fixed structural prior.
+this benchmark a stress test for any preconditioner with a fixed structural prior.
 Closed barriers in particular produce sub-domains coupled \emph{only} through near-zero
 conductance, which is the precise regime in which an $\mathcal{H}$-matrix's far-block
 representation should out-perform a sparsity-restricted approximate inverse: information

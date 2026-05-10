@@ -300,7 +300,7 @@ convergence rates.
 
 \subsection{Overview}
 
-Our preconditioner is produced by the \textsc{LeafOnlyNet} architecture, a neural network
+Our preconditioner is implemented by a neural network
 $f_\theta$ mapping a simulation state and sparse matrix $A$ to a packed tensor encoding all
 factors of the $\mathcal{H}$-matrix approximate inverse.  The architecture has four stages:
 (1) a \textbf{physics-aware encoder} lifting raw node features to rich $d$-dimensional embeddings
@@ -532,7 +532,7 @@ Per-block attention $O(L_s^2 d)$; total $O(M_\mathcal{H} L_s^2 d) = O(N d)$.  FF
 \textbf{Application:} Diagonal blocks: $O(K L_s^2) = O(N L_s/L)$.  Off-diagonal FMM chain:
 $O(\sum_m S^{(m)} L_s) = O(N L_s)$.  Total: $O(N)$.
 
-Both the preconditioner construction (one \textsc{LeafOnlyNet} forward pass) and application are
+Both the preconditioner construction (one forward pass of $f_\theta$) and application are
 $\Theta(N)$, with constants determined by fixed hyperparameters $d$, $L$, $L_s$, $n_l$.
 
 % ===========================================================================
@@ -792,7 +792,7 @@ for the $O(N)$ scaling guarantee.
 \label{sec:training:loss}
 
 \paragraph{Cosine-similarity Hutchinson loss.}
-We train \textsc{LeafOnlyNet} with a cosine-similarity Hutchinson probe loss.  Given probe
+We train $f_\theta$ with a cosine-similarity Hutchinson probe loss.  Given probe
 vectors $Z \in \mathbb{R}^{N \times K_z}$, we compute $AZ$ via sparse matrix-vector products,
 apply the preconditioner to obtain $\widehat{Z} = M(AZ)$, and minimize
 \begin{equation}
@@ -804,7 +804,7 @@ apply the preconditioner to obtain $\widehat{Z} = M(AZ)$, and minimize
 A perfect preconditioner satisfies $MA\mathbf{z} = \mathbf{z}$ for all $\mathbf{z}$, giving
 $\mathcal{L}_{\mathrm{cos}} = 0$; the worst case is $\mathcal{L}_{\mathrm{cos}} = 2$ (anti-aligned).
 Gradients flow through $M(AZ)$ into the packed preconditioner output and back through
-\textsc{LeafOnlyNet}; $AZ$ is treated as a fixed input with no gradient through $A$.
+$f_\theta$; $AZ$ is treated as a fixed input with no gradient through $A$.
 
 \paragraph{Scale invariance and eigenvalue clustering.}
 $\mathcal{L}_{\mathrm{cos}}$ is scale-invariant by construction: because it measures only angular

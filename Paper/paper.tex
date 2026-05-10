@@ -181,7 +181,7 @@ partition~\cite{hackbusch2002adaptive}, computed analytically from the leaf-inde
 and reused for every frame. With minimum block size $L$ and $K = N/L$ leaves, the partition
 consists of $K$ dense diagonal blocks of size $L\!\times\!L$ (one per leaf) and a set of
 off-diagonal tiles, each spanning $S\!\times\!S$ leaves with $S\!=\!2^{j}$, indexed by leaf
-coordinates. A two-stream transformer (\textsc{LeafOnlyNet}) operates on this layout: a
+coordinates. A two-stream transformer operates on this layout: a
 \emph{diagonal} stream emits one factor matrix per leaf at full rank, and an
 \emph{off-diagonal} stream emits one factor matrix per tile at a constant coarse token count
 $L_s\!=\!L/p$, regardless of $S$. The implied full-resolution block then has rank at most
@@ -310,137 +310,226 @@ applied, which is the subject of Section~\ref{sec:method}.
 \label{sec:background}
 % ===========================================================================
 
-\paragraph{Preconditioned conjugate gradient.}
-We seek $\mathbf{x}\in\mathbb{R}^{N}$ satisfying $A\mathbf{x}=\mathbf{b}$ with $A$ SPD.
-Preconditioned CG introduces $M\!\approx\!A^{-1}$ and applies it to the residual at every
-iteration; convergence rate is governed by the spread of the eigenvalues of $MA$, scale-free
-in $A$. Throughout we treat the preconditioner as a linear (matrix-free) operator and never
-materialize $M$.
+\paragraph{Conjugate gradient and the role of the spectrum.}
+Given an SPD system $A\mathbf{x}=\mathbf{b}$, the conjugate gradient
+method~\cite{saad2003iterative} produces at iteration $k$ the unique vector $\mathbf{x}_k$ in
+the Krylov subspace $\mathcal{K}_k(A,\mathbf{r}_0) = \mathrm{span}\{\mathbf{r}_0, A\mathbf{r}_0,
+\ldots, A^{k-1}\mathbf{r}_0\}$ that minimizes the energy norm $\|\mathbf{x}_k -
+\mathbf{x}^*\|_A$. Equivalently, the error $\mathbf{e}_k$ satisfies
+\begin{equation}
+  \|\mathbf{e}_k\|_A \;=\; \min_{p\in\mathcal{P}_k,\,p(0)=1}\;\|p(A)\,\mathbf{e}_0\|_A
+  \;\le\; \mathbf{e}_0\,\max_{\lambda\in\sigma(A)}|p(\lambda)|,
+  \label{eq:cg-poly}
+\end{equation}
+where $\mathcal{P}_k$ is the space of degree-$k$ polynomials and $\sigma(A)$ is the spectrum.
+Because $p(A)$ acts diagonally in the eigenbasis of $A$, CG's progress is dictated entirely
+by how small a degree-$k$ polynomial with $p(0)=1$ can be made on the eigenvalues of $A$. Two
+consequences of \eqref{eq:cg-poly} shape preconditioner design.
 
-\paragraph{Weak-admissibility $\mathcal{H}$-matrices.}
-Partition the index set $\{0,\ldots,N-1\}$ into $K=N/L$ contiguous \emph{leaves} of size $L$.
-A block coupling leaf ranges $\mathcal{I},\mathcal{J}$ is \emph{weakly admissible} if
-$|\mathcal{I}|\le \eta\,\mathrm{dist}(\mathcal{I},\mathcal{J})$, where $\mathrm{dist}$ is the
-gap in leaf-index space. An $\mathcal{H}$-matrix retains diagonal blocks at full rank and
-replaces every weakly admissible off-diagonal block with a low-rank factorization. We compute
-the partition by assigning to each leaf pair the largest admissible block size of $S$ leaves
-on a side ($S=2^{j}$) and collecting the unique tiles; because $A$ is symmetric we keep only
-the $r_0\!\le\!c_0$ tiles and apply both halves symmetrically at runtime. For our default
-$K=128$ leaves at $\eta=1$, the partition has $M_\mathcal{H}=487$ unique upper-triangle
-off-diagonal tiles ($\approx\!3.8K$); the count grows nearly linearly with $K$ in our regime,
-keeping storage and compute at $O(N)$.
+First, the textbook condition-number bound
+$\|\mathbf{e}_k\|_A \le 2\bigl((\sqrt{\kappa}-1)/(\sqrt{\kappa}+1)\bigr)^k \|\mathbf{e}_0\|_A$,
+with $\kappa=\lambda_{\max}/\lambda_{\min}$, follows from the Chebyshev polynomial on the
+interval $[\lambda_{\min},\lambda_{\max}]$ and is tight only when the spectrum actually fills
+that interval. In practice, the \emph{distribution} of eigenvalues within
+$[\lambda_{\min},\lambda_{\max}]$ matters at least as much as the ratio.
 
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{hmatrixgraphic.png}
-  \caption{Weak-admissibility $\mathcal{H}$-matrix partition (illustrative leaf count). Dense
-    diagonal blocks lie along the main diagonal; admissible off-diagonal tiles double in size
-    as separation from the diagonal grows. Translucent red overlays the upper-triangle row
-    and column index sets associated with one exemplar tile---the same index sets accumulated
-    into the row and column highway buffers during training (Section~\ref{sec:method:highways}).}
-  \label{fig:hmatrix-schematic}
-\end{figure}
+Second, the polynomial in \eqref{eq:cg-poly} can place its $k$ roots wherever the spectrum
+concentrates. If $\sigma(A)$ collapses to $c$ tight clusters, a degree-$c$ polynomial that
+vanishes once on each cluster drives the error to roughly the cluster widths, so CG converges
+in $\sim c$ iterations in exact arithmetic regardless of how far apart the clusters are: two
+or three well-separated tight clusters are no worse than one. By the same token, isolated
+outlying eigenvalues (a few stiff modes from boundary conditions or material contrast) cost
+only one extra iteration each, since one root of $p$ disposes of each outlier.
 
-\paragraph{Hutchinson trace estimation.}
-The Hutchinson estimator~\cite{hutchinson1989stochastic},
-$\operatorname{tr}(B) = \mathbb{E}_{\mathbf{z}\sim\mathcal{N}(0,I)}[\mathbf{z}^\top B
-\mathbf{z}]$, lets us measure preconditioner quality without ever materializing $A^{-1}$:
-drawing probes $\mathbf{z}$, computing $A\mathbf{z}$ via SpMV, applying $M$ to obtain
-$\hat{\mathbf{z}}=M(A\mathbf{z})$, and measuring the alignment of $\hat{\mathbf{z}}$ with
-$\mathbf{z}$ yields a differentiable surrogate for $MA\!\approx\!I$.
+Preconditioning replaces $A\mathbf{x}=\mathbf{b}$ with $MA\mathbf{x}=M\mathbf{b}$ (left
+preconditioning), and the same analysis applies to $\sigma(MA)$. The objective is therefore
+not ``make $MA$ close to $I$ in any matrix norm'' but rather ``make $\sigma(MA)$ look like a
+small number of tight clusters bounded away from zero,'' with the absolute scale and location
+of those clusters largely irrelevant.
+
+\paragraph{Hierarchical matrices.}
+A hierarchical matrix ($\mathcal{H}$-matrix)~\cite{hackbusch1999sparse,hackbusch2002adaptive,borm2003introduction}
+is a data-sparse representation of a dense matrix as a recursive block partition in which
+each block is either small enough to store densely or has its singular values decay fast
+enough to be stored as a low-rank factorization $UV^\top$. The construction has two
+ingredients.
+
+A \emph{cluster tree} recursively partitions the row/column index set $\{0,\ldots,N-1\}$
+into nested subsets down to leaves of bounded size. A \emph{block cluster tree} then
+enumerates pairs of index clusters $(\mathcal{I},\mathcal{J})$ and tags each pair as
+\emph{admissible} (replaceable by a low-rank factor) or \emph{inadmissible} (kept dense).
+The \emph{strong admissibility condition} of Hackbusch \emph{et al.}~\cite{hackbusch1999sparse}
+requires geometric separation,
+$\min\{\mathrm{diam}(\mathcal{I}),\mathrm{diam}(\mathcal{J})\}
+\le \eta\,\mathrm{dist}(\mathcal{I},\mathcal{J})$,
+and yields a fine partition that admits aggressive compression but contains many small
+blocks. The \emph{weak admissibility condition}~\cite{hackbusch2002adaptive}, used in this
+paper, requires only $\mathcal{I}\ne\mathcal{J}$ (or, in index-space form,
+$|\mathcal{I}|\le\eta\,\mathrm{dist}(\mathcal{I},\mathcal{J})$ as in
+HODLR~\cite{Hartland2023hodlr}), producing a coarser partition with larger but fewer
+off-diagonal blocks --- a trade-off favorable for GPU batching.
+
+The structural justification for low-rank approximation on admissible blocks is asymptotic
+smoothness of the underlying kernel: for a Green's function $G(x,y)$ smooth away from $x=y$,
+a truncated Taylor expansion on $\mathcal{I}\times\mathcal{J}$ achieves accuracy
+$\varepsilon$ at rank $O(\log^d \varepsilon^{-1})$ independent of block size, and the same
+exponential singular-value decay is observed empirically on inverses of discretized elliptic
+operators. Classical $\mathcal{H}$-matrix arithmetic (mat-vec, addition, factorization, even
+inversion) runs in $O(N\log N)$ to $O(N\log^2 N)$ time, with $\mathcal{H}^2$-matrices and
+HSS variants reducing this further by also nesting the low-rank bases across levels.
+
+\paragraph{Hutchinson trace estimation and probe spectra.}
+For any matrix $B\in\mathbb{R}^{N\times N}$ and any random probe $\mathbf{z}\in\mathbb{R}^N$
+with $\mathbb{E}[\mathbf{z}\mathbf{z}^\top]=I$, the Hutchinson
+identity~\cite{hutchinson1989stochastic} gives
+\begin{equation}
+  \mathbb{E}_{\mathbf{z}}\bigl[\mathbf{z}^\top B \mathbf{z}\bigr]
+  \;=\; \operatorname{tr}(B),
+  \label{eq:hutch}
+\end{equation}
+an unbiased Monte Carlo estimate of $\operatorname{tr}(B)$ obtainable from one matrix-vector
+product $B\mathbf{z}$ per probe, without ever materializing $B$. Standard probe distributions
+include $\mathbf{z}\sim\mathcal{N}(0,I)$ and Rademacher $\mathbf{z}\in\{\pm 1\}^N$; the
+former trades slightly higher variance for rotational invariance.
+
+What matters for our subsequent use of these probes inside a learning objective --- as
+opposed to as a pure trace estimator --- is their spectral content. Decompose $\mathbf{z}$
+in the eigenbasis $\{\mathbf{u}_i\}$ of $B$:
+$\mathbf{z} = \sum_i \alpha_i\,\mathbf{u}_i$, with $\alpha_i = \mathbf{u}_i^\top\mathbf{z}$.
+For any isotropic probe distribution, $\mathbb{E}[\alpha_i^2]=1$ for every $i$: the probe
+places equal expected energy on every eigenmode of $B$. Any scalar functional of
+$(\mathbf{z}, B\mathbf{z})$ is therefore an unbiased measurement of $B$'s action across the
+\emph{whole} spectrum, weighted uniformly --- it is not biased toward smooth/low-frequency or
+oscillatory/high-frequency modes the way a probe drawn from a band-limited distribution
+would be. This \emph{spectral whiteness} of isotropic probes is what allows a single scalar
+loss built from $\mathbf{z}$ and $(MA)\mathbf{z}$ to faithfully reflect global preconditioner
+quality across the entire spectrum of $MA$, and it is the property our training objective
+relies on.
 
 % ===========================================================================
 \section{Method}
 \label{sec:method}
 % ===========================================================================
 
-\textsc{LeafOnlyNet} is a neural network $f_\theta$ mapping a simulation state and the
-sparse matrix $A$ to a packed tensor encoding all factors of an $\mathcal{H}$-matrix
-approximate inverse. The architecture has four stages: a physics-aware encoder, a diagonal
-transformer stack over the $K$ leaves, an off-diagonal transformer stack over the
-$M_\mathcal{H}$ admissible tiles, and linear decoder heads. Highway connections optionally
-couple the two stacks at every layer.
+\paragraph{Notation.}
+Throughout this section, $A\in\mathbb{R}^{N\times N}$ is the assembled sparse SPD system,
+with degrees of freedom indexed along a space-filling-curve or bandwidth-reducing ordering.
+The $N$ indices are partitioned into $K=N/L$ contiguous \emph{leaves} of size $L$; this
+induces an $\mathcal{H}$-matrix partition consisting of $K$ diagonal leaf blocks and
+$M_\mathcal{H}$ unique weakly-admissible \emph{off-diagonal tiles}, with tile $m$ spanning
+$S_m\!\times\!S_m$ leaves (so covering an $S_mL\!\times\!S_mL$ region of $A$). The network
+operates at channel width $d$ and uses $n_l$ transformer layers per attention stack. The
+diagonal stream operates at full per-node resolution $L$ per leaf; the off-diagonal stream
+operates at a coarse token count $L_s\!\ll\!L$ per tile. We use
+$L\!=\!128,\,L_s\!=\!32,\,d\!=\!128,\,n_l\!=\!3$ in every reported result; the analysis
+generalizes verbatim to other choices.
 
-\subsection{Physics-Aware Encoder}
+\paragraph{Pipeline and dispatch budget.}
+The network is a four-stage pipeline from the simulation state and $A$ to a packed tensor of
+factor matrices encoding an $\mathcal{H}$-matrix approximate inverse $M\!\approx\!A^{-1}$:
+(1) a \emph{physics-aware encoder} (Sec.~\ref{sec:method:encoder}) lifts per-node and
+per-edge features to width-$d$ node embeddings; (2) a \emph{diagonal attention stack}
+(Sec.~\ref{sec:method:diag}) processes leaf-grouped tokens and emits one dense factor per
+leaf; (3) an \emph{off-diagonal attention stack} (Sec.~\ref{sec:method:offdiag}) processes
+tile-grouped tokens and emits one low-rank factor per off-diagonal tile; (4) linear decoder
+heads (Sec.~\ref{sec:method:decoder}) produce the final factor tensors. \emph{There are
+exactly two attention computations in the entire network} --- one batched over all $K$
+leaves and one batched over all $M_\mathcal{H}$ tiles --- so a forward pass dispatches
+exactly two attention kernels, independent of $N$. Combined with the static partition and
+the absence of data-dependent branching elsewhere, this is what later lets training and PCG
+inference run inside a single CUDA Graph.
+
+\begin{figure}[t]
+  \centering
+  \begin{minipage}[t]{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{hmatrixgraphic.png}\\
+    \small (a) $\mathcal{H}$-matrix partition.
+  \end{minipage}\hfill
+  \begin{minipage}[t]{0.49\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{highwaysgraphic.png}\\
+    \small (b) Highway channels.
+  \end{minipage}
+  \caption{Left: weak-admissibility $\mathcal{H}$-matrix partition. Dense diagonal leaf
+    blocks lie along the main diagonal; admissible off-diagonal tiles double in size with
+    separation from the diagonal. Translucent red overlays the row- and column-index sets of
+    one exemplar tile. Right: per-layer communication channels added by the highway
+    connections (Sec.~\ref{sec:method:highways}). The same off-diagonal tile contributes
+    scatter-add updates to its row- and column-strip ranges in the axial highway buffers
+    (translucent red), and to a single broadcast global token. Together with within-block
+    attention these give the network four communication channels of dimensions
+    $2\mathrm{D}/1\mathrm{D}/1\mathrm{D}/0\mathrm{D}$ per layer.}
+  \label{fig:partition-and-highways}
+\end{figure}
+
+\subsection{From simulation state to per-node embeddings}
 \label{sec:method:encoder}
 
-Each simulation node carries position $\mathbf{p}_i\!\in\!\mathbb{R}^3$, velocity
-$\mathbf{v}_i\!\in\!\mathbb{R}^3$, and per-problem features (density, pressure, material
-parameters, etc.). A two-layer MLP lifts these---together with an optional broadcast
-global-feature vector encoding simulation-level context---to dimension $d$. The lifted
-embeddings then pass through $n_{\mathrm{gcn}}\!=\!2$ residual graph-convolutional
-layers~\cite{kipf2017semi}: each layer concatenates a self-projection of $\mathbf{h}_i$ with
-an $A$-weighted neighbor mean and feeds the result to a small GELU MLP, giving every node
-an embedding aware of its local matrix entries and the physical state of nearby particles.
-Crucially, this is the only stage that observes individual graph edges; all subsequent
-processing operates on the block layout of the $\mathcal{H}$-matrix partition, not the
-graph itself, which decouples downstream cost from edge count.
+Because the preconditioner is neural rather than algebraic, the network is not constrained
+to ingest only the scalar entries $A_{ij}$: it can directly observe the per-node and
+per-pair quantities that the simulator assembles into those entries, recovering information
+that a fixed analytical preconditioner would never see. The encoder takes as input whichever
+per-node features the simulator already exposes --- typically a subset of position,
+velocity, density, pressure, temperature, and material parameters --- together with the
+geometric and coupling features $(\Delta\mathbf{x}_{ij}, A_{ij})$ for every nonzero of $A$.
+A two-layer MLP lifts the node features (optionally concatenated with a broadcast global
+context vector) to dimension $d$, and $n_{\mathrm{gcn}}\!=\!2$ residual
+graph-convolutional layers~\cite{kipf2017semi} mix in neighborhood information using $A$ as
+the message-passing weight, yielding one width-$d$ embedding per node aware of its local
+matrix entries and the physical state of its neighbors. This is the only stage of the
+network that observes individual graph edges; everything downstream operates on the block
+layout of the partition, decoupling cost from edge count.
 
-\subsection{Diagonal Transformer Stack}
+\subsection{Diagonal attention stack}
 \label{sec:method:diag}
 
-The diagonal stream produces, for each of the $K$ leaves, an $L_s\!\times\!L_s$ factor matrix
-$F_k$ such that the $k$-th diagonal block of the approximate inverse is $F_k F_k^\top$. We
-mean-pool the encoder output within each leaf by factor $p_{\mathrm{diag}}$ to a sequence of
-length $L_s = L/p_{\mathrm{diag}}$ tokens per block, and process the resulting $K\,L_s$
-tokens through $n_l$ transformer layers~\cite{vaswani2017attention} that perform attention
-strictly within each leaf. The within-block attention has cost $O(K L_s^2 d) = O(N)$.
+For each of the $K$ leaves, the diagonal stack produces a square factor
+$F_k\!\in\!\mathbb{R}^{L\times L}$, with the corresponding diagonal block of $M$ given by the
+PSD outer product $F_kF_k^\top$. The encoder embeddings inside a leaf are processed at full
+per-node resolution by $n_l$ transformer layers~\cite{Liu2021swin,vaswani2017attention} that
+restrict attention to within the leaf --- the within-window attention pattern of Swin
+adapted to one-dimensional index ranges. Attention logits carry a per-head bias produced by
+a small MLP from the four-dimensional edge descriptor
+$(\Delta\mathbf{x}_{ij}, A_{ij})$ for each in-leaf token pair, so geometry and coupling
+strength can modulate attention directly. This is the first of the two attention dispatches
+mentioned above; it is batched over all $K$ leaves.
 
-Two physics-derived modifications make the attention $A$-aware. First, attention logits are
-augmented with a per-head bias produced by a small MLP from the four-dimensional edge
-descriptor $[\Delta x,\Delta y,\Delta z,A_{ij}]$ for each in-block token pair, so geometry
-and coupling strength can directly modulate attention. Second, a binary self-marker token
-flag distinguishes diagonal entries from neighbor entries.
-
-\subsection{Off-Diagonal Transformer Stack}
+\subsection{Off-diagonal attention stack}
 \label{sec:method:offdiag}
 
-For each off-diagonal tile $m$ the off-diagonal stream produces, via two parallel linear
-heads, a pair of thin factor matrices $U_m, V_m\!\in\!\mathbb{R}^{L_s\times L_s}$. Their
-outer product $B_m = U_m V_m^\top$ is the coarse-resolution off-diagonal contribution: tile
-$m$ contributes $B_m$ to the rectangular block of the approximate inverse above the diagonal
-and $B_m^\top$ to the symmetrically located block below, preserving symmetry. We materialize
-$B_m$ once at the end of the forward pass and store only it in the packed tensor, so the
-apply path sees one $L_s\!\times\!L_s$ matrix per tile rather than a separate $U,V$ pair.
+For each off-diagonal tile $m$ spanning row index set $\mathcal{I}_m$ and column index set
+$\mathcal{J}_m$ of size $S_mL$, the off-diagonal stack produces a pair of thin factor
+matrices $U_m, V_m\!\in\!\mathbb{R}^{L_s\times L_s}$ whose outer product
+$B_m\!=\!U_mV_m^\top$ is the tile's coarse-resolution representation. Two design choices
+shape this stream.
 
-The off-diagonal stream is initialized by row- and column-strip pooling. Static binary
-weight matrices $W^{\mathrm{row}}, W^{\mathrm{col}} \in \mathbb{R}^{M_\mathcal{H}\times K}$
-encode, for each tile $m$, which leaves lie in its row range $[r_0,r_0+S)$ and column range
-$[c_0,c_0+S)$. The strip embedding is
-\begin{equation}
-  \mathbf{s}_m = \bigl(W^{\mathrm{row}}_{m,:} + W^{\mathrm{col}}_{m,:}\bigr)\,
-  \mathbf{H}_{\mathrm{leaves}}, \qquad
-  \mathbf{H}_{\mathrm{leaves}}\in\mathbb{R}^{K\times L\times d},
-\end{equation}
-optionally further pooled along the leaf-token axis by $p_{\mathrm{off}}$ so every tile
-arrives at the off-diagonal stack with the same fixed shape $(L_s, d)$. The stack itself has
-the same structure as the diagonal one: $n_l$ transformer layers attending over the $L_s$
-tokens of each tile, with edge biases derived this time from the mean of
-$[\Delta x,\Delta y,\Delta z,A_{ij}]$ over all node pairs that share a graph edge across the
-tile's row and column regions.
+\emph{Constant coarse token count, independent of tile size.} Per-node embeddings are pooled
+along the row-strip $\mathcal{I}_m$ and the column-strip $\mathcal{J}_m$ of the encoder
+output, then condensed along the in-strip axis to $L_s\!=\!L/p_{\mathrm{off}}$ tokens. Every
+tile therefore arrives at the attention stack with the same shape $(L_s, d)$, regardless of
+its physical size $S_mL$ --- a $4\times$ in-strip condensation for the smallest tiles and a
+$S_m\!\cdot\!4\times$ condensation for the largest. Attention then runs across the $L_s$
+tokens of each tile, batched over all tiles; this is the second (and final) attention
+dispatch. Edge biases for each in-tile token pair are computed from the mean of
+$(\Delta\mathbf{x}_{ij}, A_{ij})$ over all node pairs spanning the corresponding
+row/column sub-strips.
 
-The defining property of this stream is that \emph{every off-diagonal tile is processed at
-the same fixed token count $L_s$ and channel width $d$, regardless of the tile's physical
-size $SL$.} Two consequences follow. First, total off-diagonal cost is
-$O(M_\mathcal{H}\,L_s^2\,d) = O(N\,d)$, not $O(N\log N)$ as in classical
-$\mathcal{H}$-matrix arithmetic where rank is allowed to grow with block size. Second, the
-implied full-resolution block has rank at most $L_s$ on a region of size $SL\times SL$, so
-the rank fraction $L_s/(SL)$ shrinks automatically as $S$ grows---exactly the prior that
-makes $\mathcal{H}$-matrix compression effective: distant tiles, encoding smoother
-low-frequency couplings, are compressed more aggressively than near tiles.
+\emph{Constant per-tile rank, hence shrinking rank fraction with separation.} The factor
+pair $(U_m, V_m)$ has rank at most $L_s$, while the physical block it represents has size
+$S_mL\!\times\!S_mL$; the rank fraction $L_s / (S_mL)$ decreases automatically as $S_m$
+grows. This is the structural prior that makes $\mathcal{H}$-matrix compression effective:
+distant tiles, encoding smoother long-range couplings, are compressed more aggressively than
+near ones, while diagonal blocks remain at full rank (Sec.~\ref{sec:method:diag}). This
+distribution of representation capacity --- dense local, low-rank far --- is precisely the
+asymptotic-smoothness pattern documented for inverses of discretized elliptic operators
+(Sec.~\ref{sec:background}).
 
-This prior is not just structurally appealing---it is quantitatively sufficient for the
-problem class we target. Figure~\ref{fig:rank-headroom} plots the constant rank
-$L_s\!=\!32$ emitted by the architecture against the numerical rank required to capture
-the corresponding off-diagonal block of $A^{-1}$ at three truncation tolerances
-($\varepsilon\!\in\!\{10^{-3},10^{-6},10^{-9}\}$), measured on representative
-\textsf{multiphase\_v2} frames across tile sizes $SL\!\in\![128,2048]$. Even at the
-strictest tolerance $\varepsilon\!=\!10^{-9}$, the provided rank exceeds the required rank
-by $2.6\times$ at the largest tile size and the gap widens monotonically as $S$ grows.
-The architecture's structural bias (constant $L_s$ across tile sizes) is therefore
-matched, with headroom, to the actual low-rank structure of $A^{-1}$ for the elliptic
-operators of interest---a precondition for the claim that long-range couplings can be
-represented faithfully by a single fixed-width off-diagonal token budget.
+Quantitatively, the constant rank $L_s\!=\!32$ is more than sufficient for the problem class
+we target. Figure~\ref{fig:rank-headroom} compares it to the numerical rank required to
+capture the corresponding tile of $A^{-1}$ at three truncation tolerances; even at
+$\varepsilon\!=\!10^{-9}$, the provided rank exceeds the required rank by $2.6\times$ at the
+largest tile size, with the gap widening as separation grows.
 
 \begin{figure}[t]
   \centering
@@ -455,80 +544,130 @@ represented faithfully by a single fixed-width off-diagonal token budget.
   \label{fig:rank-headroom}
 \end{figure}
 
-\subsection{Highway Connections}
+\paragraph{What happens as $N$ grows.}
+A natural concern is whether a constant per-tile rank $L_s$ remains adequate as $N$ grows.
+Two regimes are distinguished. (i) \emph{Larger simulations at fixed resolution.} If $N$
+grows because the simulation domain grows --- more particles, more cells, the same physical
+length scales and the same local interaction radius --- the partition simply contains more
+tiles of the same maximum size, the singular-value decay rate of each tile is unchanged, and
+the per-tile rank budget stays appropriate. This is the regime our experiments target.
+(ii) \emph{Finer simulations at fixed domain.} If instead $N$ grows because the
+discretization is refined, the largest tile size $S_{\max}L$ grows with it and the numerical
+rank required for a fixed tolerance grows logarithmically with $S_{\max}$ for smooth
+Green's functions (Sec.~\ref{sec:background}). Because $L$ and $p_{\mathrm{off}}$ are
+hyperparameters, the natural response is to target a constant number of leaves $K$ rather
+than a constant $L$; this scales $L$ with the domain dimension at the cost of a single
+$O(N\log N)$ pooling pass and otherwise leaves the architecture untouched. We do not pursue
+this in our experiments since the regime we evaluate does not span a discretization-refinement
+octave wide enough to require it.
+
+\subsection{Highway connections}
 \label{sec:method:highways}
 
-A transformer that attends only within its block builds rich within-block representations
-but cannot directly observe the global state. To restore this, we optionally couple the
-two stacks through three highway buffers per layer: row and column \emph{axial} buffers
+Within-leaf and within-tile attention build rich local representations but cannot directly
+observe the global state. Highway connections restore this by coupling the diagonal and
+off-diagonal stacks through three buffers maintained per transformer layer: row and column
+\emph{axial} buffers
 $\mathbf{r}_{\mathrm{hw}},\mathbf{c}_{\mathrm{hw}}\!\in\!\mathbb{R}^{B\times N\times d}$,
-and a single global token
-$\mathbf{g}_{\mathrm{hw}}\!\in\!\mathbb{R}^{B\times d}$.
+and a single global summary token
+$\mathbf{g}_{\mathrm{hw}}\!\in\!\mathbb{R}^{B\times d}$ (illustrated in
+Fig.~\ref{fig:partition-and-highways}b).
 
-After the attention sublayer of each transformer block, the current block-token embeddings
-are scatter-added into their corresponding rows of the axial buffers (off-diagonal block
-tokens are first repeat-interleaved back to full leaf resolution so each off-diagonal tile
-contributes uniformly across its $S$-leaf row and column ranges), and the global token is
-updated as the mean over all active tokens. Before the FFN sublayer, every token
-$\mathbf{z}$ at index $i$ reads its highway context and forms the FFN input
-\begin{equation}
-  \tilde{\mathbf{z}} = [\,\mathbf{z}\,;\,\mathbf{r}_{\mathrm{hw}}[i]\,;\,
-  \mathbf{c}_{\mathrm{hw}}[i]\,;\,\mathbf{g}_{\mathrm{hw}}\,]\in\mathbb{R}^{4d},
-\end{equation}
-which is consumed by the FFN's input projection (width $4d$). The highway adds one $O(Nd)$
-scatter-gather per layer, preserving overall $\Theta(N)$ scaling.
+After the attention sublayer of each transformer block, block-token embeddings are
+scatter-added into their corresponding rows of the axial buffers (off-diagonal tile tokens
+are first repeat-interleaved back to full leaf resolution so each tile contributes uniformly
+across its $S$-leaf row and column ranges), and the global token is then updated as the mean
+over all active tokens. Before the FFN sublayer, each token concatenates its row, column,
+and global highway context with its own embedding and feeds the resulting $4d$-wide vector
+to the FFN's input projection. The four channels in each layer --- intra-block attention
+(2D, local), row and column highways (1D, axial), and the global token (0D, broadcast) ---
+compose a multiscale communication structure that mirrors the band-row-column-global
+geometry of the inverse of a banded matrix. The highway adds one $O(Nd)$ scatter-gather per
+layer, preserving overall $\Theta(N)$ scaling. Highways are enabled in every result we
+report; we ablate the choice of channels in Section~\ref{sec:ablation}.
 
-The four channels participating in each layer---intra-block attention (2D, local), row and
-column highways (1D, axial), and global token (0D, broadcast)---compose a multiscale
-communication structure that mirrors the $2\mathrm{D}/1\mathrm{D}/0\mathrm{D}$ band-row-column-global
-geometry of the inverse of a banded matrix. We ablate this channel structure in
-Section~\ref{sec:ablation}.
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{highwaysgraphic.png}
-  \caption{One off-diagonal tile contributes scatter-add updates to its row-strip and
-    column-strip ranges in the axial highway buffers (translucent red), and to a single
-    broadcast global token. Together with within-block attention, this gives the architecture
-    four communication channels of dimensions 2D / 1D / 1D / 0D per layer.}
-  \label{fig:highways-schematic}
-\end{figure}
-
-\subsection{Decoder and Output}
+\subsection{Decoder, output, and the geometric picture}
 \label{sec:method:decoder}
 
-After both transformer stacks, three lightweight linear heads project token embeddings to
-preconditioner factors. A two-layer \emph{leaf head} maps each diagonal-stream token to
-$\mathbb{R}^{L_s}$, giving one $F_k\!\in\!\mathbb{R}^{L_s\times L_s}$ per leaf. Two
-\emph{off-diag heads} map each off-diagonal-stream token to $\mathbb{R}^{L_s}$, giving
-$U_m,V_m\!\in\!\mathbb{R}^{L_s\times L_s}$ per tile. To extend the off-diagonal contribution
-back to full node resolution, two \emph{node heads} project per-node diagonal-stream
-embeddings (upsampled if $p_{\mathrm{diag}}\!>\!1$) to $\mathbb{R}^{L_s}$, giving node-factor
-matrices $\tilde U_k,\tilde V_k\!\in\!\mathbb{R}^{L\times L_s}$ per leaf. The application
-section below shows how $\tilde U,\tilde V,U,V$ together implement an FMM-style
-restriction-coarse-prolongation chain.
+After both attention stacks, three lightweight decoder heads project token embeddings to
+preconditioner factors:
+\begin{itemize}
+\item A \emph{leaf head} maps each diagonal-stream token (one per node, $L$ per leaf) through
+a two-layer MLP and reshapes the result into a per-leaf factor
+$F_k\!\in\!\mathbb{R}^{L\times L}$. The corresponding diagonal block of $M$ is
+$F_kF_k^\top\!\in\!\mathbb{R}^{L\times L}$, PSD by construction.
+\item Two \emph{off-diagonal heads} map each off-diagonal-stream token (one per coarse
+position, $L_s$ per tile) linearly to $L_s$ output channels, yielding factor pairs
+$U_m,V_m\!\in\!\mathbb{R}^{L_s\times L_s}$.
+\item Two \emph{node heads} project the per-node diagonal-stream embeddings linearly to
+$L_s$ output channels, producing per-leaf bridge matrices
+$\tilde U_k,\tilde V_k\!\in\!\mathbb{R}^{L\times L_s}$ that connect the fine node-level
+representation to the coarse tile-level representation.
+\end{itemize}
 
-A scalar gate finally produces a per-node correction $\lambda_i$ added as
+\emph{Geometric picture.} The bridge and tile factors together implement an FMM-style
+strip-to-strip chain (worked out in detail in Sec.~\ref{sec:application}). Reading along
+the off-diagonal contribution to $M\mathbf{r}$ for a single tile: a residual $\mathbf{r}$
+restricted to the column-strip $\mathcal{J}_m$ (length $S_mL$) is first contracted along the
+strip by the per-leaf bridge $\tilde U_k^\top$ to produce coarse leaf summaries (length
+$L_s$ per leaf in $\mathcal{J}_m$); these are then mixed across the tile by the
+$L_s\!\times\!L_s$ factor $B_m\!=\!U_mV_m^\top$; and finally expanded back to full
+node-resolution on the row-strip $\mathcal{I}_m$ by the per-leaf prolongation
+$\tilde V_l$. The shape progression is therefore
+\[
+  \underbrace{S_mL}_{\text{strip}}
+  \;\xrightarrow{\,\tilde U^\top\,}\;
+  \underbrace{S_mL_s}_{\text{thinner strip}}
+  \;\xrightarrow{\,B_m\,}\;
+  \underbrace{S_mL_s}_{\text{thinner strip}}
+  \;\xrightarrow{\,\tilde V\,}\;
+  \underbrace{S_mL}_{\text{strip}},
+\]
+a fine strip that contracts to a coarse strip, transmits the coarse far-field interaction,
+and re-expands to a fine strip. The geometry mirrors the FMM upward-pass / interaction-list /
+downward-pass structure.
+
+\emph{Positive-definiteness.}
+By construction the diagonal contribution $\sum_k F_kF_k^\top$ is PSD. The full $M$ adds
+indefinite low-rank off-diagonal corrections; in our experiments this assembled $M$ has
+remained empirically PSD on every test system and PCG has never broken down on the
+preconditioned system. Strict SPD enforcement is cheap if it should ever be needed: a
+positive diagonal of $F_k$ (via elementwise softplus or exponential, the standard trick used
+in prior neural ICs~\cite{Li2023learning,hausner2023neural}), together with a
+diagonal-dominant scaling of off-diagonal factors, would guarantee strict positive
+definiteness with negligible overhead. We do not enable these in our reported results.
+
+\emph{Jacobi residual.} A scalar gate produces a per-node correction $\lambda_i$ added to
 $\mathrm{diag}(\boldsymbol\lambda)\,\mathrm{diag}(A)^{-1}$. Early in training, when the
 hierarchical factors approximate $A^{-1}$ poorly, this Jacobi residual provides a cheap
-gradient sink that prevents loss stagnation; as the hierarchical factors improve, the gate's
-contribution is reduced and capacity shifts to the structured branch. We ablate this
-component (Section~\ref{sec:ablation}) and find that removing it both slows training and
-modestly degrades final iteration count.
+gradient sink that prevents loss stagnation; once the hierarchical factors are useful, the
+gate's contribution tends to zero and capacity shifts to the structured branch.
 
 All factors are concatenated into a single packed tensor of width
-$P = K L_s^2 + M_\mathcal{H} L_s^2 + 2NL_s + N$, which is what the apply routine consumes.
+$P = K L^2 + M_\mathcal{H} L_s^2 + 2NL_s + N$, which is what the apply routine consumes.
 
 \subsection{Complexity}
 \label{sec:method:complexity}
 
-Let $L$ be the leaf size, $K = N/L$, $L_s = L/p$, and $d, n_l$ be the model width and depth.
-Encoder cost is $O(Nd^2)$ for bounded-degree graphs. The diagonal stack costs
-$O(n_l K L_s^2 d) = O(N)$ in attention and $O(n_l K L_s d^2) = O(N)$ in FFN. The off-diagonal
-stack has $M_\mathcal{H} = O(K)$ tiles each of size $L_s$, so its cost is also $O(N)$.
-Highway scatter-gather adds $O(Nd)$ per layer. The total inference budget is therefore
-$\Theta(N)$, with constants set entirely by the fixed hyperparameters
-$d,L,L_s,n_l$.
+Encoder cost is $O(Nd^2)$ for bounded-degree graphs. The diagonal attention stack processes
+$K$ leaves of $L$ tokens each through $n_l$ layers: $O(n_l K L^2 d) = O(n_l N L d)$, linear
+in $N$ at fixed $L,d,n_l$. The off-diagonal stack processes $M_\mathcal{H}\!=\!O(K)$ tiles of
+$L_s$ tokens each: $O(n_l K L_s^2 d) = O(n_l N L_s^2 d / L)$, also linear in $N$. Highway
+scatter-gather contributes $O(Nd)$ per layer. The total inference budget is therefore
+$\Theta(N)$, with constants determined entirely by the fixed hyperparameters
+$L, L_s, d, n_l$.
+
+\paragraph{Measured breakdown.}
+Profiling the forward pass at $N\!=\!8\,192$: attention stacks $\sim\!59\%$ (diagonal
+$\sim\!36\%$, off-diagonal $\sim\!23\%$), encoder $\sim\!16\%$, decoder heads
+$\sim\!18\%$, layout helpers $<\!4\%$. Only the attention portion scales with $n_l$, so the
+transformer share rises toward $\sim\!75\%$ at the $n_l\!=\!3$ default. At the kernel
+level, CUTLASS Tensor-Op GEMMs (\texttt{cutlass\_80\_tensorop\_s1688gemm} and
+\texttt{sm90\_xmma\_gemm} TF32) consume $\sim\!31\%$ of device time and CUTLASS fused
+attention (\texttt{fmha\_cutlassF}) a further $\sim\!14\%$, confirming that the hot path
+dispatches to compute-bound Tensor Core kernels rather than to bandwidth-bound SpMV or
+indexed-gather; the remainder is copies/reshapes and elementwise/normalization
+($\sim\!17\%$ each).
 
 % ===========================================================================
 \section{Preconditioner Application}
@@ -627,7 +766,7 @@ couplings; our off-diagonal $\mathcal{H}$-tiles represent them explicitly.
 \subsection{Cosine Hutchinson Probe Loss}
 \label{sec:training:loss}
 
-We train \textsc{LeafOnlyNet} self-supervised. Given probe vectors
+We train the network self-supervised. Given probe vectors
 $\mathbf{Z}\in\mathbb{R}^{N\times K_z}$, we compute $A\mathbf{Z}$ via SpMV (treated as a
 fixed input, with no gradient through $A$), apply the preconditioner to get
 $\hat{\mathbf{Z}} = M(A\mathbf{Z})$, and minimize

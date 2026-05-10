@@ -1,12 +1,12 @@
 """
 Schematic figure for weak-admissibility H-matrix tiling (not HODLR).
 
-Uses the same dyadic admissibility rule as ``Assets/Scripts/leafonly/hmatrix.py``
-(``standard_admissible_unique_blocks``). Constants below are only for the drawing.
+Uses the same dyadic admissibility rule as ``standard_admissible_unique_blocks`` in the
+repository's H-matrix tiling sources. Constants below are only for the drawing.
 
 Toggle ``SHOW_HIGHWAYS`` (or run with ``--bare``) to draw the partition without the red bands.
-Highway band (red): mimics ``LeafOnlyNet._accumulate_highway_from_blocks`` / prolongation
-(``HM_PROLONG_ROW_LEAF_IDX``, ``HM_PROLONG_COL_LEAF_IDX`` in ``hmatrix.py``): one chosen
+Highway band (red): prolongation scatter matching ``_accumulate_highway_from_blocks`` (indices
+``HM_PROLONG_ROW_LEAF_IDX``, ``HM_PROLONG_COL_LEAF_IDX`` in the same module): one chosen
 off-diagonal tile ``(r0, c0, S)`` scatters into all row leaves ``r0..r0+S-1`` and column
 leaves ``c0..c0+S-1``. We show the union of those **row-strip** and **column-strip** regions
 restricted to the **upper triangle including the diagonal** (leaf row index ``<=`` leaf column

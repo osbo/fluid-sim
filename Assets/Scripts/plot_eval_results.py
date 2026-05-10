@@ -1,12 +1,12 @@
 """
-Plot evaluation summaries for multiphase runs.
+Plot evaluation summaries for multiphase Poisson benchmark runs.
 
 Creates figures:
 1) Baseline-vs-methods across scales (1024..16384, includes 32768 if present)
 2) Ablation impact across scales (2048/4096/8192) for:
    total/inference/solve time, iteration reduction, parameter count, training time.
 
-LeafOnly ablation rows with extreme pooled σ/μ (typically PCG-cap frames mixed into the CSV average)
+Neural-preconditioner ablation rows with extreme pooled σ/μ (typically PCG-cap frames mixed into the CSV average)
 are excluded from ablation figures by default; run EvalScaleSweep.py again to re-average without those frames.
 
 Visual language follows plot_training.py: serif fonts, colored lines; scale-methods ribbons use ±0.5σ.
@@ -203,12 +203,12 @@ def _print_ablation_leaf_data_audit(kept: pd.DataFrame, excluded: pd.DataFrame, 
     gate_disabled = max_rel_sigma != max_rel_sigma  # NaN sentinel when filter off
     if gate_disabled:
         print(
-            "\nAblation LeafOnly — stability gate: disabled (--no-ablation-outlier-filter).\n"
-            "All LeafOnly ablation rows from the CSV are plotted as-is."
+            "\nAblation plots — stability gate: disabled (--no-ablation-outlier-filter).\n"
+            "All neural ablation rows from the CSV are plotted as-is."
         )
     else:
         print(
-            "\nAblation LeafOnly — stability gate: max(σ/μ over total_ms and iters) "
+            "\nAblation plots — stability gate: max(σ/μ over total_ms and iters) "
             f"< {max_rel_sigma:g} (excludes pooled CSV rows dominated by PCG-cap outliers).\n"
             "Note: Means±σ in the CSV still mix outlier frames until you re-run EvalScaleSweep.py "
             "(it drops PCG-cap frames before averaging)."
@@ -437,7 +437,7 @@ def _plot_methods_across_scale(df: pd.DataFrame, out_path: pathlib.Path) -> None
             ax.set_ylim(y_bottom, y_top)
     ax.set_xlabel("Matrix size")
     ax.set_ylabel("Total time (ms)")
-    ax.set_title("Scale Sweep: Baseline vs Methods (multiphase)")
+    ax.set_title("Scale Sweep: Baseline vs Methods (multiphase Poisson)")
     ax.grid(True, which="major", color="#d8d8d8", zorder=0)
     ax.grid(True, which="minor", color="#efefef", zorder=0)
     ax.legend(
@@ -525,7 +525,7 @@ def _plot_ablation_impact(leaf: pd.DataFrame, out_path: pathlib.Path) -> None:
         ax.grid(True, which="minor", color="#f0f0f0", zorder=0)
         ax.set_title(ylab)
 
-    fig.suptitle("Ablation Impact Across Scales (multiphase, GCN layers fixed at 2)")
+    fig.suptitle("Ablation Impact Across Scales (multiphase Poisson, GCN layers fixed at 2)")
     fig.legend(
         handles=legend_handles,
         loc="lower center",
@@ -541,7 +541,7 @@ def _plot_ablation_impact(leaf: pd.DataFrame, out_path: pathlib.Path) -> None:
 
 
 def _plot_ablation_configs_scale(leaf: pd.DataFrame, out_path: pathlib.Path) -> None:
-    """Single-panel, scale-vs-time plot for LeafOnly configurations (same visual language as scale_methods)."""
+    """Single-panel, scale-vs-time plot for ablation configurations (same visual language as scale_methods)."""
     fig, ax = plt.subplots(figsize=(7.0, 5.1))
     fig.subplots_adjust(left=0.14, right=0.88, top=0.88, bottom=0.17)
 
@@ -612,8 +612,8 @@ def _plot_ablation_configs_scale(leaf: pd.DataFrame, out_path: pathlib.Path) -> 
             ax.set_ylim(y_bottom, y_top)
 
     ax.set_xlabel("Matrix size")
-    ax.set_ylabel("LeafOnly solve time (ms, log scale)")
-    ax.set_title("Ablation by Configuration (multiphase v2)")
+    ax.set_ylabel("Our method solve time (ms, log scale)")
+    ax.set_title("Ablation by Configuration (multiphase Poisson)")
     ax.grid(True, which="major", color="#d8d8d8", zorder=0)
     ax.grid(True, which="minor", color="#efefef", zorder=0)
     ax.legend(
@@ -709,7 +709,7 @@ def main() -> None:
     parser.add_argument(
         "--no-ablation-outlier-filter",
         action="store_true",
-        help="Use every LeafOnly ablation CSV row (disable σ/μ stability gate for plots).",
+        help="Use every neural ablation CSV row (disable σ/μ stability gate for plots).",
     )
     parser.add_argument(
         "--ablation-pool-rel-sigma-max",
@@ -717,7 +717,7 @@ def main() -> None:
         default=ABLATION_POOL_REL_SIGMA_MAX_DEFAULT,
         metavar="R",
         help=(
-            "Exclude LeafOnly rows when max(σ/μ) over total_ms and iters is ≥ R "
+            "Exclude neural-method rows when max(σ/μ) over total_ms and iters is ≥ R "
             "(default: %(default)s; guards against PCG-cap frames in pooled CSVs)."
         ),
     )
