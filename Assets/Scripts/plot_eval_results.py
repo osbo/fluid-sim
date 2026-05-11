@@ -67,7 +67,7 @@ METHOD_STYLES: dict[tuple[str, str], MethodStyle] = {
     ("jacobi", "gpu"): MethodStyle("Diag+CUDA", C_RED, "--"),
     ("cg", "gpu"): MethodStyle("None+CUDA", C_PURPLE, "-."),
     ("amg_cpu", "cpu"): MethodStyle("AMG+CPU", "#757575", (0, (4, 2))),
-    ("leafonly", "gpu"): MethodStyle("Ours+CUDA", C_BROWN, (0, (2, 1, 1, 1))),
+    ("leafonly", "gpu"): MethodStyle("Ours", C_BROWN, (0, (2, 1, 1, 1))),
 }
 
 # Frame-budget reference lines (full-frame Poisson+solve budget, single threaded assumption).

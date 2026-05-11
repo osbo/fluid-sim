@@ -424,6 +424,7 @@ def pass2_torch_profiler(
     repeat: int,
     out_dir: Path,
     nvml_sampler: Optional["NvmlSampler"],
+    export_chrome_trace: bool = False,
 ) -> None:
     try:
         from torch.profiler import ProfilerActivity, profile, record_function
@@ -554,11 +555,11 @@ def pass2_torch_profiler(
         for r in mem_rows:
             w.writerow({k: r.get(k, "") for k in keys})
 
-    # Chrome trace (full).
-    try:
-        prof.export_chrome_trace(str(out_dir / "torch_profiler_trace.json"))
-    except Exception as e:
-        print(f"[pass2] chrome trace export failed: {e}", file=sys.stderr)
+    if export_chrome_trace:
+        try:
+            prof.export_chrome_trace(str(out_dir / "torch_profiler_trace.json"))
+        except Exception as e:
+            print(f"[pass2] chrome trace export failed: {e}", file=sys.stderr)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -742,23 +743,49 @@ class NvmlSampler:
 
 # Sections to collect. Tensor-core utilization is in ComputeWorkloadAnalysis_Tensor /
 # SpeedOfLight (sm__pipe_tensor_op_*). MemoryWorkloadAnalysis covers HBM/L2 traffic.
-NCU_SECTIONS = [
-    "SpeedOfLight",
-    "SpeedOfLight_RooflineChart",
-    "SpeedOfLight_HierarchicalTensorRooflineChart",
-    "ComputeWorkloadAnalysis",
-    "MemoryWorkloadAnalysis",
-    "MemoryWorkloadAnalysis_Tables",
-    "MemoryWorkloadAnalysis_Chart",
-    "Occupancy",
-    "InstructionStats",
-    "LaunchStats",
-    "WarpStateStats",
-    "SchedulerStats",
-    "SourceCounters",
-    "Nvlink",
-    "PmSampling",
-]
+NCU_SECTION_SETS = {
+    # Just SOL + compute/memory roofs + occupancy + tensor-core SOL. Fastest meaningful set.
+    "lean": [
+        "SpeedOfLight",
+        "ComputeWorkloadAnalysis",
+        "MemoryWorkloadAnalysis",
+        "Occupancy",
+        "LaunchStats",
+        "InstructionStats",
+    ],
+    # Adds rooflines, warp-state, scheduler. Slower (more counter sets → more replays).
+    "detailed": [
+        "SpeedOfLight",
+        "SpeedOfLight_RooflineChart",
+        "SpeedOfLight_HierarchicalTensorRooflineChart",
+        "ComputeWorkloadAnalysis",
+        "MemoryWorkloadAnalysis",
+        "MemoryWorkloadAnalysis_Chart",
+        "Occupancy",
+        "InstructionStats",
+        "LaunchStats",
+        "WarpStateStats",
+        "SchedulerStats",
+    ],
+    # All-in. Includes SourceCounters / PmSampling — these alone can multiply runtime 10×.
+    "full": [
+        "SpeedOfLight",
+        "SpeedOfLight_RooflineChart",
+        "SpeedOfLight_HierarchicalTensorRooflineChart",
+        "ComputeWorkloadAnalysis",
+        "MemoryWorkloadAnalysis",
+        "MemoryWorkloadAnalysis_Tables",
+        "MemoryWorkloadAnalysis_Chart",
+        "Occupancy",
+        "InstructionStats",
+        "LaunchStats",
+        "WarpStateStats",
+        "SchedulerStats",
+        "SourceCounters",
+        "Nvlink",
+        "PmSampling",
+    ],
+}
 
 
 def pass3_ncu(
@@ -766,11 +793,12 @@ def pass3_ncu(
     data_folder: Path,
     frames: list[int],
     out_dir: Path,
+    section_set: str,
+    launch_count: int,
     extra_args: list[str],
 ) -> None:
     ncu = shutil.which("ncu")
     if ncu is None:
-        # Common cluster location.
         for cand in ("/usr/local/cuda/bin/ncu", "/opt/nvidia/nsight-compute/ncu"):
             if Path(cand).exists():
                 ncu = cand
@@ -780,19 +808,25 @@ def pass3_ncu(
               file=sys.stderr)
         return
 
+    sections = NCU_SECTION_SETS.get(section_set, NCU_SECTION_SETS["lean"])
     ncu_dir = out_dir / "ncu"
     ncu_dir.mkdir(parents=True, exist_ok=True)
     for idx in frames:
         target = ncu_dir / f"frame_{idx:02d}"
         section_args: list[str] = []
-        for s in NCU_SECTIONS:
+        for s in sections:
             section_args += ["--section", s]
+        # NVTX filter — only kernels launched inside the "measured" range are profiled.
+        # The internal --ncu-fwd-only mode wraps exactly one forward in that range.
         cmd = [
             ncu,
             "--target-processes", "application-only",
             "--replay-mode", "kernel",
             "--cache-control", "all",
             "--clock-control", "base",
+            "--nvtx",
+            "--nvtx-include", "measured/",
+            "--launch-count", str(launch_count),
             "--export", str(target),
             "--force-overwrite",
             "--print-summary", "per-kernel",
@@ -806,15 +840,17 @@ def pass3_ncu(
             "--data", str(data_folder),
         ]
         cmd += extra_args
-        print(f"[ncu] frame {idx}: {' '.join(cmd[:6])} … --export {target}", flush=True)
+        print(f"[ncu] frame {idx}: set={section_set} ({len(sections)} sections), "
+              f"launch_count={launch_count}, export={target}", flush=True)
+        t0 = time.perf_counter()
         try:
             r = subprocess.run(cmd, check=False)
             if r.returncode != 0:
                 print(f"[ncu] frame {idx} returned {r.returncode}", file=sys.stderr)
         except Exception as e:
             print(f"[ncu] frame {idx} failed: {e}", file=sys.stderr)
+        print(f"[ncu] frame {idx} done in {time.perf_counter() - t0:.1f}s", flush=True)
 
-        # Detailed section dump (human readable).
         detail_txt = ncu_dir / f"frame_{idx:02d}_details.txt"
         try:
             r = subprocess.run(
@@ -870,10 +906,18 @@ def main() -> int:
     ap.add_argument("--no-nvml", action="store_true",
                     help="Skip NVML sampler.")
     ap.add_argument("--nvml-period-ms", type=float, default=10.0)
-    ap.add_argument("--skip-ncu", action="store_true",
-                    help="Skip Nsight Compute pass.")
+    ap.add_argument("--skip-pass1", action="store_true", help="Skip per-component CUDA-event timing pass.")
+    ap.add_argument("--skip-pass2", action="store_true", help="Skip torch.profiler + NVML pass.")
+    ap.add_argument("--skip-ncu", action="store_true", help="Skip Nsight Compute pass.")
     ap.add_argument("--ncu-frames", type=int, nargs="*", default=[0],
                     help="Frame indices to profile with ncu (default: [0]). Pass nothing to use all.")
+    ap.add_argument("--ncu-set", choices=list(NCU_SECTION_SETS.keys()), default="lean",
+                    help="ncu section set. 'lean' (default, ~6 sections, ~1–3 min/frame), "
+                         "'detailed' (~11 sections), 'full' (15 sections incl. SourceCounters/PmSampling — very slow).")
+    ap.add_argument("--ncu-launch-count", type=int, default=2000,
+                    help="Cap on number of kernels ncu profiles per frame (safety net; default 2000).")
+    ap.add_argument("--export-chrome-trace", action="store_true",
+                    help="Export full torch.profiler chrome trace JSON (can be 50+ MB).")
     # Internal: forward-only for ncu replay.
     ap.add_argument("--ncu-fwd-only", action="store_true")
     ap.add_argument("--frame", type=int, default=0)
@@ -895,7 +939,9 @@ def main() -> int:
     if device.type == "cuda":
         warmup_hmatrix_prolong_gpu(device)
 
-    # --- ncu replay mode: single forward and exit -----------------------------
+    # --- ncu replay mode: warmups (un-profiled) + one NVTX-bracketed forward and exit ---
+    # ncu is invoked with --nvtx --nvtx-include "measured/", so only kernels launched
+    # inside the NVTX range are profiled. This cuts ncu time ~4× vs profiling the warmups.
     if args.ncu_fwd_only:
         dataset = FluidGraphDataset([data_folder])
         if len(dataset) == 0:
@@ -904,13 +950,15 @@ def main() -> int:
         batch = dataset[frame_idx]
         inputs = _prepare_frame_inputs(batch, device, leaf_size=int(arch["leaf_size"]))
         with torch.inference_mode():
-            for _ in range(3):
+            for _ in range(2):
                 _fwd(model, inputs)
             if device.type == "cuda":
                 torch.cuda.synchronize()
+                torch.cuda.nvtx.range_push("measured")
             _fwd(model, inputs)
             if device.type == "cuda":
                 torch.cuda.synchronize()
+                torch.cuda.nvtx.range_pop()
         return 0
 
     # --- regular benchmark ----------------------------------------------------
@@ -942,33 +990,33 @@ def main() -> int:
           f"{max(i['num_nodes_real'] for i in frame_inputs)}).", flush=True)
 
     # ── Pass 1: component timing ────────────────────────────────────────────
-    print("\n=== Pass 1: per-component CUDA timing ===", flush=True)
-    pass1_component_timing(
-        model=model,
-        frame_inputs=frame_inputs,
-        device=device,
-        warmup=args.warmup,
-        repeat=args.repeat,
-        out_dir=out_dir,
-    )
-
-    # Rebuild a clean (un-instrumented) model for pass 2 so wrapper overhead
-    # does not bias profiler counters.
-    del model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    model, _ = _build_model_from_checkpoint(weights_path, device)
+    if not args.skip_pass1:
+        print("\n=== Pass 1: per-component CUDA timing ===", flush=True)
+        pass1_component_timing(
+            model=model,
+            frame_inputs=frame_inputs,
+            device=device,
+            warmup=args.warmup,
+            repeat=args.repeat,
+            out_dir=out_dir,
+        )
+        # Rebuild a clean (un-instrumented) model for pass 2 so wrapper overhead
+        # does not bias profiler counters.
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        model, _ = _build_model_from_checkpoint(weights_path, device)
 
     # ── Pass 2: torch.profiler + NVML ──────────────────────────────────────
     sampler: Optional[NvmlSampler] = None
-    if not args.no_nvml:
+    if not args.skip_pass2 and not args.no_nvml:
         sampler = NvmlSampler(period_ms=args.nvml_period_ms, gpu_index=0)
         if sampler.available:
             sampler.start()
         else:
             sampler = None
 
-    if not args.no_profiler:
+    if not args.skip_pass2 and not args.no_profiler:
         print("\n=== Pass 2: torch.profiler ===", flush=True)
         pass2_torch_profiler(
             model=model,
@@ -977,6 +1025,7 @@ def main() -> int:
             repeat=args.repeat_pass2,
             out_dir=out_dir,
             nvml_sampler=sampler,
+            export_chrome_trace=bool(args.export_chrome_trace),
         )
 
     if sampler is not None:
@@ -992,6 +1041,8 @@ def main() -> int:
             data_folder=data_folder,
             frames=ncu_frames,
             out_dir=out_dir,
+            section_set=args.ncu_set,
+            launch_count=int(args.ncu_launch_count),
             extra_args=[],
         )
 

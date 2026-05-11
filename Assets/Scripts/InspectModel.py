@@ -7,6 +7,7 @@ Preconditioners for Conjugate Gradient Solvers on GPUs* (NeurIPS 2025;
 Diag (Jacobi), IC-class (``ilupp.IChol0`` or scipy ``spilu`` fallback), PyAMG / AMGX. On CUDA, the benchmark always runs a second AMGX session: PCG with ``MULTICOLOR_DILU`` (scalar CSR; AMGX ``MULTICOLOR_ILU`` GPU path is 4×4-only).
 
 Use ``--test-only`` to run the PCG benchmark path and print only that summary (no plots, profiling, or dense AMG build).
+Use ``--skip-leafonly`` to skip the LeafOnly model entirely (no weights load, no inference, no LeafOnly PCG line in the summary); implies ``--test-only`` and reports only the classical baselines.
 Use ``--frame N`` and ``--weights PATH`` to select the dataset index and checkpoint (defaults: frame 600, ``leaf_only_weights.bytes`` beside this script).
 Use ``--fast-plot`` to keep matrix heatmaps but skip full dense ``eig(A)``, ``eig(A·M)``, ``cond(A·M)``, and A-eigenmode error curves (saves many minutes for n in the thousands).
 
@@ -225,8 +226,9 @@ def _prepend_ld_library_path_for_amgx_before_any_torch() -> None:
 _prepend_ld_library_path_for_amgx_before_any_torch()
 _preload_conda_libstdcxx_global()
 
-# Used before optional-import warnings (pyamgx, pyamg) so ``--test-only`` stays quiet.
-_TEST_ONLY_CLI = "--test-only" in sys.argv
+# Used before optional-import warnings (pyamgx, pyamg) so ``--test-only`` / ``--skip-leafonly`` stay quiet.
+# ``--skip-leafonly`` implies ``--test-only`` semantics (see main()), so it gets the same treatment here.
+_TEST_ONLY_CLI = ("--test-only" in sys.argv) or ("--skip-leafonly" in sys.argv)
 
 # ``import pyamgx`` before LeafOnly/torch so ``libamgxsh`` binds cublas+cusolver from the same toolkit;
 # if torch loads first, its RUNPATH libcublas wins and toolkit libcusolver fails symbol checks.
@@ -980,7 +982,7 @@ def _torch_gpu_sync(device: torch.device) -> None:
 
 def _build_A_gpu_laplacian(
     A_scipy_csr,
-    A_dense_f64: np.ndarray,
+    A_dense_f64,
     viz_n: int,
     device: torch.device,
     *,
@@ -989,10 +991,27 @@ def _build_A_gpu_laplacian(
     """
     Match the simulation: SpMV on sparse ``A``. CUDA uses CSR; MPS uses CSR when supported
     (else dense fallback — O(n²) per matvec).
+
+    ``A_dense_f64`` may be a dense ``np.ndarray`` (legacy LeafOnly path) or ``None`` / a sparse
+    matrix (``--skip-leafonly`` full-system path); the dense form is materialized lazily and only
+    on the CPU device or the MPS dense-fallback branch. On CUDA we never densify.
     """
     torch_dt = dtype if dtype in (torch.float32, torch.float64) else torch.float32
     np_dt = np.float64 if torch_dt == torch.float64 else np.float32
-    np_f = A_dense_f64.astype(np_dt, copy=False)
+
+    def _materialize_dense_f() -> np.ndarray:
+        if isinstance(A_dense_f64, np.ndarray):
+            return A_dense_f64.astype(np_dt, copy=False)
+        # Sparse (or None): build dense from CSR. WARNS loudly because this is O(n^2) memory.
+        n2_bytes = int(viz_n) * int(viz_n) * (8 if np_dt == np.float64 else 4)
+        warnings.warn(
+            f"Materializing dense A ({viz_n}×{viz_n}, ~{n2_bytes / (1024**3):.2f} GiB) for device={device.type}; "
+            f"this branch is unsupported for large N without CUDA / MPS-sparse.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return A_scipy_csr.toarray().astype(np_dt, copy=False)
+
     if device.type == "cuda":
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -1046,9 +1065,9 @@ def _build_A_gpu_laplacian(
                 UserWarning,
                 stacklevel=2,
             )
-            return torch.from_numpy(np_f).to(device=device).contiguous()
+            return torch.from_numpy(_materialize_dense_f()).to(device=device).contiguous()
 
-    return torch.from_numpy(np_f).to(device=device).contiguous()
+    return torch.from_numpy(_materialize_dense_f()).to(device=device).contiguous()
 
 
 class _GpuElapsedTimer:
@@ -1776,8 +1795,10 @@ def pcg_cpu(A, b, apply_precond, tol=1e-8, max_iter=500, debug=False):
     return x, iters, (time.perf_counter() - t0) * 1000
 
 
-def _cpu_jacobi_apply_fn(A_dense_f64: np.ndarray):
-    inv = 1.0 / np.maximum(np.abs(np.diag(A_dense_f64).astype(np.float64)), 1e-30)
+def _cpu_jacobi_apply_fn(A):
+    # ``ndarray.diagonal()`` and ``scipy.sparse.csr_matrix.diagonal()`` both return a 1D ndarray, so this
+    # works for the dense (LeafOnly) and sparse (``--skip-leafonly`` full-system) baseline paths alike.
+    inv = 1.0 / np.maximum(np.abs(np.asarray(A.diagonal()).astype(np.float64)), 1e-30)
 
     def apply_j(r: np.ndarray) -> np.ndarray:
         return (np.asarray(r, dtype=np.float64).ravel() * inv).reshape(-1, 1)
@@ -1785,8 +1806,8 @@ def _cpu_jacobi_apply_fn(A_dense_f64: np.ndarray):
     return apply_j
 
 
-def _gpu_jacobi_apply_fn(A_dense_f64: np.ndarray, device: torch.device):
-    inv = (1.0 / np.maximum(np.abs(np.diag(A_dense_f64).astype(np.float64)), 1e-30)).astype(np.float32)
+def _gpu_jacobi_apply_fn(A, device: torch.device):
+    inv = (1.0 / np.maximum(np.abs(np.asarray(A.diagonal()).astype(np.float64)), 1e-30)).astype(np.float32)
     inv_t = torch.from_numpy(inv).to(device=device)
 
     def apply_j(r: torch.Tensor) -> torch.Tensor:
@@ -1795,13 +1816,16 @@ def _gpu_jacobi_apply_fn(A_dense_f64: np.ndarray, device: torch.device):
     return apply_j
 
 
-def _build_cpu_ic_apply(A_dense_f64: np.ndarray):
+def _build_cpu_ic_apply(A):
     """
     Incomplete-Cholesky-class preconditioner for SPD-ish systems: prefer ``ilupp.IChol0Preconditioner``,
     else scipy ``spilu`` (ILU, common fallback when IChol is unavailable).
     Returns (setup_ms, apply_fn_or_none, backend_label_or_none).
+
+    Accepts a dense ``np.ndarray`` (legacy LeafOnly path) or a ``scipy.sparse`` CSR/CSC (skip-leafonly
+    full-system path). ``csr_matrix(csr)`` is a no-op copy; ``csr_matrix(dense)`` builds CSR.
     """
-    A_csr = csr_matrix(A_dense_f64)
+    A_csr = A if isinstance(A, csr_matrix) else csr_matrix(A)
     A_csr.sort_indices()
     t0 = time.perf_counter()
     try:
@@ -1987,6 +2011,16 @@ def main():
         help="Only print the PCG benchmark summary; skip plots, spectral/HM profiling, and dense AMG build.",
     )
     parser.add_argument(
+        "--skip-leafonly",
+        action="store_true",
+        help=(
+            "Skip the LeafOnly model entirely: no weights load, no inference, no LeafOnly PCG solve, "
+            "and no LeafOnly line in the summary. Only the classical baselines are reported "
+            "(Unpreconditioned, Jacobi, IC, AMGX MULTICOLOR_DILU, AMG, AMGX (GPU) [PCG + AMG]). "
+            "Implies --test-only (LeafOnly-dependent plots/profiling are unavailable)."
+        ),
+    )
+    parser.add_argument(
         "--leafonly-pcg",
         choices=("bsr", "matrix_free"),
         default="matrix_free",
@@ -2079,7 +2113,10 @@ def main():
              "f64 (all float64). Default: mixed on CUDA, f32 on CPU/MPS.",
     )
     args = parser.parse_args()
-    test_only = bool(args.test_only)
+    skip_leaf = bool(getattr(args, "skip_leafonly", False))
+    # --skip-leafonly implies --test-only: M_gpu, precond_out, etc. are never built, so plot panels and
+    # dense LA profiling (which depend on the assembled LeafOnly M) cannot run.
+    test_only = bool(args.test_only) or skip_leaf
     fast_plot = bool(getattr(args, "fast_plot", False))
     pcg_cuda_backend = str(getattr(args, "pcg_cuda_backend", "cudagraph"))
 
@@ -2134,247 +2171,272 @@ def main():
     num_nodes_real = int(batch['num_nodes'])
     _info(f"System N={num_nodes_real}")
 
-    if not leaf_only_weights_path.exists():
-        raise SystemExit(f"Leaf-only weights not found: {leaf_only_weights_path}. Run LeafOnly.py first.")
-    merged = apply_leaf_only_runtime_from_checkpoint(leaf_only_weights_path)
-    ckpt_arch = leaf_only_arch_from_checkpoint(leaf_only_weights_path)
-    if ckpt_arch is None:
-        raise SystemExit(f"Could not read architecture from {leaf_only_weights_path}")
-    if merged is not None:
-        _ls = int(lo_config.LEAF_SIZE)
-        _mx = int(lo_config.MAX_MIXED_SIZE)
-        _info(
-            f"  Checkpoint runtime: LEAF_SIZE={_ls}, MAX_MIXED_SIZE={_mx}, "
-            f"MAX_NUM_LEAVES={_mx // _ls} (from header + optional JSON footer)"
-        )
-    d_model_lo = ckpt_arch["d_model"]
-    leaf_size_lo = ckpt_arch["leaf_size"]
-    input_dim_lo = ckpt_arch["input_dim"]
-    num_layers_lo = ckpt_arch["num_layers"]
-    num_heads_lo = ckpt_arch["num_heads"]
-    use_gcn_lo = ckpt_arch["use_gcn"]
-    leaf_apply_diag_ckpt = ckpt_arch["leaf_apply_diag"]
-    leaf_apply_off_ckpt = ckpt_arch["leaf_apply_off"]
-    ck_hw = int(ckpt_arch.get("highway_ffn_mlp", 0))
-    cli_hw = bool(getattr(args, "use_highways", _leaf_only_script.DEFAULT_USE_HIGHWAYS))
-    if ck_hw == 1 and not cli_hw:
-        raise SystemExit(_leaf_only_script.CHECKPOINT_ERR_HIGHWAY_IN_FILE_NEED_CLI_ON)
-    if ck_hw == 0 and cli_hw:
-        raise SystemExit(_leaf_only_script.CHECKPOINT_ERR_NO_HIGHWAY_IN_FILE_NEED_CLI_OFF)
-    ck_ffn = int(ckpt_arch.get("ffn_concat_width", 3 if ck_hw else 1))
-    if cli_hw and ck_ffn not in (3, 4):
-        raise SystemExit(f"Checkpoint ffn_concat_width={ck_ffn} invalid (expected 3 or 4 with highways).")
+    if not skip_leaf:
+        if not leaf_only_weights_path.exists():
+            raise SystemExit(f"Leaf-only weights not found: {leaf_only_weights_path}. Run LeafOnly.py first.")
+        merged = apply_leaf_only_runtime_from_checkpoint(leaf_only_weights_path)
+        ckpt_arch = leaf_only_arch_from_checkpoint(leaf_only_weights_path)
+        if ckpt_arch is None:
+            raise SystemExit(f"Could not read architecture from {leaf_only_weights_path}")
+        if merged is not None:
+            _ls = int(lo_config.LEAF_SIZE)
+            _mx = int(lo_config.MAX_MIXED_SIZE)
+            _info(
+                f"  Checkpoint runtime: LEAF_SIZE={_ls}, MAX_MIXED_SIZE={_mx}, "
+                f"MAX_NUM_LEAVES={_mx // _ls} (from header + optional JSON footer)"
+            )
+        d_model_lo = ckpt_arch["d_model"]
+        leaf_size_lo = ckpt_arch["leaf_size"]
+        input_dim_lo = ckpt_arch["input_dim"]
+        num_layers_lo = ckpt_arch["num_layers"]
+        num_heads_lo = ckpt_arch["num_heads"]
+        use_gcn_lo = ckpt_arch["use_gcn"]
+        leaf_apply_diag_ckpt = ckpt_arch["leaf_apply_diag"]
+        leaf_apply_off_ckpt = ckpt_arch["leaf_apply_off"]
+        ck_hw = int(ckpt_arch.get("highway_ffn_mlp", 0))
+        cli_hw = bool(getattr(args, "use_highways", _leaf_only_script.DEFAULT_USE_HIGHWAYS))
+        if ck_hw == 1 and not cli_hw:
+            raise SystemExit(_leaf_only_script.CHECKPOINT_ERR_HIGHWAY_IN_FILE_NEED_CLI_ON)
+        if ck_hw == 0 and cli_hw:
+            raise SystemExit(_leaf_only_script.CHECKPOINT_ERR_NO_HIGHWAY_IN_FILE_NEED_CLI_OFF)
+        ck_ffn = int(ckpt_arch.get("ffn_concat_width", 3 if ck_hw else 1))
+        if cli_hw and ck_ffn not in (3, 4):
+            raise SystemExit(f"Checkpoint ffn_concat_width={ck_ffn} invalid (expected 3 or 4 with highways).")
     leaf_L = int(lo_config.LEAF_SIZE)
-    n_requested = problem_padded_num_nodes(num_nodes_real)
-    n_pad = int(n_requested)
-    # Physical linear system for PCG / baselines / plots (no identity tail): leaf-aligned, ≤ MAX_MIXED_SIZE.
-    viz_n = n_requested
-    max_mixed = int(lo_config.MAX_MIXED_SIZE)
-    if n_requested < num_nodes_real:
-        _info(
-            f"  Leaf-aligned subgraph: {n_requested} nodes (frame has {num_nodes_real}; "
-            f"truncated to full {leaf_L}-node leaves); LeafOnly forward uses n_pad={n_pad} (no MAX_MIXED_SIZE tail)"
-        )
-    elif num_nodes_real >= max_mixed and n_pad == max_mixed:
-        _info(
-            f"  Physical system {n_requested}×{n_requested} (capped at MAX_MIXED_SIZE={max_mixed}); "
-            f"LeafOnly forward n_pad={n_pad}"
+    if skip_leaf:
+        # No LeafOnly model in play: the MAX_MIXED_SIZE / leaf-alignment cap is a constraint of the
+        # trained preconditioner, not the system itself. Solve the full frame sparsely — never
+        # materialize a dense N×N copy (would be O(N²) memory: ≈300 GiB at N≈195k).
+        n_requested = num_nodes_real
+        n_pad = num_nodes_real
+        viz_n = num_nodes_real
+        print(
+            f"  Physical system {viz_n}×{viz_n} (full frame; --skip-leafonly bypasses leaf alignment + "
+            f"MAX_MIXED_SIZE={int(lo_config.MAX_MIXED_SIZE)})"
         )
     else:
-        _info(f"  Physical system {n_requested}×{n_requested}; LeafOnly forward n_pad={n_pad} (< MAX_MIXED_SIZE)")
+        n_requested = problem_padded_num_nodes(num_nodes_real)
+        n_pad = int(n_requested)
+        # Physical linear system for PCG / baselines / plots (no identity tail): leaf-aligned, ≤ MAX_MIXED_SIZE.
+        viz_n = n_requested
+        max_mixed = int(lo_config.MAX_MIXED_SIZE)
+        if n_requested < num_nodes_real:
+            _info(
+                f"  Leaf-aligned subgraph: {n_requested} nodes (frame has {num_nodes_real}; "
+                f"truncated to full {leaf_L}-node leaves); LeafOnly forward uses n_pad={n_pad} (no MAX_MIXED_SIZE tail)"
+            )
+        elif num_nodes_real >= max_mixed and n_pad == max_mixed:
+            _info(
+                f"  Physical system {n_requested}×{n_requested} (capped at MAX_MIXED_SIZE={max_mixed}); "
+                f"LeafOnly forward n_pad={n_pad}"
+            )
+        else:
+            _info(f"  Physical system {n_requested}×{n_requested}; LeafOnly forward n_pad={n_pad} (< MAX_MIXED_SIZE)")
 
     ei, ev = batch["edge_index"], batch["edge_values"]
     # Single mask for the n_requested subgraph — reused for A, GPU edges, and connectivity.
     em = (ei[0] < n_requested) & (ei[1] < n_requested)
-    A_small = torch.sparse_coo_tensor(ei[:, em], ev[em], (n_requested, n_requested)).coalesce().to_dense().numpy()
-    A_phys_f64 = A_small.astype(np.float64, copy=False)
-    # Diagonal of A on active nodes (n_pad == n_requested: no padded identity tail).
-    jacobi_diag_np = np.ones(n_pad, dtype=np.float32)
-    jacobi_diag_np[:n_requested] = np.diag(A_small).astype(np.float32, copy=False)
+    if skip_leaf:
+        # Build scipy CSR f64 directly from COO; downstream baselines use ``.diagonal()`` / sparse SpMV.
+        rows_np = ei[0, em].numpy().astype(np.int64, copy=False)
+        cols_np = ei[1, em].numpy().astype(np.int64, copy=False)
+        vals_np = ev[em].numpy().astype(np.float64, copy=False)
+        A_phys_f64 = csr_matrix((vals_np, (rows_np, cols_np)), shape=(n_requested, n_requested))
+        A_phys_f64.sum_duplicates()
+        A_phys_f64.sort_indices()
+        # jacobi_diag_np is consumed only inside the LeafOnly forward (gated by ``if not skip_leaf``).
+    else:
+        A_small = torch.sparse_coo_tensor(ei[:, em], ev[em], (n_requested, n_requested)).coalesce().to_dense().numpy()
+        A_phys_f64 = A_small.astype(np.float64, copy=False)
+        # Diagonal of A on active nodes (n_pad == n_requested: no padded identity tail).
+        jacobi_diag_np = np.ones(n_pad, dtype=np.float32)
+        jacobi_diag_np[:n_requested] = np.diag(A_small).astype(np.float32, copy=False)
 
-    _info("\nLeafOnly (GPU)...")
-    model_leaf = LeafOnlyNet(
-        input_dim=input_dim_lo,
-        d_model=d_model_lo,
-        leaf_size=leaf_size_lo,
-        num_layers=num_layers_lo,
-        num_heads=num_heads_lo,
-        use_gcn=bool(use_gcn_lo),
-        attention_layout=default_attention_layout(leaf_size_lo),
-        off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
-        diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
-        use_highways=bool(getattr(args, "use_highways", _leaf_only_script.DEFAULT_USE_HIGHWAYS)),
-        ffn_concat_width=int(ck_ffn) if cli_hw else None,
-    ).to(device)
-    model_leaf = torch.compile(model_leaf)
-    load_leaf_only_weights(model_leaf, leaf_only_weights_path)
-    model_leaf.eval()
-    leaf_apply_diag_L = int(model_leaf.leaf_apply_size)
-    leaf_apply_off_L = int(model_leaf.leaf_apply_off)
-    if leaf_apply_diag_L != int(leaf_apply_diag_ckpt):
-        raise RuntimeError(f"header leaf_apply_diag {leaf_apply_diag_ckpt} != model {leaf_apply_diag_L}")
-    if leaf_apply_off_L != int(leaf_apply_off_ckpt):
-        raise RuntimeError(f"header leaf_apply_off {leaf_apply_off_ckpt} != model {leaf_apply_off_L}")
-    if int(lo_config.LEAF_APPLY_SIZE) != leaf_apply_diag_L or int(lo_config.LEAF_APPLY_SIZE_OFF) != leaf_apply_off_L:
-        raise RuntimeError(
-            f"leafonly.config LEAF_APPLY_SIZE={lo_config.LEAF_APPLY_SIZE}, LEAF_APPLY_SIZE_OFF={lo_config.LEAF_APPLY_SIZE_OFF} "
-            f"do not match model leaf_apply_size={leaf_apply_diag_L}, leaf_apply_off={leaf_apply_off_L}."
-        )
-    pool_diag_to_full = int(leaf_L) // leaf_apply_diag_L
-    pool_off_to_full = int(leaf_L) // leaf_apply_off_L
-    if not test_only:
-        if int(lo_config.DIAG_TOKEN_POOL) > 1:
-            _info(
-                f"  On-diagonal path: DIAG_TOKEN_POOL={lo_config.DIAG_TOKEN_POOL} → leaf_apply_diag={leaf_apply_diag_L} "
-                f"(uniform mean-pool per leaf; Transformer+MLP at {leaf_apply_diag_L} tokens/leaf; "
-                f"packed cores {leaf_apply_diag_L}×{leaf_apply_diag_L})"
-            )
-        else:
-            _info(
-                f"  On-diagonal path: DIAG_TOKEN_POOL=1, leaf_apply_diag={leaf_apply_diag_L} "
-                f"(full leaf tokens; packed cores {leaf_apply_diag_L}×{leaf_apply_diag_L})"
-            )
-        if int(lo_config.OFF_DIAG_TOKEN_POOL) > 1:
-            _info(
-                f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL={lo_config.OFF_DIAG_TOKEN_POOL} → leaf_apply_off={leaf_apply_off_L} "
-                f"(H strip + uniform mean-pool; Transformer+MLP at {leaf_apply_off_L} tokens/tile; "
-                f"packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
-            )
-        else:
-            _info(
-                f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL=1, leaf_apply_off={leaf_apply_off_L} "
-                f"(H-matrix strip aggregation only; Transformer+MLP at {leaf_apply_off_L} tokens/tile; "
-                f"packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
-            )
-
-    with torch.inference_mode():
-        x_leaf = x[:, :n_requested, :].clone()
-        if n_pad > n_requested:
-            x_leaf = F.pad(x_leaf, (0, 0, 0, n_pad - n_requested), value=0.0)
-        edge_index_leaf = ei[:, em].to(device)
-        edge_values_leaf = batch["edge_values"][em].to(device)
-
-        global_feat = batch.get("global_features")
-        if global_feat is not None:
-            global_feat = global_feat.to(device)
-            if global_feat.dim() == 1:
-                global_feat = global_feat.unsqueeze(0)
-
-        positions_leaf = x_leaf[0, :, :3]
-        # Full leaf resolution connectivity; forward() pools diag (dm, df) when DIAG_TOKEN_POOL>1,
-        # and off (om, oe) / strip when OFF_DIAG_TOKEN_POOL>1.
-        pre_leaf_connectivity = build_leaf_block_connectivity(
-            edge_index_leaf,
-            edge_values_leaf,
-            positions_leaf,
-            leaf_L,
-            device,
-            x_leaf.dtype,
+    inference_ms = 0.0
+    if not skip_leaf:
+        _info("\nLeafOnly (GPU)...")
+        model_leaf = LeafOnlyNet(
+            input_dim=input_dim_lo,
+            d_model=d_model_lo,
+            leaf_size=leaf_size_lo,
+            num_layers=num_layers_lo,
+            num_heads=num_heads_lo,
+            use_gcn=bool(use_gcn_lo),
+            attention_layout=default_attention_layout(leaf_size_lo),
             off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
             diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
-        )
-        pre_leaf_connectivity = tuple(
-            t.contiguous() if isinstance(t, torch.Tensor) else t for t in pre_leaf_connectivity
-        )
-
-        _last_out = [None]
-
-        def _fwd():
-            _last_out[0] = model_leaf(
-                x_leaf,
-                edge_index=edge_index_leaf,
-                edge_values=edge_values_leaf,
-                global_features=global_feat,
-                precomputed_leaf_connectivity=pre_leaf_connectivity,
+            use_highways=bool(getattr(args, "use_highways", _leaf_only_script.DEFAULT_USE_HIGHWAYS)),
+            ffn_concat_width=int(ck_ffn) if cli_hw else None,
+        ).to(device)
+        model_leaf = torch.compile(model_leaf)
+        load_leaf_only_weights(model_leaf, leaf_only_weights_path)
+        model_leaf.eval()
+        leaf_apply_diag_L = int(model_leaf.leaf_apply_size)
+        leaf_apply_off_L = int(model_leaf.leaf_apply_off)
+        if leaf_apply_diag_L != int(leaf_apply_diag_ckpt):
+            raise RuntimeError(f"header leaf_apply_diag {leaf_apply_diag_ckpt} != model {leaf_apply_diag_L}")
+        if leaf_apply_off_L != int(leaf_apply_off_ckpt):
+            raise RuntimeError(f"header leaf_apply_off {leaf_apply_off_ckpt} != model {leaf_apply_off_L}")
+        if int(lo_config.LEAF_APPLY_SIZE) != leaf_apply_diag_L or int(lo_config.LEAF_APPLY_SIZE_OFF) != leaf_apply_off_L:
+            raise RuntimeError(
+                f"leafonly.config LEAF_APPLY_SIZE={lo_config.LEAF_APPLY_SIZE}, LEAF_APPLY_SIZE_OFF={lo_config.LEAF_APPLY_SIZE_OFF} "
+                f"do not match model leaf_apply_size={leaf_apply_diag_L}, leaf_apply_off={leaf_apply_off_L}."
             )
+        pool_diag_to_full = int(leaf_L) // leaf_apply_diag_L
+        pool_off_to_full = int(leaf_L) // leaf_apply_off_L
+        if not test_only:
+            if int(lo_config.DIAG_TOKEN_POOL) > 1:
+                _info(
+                    f"  On-diagonal path: DIAG_TOKEN_POOL={lo_config.DIAG_TOKEN_POOL} → leaf_apply_diag={leaf_apply_diag_L} "
+                    f"(uniform mean-pool per leaf; Transformer+MLP at {leaf_apply_diag_L} tokens/leaf; "
+                    f"packed cores {leaf_apply_diag_L}×{leaf_apply_diag_L})"
+                )
+            else:
+                _info(
+                    f"  On-diagonal path: DIAG_TOKEN_POOL=1, leaf_apply_diag={leaf_apply_diag_L} "
+                    f"(full leaf tokens; packed cores {leaf_apply_diag_L}×{leaf_apply_diag_L})"
+                )
+            if int(lo_config.OFF_DIAG_TOKEN_POOL) > 1:
+                _info(
+                    f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL={lo_config.OFF_DIAG_TOKEN_POOL} → leaf_apply_off={leaf_apply_off_L} "
+                    f"(H strip + uniform mean-pool; Transformer+MLP at {leaf_apply_off_L} tokens/tile; "
+                    f"packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
+                )
+            else:
+                _info(
+                    f"  Off-diagonal path: OFF_DIAG_TOKEN_POOL=1, leaf_apply_off={leaf_apply_off_L} "
+                    f"(H-matrix strip aggregation only; Transformer+MLP at {leaf_apply_off_L} tokens/tile; "
+                    f"packed cores {leaf_apply_off_L}×{leaf_apply_off_L})"
+                )
 
-        # Jacobi diagonal for BSR / padded apply (from true A diag only; independent of precond unpack).
-        jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=x_leaf.dtype)
-        diag_A_tensor = torch.from_numpy(jacobi_diag_np).to(device)
-        diag_mask = diag_A_tensor.abs() > 1e-6
-        jacobi_inv_diag[0, diag_mask] = 1.0 / diag_A_tensor[diag_mask]
+        with torch.inference_mode():
+            x_leaf = x[:, :n_requested, :].clone()
+            if n_pad > n_requested:
+                x_leaf = F.pad(x_leaf, (0, 0, 0, n_pad - n_requested), value=0.0)
+            edge_index_leaf = ei[:, em].to(device)
+            edge_values_leaf = batch["edge_values"][em].to(device)
 
-        # Prime torch.compile / CUDA allocator; Inductor kernels also land in TORCHINDUCTOR_CACHE_DIR (see above).
-        for _ in range(15):
-            _fwd()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+            global_feat = batch.get("global_features")
+            if global_feat is not None:
+                global_feat = global_feat.to(device)
+                if global_feat.dim() == 1:
+                    global_feat = global_feat.unsqueeze(0)
 
-        # Time pure forward only (same idea as leafonly.eval ``--evaluate-gradients`` component table’s
-        # encoder + heads; training/eval Hutchinson loss also builds Jacobi-smoothed Z, which is not here).
-        # Running ``build_sparse_bsr_preconditioner`` (when ``--leafonly-pcg bsr``) or other large
-        # materialization first allocates big buffers and can leave the GPU in a different memory state,
-        # skewing this line.
-        inference_ms = _timed_ms(_fwd, device, warmup=0, repeat=10)
-        precond_out = _last_out[0]
-
-        if args.leafonly_pcg == "bsr":
-            # First BSR build: fills ``_BSR_TOPOLOGY_CACHE`` for the later PCG path (not part of inference_ms).
-            build_sparse_bsr_preconditioner(
-                precond_out.detach().contiguous(),
-                viz_n,
+            positions_leaf = x_leaf[0, :, :3]
+            # Full leaf resolution connectivity; forward() pools diag (dm, df) when DIAG_TOKEN_POOL>1,
+            # and off (om, oe) / strip when OFF_DIAG_TOKEN_POOL>1.
+            pre_leaf_connectivity = build_leaf_block_connectivity(
+                edge_index_leaf,
+                edge_values_leaf,
+                positions_leaf,
                 leaf_L,
-                leaf_apply_diag_L,
-                leaf_apply_off_L,
-                jacobi_inv_diag[:, :viz_n].contiguous(),
                 device,
+                x_leaf.dtype,
+                off_diag_dense_attention=bool(getattr(args, "off_diag_dense_attn", True)),
+                diag_dense_attention=bool(getattr(args, "diag_dense_attn", True)),
             )
+            pre_leaf_connectivity = tuple(
+                t.contiguous() if isinstance(t, torch.Tensor) else t for t in pre_leaf_connectivity
+            )
+
+            _last_out = [None]
+
+            def _fwd():
+                _last_out[0] = model_leaf(
+                    x_leaf,
+                    edge_index=edge_index_leaf,
+                    edge_values=edge_values_leaf,
+                    global_features=global_feat,
+                    precomputed_leaf_connectivity=pre_leaf_connectivity,
+                )
+
+            # Jacobi diagonal for BSR / padded apply (from true A diag only; independent of precond unpack).
+            jacobi_inv_diag = torch.ones(1, n_pad, device=device, dtype=x_leaf.dtype)
+            diag_A_tensor = torch.from_numpy(jacobi_diag_np).to(device)
+            diag_mask = diag_A_tensor.abs() > 1e-6
+            jacobi_inv_diag[0, diag_mask] = 1.0 / diag_A_tensor[diag_mask]
+
+            # Prime torch.compile / CUDA allocator; Inductor kernels also land in TORCHINDUCTOR_CACHE_DIR (see above).
+            for _ in range(15):
+                _fwd()
             if device.type == "cuda":
                 torch.cuda.synchronize()
 
-        diag_blocks, off_diag_blocks, node_U, node_V, jacobi_scale = unpack_precond(
-            precond_out,
-            n_pad,
-            leaf_size=leaf_L,
-            leaf_apply_size=leaf_apply_diag_L,
-            leaf_apply_off=leaf_apply_off_L,
+            # Time pure forward only (same idea as leafonly.eval ``--evaluate-gradients`` component table’s
+            # encoder + heads; training/eval Hutchinson loss also builds Jacobi-smoothed Z, which is not here).
+            # Running ``build_sparse_bsr_preconditioner`` (when ``--leafonly-pcg bsr``) or other large
+            # materialization first allocates big buffers and can leave the GPU in a different memory state,
+            # skewing this line.
+            inference_ms = _timed_ms(_fwd, device, warmup=0, repeat=10)
+            precond_out = _last_out[0]
+
+            if args.leafonly_pcg == "bsr":
+                # First BSR build: fills ``_BSR_TOPOLOGY_CACHE`` for the later PCG path (not part of inference_ms).
+                build_sparse_bsr_preconditioner(
+                    precond_out.detach().contiguous(),
+                    viz_n,
+                    leaf_L,
+                    leaf_apply_diag_L,
+                    leaf_apply_off_L,
+                    jacobi_inv_diag[:, :viz_n].contiguous(),
+                    device,
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+
+            diag_blocks, off_diag_blocks, node_U, node_V, jacobi_scale = unpack_precond(
+                precond_out,
+                n_pad,
+                leaf_size=leaf_L,
+                leaf_apply_size=leaf_apply_diag_L,
+                leaf_apply_off=leaf_apply_off_L,
+            )
+            num_leaves = n_pad // leaf_L
+            M_neural_gpu = torch.zeros((n_pad, n_pad), dtype=torch.float32, device=device)
+            for b in range(num_leaves):
+                r0, r1 = b * leaf_L, (b + 1) * leaf_L
+                blk = diag_blocks[0, b]
+                if pool_diag_to_full > 1:
+                    blk = blk.repeat_interleave(pool_diag_to_full, dim=0).repeat_interleave(pool_diag_to_full, dim=1)
+                M_neural_gpu[r0:r1, r0:r1] = blk
+
+            if _inspect_hm.NUM_HMATRIX_OFF_BLOCKS > 0 and off_diag_blocks is not None and node_U is not None and node_V is not None:
+                for i in range(_inspect_hm.NUM_HMATRIX_OFF_BLOCKS):
+                    r0i = int(_inspect_hm.HM_R0_CPU[i].item())
+                    c0i = int(_inspect_hm.HM_C0_CPU[i].item())
+                    si = int(_inspect_hm.HM_S_CPU[i].item())
+                    br0, br1 = r0i * leaf_L, (r0i + si) * leaf_L
+                    bc0, bc1 = c0i * leaf_L, (c0i + si) * leaf_L
+                    C_m = off_diag_blocks[0, i]
+                    U_strip = _offdiag_strip_from_packed_leaves(
+                        node_U[0], r0i, si, num_leaves, leaf_L, leaf_apply_off_L
+                    )
+                    V_strip = _offdiag_strip_from_packed_leaves(
+                        node_V[0], c0i, si, num_leaves, leaf_L, leaf_apply_off_L
+                    )
+                    U_C = torch.matmul(U_strip, C_m)
+                    oblk_dense = torch.matmul(U_C, V_strip.transpose(0, 1))
+                    _assign_dense_block_clamped(M_neural_gpu, oblk_dense, br0, br1, bc0, bc1, n_pad)
+                    _assign_dense_block_clamped(
+                        M_neural_gpu, oblk_dense.transpose(-1, -2), bc0, bc1, br0, br1, n_pad
+                    )
+
+            if jacobi_scale is not None:
+                M_neural_gpu += torch.diag((jacobi_scale[0] * jacobi_inv_diag[0]).to(M_neural_gpu.dtype))
+        _info(
+            f"  LeafOnly: static grid {n_pad}×{n_pad} ({num_leaves} leaves); "
+            f"assembled M sliced to physical {viz_n}×{viz_n} for benchmarks "
+            f"(diag {leaf_apply_diag_L}×{leaf_apply_diag_L} ×{pool_diag_to_full}, "
+            f"off {leaf_apply_off_L}×{leaf_apply_off_L} ×{pool_off_to_full})"
         )
-        num_leaves = n_pad // leaf_L
-        M_neural_gpu = torch.zeros((n_pad, n_pad), dtype=torch.float32, device=device)
-        for b in range(num_leaves):
-            r0, r1 = b * leaf_L, (b + 1) * leaf_L
-            blk = diag_blocks[0, b]
-            if pool_diag_to_full > 1:
-                blk = blk.repeat_interleave(pool_diag_to_full, dim=0).repeat_interleave(pool_diag_to_full, dim=1)
-            M_neural_gpu[r0:r1, r0:r1] = blk
 
-        if _inspect_hm.NUM_HMATRIX_OFF_BLOCKS > 0 and off_diag_blocks is not None and node_U is not None and node_V is not None:
-            for i in range(_inspect_hm.NUM_HMATRIX_OFF_BLOCKS):
-                r0i = int(_inspect_hm.HM_R0_CPU[i].item())
-                c0i = int(_inspect_hm.HM_C0_CPU[i].item())
-                si = int(_inspect_hm.HM_S_CPU[i].item())
-                br0, br1 = r0i * leaf_L, (r0i + si) * leaf_L
-                bc0, bc1 = c0i * leaf_L, (c0i + si) * leaf_L
-                C_m = off_diag_blocks[0, i]
-                U_strip = _offdiag_strip_from_packed_leaves(
-                    node_U[0], r0i, si, num_leaves, leaf_L, leaf_apply_off_L
-                )
-                V_strip = _offdiag_strip_from_packed_leaves(
-                    node_V[0], c0i, si, num_leaves, leaf_L, leaf_apply_off_L
-                )
-                U_C = torch.matmul(U_strip, C_m)
-                oblk_dense = torch.matmul(U_C, V_strip.transpose(0, 1))
-                _assign_dense_block_clamped(M_neural_gpu, oblk_dense, br0, br1, bc0, bc1, n_pad)
-                _assign_dense_block_clamped(
-                    M_neural_gpu, oblk_dense.transpose(-1, -2), bc0, bc1, br0, br1, n_pad
-                )
-
-        if jacobi_scale is not None:
-            M_neural_gpu += torch.diag((jacobi_scale[0] * jacobi_inv_diag[0]).to(M_neural_gpu.dtype))
-    _info(
-        f"  LeafOnly: static grid {n_pad}×{n_pad} ({num_leaves} leaves); "
-        f"assembled M sliced to physical {viz_n}×{viz_n} for benchmarks "
-        f"(diag {leaf_apply_diag_L}×{leaf_apply_diag_L} ×{pool_diag_to_full}, "
-        f"off {leaf_apply_off_L}×{leaf_apply_off_L} ×{pool_off_to_full})"
-    )
-
-    d = diag_blocks.detach()
-    if d.dim() == 3:
-        d = d.unsqueeze(0)
-    frobs = (d ** 2).sum(dim=(-2, -1)).sqrt()
-    flat = d.reshape(-1)
-    _info(f"  Diagonal blocks: Frob mean={frobs.mean().item():.6f} std={frobs.std().item():.6f}")
-    _info(f"  Elements: mean={flat.mean().item():.6e} std={flat.std().item():.6e} min={flat.min().item():.6e} max={flat.max().item():.6e}")
+        d = diag_blocks.detach()
+        if d.dim() == 3:
+            d = d.unsqueeze(0)
+        frobs = (d ** 2).sum(dim=(-2, -1)).sqrt()
+        flat = d.reshape(-1)
+        _info(f"  Diagonal blocks: Frob mean={frobs.mean().item():.6f} std={frobs.std().item():.6f}")
+        _info(f"  Elements: mean={flat.mean().item():.6e} std={flat.std().item():.6e} min={flat.min().item():.6e} max={flat.max().item():.6e}")
 
     A_scipy = csr_matrix(A_phys_f64)
     ml_amg = None
@@ -2389,7 +2451,8 @@ def main():
 
     A_viz_n = A_phys_f64
     assert A_viz_n.shape[0] == viz_n and A_viz_n.shape[1] == viz_n
-    M_gpu = M_neural_gpu[:viz_n, :viz_n]
+    if not skip_leaf:
+        M_gpu = M_neural_gpu[:viz_n, :viz_n]
     if not test_only:
         M_amg_n = M_amg[:viz_n, :viz_n]
 
@@ -2410,9 +2473,10 @@ def main():
     _np_pcg = np.float64 if pcg_prec == "f64" else np.float32
     A_scipy_csr = csr_matrix(A_viz_n.astype(_np_pcg))
 
-    precond_s = precond_out.detach().contiguous()
-    jacobi_s = jacobi_inv_diag.detach().contiguous()
-    jacobi_s_phys = jacobi_s[:, :viz_n].contiguous()
+    if not skip_leaf:
+        precond_s = precond_out.detach().contiguous()
+        jacobi_s = jacobi_inv_diag.detach().contiguous()
+        jacobi_s_phys = jacobi_s[:, :viz_n].contiguous()
 
     A_f64 = A_viz_n.astype(np.float64)
     leaf_rel_res = float("nan")
@@ -2445,7 +2509,7 @@ def main():
                 check_freq=check_freq,
                 acc_dtype=pcg_acc_dtype,
             )
-            _inv_jac_np = 1.0 / np.maximum(np.abs(np.diag(A_f64).astype(np.float64)), 1e-30)
+            _inv_jac_np = 1.0 / np.maximum(np.abs(np.asarray(A_f64.diagonal()).astype(np.float64)), 1e-30)
             _inv_jac = _inv_jac_np.astype(_np_pcg)
             _inv_jac_t = torch.from_numpy(_inv_jac).to(device=device, dtype=pcg_elem_dtype).contiguous()
 
@@ -2495,64 +2559,152 @@ def main():
                 check_freq=check_freq,
             )
 
-        _pcg_driver_line = (
-            f"{args.leafonly_pcg}; GPU PCG driver: {pcg_cuda_backend}"
-            + (
-                f" (effective: {_effective_pcg_gpu_backend(device, pcg_cuda_backend)})"
-                if device.type == "mps"
-                else ""
-            )
-            + (f"; resolved_backend={pcg_gpu_backend_eff}" if pcg_gpu_backend_eff != pcg_cuda_backend else "")
-            + {"f64": "; elem=float64", "mixed": "; elem=float32/acc=float64", "f32": ""}.get(pcg_prec, "")
-        )
-        if test_only:
-            print(
-                f"  LeafOnly PCG mode: {_pcg_driver_line}; "
-                f"pcg_check_freq={check_freq} (stopping residual every K iters)"
-            )
+        if skip_leaf:
+            # No model: skip LeafOnly PCG entirely. Defaults flow through to the summary so the rest of
+            # the benchmark path stays oblivious; the LeafOnly summary line is suppressed below.
+            iters_leaf = 0
+            solve_leaf_ms = 0.0
+            leaf_rel_res = float("nan")
         else:
-            _info(
-                f"  LeafOnly PCG mode: {_pcg_driver_line}; pcg_check_freq={check_freq}"
+            _pcg_driver_line = (
+                f"{args.leafonly_pcg}; GPU PCG driver: {pcg_cuda_backend}"
+                + (
+                    f" (effective: {_effective_pcg_gpu_backend(device, pcg_cuda_backend)})"
+                    if device.type == "mps"
+                    else ""
+                )
+                + (f"; resolved_backend={pcg_gpu_backend_eff}" if pcg_gpu_backend_eff != pcg_cuda_backend else "")
+                + {"f64": "; elem=float64", "mixed": "; elem=float32/acc=float64", "f32": ""}.get(pcg_prec, "")
             )
+            if test_only:
+                print(
+                    f"  LeafOnly PCG mode: {_pcg_driver_line}; "
+                    f"pcg_check_freq={check_freq} (stopping residual every K iters)"
+                )
+            else:
+                _info(
+                    f"  LeafOnly PCG mode: {_pcg_driver_line}; pcg_check_freq={check_freq}"
+                )
 
-        if args.leafonly_pcg == "bsr":
-            M_sparse_bsr = build_sparse_bsr_preconditioner(
-                precond_s,
-                viz_n,
-                leaf_L,
-                leaf_apply_diag_L,
-                leaf_apply_off_L,
-                jacobi_s_phys,
-                device,
-            )
-            verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
+            if args.leafonly_pcg == "bsr":
+                M_sparse_bsr = build_sparse_bsr_preconditioner(
+                    precond_s,
+                    viz_n,
+                    leaf_L,
+                    leaf_apply_diag_L,
+                    leaf_apply_off_L,
+                    jacobi_s_phys,
+                    device,
+                )
+                verify_leafonly_preconditioner_spd(M_sparse_bsr, viz_n, print_fn=_info)
 
-            if device.type in ("cuda", "mps"):
-                if pcg_prec == "f64":
-                    bsr_r_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
+                if device.type in ("cuda", "mps"):
+                    if pcg_prec == "f64":
+                        bsr_r_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
 
-                    def _apply_bsr_fp64(r: torch.Tensor) -> torch.Tensor:
-                        z = torch.empty_like(r)
-                        bsr_r_f32.copy_(r)
-                        z.copy_(M_sparse_bsr @ bsr_r_f32)
-                        return z
+                        def _apply_bsr_fp64(r: torch.Tensor) -> torch.Tensor:
+                            z = torch.empty_like(r)
+                            bsr_r_f32.copy_(r)
+                            z.copy_(M_sparse_bsr @ bsr_r_f32)
+                            return z
+
+                        x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
+                            A_gpu,
+                            b_gpu,
+                            _apply_bsr_fp64,
+                            tol=pcg_tol,
+                            max_iter=pcg_max_iter,
+                            device=device,
+                            check_freq=check_freq,
+                            acc_dtype=pcg_acc_dtype,
+                        )
+                        _bsr_be = "eager (fp64 PCG + fp32 BSR M·r)"
+                    else:
+                        x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_bsr_gpu(
+                            A_gpu,
+                            b_gpu,
+                            M_sparse_bsr,
+                            backend=pcg_gpu_backend_eff,
+                            tol=pcg_tol,
+                            max_iter=pcg_max_iter,
+                            device=device,
+                            check_freq=check_freq,
+                            acc_dtype=pcg_acc_dtype,
+                        )
+                        _bsr_be = {"cudagraph": "CUDAGraph", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
+                            pcg_gpu_backend_eff,
+                            pcg_cuda_backend,
+                        )
+                    _info(
+                        f"  LeafOnly PCG: BSR + {_bsr_be} (z = M @ r)"
+                        + (f"; n={viz_n}" if viz_n != n_pad else "")
+                    )
+                else:
+
+                    def apply_pcg_fast(r):
+                        return M_sparse_bsr @ r
 
                     x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
                         A_gpu,
                         b_gpu,
-                        _apply_bsr_fp64,
+                        apply_pcg_fast,
                         tol=pcg_tol,
                         max_iter=pcg_max_iter,
                         device=device,
                         check_freq=check_freq,
-                        acc_dtype=pcg_acc_dtype,
                     )
-                    _bsr_be = "eager (fp64 PCG + fp32 BSR M·r)"
+                    _info("  LeafOnly PCG: BSR preconditioner + pcg_gpu (CPU)")
+            else:
+                precond_ws = block_diagonal_m_apply_workspace(
+                    num_leaves=viz_n // leaf_L,
+                    leaf_size=leaf_L,
+                    K_dim=1,
+                    M_h=_inspect_hm.NUM_HMATRIX_OFF_BLOCKS,
+                    La_o=leaf_apply_off_L,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                warmup_hmatrix_prolong_gpu(device)
+
+                if pcg_prec == "f64":
+                    pcg_r_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
+                    pcg_z_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
+
+                    def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                        pcg_r_f32.copy_(r)
+                        apply_block_diagonal_m_into(
+                            precond_s,
+                            pcg_r_f32.reshape(1, viz_n, 1),
+                            pcg_z_f32.reshape(1, viz_n, 1),
+                            jacobi_s_phys,
+                            precond_ws,
+                            leaf_size=leaf_L,
+                            leaf_apply_size=leaf_apply_diag_L,
+                            leaf_apply_off=leaf_apply_off_L,
+                        )
+                        out.copy_(pcg_z_f32)
+                        return out
                 else:
-                    x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_bsr_gpu(
+
+                    def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+                        # Views only; apply_block_diagonal_m_into writes out in-place (no alloc) — safe inside CUDAGraph.
+                        apply_block_diagonal_m_into(
+                            precond_s,
+                            r.reshape(1, viz_n, 1),
+                            out.reshape(1, viz_n, 1),
+                            jacobi_s_phys,
+                            precond_ws,
+                            leaf_size=leaf_L,
+                            leaf_apply_size=leaf_apply_diag_L,
+                            leaf_apply_off=leaf_apply_off_L,
+                        )
+                        return out
+
+                if device.type in ("cuda", "mps"):
+                    x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_matrix_free_gpu(
                         A_gpu,
                         b_gpu,
-                        M_sparse_bsr,
+                        apply_pcg_fast_into,
                         backend=pcg_gpu_backend_eff,
                         tol=pcg_tol,
                         max_iter=pcg_max_iter,
@@ -2560,116 +2712,35 @@ def main():
                         check_freq=check_freq,
                         acc_dtype=pcg_acc_dtype,
                     )
-                    _bsr_be = {"cudagraph": "CUDAGraph", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
+                    _mf_be = {"cudagraph": "CUDAGraph replay", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
                         pcg_gpu_backend_eff,
                         pcg_cuda_backend,
                     )
-                _info(
-                    f"  LeafOnly PCG: BSR + {_bsr_be} (z = M @ r)"
-                    + (f"; n={viz_n}" if viz_n != n_pad else "")
-                )
-            else:
-
-                def apply_pcg_fast(r):
-                    return M_sparse_bsr @ r
-
-                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
-                    A_gpu,
-                    b_gpu,
-                    apply_pcg_fast,
-                    tol=pcg_tol,
-                    max_iter=pcg_max_iter,
-                    device=device,
-                    check_freq=check_freq,
-                )
-                _info("  LeafOnly PCG: BSR preconditioner + pcg_gpu (CPU)")
-        else:
-            precond_ws = block_diagonal_m_apply_workspace(
-                num_leaves=viz_n // leaf_L,
-                leaf_size=leaf_L,
-                K_dim=1,
-                M_h=_inspect_hm.NUM_HMATRIX_OFF_BLOCKS,
-                La_o=leaf_apply_off_L,
-                device=device,
-                dtype=torch.float32,
-            )
-            warmup_hmatrix_prolong_gpu(device)
-
-            if pcg_prec == "f64":
-                pcg_r_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
-                pcg_z_f32 = torch.zeros(viz_n, 1, device=device, dtype=torch.float32)
-
-                def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-                    pcg_r_f32.copy_(r)
-                    apply_block_diagonal_m_into(
-                        precond_s,
-                        pcg_r_f32.reshape(1, viz_n, 1),
-                        pcg_z_f32.reshape(1, viz_n, 1),
-                        jacobi_s_phys,
-                        precond_ws,
-                        leaf_size=leaf_L,
-                        leaf_apply_size=leaf_apply_diag_L,
-                        leaf_apply_off=leaf_apply_off_L,
+                    _info(
+                        f"  LeafOnly PCG: {_mf_be} — CSR SpMV + block_diagonal_m_apply_workspace + "
+                        f"apply_block_diagonal_m_into (no apply_block_diagonal_M)"
+                        + (f"; n={viz_n}" if viz_n != n_pad else "")
                     )
-                    out.copy_(pcg_z_f32)
-                    return out
-            else:
+                else:
 
-                def apply_pcg_fast_into(r: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-                    # Views only; apply_block_diagonal_m_into writes out in-place (no alloc) — safe inside CUDAGraph.
-                    apply_block_diagonal_m_into(
-                        precond_s,
-                        r.reshape(1, viz_n, 1),
-                        out.reshape(1, viz_n, 1),
-                        jacobi_s_phys,
-                        precond_ws,
-                        leaf_size=leaf_L,
-                        leaf_apply_size=leaf_apply_diag_L,
-                        leaf_apply_off=leaf_apply_off_L,
+                    def apply_pcg_fast(r):
+                        z = torch.empty_like(r)
+                        return apply_pcg_fast_into(r, z)
+
+                    x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
+                        A_gpu,
+                        b_gpu,
+                        apply_pcg_fast,
+                        tol=pcg_tol,
+                        max_iter=pcg_max_iter,
+                        device=device,
+                        check_freq=check_freq,
                     )
-                    return out
+                    _info("  LeafOnly PCG: matrix-free preconditioner + pcg_gpu (CPU)")
 
-            if device.type in ("cuda", "mps"):
-                x_gpu, iters_leaf, solve_leaf_ms = _dispatch_pcg_matrix_free_gpu(
-                    A_gpu,
-                    b_gpu,
-                    apply_pcg_fast_into,
-                    backend=pcg_gpu_backend_eff,
-                    tol=pcg_tol,
-                    max_iter=pcg_max_iter,
-                    device=device,
-                    check_freq=check_freq,
-                    acc_dtype=pcg_acc_dtype,
-                )
-                _mf_be = {"cudagraph": "CUDAGraph replay", "compile": "torch.compile(one_iter)", "eager": "eager pcg_gpu"}.get(
-                    pcg_gpu_backend_eff,
-                    pcg_cuda_backend,
-                )
-                _info(
-                    f"  LeafOnly PCG: {_mf_be} — CSR SpMV + block_diagonal_m_apply_workspace + "
-                    f"apply_block_diagonal_m_into (no apply_block_diagonal_M)"
-                    + (f"; n={viz_n}" if viz_n != n_pad else "")
-                )
-            else:
-
-                def apply_pcg_fast(r):
-                    z = torch.empty_like(r)
-                    return apply_pcg_fast_into(r, z)
-
-                x_gpu, iters_leaf, solve_leaf_ms = pcg_gpu(
-                    A_gpu,
-                    b_gpu,
-                    apply_pcg_fast,
-                    tol=pcg_tol,
-                    max_iter=pcg_max_iter,
-                    device=device,
-                    check_freq=check_freq,
-                )
-                _info("  LeafOnly PCG: matrix-free preconditioner + pcg_gpu (CPU)")
-
-        _bf = b_gpu.squeeze(-1)
-        _Ax = A_gpu @ x_gpu.squeeze(-1)
-        leaf_rel_res = float(((_Ax - _bf).norm() / (_bf.norm() + 1e-30)).item())
+            _bf = b_gpu.squeeze(-1)
+            _Ax = A_gpu @ x_gpu.squeeze(-1)
+            leaf_rel_res = float(((_Ax - _bf).norm() / (_bf.norm() + 1e-30)).item())
 
     x_cpu_none, iters_none_cpu, solve_none_cpu_ms = pcg_cpu(
         A_f64, b_np, lambda r: r, tol=pcg_tol, max_iter=pcg_max_iter
@@ -2786,11 +2857,12 @@ def main():
             f"  Setup: {amgx_ilu_setup_ms:.2f} ms, solve (GPU): {amgx_ilu_solve_ms:.2f} ms, {amgx_ilu_iters} iterations, "
             f"total: {total_amgx_ilu_ms:.2f} ms  [AMGX MULTICOLOR_DILU]"
         )
-    print("LeafOnly:")
-    print(
-        f"  Inference: {inference_ms:.2f} ms, solve: {solve_leaf_ms:.2f} ms, {iters_leaf} iterations, "
-        f"total: {total_leaf_ms:.2f} ms; true rel residual ||Ax-b||/||b||={leaf_rel_res:.3e} (PCG tol {pcg_tol:.0e})"
-    )
+    if not skip_leaf:
+        print("LeafOnly:")
+        print(
+            f"  Inference: {inference_ms:.2f} ms, solve: {solve_leaf_ms:.2f} ms, {iters_leaf} iterations, "
+            f"total: {total_leaf_ms:.2f} ms; true rel residual ||Ax-b||/||b||={leaf_rel_res:.3e} (PCG tol {pcg_tol:.0e})"
+        )
     print("AMG (CPU):")
     print(f"  Setup: {amg_setup_ms:.2f} ms, solve: {solve_amg_ms:.2f} ms, {iters_amg} iterations, total: {total_amg_ms:.2f} ms")
     if HAS_AMGX and device.type == "cuda":
@@ -2838,7 +2910,7 @@ def main():
 
     if PLOT_MATRICES:
         M_neural_n = M_gpu.detach().cpu().numpy()
-        methods = [("LeafOnly", M_neural_n), ("AMG", M_amg_n)]
+        methods = [("Ours", M_neural_n), ("AMG", M_amg_n)]
         n_cols = 6
         n_rows = 1 + len(methods) + 1
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 + 3 * n_rows), constrained_layout=True)
@@ -2867,7 +2939,7 @@ def main():
             vmin=float(log_a_in.min()),
             vmax=float(log_a_in.max()),
         )
-        axes[0, 0].set_title(f"A (input) log10 [leaf {leaf_L}x{leaf_L}]")
+        axes[0, 0].set_title(f"A (input) log10 [tile {leaf_L}×{leaf_L}]")
         plt.colorbar(im_a0, ax=axes[0, 0])
         im_ainv = axes[0, 1].imshow(
             log_ainv,
@@ -2881,8 +2953,8 @@ def main():
         ax_blk = axes[0, 2]
         _draw_hmatrix_weak_partition_ax(ax_blk, viz_n, leaf_L, HMATRIX_ETA)
         ax_blk.set_title(
-            f"Weak-admissible H-matrix (η={HMATRIX_ETA}), LeafOnly layout\n"
-            f"Grid {viz_n}×{viz_n}, leaf {leaf_L}×{leaf_L}, K={viz_n // leaf_L} units"
+            f"Weak-admissible H-matrix (η={HMATRIX_ETA}), preconditioner tiling\n"
+            f"Grid {viz_n}×{viz_n}, tile {leaf_L}×{leaf_L}, K={viz_n // leaf_L} blocks"
         )
         _green_cmap = plt.get_cmap("Greens")
         ax_blk.legend(
@@ -2891,7 +2963,7 @@ def main():
                     facecolor="#e8a0c8",
                     edgecolor="white",
                     linewidth=1.0,
-                    label=f"On-diagonal unit leaf ({leaf_L}×{leaf_L} px)",
+                    label=f"On-diagonal tile ({leaf_L}×{leaf_L} px)",
                 ),
                 Patch(
                     facecolor=_green_cmap(0.65),

@@ -3,7 +3,7 @@ FreqRankByDistance: visualize how off-diagonal blocks of A^{-1} change with
 their distance from the diagonal in the H-matrix partition. Two panels:
 
   (A) Radially-averaged 2D Fourier power spectrum of A^{-1} blocks, grouped by
-      tile size S (in leaf units). Near tiles concentrate energy at high
+      tile size S (in coarse-level units). Near tiles concentrate energy at high
       relative frequencies; distant tiles concentrate at low frequencies.
 
   (B) Singular-value decay of A^{-1} blocks, grouped by tile size S, normalized
@@ -307,7 +307,7 @@ def main():
              bbox=dict(boxstyle="round,pad=0.20", fc="white",
                        ec=LEGEND_EDGE, lw=0.5, alpha=0.92))
 
-    axC.set_xlabel(r"Off-diagonal tile size  (nodes per side, $\,=S\!\cdot\!L$ with leaf $L\,{=}\,128$)")
+    axC.set_xlabel(r"Off-diagonal tile size  (nodes per side, $\,=S\!\cdot\!L$ with fixed block side $L\,{=}\,128$)")
     axC.set_ylabel(r"Numerical rank, as fraction of tile size")
     axC.set_title(r"Off-diagonal rank: emitted by architecture vs required to capture $A^{-1}$")
     axC.set_xticks(block_dim)
@@ -368,7 +368,7 @@ def main():
     axA.set_xlim(3e-4, 0.5)
     axA.set_ylim(0.20, 1.02)
     _grid(axA)
-    axA.legend(title="distance ($=$ tile size in leaves)",
+    axA.legend(title=r"distance ($=$ tile width $S\!\cdot\!L$ nodes)",
                loc="lower right", framealpha=0.9, edgecolor=LEGEND_EDGE,
                title_fontsize=8.5)
 
@@ -445,7 +445,7 @@ def main():
                            ec="#b03030", lw=0.7, alpha=0.95))
     t.set_path_effects(HALO)
 
-    axC.set_xlabel(r"Distance class  $S$  (tile size in leaves)")
+    axC.set_xlabel(r"Distance class  $S$  (coarse level; tile width $S\!\cdot\!L$ nodes)")
     axC.set_ylabel(r"Rank fraction  $r/(SL)$")
     axC.set_title(r"(C)  Architecture-provided rank exceeds what's needed at every $S$")
     axC.set_xticks(S_arr)
