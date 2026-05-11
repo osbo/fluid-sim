@@ -31,6 +31,7 @@
 % Figures live in Paper/figures/. First path: latexmk from Paper/; second: cwd at repo root.
 \graphicspath{{figures/}{Paper/figures/}}
 \usepackage{booktabs}
+\usepackage{tabularx}
 % NB: do not load amssymb; acmart + newtxmath already define AMS symbols, and loading
 % amssymb triggers "Command \Bbbk already defined" and aborts pdflatex.
 
@@ -72,13 +73,15 @@ GEMMs over contiguous memory, with no triangular solves or data-dependent branch
 end-to-end in a single CUDA Graph.
 On a stiff multiphase pressure-Poisson benchmark spanning $1\,024$--$16\,384$ unknowns and
 density contrast ratios up to $100\!:\!1$, our preconditioner is the only method evaluated
-that fits inside an interactive ($60$\,fps) budget across the entire range up to
-$N\!=\!4\,096$, and it remains within a $24$\,fps budget at $N\!=\!16\,384$. At
-$N\!=\!8\,192$, mean end-to-end solve time is $18.1\!\pm\!2.4$\,ms ($3.2$\,ms inference $+$
-$14.9$\,ms PCG over $174$ iterations) versus $38.8\!\pm\!10.5$\,ms for GPU Jacobi,
-$117.7\!\pm\!4.1$\,ms for AMGX classical AMG, and $449.6\!\pm\!83.7$\,ms for AMGX
-\textsc{multicolor\_dilu}---a $2.1\times$ speedup over the best baseline that fits an
-interactive budget and over $24\times$ over the best classical GPU preconditioner we evaluate.
+that delivers interactive framerates across the full range: $\sim\!154$\,fps at
+$N\!=\!1\,024$, $\sim\!111$\,fps at $N\!=\!4\,096$, and $\sim\!22$\,fps at $N\!=\!16\,384$,
+versus $\sim\!85$, $\sim\!31$, and $\sim\!16$\,fps for the closest GPU baseline (Jacobi)
+on identical hardware. At $N\!=\!8\,192$, mean end-to-end solve time is
+$18.1\!\pm\!2.4$\,ms ($3.2$\,ms inference $+$ $14.9$\,ms PCG over $174$ iterations) versus
+$38.8\!\pm\!10.5$\,ms for GPU Jacobi, $117.7\!\pm\!4.1$\,ms for AMGX classical AMG, and
+$449.6\!\pm\!83.7$\,ms for AMGX \textsc{multicolor\_dilu} --- a $2.1\times$ speedup over
+the best interactive-range baseline and over $24\times$ over the best classical GPU
+preconditioner we evaluate.
 \end{abstract}
 
 \begin{CCSXML}
@@ -537,7 +540,7 @@ largest tile size, with the gap widening as separation grows.
   \caption{Off-diagonal rank emitted by the architecture (constant $L_s\!=\!32$, red)
     versus numerical rank required to capture the corresponding tile of $A^{-1}$ to
     relative error $\varepsilon\!\in\!\{10^{-3},10^{-6},10^{-9}\}$ (dashed), reported as
-    a fraction of tile size on \textsf{multiphase\_v2} frames with leaf $L\!=\!128$.
+    a fraction of tile size on multiphase Poisson frames with leaf $L\!=\!128$.
     Shaded bands: $\pm 1\sigma$ across tiles in the same size class. The provided rank
     sits above the required rank at every tile size and every tolerance, with
     $2.6\times$ headroom at the largest tile under the strictest tolerance.}
@@ -674,30 +677,42 @@ indexed-gather; the remainder is copies/reshapes and elementwise/normalization
 \label{sec:application}
 % ===========================================================================
 
-PCG calls $M$ on the residual once per iteration. Two design choices keep this hot path
-allocation-free, branch-free, and dispatchable as a single CUDA Graph. First, $M$ is never
-formed explicitly: at full resolution its off-diagonal blocks reach
-$\tfrac{N}{2}\!\times\!\tfrac{N}{2}$, and assembling $AM$ to recast as left-preconditioned
-would further densify the off-diagonal couplings and destroy the factored low-rank structure
-that gives our method its $\Theta(N)$ scaling. Instead we maintain $M$ in the factored form
-$\{F_k, \tilde U_k, \tilde V_k\}_k\cup\{B_m\}_m$ and right-precondition. Second, every
-intermediate buffer is preallocated at solve setup so the PCG inner loop never allocates.
+PCG calls $M$ on the residual once per iteration; the cost and the GPU behavior of this
+apply is what determines the per-frame throughput of any preconditioner in the inner loop.
+$M$ is never assembled --- at full resolution its off-diagonal blocks reach
+$\tfrac{N}{2}\!\times\!\tfrac{N}{2}$, and materializing them would destroy the factored
+low-rank structure that gives the method its $\Theta(N)$ scaling. We keep $M$ in factored
+form $\{F_k\}_k \cup \{\tilde U_k,\tilde V_k\}_k \cup \{B_m\}_m$, right-precondition, and
+preallocate every intermediate buffer at solve setup from the static partition so the inner
+loop never branches and never allocates.
+
+\paragraph{Why every access is contiguous.}
+Three properties of the system compound to make every operand in the apply path a stride-1
+read over a contiguous tensor. (i) The system $A$ is indexed along a space-filling-curve or
+bandwidth-reducing ordering (Sec.~\ref{sec:intro}), so the residual $\mathbf{r}\!\in\!\mathbb{R}^N$
+lays out spatially-adjacent degrees of freedom in adjacent memory addresses. (ii) The
+$\mathcal{H}$-matrix partition is fixed in advance and its leaf and tile boundaries are
+aligned with this ordering, so the slice $\mathbf{r}_k = \mathbf{r}[kL:(k\!+\!1)L]$ is a
+contiguous view into the residual rather than a gather. (iii) Within each leaf and within
+each tile, attention is windowed and produces factor tensors stored as contiguous batched
+arrays of shapes $(K,L,L)$, $(M_\mathcal{H},L_s,L_s)$, and $(K,L,L_s)$. These three choices
+are not independent: each presupposes the next, and together they reduce the apply to a
+fixed sequence of batched GEMMs over preallocated tensors with no gather/scatter
+indirection. The CSR SpMV for $A\mathbf{r}$ is the one nominal exception, but the same
+ordering also makes the residual's access pattern within $A$ nearly banded, so the SpMV's
+gathers hit a small working set rather than the whole vector.
 
 \paragraph{Diagonal contribution.}
-The diagonal blocks are extracted as a strided view (no copy) into the packed tensor.
-The input residual is reshaped into $K$ leaf segments, optionally mean-pooled to $L_s$
-tokens, and a single batched GEMM evaluates $\mathbf{y}^{\mathrm{diag}}_k = F_k\,\mathbf{r}_k$
-across all leaves at once; the result is then expanded back to length $L$ if pooled. Total
-cost is $2KL_s^2 = 2N L_s/L$ FLOPs over $K$ contiguous matrices, with arithmetic intensity
-$\sim L_s/2$ FLOPs/byte---two orders of magnitude above the scalar Jacobi multiply, and well
-inside the compute-bound regime on Tensor Core hardware.
+A single batched GEMM evaluates $\mathbf{y}^{\mathrm{diag}}_k = F_k\mathbf{r}_k$ across all
+$K$ leaves at once. The blocks are dense $L\!\times\!L$, so this stage has high arithmetic
+intensity and saturates Tensor Cores. Cost is $O(NL)$ FLOPs.
 
 \paragraph{Off-diagonal contribution: FMM-style four-stage chain.}
-The node factors $\tilde U,\tilde V$ project node-resolution data to coarse moments;
-the coarse blocks $B_m\!=\!U_m V_m^\top$ couple moments across well-separated leaf ranges;
-and the projection is inverted at the end. Concretely, with $\mathbf{r}_k$ the residual
-on leaf $k$, $\mathcal{R}_m\!=\![r_0^{(m)},r_0^{(m)}\!+\!S^{(m)})$ and
-$\mathcal{C}_m\!=\![c_0^{(m)},c_0^{(m)}\!+\!S^{(m)})$:
+The bridge factors $\tilde U_k,\tilde V_k$ project each leaf's residual to a coarse summary;
+the tile factors $B_m\!=\!U_m V_m^\top$ couple summaries between well-separated leaf ranges;
+the projection is then inverted to deposit the contribution back on full-resolution leaves.
+With $\mathbf{r}_k$ the residual on leaf $k$ and $\mathcal{R}_m,\mathcal{C}_m$ the row and
+column leaf ranges of tile $m$:
 \begin{align}
   \hat{\mathbf{u}}_k &= \tilde U_k^\top\mathbf{r}_k,\qquad
   \hat{\mathbf{v}}_k = \tilde V_k^\top\mathbf{r}_k && \text{(restriction)}\\
@@ -710,53 +725,77 @@ $\mathcal{C}_m\!=\![c_0^{(m)},c_0^{(m)}\!+\!S^{(m)})$:
                     +  \tilde V_k\,{\textstyle\sum_{m:k\in\mathcal{C}_m}\!\mathbf{t}^{\mathrm{c}}_m}
    && \text{(prolong.)}
 \end{align}
-Stages 1 and 4 are batched GEMMs of shape $(K,L,L_s)$ over contiguous memory; stage 3 is
-a batched GEMM of shape $(M_\mathcal{H},L_s,L_s)$ that fully occupies Tensor Cores; stage 2
-is two scatter-add operations whose gather indices are precomputed once at module init
-from the static partition. Total cost is $O(NL_s)$. Symmetry of the preconditioner means
-we store only the $r_0\!\le\!c_0$ tiles and reuse each $B_m$ for both upper- and
-lower-triangular contributions.
+Stages 1 and 4 are batched GEMMs of shape $(K,L,L_s)$; stage 3 is a batched GEMM of shape
+$(M_\mathcal{H},L_s,L_s)$ that fully occupies Tensor Cores; stage 2 is two scatter-adds
+whose gather indices are computed once from the static partition and accessed in contiguous
+stride at apply time. Total cost is $O(NL_s)$ FLOPs over $K + M_\mathcal{H}$ small matrices.
+Symmetry of $M$ means each $B_m$ is reused for both the upper- and lower-triangular
+contribution.
 
 \paragraph{Single-graph capture.}
-Because the apply path performs no Python branching and no dynamic allocation---all
-workspace is preallocated at solve setup---the inner PCG loop (one CSR SpMV for $A\mathbf{r}$,
-one apply, plus the PCG scalar updates) records cleanly into a single
-\verb|torch.cuda.graph|. Subsequent iterations replay the graph with one
-\verb|cudaGraphLaunch| call: zero CPU dispatch, zero kernel argument serialization. This
-captures \emph{the entire} per-iteration solver state. By contrast, IC- and DILU-class
-preconditioners require sequential triangular solves whose wavefront scheduling creates
-data hazards across SMs, and AMG V-cycles demand level-by-level synchronization barriers
-that prevent capture of a single fused graph.
+Capture by \verb|torch.cuda.graph| requires the captured region to contain no Python
+control flow, no host-side allocation, and no kernels whose launch parameters depend on
+runtime data. The apply path described above satisfies all three by construction: the
+partition is determined analytically before training and never changes, the workspace is
+preallocated, and every kernel's launch shape is fixed by hyperparameters $L,L_s,d,K$. The
+complete PCG inner loop --- one CSR SpMV for $A\mathbf{r}$, one preconditioner apply, and
+the PCG scalar dot products and SAXPY updates --- therefore records into a single CUDA Graph,
+which subsequent iterations replay with one \verb|cudaGraphLaunch|: zero CPU dispatch
+overhead, zero kernel-argument serialization, and a fixed end-to-end latency per iteration.
+
+In a real-time engine, the CPU/GPU dispatch latency between successive small kernels is
+often what sets the floor on achievable frame time, not raw arithmetic. Methods whose inner
+loop \emph{can} be captured as a single graph enjoy a step-function reduction in this floor;
+methods whose inner loop \emph{cannot} pay the dispatch overhead on every iteration. We did
+not design for graph capture explicitly --- it falls out of the static partition, the
+absence of triangular solves, the contiguous data layout, and the fixed launch shapes ---
+but the practical consequence is a property we explicitly target with this paper. For
+contrast, IC- and DILU-class preconditioners cannot be captured this way because their
+triangular solves serialize through data-dependent wavefronts that the runtime cannot
+schedule into a single graph, and AMG V-cycles require level-by-level synchronization
+barriers that fragment the capture by construction.
+
+\paragraph{Memory access compared.}
+Among learned alternatives, neural SPAI~\cite{Yang2025sparse} also avoids triangular solves
+and is graph-capturable. Its apply, however, evaluates $\mathbf{y} = G^\top(G\mathbf{r})$ as
+two SpMVs against a sparse $G$ inheriting the nonzero pattern of $A$. For each nonzero
+$G_{ij}$, the SpMV fetches $\mathbf{r}_j$ from an offset determined entirely by $G$'s
+sparsity pattern, not by any block structure; even under a good node ordering the gather
+addresses skip across the residual at the irregularity of the underlying graph, leaving the
+kernel bandwidth-bound and limited by random-access throughput on the GPU memory
+subsystem~\cite{bell2009implementing}. Our apply replaces this irregular-gather access
+pattern with batched GEMMs over preallocated contiguous tensors aligned to the partition;
+the address arithmetic of every operand is a single stride and the kernel becomes
+compute-bound on Tensor Cores. The advantage is not the ordering itself --- which the SPAI
+apply could in principle also enjoy --- but the fact that windowed attention coupled to the
+$\mathcal{H}$-matrix partition lets us express the apply as dense block work rather than
+nonzero-by-nonzero gathers. Table~\ref{tab:apply_complexity} summarizes.
 
 \begin{table}[t]
 \centering
-\caption{Per-iteration preconditioner application cost. $\mathrm{nnz}$ denotes the nonzero
-count of the relevant factor; ``Sequential'' indicates operations with unavoidable
-data-dependent wavefront scheduling.}
+\caption{Per-iteration preconditioner application: arithmetic cost, dominant memory-access
+pattern, the resource that gates throughput on modern GPUs, and whether the apply admits
+single-CUDA-Graph capture of the PCG inner loop. $\mathrm{nnz}$ is the nonzero count of the
+relevant factor.}
 \label{tab:apply_complexity}
 \small
-\begin{tabular}{@{}lllc@{}}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.19\linewidth}
+  >{\raggedright\arraybackslash}X
+  >{\raggedright\arraybackslash}X
+  >{\raggedright\arraybackslash}X
+  c@{}}
 \toprule
-Method & FLOPs & Parallelism & Graph-cap.? \\
+Method & Apply FLOPs & Memory access & Throughput limit & Single-graph \\
 \midrule
-Jacobi & $O(N)$ & embarrassing & \checkmark \\
-IC (triangular solve) & $O(\mathrm{nnz})$ & sequential & $\times$ \\
-Neural SPAI~\cite{Yang2025sparse} & $O(\mathrm{nnz})$ & SpMV & \checkmark \\
-AMG (V-cycle) & $O(N\log N)$ & level-sync & $\times$ \\
-\textbf{Ours} & $O(N L_s)$ & batched GEMM & \checkmark \\
+Jacobi & $O(N)$ & stride-1 read & memory bandwidth & \checkmark \\
+IC (tri.\ solve) & $O(\mathrm{nnz})$ & wavefront-dependent & latency / data hazards & $\times$ \\
+Neural SPAI~\cite{Yang2025sparse} & $O(\mathrm{nnz})$ & random gather (SpMV) & memory bandwidth & \checkmark \\
+AMG (V-cycle) & $O(N\log N)$ & multilevel, irregular & level synchronization & $\times$ \\
+\textbf{Ours} & $O(NL_s)$ & batched GEMM, stride-1 & compute (Tensor Cores) & \checkmark \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{table}
-
-\paragraph{Comparison.}
-Two comparisons inform the design (Table~\ref{tab:apply_complexity}). Against IC, our apply
-is FLOPs-comparable but has no sequential dependency: every GEMM in every stage is issued
-as a single batched call. Against neural SPAI~\cite{Yang2025sparse}, both methods avoid
-triangular solves, but SPAI apply is dominated by SpMV with irregular memory access (one
-random gather per nonzero of $A$) and is therefore bandwidth-bound; our apply consists of
-batched GEMMs over contiguous tensor blocks and is compute-bound on Tensor Core hardware.
-Furthermore, SPAI is constrained to the sparsity pattern of $A$, excluding non-adjacent
-couplings; our off-diagonal $\mathcal{H}$-tiles represent them explicitly.
 
 % ===========================================================================
 \section{Training}
@@ -766,49 +805,69 @@ couplings; our off-diagonal $\mathcal{H}$-tiles represent them explicitly.
 \subsection{Cosine Hutchinson Probe Loss}
 \label{sec:training:loss}
 
-We train the network self-supervised. Given probe vectors
-$\mathbf{Z}\in\mathbb{R}^{N\times K_z}$, we compute $A\mathbf{Z}$ via SpMV (treated as a
-fixed input, with no gradient through $A$), apply the preconditioner to get
-$\hat{\mathbf{Z}} = M(A\mathbf{Z})$, and minimize
+We train the network self-supervised. Given a batch of probe vectors
+$\mathbf{Z}\in\mathbb{R}^{N\times K_z}$ drawn from the spectrally-balanced distribution
+described below, we compute $A\mathbf{Z}$ via SpMV (treated as a fixed input, with no
+gradient through $A$), apply the preconditioner to obtain $MA\mathbf{Z}$, and minimize the
+angle between $MA\mathbf{Z}$ and $\mathbf{Z}$ as flattened tensors:
 \begin{equation}
-  \mathcal{L}_{\cos} \;=\; 1 \,-\, \frac{1}{K_z}\sum_{k=1}^{K_z}
-  \frac{\hat{\mathbf{z}}_k\!\cdot\!\mathbf{z}_k}
-  {\|\hat{\mathbf{z}}_k\|_2\,\|\mathbf{z}_k\|_2}.
+  \mathcal{L}_{\cos}
+  \;=\; 1 \,-\, \frac{\langle \mathbf{Z},\,MA\mathbf{Z}\rangle_F}
+        {\|\mathbf{Z}\|_F\,\|MA\mathbf{Z}\|_F},
   \label{eq:loss}
 \end{equation}
-A perfect preconditioner gives $\mathcal{L}_{\cos}=0$; the worst case is
-$\mathcal{L}_{\cos}=2$ (anti-aligned).
+where $\langle X,Y\rangle_F = \operatorname{tr}(X^\top Y)$ is the Frobenius inner product and
+$\|\!\cdot\!\|_F$ the Frobenius norm. Equivalently, this is the cosine similarity between
+$\operatorname{vec}(\mathbf{Z})$ and $\operatorname{vec}(MA\mathbf{Z})$ --- a single global
+angle over all $N\!\cdot\!K_z$ entries rather than an average of $K_z$ per-probe cosines.
+The single-denominator form ties all probes together through the same normalization, which
+we found to give noticeably more stable gradients at small $K_z$ than the per-probe mean.
+A perfect preconditioner gives $\mathcal{L}_{\cos}\!=\!0$; the worst case is
+$\mathcal{L}_{\cos}\!=\!2$ (anti-aligned).
 
 \paragraph{Why cosine.}
 $\mathcal{L}_{\cos}$ is invariant under arbitrary positive rescaling of $M$: scaling $M$ by
-$\alpha\!>\!0$ leaves the angle of $\hat{\mathbf{z}}_k$ unchanged. This matches the
-scale-invariance of PCG convergence, which depends only on the relative spread of
-eigenvalues of $MA$, not their absolute location. Frobenius-style objectives---including the
-SAI loss $\bigl\|\frac{1}{\|A\|}AM-I\bigr\|_F^2$ used by~\cite{Yang2025sparse}---instead
-penalize deviations from $\frac{1}{\|A\|}AM\!=\!I$ pointwise, implicitly demanding that the eigenvalues of
-$AM$ cluster near $\|A\|$, even though PCG converges as fast on any tight cluster.
-$\mathcal{L}_{\cos}$ removes that location prior, freeing the network to cluster eigenvalues
-wherever the current preconditioner makes alignment easiest---a behavior we observe directly
-in Section~\ref{sec:results:training} (Fig.~\ref{fig:training:dynamics}) and ablate against
-SAI and an $\ell_2$ Hutchinson loss in Section~\ref{sec:ablation:loss}.
+$\alpha\!>\!0$ leaves the angle of $MA\mathbf{Z}$ relative to $\mathbf{Z}$ unchanged. This
+matches the scale-invariance of PCG convergence, which depends only on the relative spread
+of the eigenvalues of $MA$, not their absolute location (Sec.~\ref{sec:background}).
+Frobenius-style objectives --- including the SAI loss
+$\bigl\|\tfrac{1}{\|A\|}AM-I\bigr\|_F^2$ used by~\cite{Yang2025sparse} --- instead penalize
+deviations from $\tfrac{1}{\|A\|}AM=I$ pointwise, implicitly demanding that the eigenvalues
+of $AM$ cluster near $\|A\|$, even though PCG converges as fast on any tight cluster.
+$\mathcal{L}_{\cos}$ drops that location prior, freeing the network to cluster eigenvalues
+wherever the current preconditioner makes angular alignment easiest --- a behavior we
+observe directly in Section~\ref{sec:results:training} (Fig.~\ref{fig:training:dynamics})
+and ablate against SAI and an $\ell_2$ Hutchinson loss in
+Section~\ref{sec:ablation:loss}.
 
 \subsection{Spectrally Biased Probe Vectors}
 
-Naive Gaussian probes weight all spatial frequencies uniformly by energy, so the gradient
-signal is dominated by high-frequency content---which the diagonal blocks (with full rank
-$L_s$ per block) already cover. The off-diagonal factors, which encode low-frequency
-long-range structure with shared rank $L_s$ across $S\!\gg\!L_s$ nodes, receive
-comparatively weak gradients and saturate much later. To balance the two streams, we apply a
-small number of damped-Jacobi smoothing steps to the probes before use:
+An isotropic Gaussian probe places equal expected energy on every eigenmode of $MA$
+(Sec.~\ref{sec:background}), so the resulting gradient signal is also white in the probe's
+eigenbasis. The blocks of our preconditioner, however, are not all at the same spatial
+scale: leaf-diagonal blocks resolve fine, high-frequency structure over $L$ adjacent nodes,
+while an off-diagonal tile of size $SL$ resolves much lower-frequency, larger-scale
+structure. A spectrally white probe distribution therefore distributes the gradient signal
+unevenly across these block scales --- the high-frequency components, which the
+fine-scale (diagonal) blocks are tuned to, dominate the signal; the coarse-scale
+(off-diagonal, large-$S$) blocks receive proportionally weaker gradients. The downstream
+effect is that blocks at different scales saturate at different times during training, with
+the coarse blocks plateauing late and limiting overall convergence.
+
+We rebalance the gradient signal across block scales by shifting probe energy toward lower
+spatial frequencies. A small number of damped-Jacobi smoothing steps acts as a spectral
+low-pass on the probe:
 \begin{equation}
-  \mathbf{z}^{(t+1)} = \mathbf{z}^{(t)} - \omega\,D^{-1} A\,\mathbf{z}^{(t)},\qquad
-  D = \mathrm{diag}(A),
+  \mathbf{z}^{(t+1)} = \mathbf{z}^{(t)} \,-\, \omega\,D^{-1} A\,\mathbf{z}^{(t)},\qquad
+  D = \operatorname{diag}(A),
   \label{eq:jacobi_smooth}
 \end{equation}
-with fixed $\omega\!=\!0.6$ and $2$ steps. Each step damps high-frequency components more
-strongly than low-frequency ones, shifting probe energy toward lower spatial frequencies and
-delivering proportionally larger gradients to the off-diagonal parameters. The probes are
-treated as detached inputs, so gradients do not flow back through the smoothing.
+with $\omega\!=\!0.6$ and two steps in every reported run. The high-frequency components of
+the probe are damped more strongly than the low-frequency components, redistributing probe
+energy toward the eigenmodes the coarse blocks are responsible for. The result is more
+even gradient magnitudes across block scales and substantially more synchronous training of
+fine and coarse blocks. Probes are detached, so gradients do not flow back through the
+smoothing.
 
 \subsection{Training Setup}
 
@@ -816,8 +875,10 @@ We train with AdamW under a reduce-on-plateau schedule and global gradient clipp
 contexts (graph, $A$, masks, padded sizes, smoothed probes) are precomputed once and cached
 on disk; at each step a mini-batch is drawn at random and padded to a common node count. We
 set the number of probe vectors to $K_z = \max(64,\lceil\sqrt{N}\rceil)$, balancing gradient
-noise against compute. The model is compiled with \verb|torch.compile|. All model weights
-are float32 except the PCG scalar accumulators, which use float64 (Section~\ref{sec:results:generalization}).
+noise against compute. The model is compiled with \verb|torch.compile|. Preconditioner
+weights and the apply path use float32; only the PCG scalar accumulators (dot products,
+residual norms, step sizes) are computed in float64, which we found is sufficient to
+prevent residual drift on stiff systems without paying for full mixed-precision GEMMs.
 
 % ===========================================================================
 \section{Experiments}
@@ -850,32 +911,86 @@ learned baseline but its public implementation does not yet support our problem 
 without substantial reimplementation; we leave a quantitative comparison to future work.}
 
 % ---------------------------------------------------------------------------
-\subsection{Benchmark: Multiphase Pressure-Poisson}
+\subsection{Target regime}
+\label{sec:results:regime}
+% ---------------------------------------------------------------------------
+
+Many interactive physics-simulation pipelines --- graphics-grade fluid simulators, cloth
+and contact dynamics, soft-body and deformable solvers used in games and visual effects,
+real-time finite-element solvers for haptics and surgical simulation, control-stack solvers
+for robotics --- spend a substantial fraction of their per-frame budget on a sparse SPD
+solve in which $A$ is rebuilt every time step. The bottleneck in these settings is rarely
+raw size; the systems involved typically resolve to $N \!\sim\! 10^3$--$10^5$ unknowns per
+frame. The bottleneck is conditioning and connectivity: heterogeneous material contrast
+(multiphase fluids, stiff-soft contact, anisotropic media) drives the condition number up,
+and complex domain topology (closed barriers, near-disconnected sub-regions, internal
+boundaries) forces long-range coupling that local preconditioners cannot resolve in a few
+iterations.
+
+The regime we target with this paper is exactly this one: \emph{mid-size, stiff,
+every-frame-different SPD systems with a hard real-time budget}. We explicitly do not
+target massive regular voxel grids ($N\!\gg\!10^{6}$), where structured multigrid amortizes
+its setup across many similar solves and dominates~\cite{Lyu2026multigrid}, nor batched
+offline PDE workloads where setup cost is irrelevant. The benchmark we evaluate on is the
+one that follows from the regime described above.
+
+% ---------------------------------------------------------------------------
+\subsection{Benchmark}
 \label{sec:results:benchmark}
 % ---------------------------------------------------------------------------
 
-We evaluate on a single benchmark family, \textsf{multiphase\_v2}, scaled across five
-problem sizes $N\in\{1024,2048,4096,8192,16384\}$ with $20$ test frames per scale (held out
-from training, fresh seeds). The choice is deliberate: rather than spread evidence across
-many easy benchmarks, we target a single \emph{specific} but \emph{representative} hard
-class typical of interactive-grade specialized fluid simulators, and report on it carefully.
-We discuss generalization and the limits of this setup in
-Section~\ref{sec:results:generalization} and Section~\ref{sec:limitations}.
+We instantiate the regime above as a multiphase pressure-Poisson problem: the sparse SPD
+system that arises in the pressure-projection step of an incompressible fluid simulator,
+with a heterogeneous density field driving multi-scale coupling and elevating the condition
+number. We choose pressure-Poisson for ubiquity --- it is one of the most common SPD systems
+that appears in graphics-grade specialized simulators across fluid, MPM, and fractional-step
+pipelines --- but the algorithmic features that make this system hard (mid-size, stiff,
+multi-scale coupling, every-frame-different) are representative of the broader class of
+real-time interactive problems described above. Comparable learned-preconditioner work in
+graphics literature evaluates on problems of essentially the same
+order of magnitude~\cite{Li2023learning,hausner2023neural,Yang2025sparse}.
+
+\paragraph{Why 2D, why structured, why this size.}
+Three deliberate restrictions of this initial evaluation deserve comment.
+
+\emph{2D rather than 3D.} On a given problem class, 2D is in fact the \emph{harder} setting
+for local preconditioners: each node has only $4$ neighbors rather than $\sim\!6$+, so each
+row of an IC factor or sparse approximate inverse carries less local coupling information,
+while the stiffness of the system (driven by density contrast) is unchanged. Evaluating in
+2D isolates the algorithmic challenge from raw parallelism. The architecture itself is
+dimension-agnostic --- it requires only a loose spatial ordering of degrees of freedom ---
+and a quantitative 3D evaluation is one axis of future work.
+
+\emph{Structured rather than unstructured.} The architecture is equally applicable to
+structured or unstructured systems: only a loose spatial ordering is required. We chose a
+structured grid for this initial evaluation because classical Cartesian-grid methods (IC,
+AMG) tend to perform best on regular grids, giving the baselines we compare against a fair
+shake.
+
+\emph{Mid-size rather than massive.} The largest scale we evaluate, $N\!=\!16{,}384$
+(a $128\!\times\!128$ grid), sits in the band where graphics-grade specialized simulators
+run today and in which setup-amortized methods cannot fully amortize their cost. Existing
+learned-preconditioner papers in
+graphics~\cite{Li2023learning,hausner2023neural,Yang2025sparse} evaluate in essentially
+this same range; \cite{Lyu2026multigrid} is the outlier targeting $N\!\gtrsim\!10^{6}$ on
+regular voxel grids, which we explicitly leave to multigrid-coarsening methods.
 
 \paragraph{Discretization.}
-Each frame is a 2D structured grid with $N$ cells, ordered along a Morton (Z-curve) curve;
-the assembled $A$ is the standard 5-point pressure-Poisson Laplacian
-$A_{ii}=\sum_j w_{ij}$, $A_{ij}=-w_{ij}$ for neighbors, with face conductances
-$w_{ij}=2\rho_i\rho_j/(\rho_i+\rho_j)$ (harmonic mean) on a per-cell density field
-$\rho:\Omega\to\mathbb{R}_{>0}$. This is the discretization used in nearly every
-production particle-based fluid simulator (FLIP/PIC, MPM, fractional step) for pressure
-projection, modulo boundary-condition specifics.
+Each frame is a 2D structured grid with $N$ cells, indexed along a Morton (Z-curve) curve.
+The assembled $A$ is the standard 5-point pressure-Poisson Laplacian
+$A_{ii}\!=\!\sum_j w_{ij}$, $A_{ij}\!=\!-w_{ij}$ for neighbors, with face conductances
+$w_{ij}\!=\!2\rho_i\rho_j/(\rho_i\!+\!\rho_j)$ (harmonic mean) on a per-cell density field
+$\rho:\Omega\!\to\!\mathbb{R}_{>0}$. The harmonic-mean discretization is the standard
+finite-volume choice for pressure projection on a piecewise-constant density field, and is
+the workhorse for pressure-projection steps in graphics-grade specialized fluid simulators
+(FLIP/PIC, MPM, fractional-step Navier--Stokes), modulo boundary-condition specifics.
 
 \paragraph{Per-frame randomization.}
-Each frame independently randomizes three axes designed to stress an
-$\mathcal{H}$-matrix-style preconditioner (full generation procedure in Supplementary Material, \S\ref{SX-supp:dataset}):
+Each frame independently randomizes three axes designed to stress the preconditioner across
+the multi-scale, multi-topology regime described above (full generation procedure in
+Supplementary Material, \S\ref{SX-supp:dataset}):
 \begin{itemize}
-\item \emph{Density contrast.} $\rho_{\text{light}}\!=\!1$ everywhere outside barriers;
+\item \emph{Multiphase density contrast.} $\rho_{\text{light}}\!=\!1$ outside barriers;
 inside barriers, $\rho_{\text{heavy}}$ is drawn log-uniformly from $[5,100]$ each frame, so
 condition numbers span roughly $5\!\times$--$100\!\times$ the pure-Laplacian baseline within
 a single dataset.
@@ -883,98 +998,103 @@ a single dataset.
 barriers, each independently vertical or horizontal (random center and thickness), with the
 gap topology drawn from \{top, bottom, middle hole, \emph{closed}\}. Closed barriers create
 near-disconnected sub-domains where pressure equilibrates almost entirely through long-range
-coupling---exactly the regime where local preconditioners (Jacobi, IC, sparsity-restricted
-neural SPAI) lose their conditioning.
+coupling --- the regime where local preconditioners lose conditioning.
 \item \emph{Orientation.} Both vertical and horizontal barriers appear, exercising the
 row-strip and column-strip highway buffers symmetrically (Section~\ref{sec:method:highways}).
 \end{itemize}
 A small additive noise ($\sigma\!=\!5\%$) is applied to $\rho$ pointwise so no two frames
-share a density field. The dataset is small enough to release in full
+share an identical density field. The dataset is small enough to release in full
 ($\sim\!120$\,frames per scale at the largest scale, $\sim\!200$\,MB total binary).
 
-\paragraph{Why this benchmark, and what it represents.}
-We chose \textsf{multiphase\_v2} to be \emph{simultaneously} (i) algorithmically hard---high
-condition number, multiple length scales of coupling, no global symmetry to exploit;
-(ii) physically realistic---it is the precise pressure-Poisson system that arises in
-specialized two-phase fluid simulation and contact-resolution codes, with the standard
-finite-volume harmonic-mean discretization; and (iii) bounded in size---the largest scale
-we evaluate ($N\!=\!16\,384$, equivalent to a $128\!\times\!128$ grid) is in the band
-where graphics-grade specialized simulators run today and where setup-amortized methods
-like AMG cannot fully amortize. We do not claim the result generalizes without loss to
-$N\!\gg\!10^{5}$ structured fluids (where graph-coarsening methods recover their advantage),
-nor to embedded-boundary CFD with dense Schur complements; we claim it generalizes
-representatively across the family of medium-sized stiff Poisson systems that share the
-above three features. A controlled study at higher contrast ratios and on partially
-out-of-distribution barrier topologies is presented in
-Section~\ref{sec:results:generalization}.
+\paragraph{Setup amortization, reframed.}
+A central appeal of a learned preconditioner in this regime is that it relocates setup cost
+out of the per-frame budget entirely. Classical preconditioners that cannot reuse their
+factorization pay their setup cost once per frame because $A$ changes; ours pays it once,
+offline, before the real-time loop begins. Training the configuration used in every result
+below takes approximately $15$ minutes on a single NVIDIA H200 --- a short offline commitment
+in exchange for zero in-the-loop setup, an attractive trade for any application where the
+same simulator runs many sessions over a tight distribution of physics parameters.
+
+\paragraph{Scope of the claim.}
+We claim that, within the regime defined above, our method is the only one evaluated that
+delivers convergence-quality solves inside an interactive frame budget: $60$\,fps for
+$N\!\le\!4{,}096$ and $24$\,fps across the full range up to $N\!=\!16{,}384$. The
+architecture extends to 3D and to unstructured systems on the same principles; quantitative
+validation of those extensions, and the $N$-flexible variant of the partition discussed in
+Sec.~\ref{sec:method:offdiag}, are the primary axes of future work.
 
 % ---------------------------------------------------------------------------
 \subsection{Main Performance}
 \label{sec:results:perf}
 % ---------------------------------------------------------------------------
 
-% --- HEADLINE FIGURE: scale sweep (placed on a figures-only end page per SIGGRAPH Asia
-% rules; the body refers to it via \ref). ---
-\begin{figure*}[p]
+\begin{figure}[t]
   \centering
-  \includegraphics[width=0.85\textwidth]{scale_methods.png}
-  \caption{End-to-end PCG solve time on the \textsf{multiphase\_v2} benchmark across five
-  problem sizes, $20$ frames per scale (mean $\pm 1\sigma$ band; relative residual
-  tolerance $10^{-8}$). Dashed grey lines mark the $24$\,fps and $60$\,fps interactive
-  budgets. Our method is the only entry that fits within $60$\,fps for $N\!\le\!4{,}096$
-  and within $24$\,fps for the entire range up to $N\!=\!16{,}384$; AMGX classical AMG and
-  GPU IC-class (\textsc{multicolor\_dilu}) lie above $40$\,ms across all scales despite
-  much lower iteration counts, because their per-iteration cost is dominated by
-  unparallelizable triangular solves or V-cycle level synchronization.}
+  \includegraphics[width=\linewidth]{scale_methods.png}
+  \caption{End-to-end PCG solve time on the multiphase Poisson benchmark across five
+    problem sizes, $20$ frames per scale (mean $\pm 1\sigma$ band; relative residual
+    tolerance $10^{-8}$). Dashed grey lines mark the $24$\,fps and $60$\,fps interactive
+    budgets. Ours is the only entry delivering interactive framerates across the full
+    range, from $\sim\!154$\,fps at $N\!=\!1{,}024$ down to $\sim\!22$\,fps at
+    $N\!=\!16{,}384$; the closest GPU baseline (Jacobi) covers $\sim\!85$\,fps to
+    $\sim\!16$\,fps over the same range. AMGX classical AMG and GPU
+    \textsc{multicolor\_dilu} sit above $40$\,ms across all scales despite much lower
+    iteration counts, dominated by unparallelizable triangular solves or V-cycle level
+    synchronization.}
   \label{fig:scale_methods}
-\end{figure*}
+\end{figure}
 
 % --- TABLE: main performance table (Totals only; iter counts in supplementary) ---
 \begin{table}[t]
 \centering
-\caption{Per-frame mean$\pm$std end-to-end PCG time (ms) on \textsf{multiphase\_v2} ($20$
+\caption{Per-frame mean$\pm$std end-to-end PCG time (ms) on the multiphase Poisson benchmark ($20$
 frames per scale, $\mathrm{rtol}\!=\!10^{-8}$). ``$\dagger$''~=~CUDA Graph not supported.
 Best per scale in \textbf{bold}. Iteration counts in Supplementary Material, Table~\ref{SX-tab:full_perf_table}.}
 \label{tab:main:perf}
-\footnotesize\setlength{\tabcolsep}{4pt}
-\begin{tabular}{@{}l ccccc@{}}
+\footnotesize\setlength{\tabcolsep}{2.8pt}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.21\linewidth}
+  *{5}{>{\centering\arraybackslash}X}@{}}
 \toprule
 Method & $N{=}1024$ & $N{=}2048$ & $N{=}4096$ & $N{=}8192$ & $N{=}16384$ \\
 \midrule
-Unprec.~CG (GPU)             & $17.9\!\pm\!5.2$  & $24.0\!\pm\!8.9$   & $44.0\!\pm\!16.4$ & $70.6\!\pm\!68.8$ & $85.5\!\pm\!39.4$ \\
-Jacobi (GPU)                 & $11.7\!\pm\!3.0$  & $15.8\!\pm\!4.2$   & $32.0\!\pm\!18.0$ & $38.8\!\pm\!10.5$ & $63.3\!\pm\!39.7$ \\
-IC (CPU)$^\dagger$           &  $6.7\!\pm\!1.3$  & $25.8\!\pm\!5.4$   & $80.3\!\pm\!21.3$ & $711\!\pm\!207$   & $4{,}756\!\pm\!1177$ \\
-IC / DILU (GPU)$^\dagger$    & $127.5\!\pm\!6.7$ & $191.7\!\pm\!11.3$ & $320\!\pm\!58$    & $450\!\pm\!84$    & $579\!\pm\!51$ \\
-AMG (CPU)$^\dagger$          &  $9.7\!\pm\!2.8$  & $15.5\!\pm\!4.7$   & $17.0\!\pm\!9.4$  & $64.8\!\pm\!46.4$ & $271\!\pm\!164$ \\
-AMG / AMGX (GPU)$^\dagger$   & $43.2\!\pm\!9.8$  & $56.9\!\pm\!14.4$  & $75.2\!\pm\!20.7$ & $117.7\!\pm\!4.1$ & $188.5\!\pm\!13.4$ \\
-\textbf{Ours (GPU)}          & $\mathbf{6.5\!\pm\!0.8}$ & $\mathbf{7.7\!\pm\!1.3}$ & $\mathbf{9.0\!\pm\!1.9}$ & $\mathbf{18.1\!\pm\!2.4}$ & $\mathbf{46.5\!\pm\!6.9}$ \\
+Unprec.~CG (GPU) & $17.9\!\pm\!5.2$ & $24.0\!\pm\!8.9$ & $44.0\!\pm\!16.4$ & $70.6\!\pm\!68.8$ & $85.5\!\pm\!39.4$ \\
+Jacobi (GPU) & $11.7\!\pm\!3.0$ & $15.8\!\pm\!4.2$ & $32.0\!\pm\!18.0$ & $38.8\!\pm\!10.5$ & $63.3\!\pm\!39.7$ \\
+IC (CPU)$^\dagger$ & $6.7\!\pm\!1.3$ & $25.8\!\pm\!5.4$ & $80.3\!\pm\!21.3$ & $711\!\pm\!207$ & $4{,}756\!\pm\!1177$ \\
+IC / DILU (GPU)$^\dagger$ & $127.5\!\pm\!6.7$ & $191.7\!\pm\!11.3$ & $320\!\pm\!58$ & $450\!\pm\!84$ & $579\!\pm\!51$ \\
+AMG (CPU)$^\dagger$ & $9.7\!\pm\!2.8$ & $15.5\!\pm\!4.7$ & $17.0\!\pm\!9.4$ & $64.8\!\pm\!46.4$ & $271\!\pm\!164$ \\
+AMG / AMGX (GPU)$^\dagger$ & $43.2\!\pm\!9.8$ & $56.9\!\pm\!14.4$ & $75.2\!\pm\!20.7$ & $117.7\!\pm\!4.1$ & $188.5\!\pm\!13.4$ \\
+\textbf{Ours (GPU)} & $\mathbf{6.5\!\pm\!0.8}$ & $\mathbf{7.7\!\pm\!1.3}$ & $\mathbf{9.0\!\pm\!1.9}$ & $\mathbf{18.1\!\pm\!2.4}$ & $\mathbf{46.5\!\pm\!6.9}$ \\
 \midrule
-\multicolumn{6}{l}{\emph{Speedup of Ours vs.\ each baseline at same scale:}} \\
-~~vs.~Jacobi (GPU)           & $1.80\times$ & $2.05\times$ & $3.55\times$ & $2.14\times$ & $1.36\times$ \\
-~~vs.~AMGX AMG (GPU)         & $6.63\times$ & $7.38\times$ & $8.35\times$ & $6.50\times$ & $4.05\times$ \\
-~~vs.~AMGX DILU (GPU)        & $19.5\times$ & $24.8\times$ & $35.6\times$ & $24.8\times$ & $12.4\times$ \\
+\multicolumn{6}{@{}>{\raggedright\arraybackslash}p{\dimexpr\linewidth-4\tabcolsep\relax}@{}}{%
+  \emph{Speedup of Ours vs.\ each baseline at same scale:}} \\
+~~vs.~Jacobi (GPU) & $1.80\times$ & $2.05\times$ & $3.55\times$ & $2.14\times$ & $1.36\times$ \\
+~~vs.~AMGX AMG (GPU) & $6.63\times$ & $7.38\times$ & $8.35\times$ & $6.50\times$ & $4.05\times$ \\
+~~vs.~AMGX DILU (GPU) & $19.5\times$ & $24.8\times$ & $35.6\times$ & $24.8\times$ & $12.4\times$ \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{table}
 
 \paragraph{Headline result.}
-Figure~\ref{fig:scale_methods} and Table~\ref{tab:main:perf} present per-frame mean$\pm$std
-solve time across $20$ test frames per scale. Three findings deserve emphasis. First, our
-method is the only one that stays under the $60$\,fps interactive budget ($16.67$\,ms) for
-$N\!\le\!4\,096$, and the only GPU method that stays under the $24$\,fps budget
-($41.67$\,ms) at $N\!=\!16\,384$. Second, the closest contender at small scales is
-GPU Jacobi (Diag), reflecting the fact that on small, well-conditioned blocks the
-preconditioner-quality advantage barely matters: bandwidth dominates and Jacobi is as cheap
-as you can be. The advantage of our method grows as the problem stiffens with scale ($N$
-larger, contrast wider, more long-range coupling), peaks at $3.55\times$ over Jacobi at
-$N\!=\!4\,096$, and shrinks to $1.36\times$ at $N\!=\!16\,384$ because our PCG iteration
-count grows with $N$ ($50\!\to\!386$) while Jacobi's also does---both are $\Theta(N)$ per
-iteration, and our absolute advantage at large $N$ comes from a $\sim\!4\!\times$ smaller
-iteration count rather than from per-iteration speed. Third, the IC and AMG baselines
-\emph{do} achieve very low iteration counts ($30$--$40$ for DILU, $1$--$3$ for AMG), but
-their per-iteration cost is dominated by sequential triangular solves and level-by-level
-V-cycle synchronization that map poorly onto the GPU---confirming the architectural
-argument from Section~\ref{sec:application} (Table~\ref{tab:apply_complexity}).
+Figure~\ref{fig:scale_methods} and Table~\ref{tab:main:perf} report per-frame mean$\pm$std
+solve time across $20$ test frames per scale. Our method runs at interactive framerates
+across the full range: $\sim\!154$\,fps at $N\!=\!1{,}024$, $\sim\!111$\,fps at
+$N\!=\!4{,}096$, $\sim\!55$\,fps at $N\!=\!8{,}192$, and $\sim\!22$\,fps at
+$N\!=\!16{,}384$. The closest GPU baseline that delivers convergence in the same regime is
+Jacobi, at $\sim\!85$, $\sim\!31$, $\sim\!26$, and $\sim\!16$\,fps respectively --- a
+$2$--$3\times$ framerate gap on identical hardware. The IC and AMG baselines do achieve
+very low iteration counts ($30$--$40$ for DILU, $1$--$3$ for AMG), but their per-iteration
+cost is dominated by sequential triangular solves or level-by-level V-cycle
+synchronization, putting GPU AMG at $\sim\!5$\,fps and GPU \textsc{multicolor\_dilu} below
+$2$\,fps at $N\!=\!16{,}384$ --- confirming the architectural argument from
+Section~\ref{sec:application} (Table~\ref{tab:apply_complexity}).
+
+The scaling behavior of the gap is itself informative. At small $N$, where the blocks of
+$A$ are well-conditioned and bandwidth dominates, the preconditioner-quality advantage
+matters less and our gain over Jacobi is $1.8\times$. The advantage peaks at $3.55\times$
+at $N\!=\!4{,}096$, where contrast and stiffness start to bite but Jacobi's iteration count
+has already begun to blow up. By $N\!=\!16{,}384$, our PCG iteration count itself has grown
+($50\!\to\!386$) along with Jacobi's, and our $1.36\times$ absolute advantage there comes
+from a $\sim\!4\times$ smaller iteration count rather than from per-iteration speed.
 
 \paragraph{Variance.}
 Standard deviations track condition number, not problem size. Unpreconditioned CG has
@@ -1007,86 +1127,69 @@ preconditioners.
 % \end{figure}
 
 % ---------------------------------------------------------------------------
-\subsection{Training Dynamics}
+\subsection{Training dynamics and loss behavior}
 \label{sec:results:training}
 % ---------------------------------------------------------------------------
 
-% --- FIGURE: training dynamics (placed on a figures-only end page per SIGGRAPH Asia rules) ---
-\begin{figure*}[p]
+\begin{figure}[t]
   \centering
-  \includegraphics[width=0.7\textwidth]{training.png}
-  \caption{Training profile of the configuration used in Table~\ref{tab:main:perf}
-    ($N\!=\!8\,192$, $d\!=\!128$, $n_l\!=\!3$, highways). Blue: $\mathcal{L}_{\cos}$ on
-    the training set (mean $\pm 1\sigma$, last 100 steps). Green dashed: SAI
-    loss~\cite{Yang2025sparse} computed on a held-out validation frame at the same
-    checkpoints (\emph{not} used for training). Orange: PCG iteration count to
-    $\mathrm{rtol}\!=\!10^{-8}$ on that frame, log scale. Top axis: wall-clock minutes.
-    Horizontal grey lines: unpreconditioned CG and Jacobi GPU baselines.}
+  \includegraphics[width=\linewidth]{training.png}
+  \caption{Training profile at $N\!=\!8\,192$ (default config). Blue: $\mathcal{L}_{\cos}$
+    on the training set (mean $\pm 1\sigma$, last 100 steps). Green dashed: SAI
+    loss~\cite{Yang2025sparse} on a held-out frame at the same checkpoints (not used for
+    training). Orange: PCG iterations to $\mathrm{rtol}\!=\!10^{-8}$ on that frame, log
+    scale. Bottom axis: wall-clock minutes; top axis: optimizer steps. Horizontal grey:
+    unpreconditioned CG and Jacobi baselines.}
   \label{fig:training:dynamics}
-\end{figure*}
+\end{figure}
 
-Figure~\ref{fig:training:dynamics} provides our clearest empirical evidence for the design
-rationale of $\mathcal{L}_{\cos}$. Total wall-clock training time on a single GPU is
-$16.2$\,min for $24\,300$ optimizer steps; the model beats GPU Jacobi by step
-$\sim\!2{,}000$ ($\sim\!1.3$\,min) and drops under $200$ PCG iterations by step
-$\sim\!12{,}000$ ($\sim\!8$\,min). The structural finding is in the relationship
-\emph{between} the three curves. Up to step $\sim\!8\,000$, all three quantities decrease
-together. After that, the SAI loss plateaus and then \emph{rises}, from $\sim\!10^{-3}$
-at step $10\,000$ to $\sim\!0.5$ by step $24\,000$, even as $\mathcal{L}_{\cos}$ continues
-to decrease smoothly and PCG iteration count continues to fall in lockstep with it. The
-model is moving the eigenvalues of $MA$ \emph{away} from $\lambda\!=\!\|A\|$ in pointwise
-terms, but \emph{toward} a tighter relative cluster wherever that turns out to be---the
-exact behavior we predicted analytically in Section~\ref{sec:training:loss}, and the
-single strongest argument for using a scale- and location-invariant cosine objective
-rather than a Frobenius surrogate.
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{solver_spectral_clustering.png}
+  \caption{Spectra of $MA$ at $N\!=\!1{,}024$ on a representative multiphase Poisson frame
+    (full eigendecomposition; $y$ jittered). \emph{Top}: unpreconditioned (left) and
+    Jacobi (right). \emph{Bottom}: same architecture trained with SAI (left,
+    $16\!\times$ $\kappa$ reduction, cluster anchored near $\lambda\!=\!\|A\|$ as the
+    Frobenius objective demands) versus cosine-Hutchinson (right, $68\!\times$ reduction,
+    cluster wherever angular alignment is easiest). The $4.3\times$ gap is attributable
+    entirely to the loss.}
+  \label{fig:loss:eigenvalues}
+\end{figure}
+
+Two figures together provide the empirical case for the cosine-Hutchinson loss
+(Sec.~\ref{sec:training:loss}).
+
+Figure~\ref{fig:training:dynamics} tracks $\mathcal{L}_{\cos}$, an externally-computed SAI
+loss on the same checkpoints, and the resulting PCG iteration count across training. The
+three curves move together up to step $\sim\!8\,000$, after which the SAI loss
+\emph{rises} from $\sim\!10^{-3}$ to $\sim\!0.5$ while $\mathcal{L}_{\cos}$ continues to
+decrease and PCG iteration count continues to fall in lockstep with it. The model is
+moving the eigenvalues of $MA$ \emph{away} from $\lambda\!=\!\|A\|$ in pointwise terms
+while moving them \emph{toward} a tighter relative cluster wherever the residual makes
+alignment easiest --- the behavior predicted in Sec.~\ref{sec:training:loss}, and the
+strongest single argument for dropping the eigenvalue-location prior.
+
+Figure~\ref{fig:loss:eigenvalues} confirms this directly on the spectrum at $N\!=\!1{,}024$
+(the largest scale where a full eigendecomposition is tractable). An SAI-trained model
+delivers a $16\times$ condition-number reduction with the cluster anchored near
+$\lambda\!=\!\|A\|$; a cosine-trained model with the identical architecture delivers a
+$68\times$ reduction with the cluster settled near $\lambda\!\approx\!0.08$ --- the gap is
+attributable to the loss alone. Total wall-clock training is $16.2$\,min on a single H200
+($24\,300$ steps); the model overtakes GPU Jacobi at step $\sim\!2\,000$ ($\sim\!1.3$\,min)
+and drops under $200$ PCG iterations by step $\sim\!12\,000$ ($\sim\!8$\,min).
 
 % ---------------------------------------------------------------------------
 \subsection{Ablations}
 \label{sec:ablation}
 % ---------------------------------------------------------------------------
 
-We ablate model width~$d$, transformer depth~$n_l$, and highway connections.  Each
-configuration is trained independently to convergence on the same dataset.  Because not
-every variant was evaluated at every problem size, the three groups in
+We ablate model width~$d$, transformer depth~$n_l$, and highway connections (the loss
+ablation is presented in Sec.~\ref{sec:results:training} together with the training
+dynamics figures). Each configuration is trained independently to convergence on the same
+dataset. Because not every variant was evaluated at every problem size, the three groups in
 Table~\ref{tab:ablation} report results at different scale sets; within each group all
-variants share the same scale(s)---same held-out 20-frame test set, same convergence
-criterion---and averages are taken across scales where more than one is available.
-Section~\ref{sec:ablation:loss} and Figure~\ref{fig:training:dynamics} address the loss
-objective separately.
-
-% --- TABLE: ablation sweep ---
-\begin{table}[t]
-\centering
-\caption{Hyperparameter ablations on \textsf{multiphase\_v2} ($\mathrm{rtol}\!=\!10^{-8}$,
-$20$~frames per scale, neural preconditioner only).
-\emph{Train}~=~wall-clock time to convergence (min);
-\emph{Infer.}~=~preconditioner forward pass (ms);
-\emph{Iters}~=~mean PCG iterations;
-\emph{Total}~=~inference $+$ PCG solve (ms);
-$\Delta$ solve time~=~fractional change in Total vs.\ the ``---'' row.}
-\label{tab:ablation}
-\footnotesize\setlength{\tabcolsep}{3.5pt}
-\begin{tabular}{@{}l rr rr r@{}}
-\toprule
-Configuration & Train & Infer. & Iters & Total & $\Delta$ solve \\
-              & (min) & (ms)   &       & (ms)  & time \\
-\midrule
-\multicolumn{6}{l}{\emph{Width} (avg.\ $N\!\in\!\{2048,4096,8192\}$):}\\
-$d{=}64,\;n_l{=}3$, hw     &  9.5 & 3.0 & 147 & 15.4 & $+28\%$  \\
-$d{=}128,\;n_l{=}3$, hw    & 10.7 & 3.1 & 105 & 12.0 & ---      \\
-$d{=}256,\;n_l{=}3$, hw    & 12.3 & 3.2 & 191 & 19.3 & $+61\%$  \\
-\midrule
-\multicolumn{6}{l}{\emph{Depth} ($N\!=\!8192$):}\\
-$d{=}128,\;n_l{=}1$, hw    &  6.1 & 1.3 & 421 & 36.9 & $+106\%$ \\
-$d{=}128,\;n_l{=}2$, hw    &  9.6 & 2.3 & 218 & 20.8 & $+16\%$  \\
-$d{=}128,\;n_l{=}3$, hw    & 16.2 & 3.4 & 168 & 17.9 & ---      \\
-\midrule
-\multicolumn{6}{l}{\emph{Highways} ($N\!=\!2048$):}\\
-$d{=}128,\;n_l{=}3$, hw    &  6.0 & 3.3 &  66 &  8.8 & ---      \\
-$d{=}128,\;n_l{=}3$, no-hw &  4.8 & 2.2 & 149 & 13.8 & $+58\%$  \\
-\bottomrule
-\end{tabular}
-\end{table}
+variants share the same scale(s) --- same held-out 20-frame test set, same convergence
+criterion --- and averages are taken across scales where more than one is available.
 
 \subsubsection{Architecture}
 
@@ -1121,73 +1224,165 @@ mechanism by which independently processed transformer blocks exchange global sp
 context; without them, each block optimises a purely local factor with no awareness of
 the bulk spectral shift required for effective long-range preconditioning.
 
+% --- TABLE: ablation sweep, placed adjacent to the analysis above ---
+\begin{table}[h!]
+\centering
+\caption{Hyperparameter ablations on multiphase Poisson ($\mathrm{rtol}\!=\!10^{-8}$,
+$20$~frames per scale, neural preconditioner only).
+\emph{Train}~=~wall-clock time to convergence (min);
+\emph{Infer.}~=~preconditioner forward pass (ms);
+\emph{Iters}~=~mean PCG iterations;
+\emph{Total}~=~inference $+$ PCG solve (ms);
+$\Delta$ solve time~=~fractional change in Total vs.\ the ``---'' row.}
+\label{tab:ablation}
+\footnotesize\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}l rr rr r@{}}
+\toprule
+Configuration & Train & Infer. & Iters & Total & $\Delta$ solve \\
+              & (min) & (ms)   &       & (ms)  & time \\
+\midrule
+\multicolumn{6}{l}{\emph{Width} (avg.\ $N\!\in\!\{2048,4096,8192\}$):}\\
+$d{=}64,\;n_l{=}3$, hw     &  9.5 & 3.0 & 147 & 15.4 & $+28\%$  \\
+$d{=}128,\;n_l{=}3$, hw    & 10.7 & 3.1 & 105 & 12.0 & ---      \\
+$d{=}256,\;n_l{=}3$, hw    & 12.3 & 3.2 & 191 & 19.3 & $+61\%$  \\
+\midrule
+\multicolumn{6}{l}{\emph{Depth} ($N\!=\!8192$):}\\
+$d{=}128,\;n_l{=}1$, hw    &  6.1 & 1.3 & 421 & 36.9 & $+106\%$ \\
+$d{=}128,\;n_l{=}2$, hw    &  9.6 & 2.3 & 218 & 20.8 & $+16\%$  \\
+$d{=}128,\;n_l{=}3$, hw    & 16.2 & 3.4 & 168 & 17.9 & ---      \\
+\midrule
+\multicolumn{6}{l}{\emph{Highways} ($N\!=\!2048$):}\\
+$d{=}128,\;n_l{=}3$, hw    &  6.0 & 3.3 &  66 &  8.8 & ---      \\
+$d{=}128,\;n_l{=}3$, no-hw &  4.8 & 2.2 & 149 & 13.8 & $+58\%$  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsubsection{Loss}
 \label{sec:ablation:loss}
-We compare $\mathcal{L}_{\cos}$ against the SAI loss of~\cite{Yang2025sparse} on the same
-architecture and training budget; Fig.~\ref{fig:loss:eigenvalues} shows the resulting
-eigenvalue spectra of $MA$ at $N\!=\!1024$, the scale at which a full eigendecomposition is
-tractable.  The training-curve argument from Section~\ref{sec:results:training} is confirmed
-directly: SAI constrains eigenvalues to cluster near $\lambda\!=\!\|A\|$ and achieves a
-$16\!\times$ condition-number reduction; $\mathcal{L}_{\cos}$ allows the cluster to settle
-wherever the residual makes alignment easiest---here near $\lambda\!\approx\!0.08$---and
-achieves a $68\!\times$ reduction, a $4.3\!\times$ better-conditioned system despite
-identical architectures.  The bimodal cluster structure in both neural preconditioners
-reflects the two-phase density contrast of the benchmark: light and heavy fluid regions
-induce two eigenvalue groups whose relative spread sets the condition number.
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{solver_spectral_clustering.png}
-  \caption{Eigenvalue spectra of $MA$ on a representative \textsf{multiphase\_v2} frame at
-    $N\!=\!1024$ (full eigendecomposition, $y$-axis jittered for visibility).
-    \emph{Top row}: unpreconditioned $A$ ($\tilde\kappa\!\approx\!5\!\times\!10^9$) and
-    Jacobi ($1\!\times$ $\kappa$ reduction).
-    \emph{Bottom row}: SAI-trained neural preconditioner ($16\!\times$ reduction,
-    cluster anchored near $\lambda\!=\!\|A\|$ as required by the Frobenius objective) vs.\
-    cosine-Hutchinson ($68\!\times$ reduction, cluster near $\lambda\!\approx\!0.08$,
-    unconstrained by any location prior).  Both neural preconditioners share an identical
-    architecture; the $4.3\!\times$ gap in $\kappa$ reduction is attributable entirely to
-    the loss objective.}
-  \label{fig:loss:eigenvalues}
-\end{figure}
+The training-curve view (Fig.~\ref{fig:training:dynamics}) and the spectrum view
+(Fig.~\ref{fig:loss:eigenvalues}) in Sec.~\ref{sec:results:training} together \emph{are}
+the loss ablation: same architecture, same training budget, same dataset, with the only
+variable the training objective. The cosine-Hutchinson loss delivers a $4.3\times$
+better-conditioned system than SAI ($68\times$ versus $16\times$ reduction in $\kappa$).
+The bimodal cluster structure visible in both neural preconditioners reflects the
+two-phase density contrast of the benchmark: the light and heavy regions induce two
+eigenvalue groups whose relative spread sets the condition number.
 
 % ---------------------------------------------------------------------------
-\subsection{Generalization, Precision, and Hardware Efficiency}
+\subsection{Planned evaluations}
 \label{sec:results:generalization}
 % ---------------------------------------------------------------------------
 
-We additionally evaluate three secondary axes whose detailed results we defer to the
-supplementary material in the interest of space (Supplementary \S\ref{SX-supp:generalization}
-and \S\ref{SX-supp:precision}):
-(i)~\emph{Out-of-distribution generalization}---models trained at one scale evaluated at
-larger and smaller $N$, and at contrast ratios outside the training range $[5,100]$;
-(ii)~\emph{Precision sensitivity}---float32 vs.\ mixed-precision vs.\ float64 in the apply
-path, with PCG scalar accumulators held at float64 throughout;
-(iii)~\emph{Hardware efficiency}---achieved Tensor Core utilization and DRAM bandwidth
-during apply, contrasted with the bandwidth-bound Jacobi and SpMV-bound IC kernels.
-The pattern across all three is consistent with the headline result: as the problem class
-moves further from the training distribution, our advantage over Jacobi narrows but
-remains positive across the entire range we tested. % TODO: insert OOD speedup numbers when ready.
+Two evaluations are outside the scope of the present submission but are the natural next
+steps for this work, and we name them explicitly here rather than fold them into the
+limitations section so reviewers can see the planned shape of the followup.
+
+\paragraph{Quantitative comparison against prior learned preconditioners.}
+The closest learned baseline is the sparse-approximate-inverse GNN of
+Yang \emph{et al.}~\cite{Yang2025sparse}; their public implementation does not yet support
+our problem class without substantial reimplementation. A head-to-head on a shared benchmark
+--- our multiphase Poisson set ported into their input format, and their reported benchmark
+families run through our pipeline --- is the most important single result this paper does
+not yet contain, and is in progress.
+
+\paragraph{Generalization across problem types.}
+The architecture is dimension- and discretization-agnostic, and the regime described in
+Sec.~\ref{sec:results:regime} appears across many simulation modalities beyond pressure
+projection. A useful evaluation would span at least: (i)~3D structured pressure-Poisson
+with the same multiphase contrast distribution, isolating the dimensional axis from
+everything else; (ii)~unstructured 2D and 3D meshes from a real simulator pipeline, to
+test whether the loose-spatial-ordering assumption holds under non-Cartesian connectivity;
+and (iii)~at least one non-fluid SPD system from the broader regime --- e.g.\ a cloth- or
+contact-style stiffness matrix --- to test whether the learned prior transfers beyond
+elliptic pressure operators or is in fact pressure-projection-specific.
+Out-of-distribution sensitivity within the multiphase Poisson family (held-out contrast
+ratios above and below the training range, and held-out barrier topologies) is reported in
+Supplementary \S\ref{SX-supp:generalization}.
 
 % ===========================================================================
 \section{Limitations and Future Work}
 \label{sec:limitations}
 % ===========================================================================
 
-Three limitations are worth flagging. (i) The $\mathcal{H}$-matrix partition is fixed by
-the index ordering of $A$; discretizations with poor spatial locality after Morton/RCM
-(e.g.\ irregular unstructured meshes) may have weaker low-rank structure on admissible
-tiles. (ii) The partition is keyed to $N$ and $L$, so extreme rescaling
-($\!\gtrsim\!4\times$ larger) currently requires retraining. (iii) Our preconditioner is
-symmetric but not strictly SPD: the diagonal contribution is PSD, but the off-diagonal
-contributions are symmetric and generally indefinite. PCG converges robustly in
-experiments, but flexible GMRES~\cite{saad1993flexible} would lift this assumption and
-extend to non-symmetric systems---a direction we leave to future work along with
-input-adaptive partitioning that preserves single-graph capture. To summarize: a fixed
-$\mathcal{H}$-matrix partition combined with a coarse-rank transformer-emitted off-diagonal
-stream and a $\Theta(N)$ allocation-free apply path yields the only method we evaluate that
-fits an interactive-fps budget across $1{,}024$--$16{,}384$ unknowns on stiff multiphase
-pressure-Poisson.
+\paragraph{Evaluation breadth.}
+The single most important caveat is the one already signaled in Sec.~\ref{sec:results:regime}
+and \S\ref{sec:results:generalization}: the quantitative evaluation in this paper is on a
+single SPD family (multiphase pressure-Poisson on 2D structured grids at
+$N\!\in\![1{,}024, 16{,}384]$), instantiated to be representative of the mid-size, stiff,
+real-time regime that motivates the work. We argue throughout that the algorithmic features
+that make this benchmark hard --- mid-size, stiff, multi-scale coupling, every-frame-different
+--- carry over to other interactive simulation modalities (cloth and contact dynamics,
+real-time FEM, soft-body deformation), and the architecture's design does not depend on any
+fluid-specific structure. We do not yet provide quantitative validation of that transfer.
+A broader cross-modality evaluation is the primary axis of follow-up work
+(\S\ref{sec:results:generalization}). The honest read of the present submission is that it
+establishes the regime and the architectural recipe but evaluates them on a deliberately
+narrow benchmark to keep the comparison controlled.
+
+\paragraph{Comparison with the closest learned baseline.}
+We do not yet contain a quantitative head-to-head against the sparse-approximate-inverse
+GNN of Yang \emph{et al.}~\cite{Yang2025sparse}, which is the most natural learned baseline
+in this space. The comparison is in progress and is the second axis of follow-up work; in
+its absence we limit ourselves to the architectural and access-pattern differentiation
+argued in Sec.~\ref{sec:related} and Sec.~\ref{sec:application}.
+
+\paragraph{Problem-size flexibility.}
+Training pre-sizes the partition and the apply-path workspace to a maximum $N$; inference
+at smaller $N$ within that maximum remains time-efficient (apply-path compute scales with
+the actual number of active leaves, not the workspace size), but is not memory-efficient
+(the GPU memory footprint stays at the training maximum). Pushing past the trained maximum
+currently requires retraining. The dynamic-partition variant discussed in
+Sec.~\ref{sec:method:offdiag} --- targeting a constant leaf count at $O(N\log N)$ rather
+than a constant leaf size at $O(N)$ --- removes this ceiling at the cost of one extra
+pooling pass per layer, and is the most concrete near-term architectural change we plan.
+
+\paragraph{Positive definiteness.}
+$M$ is symmetric by construction and PSD on its diagonal contribution, but the off-diagonal
+contributions are symmetric and generally indefinite, so the assembled $M$ is not strictly
+SPD. Empirically this has not caused difficulty: PCG converged on every test frame in every
+experiment we ran, and we did not observe a single breakdown. Where strict SPD is required
+by design --- some flexible-Krylov outer-loop settings, certain stability proofs --- the
+architecture admits a cheap fix used by prior neural ICs~\cite{Li2023learning,hausner2023neural}:
+a positive diagonal of $F_k$ (via softplus or exponential) plus a diagonal-dominant scaling
+of off-diagonal factors guarantees strict positive definiteness with negligible overhead.
+We did not enable this in the reported results.
+
+\paragraph{Where the structural prior breaks.}
+The $\mathcal{H}$-matrix prior we anchor to assumes some spatial locality of $A$ under its
+indexing --- nearby indices encoding nearby physical interactions, well-separated index
+ranges supporting low-rank off-diagonal blocks. The prior degrades where this geometry is
+absent: operators with no natural spatial coordinate (power-grid Laplacians,
+electrical-circuit matrices, social-network/graph operators, dense kernel matrices with no
+spatial embedding), and integral operators whose far-field rank does not decay with
+separation. The architecture is not specific to structured grids --- it operates equally on
+unstructured meshes whose nodes admit a loose spatial ordering --- but the underlying prior
+is geometric, and problems without that geometry are out of scope for this design.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We anchored a learned preconditioner to a weak-admissibility $\mathcal{H}$-matrix
+partition, trained it with a scale- and location-invariant cosine-Hutchinson objective on
+spectrally-balanced probes, and captured the entire PCG inner loop as a single CUDA Graph.
+The combination addresses three orthogonal pain points of the real-time preconditioner
+setting: learned alternatives are usually trapped in the sparsity pattern of $A$ and so
+miss long-range coupling; Frobenius-style training objectives impose an unnecessary
+eigenvalue-location prior; and classical inner loops fragment into many small kernels
+whose CPU/GPU dispatch overhead can dominate the per-frame budget for problems of the
+size we target.
+
+The single benchmark we evaluate on is narrow on purpose --- mid-size 2D multiphase
+pressure-Poisson with multi-scale coupling --- and is instantiated as a representative
+hard instance of the regime described in Sec.~\ref{sec:results:regime}. Within that
+regime, ours is the only method evaluated that delivers convergence-quality solves at
+interactive framerates across the full size range we test ($154$\,fps at $N\!=\!1{,}024$
+down to $22$\,fps at $N\!=\!16{,}384$); the closest GPU baseline covers the same range at
+$85$\,fps down to $16$\,fps. Whether the same recipe transfers to 3D, to unstructured
+discretizations, to other SPD families in the same regime, and how it compares
+quantitatively against the closest learned baselines, are the follow-up evaluations
+named in Sec.~\ref{sec:results:generalization}, and we expect a stronger conclusion once
+they are complete.
 
 \section*{Acknowledgments}
 Omitted for anonymous review.

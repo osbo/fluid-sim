@@ -177,30 +177,41 @@ def main(out_path: pathlib.Path) -> None:
     x_max = steps_all[-1]
     ax_loss.set_xlim(0, x_max)
 
-    # Baseline reference lines — labels sit *below* the dashed line (va=top) so nothing clips the top margin.
+    # Baseline reference lines. With the y-axis capped at 600 (set below), baselines that
+    # exceed the cap are off-scale; we draw their labels just inside the top of the visible
+    # region with an "off-scale" indicator instead of letting them float outside the axes.
     final_pcg = pcg_iters[-1]
     visible_baselines = [(lbl, it, col) for lbl, it, col in BASELINES if it > final_pcg]
+    pcg_cap = 600.0
+    off_scale_anchor = pcg_cap * 0.97
+    off_scale_offset = 0.78  # multiplicative spacing for multiple off-scale labels on log axis
+    n_off_scale = 0
     for bl_label, iters, color in visible_baselines:
-        ax_pcg.axhline(iters, color=color, ls="--", lw=0.9, zorder=1)
-        y_lbl = iters * 0.97
-        # Both labels below their dashed lines, flush right (log y keeps them vertically separated).
-        x_lbl, ha = x_max * 0.99, "right"
+        if iters <= pcg_cap:
+            ax_pcg.axhline(iters, color=color, ls="--", lw=0.9, zorder=1)
+            y_lbl = iters * 0.97
+            text = f"{bl_label} ({iters:,} iterations)"
+            va = "top"
+        else:
+            y_lbl = off_scale_anchor * (off_scale_offset ** n_off_scale)
+            text = f"{bl_label}: {iters:,} iters (off-scale)"
+            va = "top"
+            n_off_scale += 1
         ax_pcg.text(
-            x_lbl,
+            x_max * 0.99,
             y_lbl,
-            f"{bl_label} ({iters:,} iterations)",
+            text,
             color=color,
             fontsize=8.5,
-            ha=ha,
-            va="top",
+            ha="right",
+            va=va,
             zorder=5,
         )
 
-    # PCG y-limits: include curve and any baseline reference lines (stable log ticks)
+    # PCG y-limits: cap at 600 to keep the model's iteration range readable; baselines that
+    # exceed this are still drawn but their labels are positioned at the cap.
     pcg_min = float(np.nanmin(pcg_iters))
-    pcg_max = float(np.nanmax(pcg_iters))
-    ref_hi = max((it for _, it, _ in visible_baselines), default=pcg_max)
-    ax_pcg.set_ylim(max(1.0, pcg_min * 0.88), max(pcg_max, ref_hi) * 1.15)
+    ax_pcg.set_ylim(max(1.0, pcg_min * 0.88), 600.0)
 
     # Loss axis
     ax_loss.set_ylim(bottom=-0.005, top=loss_mean.max() * 1.08)
@@ -209,12 +220,12 @@ def main(out_path: pathlib.Path) -> None:
     ax_loss.spines["left"].set_edgecolor(C_LOSS)
     ax_loss.yaxis.set_minor_locator(ticker.AutoMinorLocator(4))
 
-    # SAI axis — top clipped to second-checkpoint max so transient at step 2000
-    # doesn't compress the scale; the first point plots outside the visible area.
+    # SAI axis — capped at 3 so the late-training rise stays readable without compressing the
+    # main range; transients above 3 (early-training spike) plot outside the visible area.
     ax_sai.set_ylabel("SAI loss (linear)", color=C_SAI, labelpad=6)
     ax_sai.tick_params(axis="y", colors=C_SAI)
     ax_sai.spines["left"].set_edgecolor(C_SAI)
-    ax_sai.set_ylim(bottom=0, top=sai_for_scale.max() * 1.12)
+    ax_sai.set_ylim(bottom=0, top=3.0)
 
     # PCG axis (log): explicit {1,2,5}×10^k majors + plain integers — LogLocator on twinx often
     # drops to a single $10^k$ label in practice.
@@ -227,20 +238,15 @@ def main(out_path: pathlib.Path) -> None:
     ax_pcg.yaxis.set_major_formatter(ticker.FuncFormatter(_fmt_pcg_tick))
     ax_pcg.yaxis.set_minor_locator(ticker.NullLocator())
 
-    # Shared x-axis
-    ax_loss.set_xlabel("Training step")
-    ax_loss.xaxis.set_minor_locator(ticker.AutoMinorLocator(4))
-
     # Grid (only on the main axis to avoid clutter)
     ax_loss.grid(True, which="major", color="#dddddd", zorder=0)
     ax_loss.grid(True, which="minor", color="#f0f0f0", zorder=0)
 
     # -----------------------------------------------------------------------
-    # Secondary x-axis: wall-clock (minutes)
+    # Primary x-axis (bottom): wall-clock minutes. The underlying data is plotted against
+    # step indices, so we set tick positions at step-coordinates corresponding to round
+    # minute values and re-label them in minutes.
     # -----------------------------------------------------------------------
-    ax_wall = ax_loss.twiny()
-    ax_wall.set_xlim(ax_loss.get_xlim())
-
     total_wall = wall_all[-1]
     raw_iv     = total_wall / 5
     scale      = 10 ** np.floor(np.log10(max(raw_iv, 1e-9)))
@@ -248,15 +254,22 @@ def main(out_path: pathlib.Path) -> None:
     wall_ticks = np.arange(0, total_wall + interval * 0.5, interval)
     step_pos   = np.interp(wall_ticks, wall_all, steps_all)
 
-    ax_wall.set_xticks(step_pos)
-
     def _fmt_min(m: float) -> str:
         if m >= 100 or abs(m - round(m)) < 0.05 * max(interval, 1.0):
             return f"{m:.0f}"
         return f"{m:g}"
 
-    ax_wall.set_xticklabels([_fmt_min(m) for m in wall_ticks])
-    ax_wall.set_xlabel("Wall-clock time (min)", labelpad=5)
+    ax_loss.set_xticks(step_pos)
+    ax_loss.set_xticklabels([_fmt_min(m) for m in wall_ticks])
+    ax_loss.set_xlabel("Wall-clock time (min)")
+
+    # -----------------------------------------------------------------------
+    # Secondary x-axis (top): training step.
+    # -----------------------------------------------------------------------
+    ax_wall = ax_loss.twiny()
+    ax_wall.set_xlim(ax_loss.get_xlim())
+    ax_wall.set_xlabel("Training step", labelpad=5)
+    ax_wall.xaxis.set_minor_locator(ticker.AutoMinorLocator(4))
 
     # -----------------------------------------------------------------------
     # Title and combined legend
