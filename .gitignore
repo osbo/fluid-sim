@@ -41,8 +41,10 @@ __pycache__/
 .Python
 *.so
 
-# Large Unity streaming test assets (regenerate locally)
-Assets/StreamingAssets/TestData/
+# Large Unity streaming test assets (regenerate locally). Track only explicit runs below.
+Assets/StreamingAssets/TestData/**
+!Assets/StreamingAssets/TestData/Run_2026-05-11_10-26-02/
+!Assets/StreamingAssets/TestData/Run_2026-05-11_10-26-02/**
 
 # Local datasets and training caches under Scripts (often >100MB; regenerate locally)
 Assets/Scripts/data/
