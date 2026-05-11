@@ -109,6 +109,22 @@ neural operators, physics simulation, real-time graphics}
 % ===========================================================================
 \section{Introduction}
 \label{sec:intro}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{multiphase_hero.png}
+  \caption{A representative frame from our multiphase pressure-Poisson benchmark at
+    $N\!=\!16{,}384$ ($128\!\times\!128$ grid). \emph{Left:} heterogeneous density field
+    $\rho$ with a $27\!\times$ light/heavy contrast, separated by closed and partially-closed
+    barriers (yellow). \emph{Middle:} the buoyancy-driven right-hand side
+    $b\!=\!-\partial_y \rho$, concentrated on horizontal density interfaces. \emph{Right:}
+    pressure field $p$ recovered by our preconditioned conjugate gradient solve, with
+    velocity $-\nabla p / \rho$ overlaid. Every frame in our benchmark independently
+    randomizes barrier topology, orientation, and density contrast, producing a stream of
+    stiff every-frame-different SPD systems that classical fixed-pattern preconditioners
+    cannot amortize.}
+  \label{fig:teaser}
+\end{figure}
 % ===========================================================================
 
 Real-time simulation of fluids, soft bodies, and coupled multiphysics systems often reduces,
@@ -526,7 +542,8 @@ distant tiles, encoding smoother long-range couplings, are compressed more aggre
 near ones, while diagonal blocks remain at full rank (Sec.~\ref{sec:method:diag}). This
 distribution of representation capacity --- dense local, low-rank far --- is precisely the
 asymptotic-smoothness pattern documented for inverses of discretized elliptic operators
-(Sec.~\ref{sec:background}).
+(Sec.~\ref{sec:background}), and one that the trained $M$ visibly reproduces on real frames
+(Fig.~\ref{fig:convergence}, top row: $A^{-1}$ versus learned $M$).
 
 Quantitatively, the constant rank $L_s\!=\!32$ is more than sufficient for the problem class
 we target. Figure~\ref{fig:rank-headroom} compares it to the numerical rank required to
@@ -897,7 +914,14 @@ nodes with eight GPUs per node).
 We built GPU code with the CUDA~12 toolchain and a PyTorch \texttt{2.6.x} build from a
 fixed Conda environment on that cluster, using \verb|torch.compile| as above; CPU baselines
 use Eigen, SciPy, and PyAMG on the same eight cores.
-PCG scalar accumulators use float64; preconditioner weights and apply use float32. GPU timings are
+PCG scalar accumulators use float64; preconditioner weights and apply use float32.
+All reported solve times and iteration counts are to a relative residual tolerance of
+$\|\mathbf{r}_k\|_2 / \|\mathbf{r}_0\|_2 \!\le\! 10^{-8}$. This is two to three orders of
+magnitude tighter than the $\sim\!10^{-3}$ accuracy typical of graphics-grade pressure
+projection, deliberately chosen so that comparisons reflect preconditioner quality rather
+than early-termination effects; at a looser graphics tolerance every method finishes in
+fewer iterations, but the ordering and relative gaps we report are preserved.
+GPU timings are
 taken after one warmup pass; PCG timing uses single-graph CUDA Graph replay
 (Section~\ref{sec:application}) for all methods that admit it (unpreconditioned CG,
 Jacobi, AMGX SPAI, and ours), but not for IC- or AMG-class methods whose sequential
@@ -939,7 +963,8 @@ one that follows from the regime described above.
 \label{sec:results:benchmark}
 % ---------------------------------------------------------------------------
 
-We instantiate the regime above as a multiphase pressure-Poisson problem: the sparse SPD
+We instantiate the regime above as a multiphase pressure-Poisson problem
+(Fig.~\ref{fig:teaser}): the sparse SPD
 system that arises in the pressure-projection step of an incompressible fluid simulator,
 with a heterogeneous density field driving multi-scale coupling and elevating the condition
 number. We choose pressure-Poisson for ubiquity --- it is one of the most common SPD systems
@@ -1005,6 +1030,24 @@ row-strip and column-strip highway buffers symmetrically (Section~\ref{sec:metho
 A small additive noise ($\sigma\!=\!5\%$) is applied to $\rho$ pointwise so no two frames
 share an identical density field. The dataset is small enough to release in full
 ($\sim\!120$\,frames per scale at the largest scale, $\sim\!200$\,MB total binary).
+Figure~\ref{fig:variety} shows twelve frames sampled across all three axes; condition
+numbers span roughly $10^{3}$--$10^{5}$ within the single distribution the network is
+trained on.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{multiphase_variety.png}
+  \caption{Twelve frames sampled from the multiphase Poisson benchmark, illustrating the
+    three per-frame randomization axes: barrier \emph{topology} (single/multiple, open/closed
+    gaps, U- and cross-shaped composites), \emph{orientation} (vertical and horizontal,
+    exercising row- and column-strip highways symmetrically), and \emph{density contrast}
+    $\rho_{\text{heavy}}/\rho_{\text{light}}$ (here $11\!\times$--$103\!\times$ across the
+    panels shown). Each panel is annotated with $N$, contrast, and condition number
+    $\kappa(A)$, which spans roughly $10^{3}$--$10^{5}$. No two frames share the same
+    $A$: this is the every-frame-different regime that motivates a learned, amortized
+    preconditioner over fixed-pattern alternatives.}
+  \label{fig:variety}
+\end{figure}
 
 \paragraph{Setup amortization, reframed.}
 A central appeal of a learned preconditioner in this regime is that it relocates setup cost
@@ -1087,6 +1130,30 @@ cost is dominated by sequential triangular solves or level-by-level V-cycle
 synchronization, putting GPU AMG at $\sim\!5$\,fps and GPU \textsc{multicolor\_dilu} below
 $2$\,fps at $N\!=\!16{,}384$ --- confirming the architectural argument from
 Section~\ref{sec:application} (Table~\ref{tab:apply_complexity}).
+
+Figure~\ref{fig:convergence} traces what convergence actually looks like on one such stiff
+frame: the residual is dominated by long-range structure along closed barriers and density
+interfaces --- exactly the modes a local preconditioner stalls on --- and our learned $M$,
+whose top-left block visibly inherits the multiscale structure of $A^{-1}$, flattens that
+structure within a few dozen iterations before driving the residual to
+$\mathrm{rtol}\!=\!10^{-8}$.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{multiphase_convergence.png}
+  \caption{PCG with our learned preconditioner on a stiff multiphase Poisson frame
+    ($N\!=\!16{,}384$, $\rho_{\text{heavy}}/\rho_{\text{light}}\!=\!27\!\times$,
+    $\kappa(A)\!\approx\!6.9{\times}10^{4}$). \emph{Top row:} the density field $\rho$,
+    right-hand side $b$, and the $128{\times}128$ top-left blocks of $A$, $A^{-1}$, and the
+    learned $M\!\approx\!A^{-1}$ (log magnitude); the multiscale off-diagonal structure of
+    $A^{-1}$ that the weak-admissibility $\mathcal{H}$-matrix prior is designed to capture is
+    visibly reproduced by $M$. \emph{Lower rows:} residual magnitude $|r_k|$ as PCG progresses
+    through iterations $k\!=\!1, 2, 4, 7, 14, 28, 48, 96, 192, 369$ (log scale, shared
+    colorbar). Long-range error along the barriers and density interfaces --- the modes on
+    which Jacobi and IC stall --- is flattened by $k\!\sim\!50$; the relative residual hits
+    $10^{-8}$ at $k\!=\!369$ on this frame.}
+  \label{fig:convergence}
+\end{figure}
 
 The scaling behavior of the gap is itself informative. At small $N$, where the blocks of
 $A$ are well-conditioned and bandwidth dominates, the preconditioner-quality advantage

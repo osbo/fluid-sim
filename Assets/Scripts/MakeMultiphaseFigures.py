@@ -63,6 +63,28 @@ def _apply_paper_style() -> None:
     )
 
 
+def _apply_paper_style_compact() -> None:
+    """Larger relative fonts for figures that paper.tex renders at single-column width.
+
+    The hero, variety, and convergence figures are saved at roughly half the canvas size
+    of a full-width figure (~5--7 in instead of ~11--14 in). When LaTeX scales the PNG
+    down to single-column width (~3.3 in), font sizes shrink by the same factor. Bumping
+    the matplotlib font sizes here keeps the final on-page text at a readable ~6.5--8 pt.
+    """
+    _apply_paper_style()
+    matplotlib.rcParams.update(
+        {
+            "font.size": 12,
+            "axes.labelsize": 13,
+            "axes.titlesize": 13.5,
+            "figure.titlesize": 14,
+            "legend.fontsize": 11,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+        }
+    )
+
+
 def _savefig_paper(fig, out_path):
     fig.savefig(out_path, dpi=int(matplotlib.rcParams.get("savefig.dpi", 300)), bbox_inches="tight")
 
@@ -800,7 +822,7 @@ def imshow_barrier(ax, info, title=None):
 # Figure 1: hero strip
 # ============================================================================
 def make_hero(frame_dir, out_path):
-    _apply_paper_style()
+    _apply_paper_style_compact()
     info = load_frame(frame_dir)
     print(f"[hero] frame N={info['N']}  ratio={info['ratio']:.1f}x")
 
@@ -825,11 +847,13 @@ def make_hero(frame_dir, out_path):
     b_masked = np.where(active, b_grid, np.nan)
     P_masked = np.where(active, P, np.nan)
 
-    fig, axes = plt.subplots(1, 3, figsize=(11.5, 4.0), constrained_layout=True)
+    # Saved at ~half full-text-width so a single-column \includegraphics scale-down
+    # (3.3in / 5.8in ≈ 0.57) leaves on-page text at a readable ~7pt.
+    fig, axes = plt.subplots(1, 3, figsize=(5.8, 2.1), constrained_layout=True)
 
     im0 = imshow_density(
         axes[0], info,
-        title=rf"Density $\rho$  (range {info['rho_light']:.2g}–{info['rho_heavy']:.2g})",
+        title=rf"Density $\rho$",
     )
     fig.colorbar(im0, ax=axes[0], shrink=0.85)
 
@@ -842,10 +866,7 @@ def make_hero(frame_dir, out_path):
         vmin=-b_abs, vmax=b_abs, interpolation="nearest",
     )
     axes[1].set_xticks([]); axes[1].set_yticks([])
-    axes[1].set_title(
-        fr"Right-hand side $b = -\partial_y \rho$  "
-        fr"($\rho_{{\rm heavy}}/\rho_{{\rm light}}\!=\!{info['ratio']:.0f}\times$)"
-    )
+    axes[1].set_title(fr"RHS $b = -\partial_y \rho$")
     fig.colorbar(im1, ax=axes[1], shrink=0.85)
 
     P_abs = max(float(np.percentile(np.abs(p), 99)), 1e-30)
@@ -866,10 +887,11 @@ def make_hero(frame_dir, out_path):
         color="black", scale_units="xy", scale=None, width=0.0025, alpha=0.7,
     )
     axes[2].set_xticks([]); axes[2].set_yticks([])
-    axes[2].set_title("Pressure $p$ with velocity $-\\nabla p / \\rho$")
+    axes[2].set_title(r"Pressure $p$ with velocity")
     fig.colorbar(im2, ax=axes[2], shrink=0.85)
 
-    fig.suptitle(f"Multiphase pressure-Poisson frame  ($N\\!=\\!{info['N']}$)")
+    # No suptitle: paper.tex caption already gives full context (N, contrast, etc.),
+    # and dropping it lets the three panels fill the limited vertical budget.
     _savefig_paper(fig, out_path)
     plt.close(fig)
     print(f"[hero] -> {out_path}")
@@ -880,7 +902,7 @@ def make_hero(frame_dir, out_path):
 # ============================================================================
 def make_variety(data_root, out_path, scales=(2048, 4096, 8192), n_cells=12, condnum=True, seed=0):
     """Sample n_cells frames across topology / contrast axes, both splits, multiple scales."""
-    _apply_paper_style()
+    _apply_paper_style_compact()
     data_root = Path(data_root)
     candidates = []
     for scale in scales:
@@ -927,7 +949,9 @@ def make_variety(data_root, out_path, scales=(2048, 4096, 8192), n_cells=12, con
 
     rows = 3 if n_cells == 12 else max(1, int(math.ceil(n_cells / 4)))
     cols = 4
-    fig, axes = plt.subplots(rows, cols, figsize=(3.3 * cols, 3.2 * rows), constrained_layout=True)
+    # Saved ~half-scale so the single-column \includegraphics scale-down keeps
+    # per-panel annotations (N, contrast, kappa) at readable ~7pt on the page.
+    fig, axes = plt.subplots(rows, cols, figsize=(1.7 * cols, 1.65 * rows), constrained_layout=True)
     axes = np.atleast_2d(axes).reshape(rows, cols)
 
     vmin = max(min(float(p["mass_flat"].min()) for p in picks), 1e-3)
@@ -941,15 +965,16 @@ def make_variety(data_root, out_path, scales=(2048, 4096, 8192), n_cells=12, con
         im = imshow_density(ax, info, vmin=vmin, vmax=vmax)
         kstr = (f"$\\kappa\\!\\approx\\!{kappas[idx]:.1e}$"
                 if math.isfinite(kappas[idx]) else "$\\kappa$ n/a")
+        # Two-line title so the metadata fits within the narrow single-column panel.
         ax.set_title(
-            f"$N\\!=\\!{info['N']}$,  $\\rho_H/\\rho_L\\!=\\!{info['ratio']:.0f}\\times$,  {kstr}",
+            f"$N\\!=\\!{info['N']}$,  $\\rho_H/\\rho_L\\!=\\!{info['ratio']:.0f}\\times$\n{kstr}",
+            fontsize=matplotlib.rcParams["axes.titlesize"] * 0.78,
+            linespacing=0.95,
         )
 
     cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, location="right")
     cbar.set_label(r"$\rho$", fontsize=matplotlib.rcParams["axes.labelsize"])
-    fig.suptitle(
-        "Multiphase Poisson systems: every frame independently randomizes topology, contrast, orientation, scale",
-    )
+    # Suptitle dropped: the paper.tex caption describes the three randomization axes.
     _savefig_paper(fig, out_path)
     plt.close(fig)
     print(f"[variety] -> {out_path}")
@@ -997,7 +1022,7 @@ def make_convergence(
     snap_iters_explicit: Optional[list[int]] = None,
     matrix_max_n: int = 65536,
 ):
-    _apply_paper_style()
+    _apply_paper_style_compact()
     if not ours_weights:
         raise SystemExit(
             "The convergence figure requires --ours-weights (a trained .bytes checkpoint for this frame scale)."
@@ -1050,26 +1075,22 @@ def make_convergence(
     if n_resid < 1:
         raise RuntimeError("no residual snapshots to plot")
 
-    # Nested layout: 3×5 heatmaps + dedicated colorbar column. Larger canvas, smaller type
-    # (top row titles stay two-line; |r_k| panels use a single compact line).
-    _t_top = 8.6
-    _t_res = 7.85
-    _t_sup = 10.6
-    _t_cbar = 7.45
-    _t_cbar_lab = 9.45
-    fig = plt.figure(figsize=(14.25, 7.75), constrained_layout=True)
+    # Nested layout: 3×5 heatmaps + dedicated colorbar column. Saved at ~half the
+    # full-text-width canvas so single-column \includegraphics in paper.tex leaves
+    # per-panel labels at a readable ~6.5pt on the page. Font knobs (in points) are
+    # bumped to compensate for the LaTeX downscale (3.3in / 7.1in ≈ 0.46).
+    _t_top = 13.5
+    _t_res = 12.5
+    _t_cbar = 11.5
+    _t_cbar_lab = 13.0
+    fig = plt.figure(figsize=(7.1, 3.95), constrained_layout=True)
     outer = GridSpec(1, 2, figure=fig, width_ratios=(1.0, 0.032), wspace=0.011)
     inner = GridSpecFromSubplotSpec(3, 5, outer[0, 0], wspace=0.011, hspace=0.038)
     ax_top = [fig.add_subplot(inner[0, j]) for j in range(5)]
     ax_mid = [fig.add_subplot(inner[1, j]) for j in range(5)]
     ax_bot = [fig.add_subplot(inner[2, j]) for j in range(5)]
     cax = fig.add_subplot(outer[0, 1])
-    _eng = fig.get_layout_engine()
-    if _eng is not None and hasattr(_eng, "set"):
-        try:
-            _eng.set(rect=(0.0, 0.0, 1.0, 0.88))
-        except (TypeError, ValueError):
-            pass
+    # No suptitle anymore (info is in the paper.tex caption); use the full canvas height.
 
     # --- Top row: frame, b, A, A^-1, M ---
     im_rho = imshow_density(
@@ -1192,12 +1213,7 @@ def make_convergence(
         cb.ax.tick_params(labelsize=_t_cbar)
         cb.set_label(r"$|r_k|$", fontsize=_t_cbar_lab)
 
-    fig.suptitle(
-        rf"PCG with learned preconditioner: $N\!=\!{info['N']}$, "
-        rf"$\rho_H/\rho_L\!=\!{info['ratio']:.0f}\times$, $\kappa\!\approx\!{kappa:.1e}$",
-        fontsize=_t_sup,
-        y=0.945,
-    )
+    # Suptitle dropped: N, contrast, and kappa are already in the paper.tex caption.
     _savefig_paper(fig, out_path)
     plt.close(fig)
     print(f"[conv] -> {out_path}")
