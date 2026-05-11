@@ -3,8 +3,10 @@
 Subfigures (one per --fig flag, or --fig all):
     hero        — 3-panel strip: density rho, right-hand side b, pressure + velocity quiver.
     variety     — 4x3 grid sampling topology / contrast / orientation axes, with N, ratio, kappa.
-    convergence — 3×5 grid: top row = density, b, log₁₀|A|, |A⁻¹|, |M| (top-left 128², no per-panel scales;
-                  dense matrices by default up to very large N—use --conv-matrix-max-n to cap if needed);
+    convergence — 3×5 grid: top row = density, b, log₁₀|A|, |A⁻¹|, |M| (top-left 256²; |A⁻¹| and |M|
+                  share a single log-magnitude color scale so the learned preconditioner is directly
+                  comparable to the true inverse; dense matrices by default up to very large N—use
+                  --conv-matrix-max-n to cap if needed);
                   rows 2–3 = ten |r_k| snapshots with one shared log colorbar (PCG is scale-invariant in A, b).
 
 Run on the slurm GPU node so the `fluid` conda env (numpy/scipy/pyamg/matplotlib/torch) is available.
@@ -682,6 +684,45 @@ def _finalize_conv_residual_snaps(snaps: dict[int, np.ndarray], K_final: int, n_
     return {k: snaps[k] for k in chosen}
 
 
+def _shared_log_abs_limits(
+    matrices,
+    *,
+    vmin_pct: float = 1.0,
+    vmax_pct: float = 99.5,
+    diag_band_exclude_for_scale: Optional[int] = None,
+    subtract_log_max: bool = False,
+) -> tuple[float, float]:
+    """Shared (lo, hi) log₁₀|·| range across multiple matrices (off-diagonal band optional).
+
+    When ``subtract_log_max`` is True, each matrix is shifted in log space so its own max
+    maps to 0 *before* the percentile is taken. This normalizes the inputs onto a common
+    "peak-relative" scale, so e.g. ``A^{-1}`` (large absolute entries) and learned ``M``
+    (smaller absolute entries) can share a colorbar that emphasizes structure, not magnitude.
+    """
+    all_vals = []
+    for M in matrices:
+        M = np.asarray(M, dtype=np.float64)
+        M_abs = np.abs(M)
+        logm = np.log10(M_abs + 1e-9)
+        if subtract_log_max:
+            logm = logm - float(np.log10(max(float(M_abs.max()), 1e-30)))
+        if diag_band_exclude_for_scale is not None and int(diag_band_exclude_for_scale) > 0:
+            c = logm.shape[0]
+            b = int(diag_band_exclude_for_scale)
+            off = np.abs(np.arange(c, dtype=np.int32)[:, None] - np.arange(c, dtype=np.int32)[None, :]) > b
+            vals = logm[off]
+            if vals.size >= 64:
+                all_vals.append(vals)
+                continue
+        all_vals.append(logm.ravel())
+    cat = np.concatenate(all_vals)
+    lo = float(np.percentile(cat, vmin_pct))
+    hi = float(np.percentile(cat, vmax_pct))
+    if hi <= lo + 1e-12:
+        hi = lo + 1e-12
+    return lo, hi
+
+
 def _imshow_matrix_log10_abs(
     ax,
     M: np.ndarray,
@@ -691,17 +732,30 @@ def _imshow_matrix_log10_abs(
     vmin_pct: float = 1.0,
     vmax_pct: float = 99.5,
     diag_band_exclude_for_scale: Optional[int] = None,
+    vmin_log: Optional[float] = None,
+    vmax_log: Optional[float] = None,
+    subtract_log_max: bool = False,
 ):
     """log₁₀|·| heatmap of the top-left ``crop``×``crop`` block (square aspect).
 
     Color limits use robust percentiles so a dominant diagonal does not crush the rest.
     If ``diag_band_exclude_for_scale`` is set, entries with ``|i-j| <= band`` are ignored when
     picking vmin/vmax (useful for learned ``M`` so off-diagonal / block structure stays visible).
+    Pass ``vmin_log``/``vmax_log`` (in log10 units) to override the percentile pick — used to
+    share a single color scale across multiple matrices (e.g. ``A^{-1}`` vs learned ``M``).
+    When ``subtract_log_max`` is True, the displayed values are ``log10(|M| / max|M|)`` instead
+    of ``log10|M|`` — this peak-normalizes each matrix so two panels can share a single
+    structure-revealing colorbar even when their absolute magnitudes differ by orders.
     """
     M = np.asarray(M, dtype=np.float64)
     c = max(1, min(int(crop), M.shape[0], M.shape[1]))
-    logm = np.log10(np.abs(M[:c, :c]) + 1e-9)
-    if diag_band_exclude_for_scale is not None and int(diag_band_exclude_for_scale) > 0:
+    M_abs = np.abs(M[:c, :c])
+    logm = np.log10(M_abs + 1e-9)
+    if subtract_log_max:
+        logm = logm - float(np.log10(max(float(M_abs.max()), 1e-30)))
+    if vmin_log is not None and vmax_log is not None:
+        lo, hi = float(vmin_log), float(vmax_log)
+    elif diag_band_exclude_for_scale is not None and int(diag_band_exclude_for_scale) > 0:
         b = int(diag_band_exclude_for_scale)
         off = np.abs(np.arange(c, dtype=np.int32)[:, None] - np.arange(c, dtype=np.int32)[None, :]) > b
         vals = logm[off]
@@ -847,9 +901,9 @@ def make_hero(frame_dir, out_path):
     b_masked = np.where(active, b_grid, np.nan)
     P_masked = np.where(active, P, np.nan)
 
-    # Saved at ~half full-text-width so a single-column \includegraphics scale-down
-    # (3.3in / 5.8in ≈ 0.57) leaves on-page text at a readable ~7pt.
-    fig, axes = plt.subplots(1, 3, figsize=(5.8, 2.1), constrained_layout=True)
+    # Canvas saved at full text-width so the on-page rendering puts text at ~50% the relative
+    # size of the previous half-scale layout (i.e. plot panels twice as large per inch of text).
+    fig, axes = plt.subplots(1, 3, figsize=(11.6, 4.2), constrained_layout=True)
 
     im0 = imshow_density(
         axes[0], info,
@@ -949,9 +1003,9 @@ def make_variety(data_root, out_path, scales=(2048, 4096, 8192), n_cells=12, con
 
     rows = 3 if n_cells == 12 else max(1, int(math.ceil(n_cells / 4)))
     cols = 4
-    # Saved ~half-scale so the single-column \includegraphics scale-down keeps
-    # per-panel annotations (N, contrast, kappa) at readable ~7pt on the page.
-    fig, axes = plt.subplots(rows, cols, figsize=(1.7 * cols, 1.65 * rows), constrained_layout=True)
+    # Doubled per-panel canvas so on-page text reads ~50% the relative size of the previous
+    # half-scale layout (i.e. plot cells twice as large for the same absolute pt fonts).
+    fig, axes = plt.subplots(rows, cols, figsize=(3.4 * cols, 3.3 * rows), constrained_layout=True)
     axes = np.atleast_2d(axes).reshape(rows, cols)
 
     vmin = max(min(float(p["mass_flat"].min()) for p in picks), 1e-3)
@@ -1075,15 +1129,15 @@ def make_convergence(
     if n_resid < 1:
         raise RuntimeError("no residual snapshots to plot")
 
-    # Nested layout: 3×5 heatmaps + dedicated colorbar column. Saved at ~half the
-    # full-text-width canvas so single-column \includegraphics in paper.tex leaves
-    # per-panel labels at a readable ~6.5pt on the page. Font knobs (in points) are
-    # bumped to compensate for the LaTeX downscale (3.3in / 7.1in ≈ 0.46).
+    # Nested layout: 3×5 heatmaps + dedicated colorbar column. Doubled canvas vs the
+    # earlier half-scale layout — per-panel labels and the suptitle render at ~50% the
+    # previous relative size, giving plot cells twice the area per inch of text. Absolute
+    # font knobs (in points) are kept the same as the half-scale version.
     _t_top = 13.5
     _t_res = 12.5
     _t_cbar = 11.5
     _t_cbar_lab = 13.0
-    fig = plt.figure(figsize=(7.1, 3.95), constrained_layout=True)
+    fig = plt.figure(figsize=(14.2, 7.9), constrained_layout=True)
     outer = GridSpec(1, 2, figure=fig, width_ratios=(1.0, 0.032), wspace=0.011)
     inner = GridSpecFromSubplotSpec(3, 5, outer[0, 0], wspace=0.011, hspace=0.038)
     ax_top = [fig.add_subplot(inner[0, j]) for j in range(5)]
@@ -1122,33 +1176,47 @@ def make_convergence(
         print(f"[conv] dense matrix panels (n={viz_n} ≤ {matrix_max_n}) …")
         t0 = time.time()
         A_dense = ours.dense_A_numpy()
-        mc = min(128, viz_n)
+        mc = min(256, viz_n)
         im_a = _imshow_matrix_log10_abs(
             ax_top[2],
             A_dense,
             rf"$A$ (log$_{{10}}$|·|)" + "\n" + rf"top-left ${mc}\times{mc}$",
+            crop=mc,
         )
         ax_top[2].set_box_aspect(1)
         A_inv = _dense_inv_numpy_or_torch(A_dense, ours.device)
         print(f"[conv]   inv(A) in {time.time() - t0:.1f}s")
-        im_ai = _imshow_matrix_log10_abs(
-            ax_top[3],
-            A_inv,
-            rf"$A^{{-1}}$ (log$_{{10}}$|·|)" + "\n" + rf"top-left ${mc}\times{mc}$",
-        )
-        ax_top[3].set_box_aspect(1)
         t1 = time.time()
         M_dense = ours.assembled_dense_M_numpy()
         print(f"[conv]   assembled M in {time.time() - t1:.1f}s")
-        # Exclude a diagonal band from percentile scaling so log₁₀|M| shows block / off-diag pattern.
+        # Same scaling recipe for A^-1 and M: peak-normalize each by its own max (so both
+        # peak at 0 in log space), then percentile-clip with diagonal-band exclusion. A^-1
+        # spans ~1–2 orders of magnitude (slowly-decaying Green's function) while M spans
+        # ~7 (block-sparse with near-zero off-blocks). A literal shared (vmin, vmax) is
+        # incompatible — one always blows out — so we apply identical normalization +
+        # percentile logic to each and let each panel render its full structure. Colors map
+        # consistently as "peak-relative magnitude" within each panel.
         band_m = max(8, mc // 8)
-        im_m = _imshow_matrix_log10_abs(
-            ax_top[4],
-            M_dense,
-            rf"Learned $M$ (log$_{{10}}$|·|)" + "\n" + rf"top-left ${mc}\times{mc}$",
+        im_ai = _imshow_matrix_log10_abs(
+            ax_top[3],
+            A_inv,
+            rf"$A^{{-1}}$  (log$_{{10}}\,|\cdot|/\max$)" + "\n" + rf"top-left ${mc}\times{mc}$",
+            crop=mc,
             vmin_pct=0.5,
             vmax_pct=99.8,
             diag_band_exclude_for_scale=band_m,
+            subtract_log_max=True,
+        )
+        ax_top[3].set_box_aspect(1)
+        im_m = _imshow_matrix_log10_abs(
+            ax_top[4],
+            M_dense,
+            rf"Learned $M$  (log$_{{10}}\,|\cdot|/\max$)" + "\n" + rf"top-left ${mc}\times{mc}$",
+            crop=mc,
+            vmin_pct=0.5,
+            vmax_pct=99.8,
+            diag_band_exclude_for_scale=band_m,
+            subtract_log_max=True,
         )
         ax_top[4].set_box_aspect(1)
     else:
