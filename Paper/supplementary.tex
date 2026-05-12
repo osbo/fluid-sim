@@ -313,7 +313,8 @@ omits to fit the column budget.
 benchmark ($\mathrm{rtol}\!=\!10^{-8}$, $20$ frames per scale). Bold row marks
 the proposed method.}
 \label{tab:full_perf_table}
-\footnotesize\setlength{\tabcolsep}{4pt}
+\footnotesize\setlength{\tabcolsep}{3pt}
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{@{}l ccccc@{}}
 \toprule
 Method & $N\!=\!1\,024$ & $N\!=\!2\,048$ & $N\!=\!4\,096$ & $N\!=\!8\,192$ & $N\!=\!16\,384$ \\
@@ -328,6 +329,7 @@ AMG (CPU)                    & $5\!\pm\!6$     & $9\!\pm\!6$     & $5\!\pm\!7$  
 \textbf{Ours (GPU)}          & $\mathbf{47\!\pm\!9}$ & $\mathbf{66\!\pm\!16}$ & $\mathbf{80\!\pm\!24}$ & $\mathbf{168\!\pm\!26}$ & $\mathbf{394\!\pm\!68}$ \\
 \bottomrule
 \end{tabular}
+}
 \end{table}
 
 \noindent
