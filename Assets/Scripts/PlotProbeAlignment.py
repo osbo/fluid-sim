@@ -217,6 +217,52 @@ def _build_parser(_auto_data):
         help="Draw quiver arrows from origin to tips (can clutter if K is large). Default: false.",
     )
     parser.add_argument(
+        "--axis-mode",
+        type=str,
+        choices=("shared", "per_panel"),
+        default="shared",
+        help=(
+            "3D axis framing: shared uses one limit box for both panels; "
+            "per_panel zooms each panel to its own cloud. Default: shared."
+        ),
+    )
+    parser.add_argument(
+        "--axis-percentile",
+        type=float,
+        default=94.0,
+        help=(
+            "Robust cloud extent percentile used for axis framing (helps ignore outliers). "
+            "Default: 94.0."
+        ),
+    )
+    parser.add_argument(
+        "--axis-pad",
+        type=float,
+        default=0.02,
+        help="Fractional padding around framed cloud extent. Default: 0.02.",
+    )
+    parser.add_argument(
+        "--view-zoom",
+        type=float,
+        default=1.35,
+        help="3D box zoom multiplier (>1 zooms in). Default: 1.35.",
+    )
+    parser.add_argument(
+        "--plot-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale factor applied only to plotted points/lines (not axis limits). "
+            "Use >1 to let data visually push beyond fixed axis bounds. Default: 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--transparent-bg",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Render figure/axes panes with transparent background while keeping grid lines. Default: false.",
+    )
+    parser.add_argument(
         "--title",
         type=str,
         default="Aligned 200 MAz probes in shared PCA basis",
@@ -514,12 +560,25 @@ def main():
     proj_early = _project(pts_early, basis, mean_early)
     proj_late = _project(pts_late, basis, mean_early)
 
-    mins = proj_early.min(axis=0)
-    maxs = proj_early.max(axis=0)
-    span = np.maximum(maxs - mins, 1e-6)
-    pad = 0.08 * span
-    lo = mins - pad
-    hi = maxs + pad
+    def _limits_from_cloud(proj, percentile, pad):
+        p = max(1.0, min(100.0, float(percentile)))
+        lo_q = (100.0 - p) * 0.5
+        hi_q = 100.0 - lo_q
+        q_lo = np.percentile(proj, lo_q, axis=0)
+        q_hi = np.percentile(proj, hi_q, axis=0)
+        center = 0.5 * (q_lo + q_hi)
+        span = np.maximum(q_hi - q_lo, 1e-9)
+        half = 0.5 * float(np.max(span))
+        half = half * (1.0 + max(0.0, float(pad)))
+        return center - half, center + half
+
+    if args.axis_mode == "shared":
+        lo_shared, hi_shared = _limits_from_cloud(proj_early, args.axis_percentile, args.axis_pad)
+        lo_early, hi_early = lo_shared, hi_shared
+        lo_late, hi_late = lo_shared, hi_shared
+    else:
+        lo_early, hi_early = _limits_from_cloud(proj_early, args.axis_percentile, args.axis_pad)
+        lo_late, hi_late = _limits_from_cloud(proj_late, args.axis_percentile, args.axis_pad)
 
     if args.output:
         _out = Path(args.output).expanduser()
@@ -528,11 +587,18 @@ def main():
         out_path = (_repo_root / "Paper" / "figures" / f"probe_alignment_{inferred_scale or 'unknown'}.png").resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig = plt.figure(figsize=(14, 6))
+    fig = plt.figure(figsize=(15, 7.6))
+    if args.transparent_bg:
+        fig.patch.set_alpha(0.0)
+    else:
+        fig.patch.set_facecolor("white")
     ax1 = fig.add_subplot(1, 2, 1, projection="3d")
     ax2 = fig.add_subplot(1, 2, 2, projection="3d")
 
-    all_proj = np.vstack([proj_early, proj_late])
+    plot_proj_early = proj_early * float(args.plot_scale)
+    plot_proj_late = proj_late * float(args.plot_scale)
+
+    all_proj = np.vstack([plot_proj_early, plot_proj_late])
     all_r = np.linalg.norm(all_proj, axis=1)
     r_min = float(all_r.min())
     r_max = float(all_r.max())
@@ -541,32 +607,44 @@ def main():
     norm = plt.Normalize(vmin=r_min, vmax=r_max)
     cmap = plt.get_cmap("magma")
 
-    def _plot_cloud(ax, proj, ttl):
+    def _plot_cloud(ax, proj, ttl, lo_xyz, hi_xyz):
         r = np.linalg.norm(proj, axis=1)
         colors = cmap(norm(r))
-        ax.scatter(proj[:, 0], proj[:, 1], proj[:, 2], s=12, alpha=0.9, c=colors)
+        ax.scatter(proj[:, 0], proj[:, 1], proj[:, 2], s=16, alpha=0.9, c=colors)
         if args.draw_arrows:
-            zeros = np.zeros((proj.shape[0],))
-            ax.quiver(
-                zeros,
-                zeros,
-                zeros,
-                proj[:, 0],
-                proj[:, 1],
-                proj[:, 2],
-                length=1.0,
-                normalize=False,
-                linewidths=0.4,
-                alpha=0.25,
-                color=colors,
-            )
+            for i in range(proj.shape[0]):
+                c = colors[i]
+                ax.plot(
+                    [0.0, float(proj[i, 0])],
+                    [0.0, float(proj[i, 1])],
+                    [0.0, float(proj[i, 2])],
+                    color=c,
+                    linewidth=0.95,
+                    alpha=0.32,
+                )
         ax.set_title(ttl)
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.set_zlabel("PC3")
-        ax.set_xlim(lo[0], hi[0])
-        ax.set_ylim(lo[1], hi[1])
-        ax.set_zlim(lo[2], hi[2])
+        if args.transparent_bg:
+            ax.set_facecolor((1.0, 1.0, 1.0, 0.0))
+            ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+            ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+            ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+            ax.grid(True, alpha=0.45, linewidth=0.8)
+        else:
+            ax.set_facecolor("white")
+            ax.xaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+            ax.yaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+            ax.zaxis.set_pane_color((1.0, 1.0, 1.0, 1.0))
+            ax.grid(True, alpha=0.45, linewidth=0.8)
+        ax.set_xlim(lo_xyz[0], hi_xyz[0])
+        ax.set_ylim(lo_xyz[1], hi_xyz[1])
+        ax.set_zlim(lo_xyz[2], hi_xyz[2])
+        try:
+            ax.set_box_aspect((1, 1, 1), zoom=max(0.2, float(args.view_zoom)))
+        except TypeError:
+            ax.set_box_aspect((1, 1, 1))
 
     def _label_with_pcg(tag, step):
         pit = pcg_iters_by_step.get(step)
@@ -574,11 +652,11 @@ def main():
             return f"{tag} (step {step})"
         return f"{tag} (step {step}, PCG={pit})"
 
-    _plot_cloud(ax1, proj_early, _label_with_pcg("Early M", early_step))
-    _plot_cloud(ax2, proj_late, _label_with_pcg("Late M", late_step))
+    _plot_cloud(ax1, plot_proj_early, _label_with_pcg("Early M", early_step), lo_early, hi_early)
+    _plot_cloud(ax2, plot_proj_late, _label_with_pcg("Late M", late_step), lo_late, hi_late)
     fig.suptitle(args.title)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=int(args.dpi))
+    fig.subplots_adjust(left=0.03, right=0.99, bottom=0.08, top=0.90, wspace=0.10)
+    fig.savefig(out_path, dpi=int(args.dpi), transparent=bool(args.transparent_bg))
     print(f"Saved figure: {out_path}")
 
     if args.dump_npz:

@@ -166,7 +166,10 @@ def _rho_grid_multiphase_v2(
     rho_light: float,
     rho_heavy_min: float,
     rho_heavy_max: float,
+    min_barriers: int = 1,
     max_barriers: int = 3,
+    allowed_gap_types: Optional[List[str]] = None,
+    allowed_orientations: Optional[List[str]] = None,
 ) -> List[Tuple[int, int, int, float]]:
     """Upgraded multiphase grid for architecture benchmarking.
 
@@ -188,11 +191,14 @@ def _rho_grid_multiphase_v2(
     log_hi = np.log(max(float(rho_heavy_min) * 1.01, float(rho_heavy_max)))
     rho_heavy = float(np.exp(frame_rng.uniform(log_lo, log_hi)))
 
-    n_barriers = int(frame_rng.choice(list(range(1, max(2, int(max_barriers) + 1)))))
-    gap_choices = ["top", "bottom", "middle_hole", "closed"]
+    min_b = max(1, int(min_barriers))
+    max_b = max(min_b, int(max_barriers))
+    n_barriers = int(frame_rng.choice(list(range(min_b, max_b + 1))))
+    gap_choices = allowed_gap_types if allowed_gap_types else ["top", "bottom", "middle_hole", "closed"]
+    orientation_choices = allowed_orientations if allowed_orientations else ["vertical", "horizontal"]
     barriers: List[Tuple[str, float, float, str]] = []
     for _ in range(n_barriers):
-        orientation = str(frame_rng.choice(["vertical", "horizontal"]))
+        orientation = str(frame_rng.choice(orientation_choices))
         center = float(frame_rng.uniform(0.2, 0.8))
         thickness = float(frame_rng.uniform(0.05, 0.20))
         gap_type = str(frame_rng.choice(gap_choices))
@@ -496,7 +502,10 @@ def generate_frame(
     num_fractures: int = 8,
     fracture_thickness: float = 0.015,
     rho_heavy_min: float = 5.0,
+    min_barriers: int = 1,
     max_barriers: int = 3,
+    allowed_gap_types: Optional[List[str]] = None,
+    allowed_orientations: Optional[List[str]] = None,
 ) -> None:
     _ = blob_threshold
     grid_w, grid_h = _grid_dims(n_target)
@@ -531,7 +540,16 @@ def generate_frame(
         nodes_full = _rho_grid_hard_multiphase(grid_w, grid_h, frame_rng, rho_light, rho_heavy)
     elif dataset_type == "multiphase-v2":
         nodes_full = _rho_grid_multiphase_v2(
-            grid_w, grid_h, frame_rng, rho_light, rho_heavy_min, rho_heavy, max_barriers
+            grid_w,
+            grid_h,
+            frame_rng,
+            rho_light,
+            rho_heavy_min,
+            rho_heavy,
+            min_barriers=min_barriers,
+            max_barriers=max_barriers,
+            allowed_gap_types=allowed_gap_types,
+            allowed_orientations=allowed_orientations,
         )
     elif dataset_type == "moving-barrier":
         if episode_rng is None:
@@ -658,10 +676,34 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--min-barriers",
+        type=int,
+        default=1,
+        help="Minimum number of barriers per frame for --dataset-type multiphase-v2.",
+    )
+    p.add_argument(
         "--max-barriers",
         type=int,
         default=3,
-        help="Maximum number of barriers per frame for --dataset-type multiphase-v2 (drawn uniformly from 1..max).",
+        help="Maximum number of barriers per frame for --dataset-type multiphase-v2 (drawn uniformly from min..max).",
+    )
+    p.add_argument(
+        "--allowed-gap-types",
+        type=str,
+        default="top,bottom,middle_hole,closed",
+        help=(
+            "Comma-separated allowed gap types for --dataset-type multiphase-v2. "
+            "Subset of: top,bottom,middle_hole,closed."
+        ),
+    )
+    p.add_argument(
+        "--allowed-orientations",
+        type=str,
+        default="vertical,horizontal",
+        help=(
+            "Comma-separated allowed barrier orientations for --dataset-type multiphase-v2. "
+            "Subset of: vertical,horizontal."
+        ),
     )
     p.add_argument(
         "--pilot",
@@ -709,6 +751,22 @@ def main() -> None:
         raise SystemExit("--rho-heavy-min must be less than --rho-heavy for multiphase-v2")
     if int(args.max_barriers) < 1:
         raise SystemExit("--max-barriers must be at least 1")
+    if int(args.min_barriers) < 1:
+        raise SystemExit("--min-barriers must be at least 1")
+    if int(args.min_barriers) > int(args.max_barriers):
+        raise SystemExit("--min-barriers must be <= --max-barriers")
+    valid_gaps = {"top", "bottom", "middle_hole", "closed"}
+    valid_orientations = {"vertical", "horizontal"}
+    allowed_gap_types = [s.strip() for s in str(args.allowed_gap_types).split(",") if s.strip()]
+    allowed_orientations = [s.strip() for s in str(args.allowed_orientations).split(",") if s.strip()]
+    if not allowed_gap_types:
+        raise SystemExit("--allowed-gap-types must include at least one value")
+    if not set(allowed_gap_types).issubset(valid_gaps):
+        raise SystemExit("--allowed-gap-types must be a comma-separated subset of: top,bottom,middle_hole,closed")
+    if not allowed_orientations:
+        raise SystemExit("--allowed-orientations must include at least one value")
+    if not set(allowed_orientations).issubset(valid_orientations):
+        raise SystemExit("--allowed-orientations must be a comma-separated subset of: vertical,horizontal")
     if args.dataset_type in ("unstructured-multiphase", "fractured-media") and _KDTree is None:
         raise SystemExit(f"{args.dataset_type} requires scipy; install scipy for KDTree support.")
     if int(args.morton_quant_bins) < 2:
@@ -754,7 +812,10 @@ def main() -> None:
                 num_fractures=int(args.num_fractures),
                 fracture_thickness=float(args.fracture_thickness),
                 rho_heavy_min=float(args.rho_heavy_min),
+                min_barriers=int(args.min_barriers),
                 max_barriers=int(args.max_barriers),
+                allowed_gap_types=allowed_gap_types,
+                allowed_orientations=allowed_orientations,
             )
 
     print("Done.")

@@ -1,0 +1,49 @@
+================================================================
+Job 13785802 on node1615
+Started: Mon May 11 23:53:25 EDT 2026
+================================================================
+
+=== g4096_train_id ===
+[multiphase-v2] Generating 100 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_train_id/train (train)
+[multiphase-v2] Generating 20 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_train_id/test (test)
+Done.
+
+=== g4096_train_topo_no_closed ===
+[multiphase-v2] Generating 100 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_train_topo_no_closed/train (train)
+[multiphase-v2] Generating 20 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_train_topo_no_closed/test (test)
+Done.
+
+=== g4096_train_param_low ===
+[multiphase-v2] Generating 100 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_train_param_low/train (train)
+[multiphase-v2] Generating 20 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_train_param_low/test (test)
+Done.
+
+=== g4096_train_combo_no_closed_low ===
+[multiphase-v2] Generating 100 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_train_combo_no_closed_low/train (train)
+[multiphase-v2] Generating 20 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_train_combo_no_closed_low/test (test)
+Done.
+
+=== g4096_eval_id ===
+[multiphase-v2] Generating 0 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_id/train (train)
+[multiphase-v2] Generating 100 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_id/test (test)
+Done.
+
+=== g4096_eval_closed_only ===
+[multiphase-v2] Generating 0 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_closed_only/train (train)
+[multiphase-v2] Generating 100 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_closed_only/test (test)
+Done.
+
+=== g4096_eval_param_high ===
+[multiphase-v2] Generating 0 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_param_high/train (train)
+[multiphase-v2] Generating 100 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_param_high/test (test)
+Done.
+
+=== g4096_eval_combo_closed_high ===
+[multiphase-v2] Generating 0 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_combo_closed_high/train (train)
+[multiphase-v2] Generating 100 frames -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_combo_closed_high/test (test)
+Done.
+
+Done generating generalization datasets.
+================================================================
+Finished: Mon May 11 23:54:05 EDT 2026
+================================================================
