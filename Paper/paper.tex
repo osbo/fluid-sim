@@ -83,9 +83,9 @@ the entire PCG step (preconditioner application plus sparse matvec) is a sequenc
 GEMMs over contiguous memory, with no triangular solves or data-dependent branching, captured
 end-to-end in a single CUDA Graph.
 On a stiff multiphase pressure-Poisson benchmark spanning $1\,024$--$16\,384$ unknowns and
-density contrast ratios up to $100\!:\!1$, our preconditioner sustains interactive
-framerates across the full range while every classical and learned baseline we evaluate
-drops below interactive by $N\!=\!16\,384$. It runs at $\sim\!154$\,fps at
+density contrast ratios up to $100\!:\!1$, our preconditioner stays above
+$22$\,fps across the full range; every classical and learned baseline we
+evaluate falls below $20$\,fps by $N\!=\!16\,384$. It runs at $\sim\!154$\,fps at
 $N\!=\!1\,024$, $\sim\!111$\,fps at $N\!=\!4\,096$, and $\sim\!22$\,fps at $N\!=\!16\,384$.
 The closest GPU baseline (Jacobi) reaches $\sim\!85$, $\sim\!31$, and $\sim\!16$\,fps on
 identical hardware. At $N\!=\!8\,192$, mean end-to-end solve time is
@@ -123,20 +123,22 @@ neural operators, physics simulation, real-time graphics}
     \centering
     \begin{tabular}{@{}c@{\hspace{8pt}}c@{\hspace{8pt}}c@{\hspace{8pt}}c@{}}
       \parbox[c][1.65in][c]{0.22\linewidth}{\centering
-        \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{3 fluid.jpeg}} &
+        \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{hmatrix_partition_compact.png}} &
       \parbox[c][1.65in][c]{0.22\linewidth}{\centering
         \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{multiphase_m_zoom_strip.png}} &
       \parbox[c][1.65in][c]{0.22\linewidth}{\centering
         \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{residual_correction_traces.png}} &
       \parbox[c][1.65in][c]{0.22\linewidth}{\centering
-        \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{hmatrix_partition_compact.png}} \\[4pt]
-      \parbox[t]{0.22\linewidth}{\centering\footnotesize (a) 3D multiphase fluid simulation} &
+        \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{3 fluid.jpeg}} \\[4pt]
+      \parbox[t]{0.22\linewidth}{\centering\footnotesize (a) H-matrix block partition} &
       \parbox[t]{0.22\linewidth}{\centering\footnotesize (b) Learned preconditioner for 3D multiphase} &
       \parbox[t]{0.22\linewidth}{\centering\footnotesize (c) Multiscale residual-correction traces} &
-      \parbox[t]{0.22\linewidth}{\centering\footnotesize (d) H-matrix block partition}
+      \parbox[t]{0.22\linewidth}{\centering\footnotesize (d) 3D multiphase fluid simulation}
     \end{tabular}
   \end{minipage}}
-  \caption{Hierarchical neural preconditioning for interactive physics simulation.}
+  \caption{Hierarchical neural preconditioning for interactive multiphase Poisson solves:
+    structural prior (a), learned operator (b), induced multiscale correction flow (c), and
+    application-context visualization (d).}
   \label{fig:teaser}
 \end{teaserfigure}
 
@@ -166,6 +168,10 @@ cost approaches the per-frame budget cannot amortize; this affects IC and AMG mo
 their setup is sequential and irregular~\cite{naumov2015amgx}, and IC application is further
 bottlenecked on triangular solves whose data hazards resist GPU
 parallelization~\cite{liu2016synchronization,yamazaki2020performance}.
+Figure~\ref{fig:teaser} summarizes this narrative early: partition prior (a), learned
+preconditioner structure (b), and resulting multiscale residual-correction behavior (c),
+with panel~(d) included as an application-context illustration of the target multiphase
+Poisson setting rather than as evidence of full frame-to-frame simulator integration.
 
 Machine learning offers an appealing alternative: given a distribution of simulation states,
 a neural preconditioner can be trained once and amortized across frames at near-constant,
@@ -239,7 +245,7 @@ preconditioned image $MA\mathbf{z}$ of random probes $\mathbf{z}$. Compared to F
 SAI-style objectives~\cite{Yang2025sparse}, the cosine objective is invariant to both the
 scale and the absolute location of the eigenvalues of $MA$: it imposes no preferred location
 or scale for the eigenvalue cluster, only that the preconditioned probe align angularly with
-its source. The network is free to be \emph{lazy} --- to cluster the spectrum wherever doing
+its source. The network is free cluster the spectrum wherever doing
 so minimizes the angular gap between $\mathbf{z}$ and $MA\mathbf{z}$ the most, without paying
 for the wrong overall scale or center. This matters for stiff multiphase systems whose
 spectra do not naturally cluster around $1$.
@@ -300,11 +306,11 @@ AMG (V-cycle)      & $O(N\log N)$     & multilevel, irregular   & level synchron
 
 \paragraph{Classical iterative solvers.}
 Preconditioning sparse SPD systems is a textbook concern of scientific
-computing~\cite{saad2003iterative}. The canonical algebraic preconditioners --- Jacobi,
-incomplete Cholesky/LU (IC/ILU)~\cite{lin1999incomplete}, sparse approximate inverses
-(SPAI)~\cite{kolotilina1993factorized,benzi1996sparse}, and algebraic multigrid
-(AMG)~\cite{ruge1987algebraic} --- are mature, well-analyzed, and remain the default choice
-across most of scientific computing. IC and ILU mirror the elimination structure of $A$
+computing~\cite{saad2003iterative}. Canonical algebraic preconditioners include Jacobi,
+incomplete Cholesky/LU (IC/ILU), sparse approximate inverses (SPAI), and algebraic
+multigrid (AMG)~\cite{lin1999incomplete,kolotilina1993factorized,benzi1996sparse,ruge1987algebraic}.
+These methods are mature, well analyzed, and remain
+default choices in scientific computing. IC and ILU mirror the elimination structure of $A$
 within a chosen sparsity pattern, giving strong spectral approximation per unit memory.
 SPAI methods approximate $A^{-1}$ directly as a sparse matrix, exposing parallelism by
 replacing triangular solves with a sparse matvec at apply time, with the choice of sparsity
@@ -706,6 +712,7 @@ $S_m$ leaves of the row-strip $\mathcal{I}_m$, and finally expanded to full
 node-resolution by the per-leaf prolongation $\tilde V_l$. The shape progression is
 therefore
 \[
+  \resizebox{\columnwidth}{!}{$
   \underbrace{S_mL}_{\text{strip}}
   \;\xrightarrow{\,\tilde U^\top\,}\;
   \underbrace{S_mL_s}_{\text{thinner strip}}
@@ -716,7 +723,8 @@ therefore
   \;\xrightarrow{\,\text{broadcast}\,}\;
   \underbrace{S_mL_s}_{\text{thinner strip}}
   \;\xrightarrow{\,\tilde V\,}\;
-  \underbrace{S_mL}_{\text{strip}},
+  \underbrace{S_mL}_{\text{strip}}.
+  $}
 \]
 a fine strip that contracts to a coarse strip, aggregates to a single tile summary,
 transmits the coarse far-field interaction, and re-expands back to a fine strip. The geometry mirrors the FMM upward-pass / interaction-list /
@@ -1076,11 +1084,11 @@ each iteration of a local preconditioner closes less of the residual gap, so con
 is slower and the advantage of a long-range preconditioner is more pronounced. On a
 structured grid the classical Cartesian-grid baselines (IC, AMG) are also at their
 strongest, so any gap we report is against well-tuned competition. We further restrict
-to structured grids not because the architecture requires regular connectivity --- it
-does not; the only role connectivity plays is bounding the number of GCN passes, and all
-that is needed is a loose spatial ordering of degrees of freedom --- but because
-structured pressure-Poisson is the dominant bottleneck in the target graphics simulation
-pipelines and therefore the natural representative choice. Comparable learned-preconditioner work in graphics
+to structured grids for the quantitative study because structured pressure-Poisson is the
+dominant bottleneck in target graphics simulation pipelines. Architecturally, the method
+does not assume regular grid connectivity; it requires only a sparse neighborhood graph and
+a loose spatial ordering of degrees of freedom. We leave direct unstructured-mesh
+validation to future work. Comparable learned-preconditioner work in graphics
 evaluates on problems of essentially the same order of
 magnitude~\cite{Li2023learning,hausner2023neural,Yang2025sparse}.
 Fig.~\ref{fig:bench-frame} shows a representative frame.
@@ -1147,9 +1155,9 @@ frame because $A$ changes; we move that cost out of the per-frame budget entirel
   \caption{End-to-end PCG solve time on the multiphase Poisson benchmark across five
     problem sizes, $20$ frames per scale (mean $\pm 1\sigma$ band; relative residual
     tolerance $10^{-8}$). Dashed grey lines mark the $24$\,fps and $60$\,fps interactive
-    budgets. Ours stays above $24$\,fps at every $N$ tested; the closest GPU baseline
-    (Jacobi) covers $\sim\!85$\,fps to
-    $\sim\!16$\,fps over the same range. AMGX SPAI and GPU IC sit above $40$\,ms across
+    budgets. Ours covers $\sim\!154$ down to $\sim\!22$\,fps across the size
+    range; the closest GPU baseline (Jacobi) covers $\sim\!85$ down to
+    $\sim\!16$\,fps on the same hardware. AMGX SPAI and GPU IC sit above $40$\,ms across
     all scales despite much lower iteration counts, dominated by unparallelizable
     triangular solves or V-cycle level synchronization. PyAMG (CPU) is omitted: its
     setup cost scales nonlinearly with contrast under stiff multiphase systems, making
@@ -1415,14 +1423,15 @@ the contours of that regime in three directions.
 generalization claim at the deployment boundary we target: within-family configuration
 drift in multiphase Poisson (\S\ref{sec:results:generalization}). The architecture
 depends on nothing fluid-specific --- only a loose spatial ordering of degrees of
-freedom --- and operates identically in 3D (Fig.~\ref{fig:teaser}) and on unstructured
-meshes; regular connectivity is not required (it would only tighten the bound on GCN
-passes). We evaluate on structured grids because they are the representative bottleneck
+freedom --- and extends directly to 3D (Fig.~\ref{fig:teaser}). The same design is
+compatible with unstructured meshes because regular connectivity is not required (it would
+only tighten the bound on GCN passes), but we do not provide unstructured-mesh experiments
+in this paper. We evaluate on structured grids because they are the representative bottleneck
 in the target pipelines, not as a limitation. Transfer to non-fluid SPD families ---
-cloth, contact stiffness, and other interactive physics --- remains the primary open
-empirical question. Quantifying that transfer, including a head-to-head against the
-sparse-approximate-inverse GNN of Yang \emph{et al.}~\cite{Yang2025sparse} on a shared
-benchmark (in progress), is a primary follow-up direction.
+cloth, contact stiffness, and other interactive physics --- is the main open
+question. We are running a head-to-head against the sparse-approximate-inverse
+GNN of Yang \emph{et al.}~\cite{Yang2025sparse} on a shared benchmark; that
+comparison is the next step.
 
 \paragraph{Problem-size flexibility.} Training pre-sizes the partition and apply-path
 workspace to a maximum $N$. Inference at smaller $N$ remains time-efficient
@@ -1438,8 +1447,9 @@ some spatial locality of $A$ under its indexing. The prior degrades where that
 geometry is absent: operators with no natural spatial coordinate (power-grid
 Laplacians, electrical-circuit and social-network matrices, dense kernel matrices
 without spatial embedding) and integral operators whose far-field rank does not decay
-with separation. The architecture is not specific to structured grids --- it operates
-equally on unstructured meshes that admit a loose spatial ordering --- but the
+with separation. The architecture is not specific to structured grids and is compatible
+with unstructured meshes that admit a loose spatial ordering, but this paper does not
+empirically validate that setting. The
 underlying prior is geometric, and problems without that geometry are out of scope.
 This scope statement identifies the SPD families for which this
 recipe is appropriate.
