@@ -1473,7 +1473,7 @@ def make_residual_3d(
     *,
     k: int = 1,
     cmap_name: str = "inferno",
-    barrier_alpha: float = 0.06,
+    barrier_alpha: float = 0.14,
     elev: float = 22,
     azim: float = -55,
     dpi: int = 200,
@@ -1552,13 +1552,19 @@ def make_residual_3d(
     xg, yg, zg = np.indices((W + 1, H + 1, D + 1), dtype=np.float32)
     xg -= 0.5; yg -= 0.5; zg -= 0.5
 
-    # Faint barrier context.
+    # Solid, lit barrier context (contiguous-looking blocks; no voxel edge grid).
     if info["barrier"].any() and barrier_alpha > 0:
         bfc = np.zeros(info["barrier"].shape + (4,), dtype=np.float32)
-        bfc[..., :3] = 0.22
-        bfc[..., 3] = barrier_alpha
-        bec = np.zeros_like(bfc); bec[..., 3] = 0.0
-        ax.voxels(xg, yg, zg, info["barrier"], facecolors=bfc, edgecolors=bec, linewidth=0.0, zorder=0)
+        bfc[..., :3] = 0.58
+        bfc[..., 3] = 1.0
+        ax.voxels(
+            xg, yg, zg, info["barrier"],
+            facecolors=bfc,
+            edgecolors=None,
+            linewidth=0.0,
+            shade=True,
+            zorder=0,
+        )
 
     mode = str(render_mode).lower()
 
@@ -1635,6 +1641,7 @@ def make_residual_3d(
     # ------------------------------------------------------------------ traces
     elif mode == "traces":
         from scipy import ndimage as _ndi
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
         # Build the scalar grid for tracing (scalar_main) and the seed-source grid.
         s_grid = np.zeros((W, H, D), dtype=np.float32)
@@ -1654,16 +1661,22 @@ def make_residual_3d(
         nrm_f = np.sqrt(vx_f**2 + vy_f**2 + vz_f**2) + 1e-12
         vx_f /= nrm_f; vy_f /= nrm_f; vz_f /= nrm_f
 
-        # Seeds: top percentile of seed_source (interface nodes for correction field).
-        seed_q = 97.0
-        seed_pool = np.flatnonzero(seed_source >= float(np.percentile(seed_source, seed_q)))
-        if seed_pool.size == 0:
-            seed_pool = np.arange(seed_source.shape[0], dtype=np.int64)
-        if seed_pool.size > int(trace_seeds):
-            pick = np.linspace(0, seed_pool.size - 1, num=int(trace_seeds)).round().astype(np.int64)
-            seed_idx = seed_pool[pick]
-        else:
-            seed_idx = seed_pool
+        # Streamline-style seeding: start from an even volumetric lattice inside the domain.
+        n_seed_target = max(1, int(trace_seeds) * 3)
+        domain_vol = max(float(W * H * D), 1.0)
+        target_candidates = max(n_seed_target * 4, 64)
+        spacing = (domain_vol / float(target_candidates)) ** (1.0 / 3.0)
+        nx = max(3, int(np.ceil(W / max(spacing, 1e-6))))
+        ny = max(3, int(np.ceil(H / max(spacing, 1e-6))))
+        nz = max(3, int(np.ceil(D / max(spacing, 1e-6))))
+        x_seed = np.linspace(0.5, max(0.5, W - 1.5), nx, dtype=np.float64)
+        y_seed = np.linspace(0.5, max(0.5, H - 1.5), ny, dtype=np.float64)
+        z_seed = np.linspace(0.5, max(0.5, D - 1.5), nz, dtype=np.float64)
+        gx_s, gy_s, gz_s = np.meshgrid(x_seed, y_seed, z_seed, indexing="ij")
+        seed_xyz = np.stack([gx_s.ravel(), gy_s.ravel(), gz_s.ravel()], axis=1)
+        # Deterministic shuffle reduces directional striping from strict raster order.
+        rng = np.random.default_rng(0)
+        seed_xyz = seed_xyz[rng.permutation(seed_xyz.shape[0])]
 
         def _sample_scalar(F, x, y, z):
             if x < 0 or y < 0 or z < 0 or x > W - 1 or y > H - 1 or z > D - 1:
@@ -1689,10 +1702,49 @@ def make_residual_3d(
                 return None
             return (vx/nn, vy/nn, vz/nn)
 
-        def _trace(seed_x, seed_y, seed_z, sign):
+        # Use an absolute-distance streamline spacing check (continuous coordinates),
+        # not voxel occupancy, so spacing is less aggressive on coarse grids.
+        min_sep = max(0.18, 0.38 * max(float(trace_step_size), 1e-6))
+        min_sep2 = float(min_sep * min_sep)
+        cell = min_sep
+        spatial: dict[tuple[int, int, int], list[tuple[float, float, float]]] = {}
+
+        def _cell_key(x, y, z):
+            return (
+                int(np.floor(float(x) / cell)),
+                int(np.floor(float(y) / cell)),
+                int(np.floor(float(z) / cell)),
+            )
+
+        def _near_occupied(x, y, z):
+            cx, cy, cz = _cell_key(x, y, z)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        pts = spatial.get((cx + dx, cy + dy, cz + dz))
+                        if not pts:
+                            continue
+                        for px0, py0, pz0 in pts:
+                            ddx = float(x) - px0
+                            ddy = float(y) - py0
+                            ddz = float(z) - pz0
+                            if (ddx * ddx + ddy * ddy + ddz * ddz) < min_sep2:
+                                return True
+            return False
+
+        def _mark_trace(xs, ys, zs):
+            for x0, y0, z0 in zip(xs, ys, zs):
+                key = _cell_key(x0, y0, z0)
+                if key not in spatial:
+                    spatial[key] = [(float(x0), float(y0), float(z0))]
+                else:
+                    spatial[key].append((float(x0), float(y0), float(z0)))
+
+        def _trace(seed_x, seed_y, seed_z):
             xs = [float(seed_x)]; ys = [float(seed_y)]; zs = [float(seed_z)]
             x = float(seed_x); y = float(seed_y); z = float(seed_z)
-            h = max(float(trace_step_size), 1e-6) * float(sign)
+            # Backward integration only (opposite to local transport direction).
+            h = -max(float(trace_step_size), 1e-6)
             for _ in range(int(trace_steps)):
                 v = _sample_vec(x, y, z)
                 if v is None:
@@ -1700,38 +1752,66 @@ def make_residual_3d(
                 x += h*v[0]; y += h*v[1]; z += h*v[2]
                 if x < 0 or y < 0 or z < 0 or x > W-1 or y > H-1 or z > D-1:
                     break
+                # Stop this streamline when it approaches an existing one.
+                if _near_occupied(x, y, z):
+                    break
                 xs.append(x); ys.append(y); zs.append(z)
             return xs, ys, zs
 
-        # Colour traces by the *correction* magnitude at the seed.
-        seed_vals = scalar_main[seed_idx]
-        s_lo = float(np.percentile(seed_vals, 5.0))
-        s_hi = max(float(np.percentile(seed_vals, 99.0)), s_lo + 1e-12)
-        s_t = np.clip((seed_vals - s_lo) / (s_hi - s_lo), 0.0, 1.0)
-        seed_cols = cmap_main(s_t)
-        seed_cols[:, 3] = 0.62
+        log_full = np.log10(np.maximum(scalar_main, 1e-30))
+        lo = float(np.percentile(log_full, 2.0))
+        hi = float(np.percentile(log_full, 99.5))
+        if hi <= lo:
+            hi = lo + 1e-6
+        trace_norm = matplotlib.colors.Normalize(vmin=lo, vmax=hi)
 
-        for i, si in enumerate(seed_idx):
-            sx = float(px[si]); sy = float(py[si]); sz = float(pz[si])
-            c = seed_cols[i]
-            xf, yf, zf = _trace(sx, sy, sz, +1.0)
-            xb, yb, zb = _trace(sx, sy, sz, -1.0)
-            if len(xf) > 1:
-                ax.plot(xf, yf, zf, color=c, linewidth=1.2, alpha=0.58, zorder=2)
-            if len(xb) > 1:
-                ax.plot(xb, yb, zb, color=c, linewidth=1.2, alpha=0.58, zorder=2)
-            ax.scatter([sx], [sy], [sz], c=[c], s=10.0, linewidths=0, depthshade=False, zorder=3)
+        def _add_colored_trace(xs, ys, zs):
+            if len(xs) < 2:
+                return
+            pts = np.stack(
+                [np.asarray(xs, dtype=np.float64),
+                 np.asarray(ys, dtype=np.float64),
+                 np.asarray(zs, dtype=np.float64)],
+                axis=1,
+            )
+            segs = np.stack([pts[:-1], pts[1:]], axis=1)
+            mids = 0.5 * (pts[:-1] + pts[1:])
+            seg_vals = np.asarray(
+                [np.log10(max(_sample_scalar(s_grid, float(mx), float(my), float(mz)), 1e-30))
+                 for (mx, my, mz) in mids],
+                dtype=np.float64,
+            )
+            lc = Line3DCollection(
+                segs,
+                cmap=cmap_main,
+                norm=trace_norm,
+                linewidth=1.0,
+                alpha=0.64,
+                zorder=2,
+            )
+            lc.set_array(seg_vals)
+            ax.add_collection3d(lc)
 
-        log_s = np.log10(seed_vals + 1e-30)
-        lo = float(log_s.min()); hi = float(log_s.max())
+        n_accepted = 0
+        for sx, sy, sz in seed_xyz:
+            if n_accepted >= n_seed_target:
+                break
+            if _near_occupied(float(sx), float(sy), float(sz)):
+                continue
+            xb, yb, zb = _trace(float(sx), float(sy), float(sz))
+            if len(xb) < 4:
+                continue
+            _add_colored_trace(xb, yb, zb)
+            _mark_trace(xb, yb, zb)
+            n_accepted += 1
 
         if show_colorbar:
             sm = matplotlib.cm.ScalarMappable(cmap=cmap_main,
                                                norm=matplotlib.colors.Normalize(vmin=lo, vmax=hi))
             sm.set_array([])
             cb = fig.colorbar(sm, ax=ax, shrink=0.65, pad=0.08, aspect=30)
-            field_lbl = r"$|M^{-1}b|$" if field_key == "correction" else rf"$|r_{{{k}}}|$"
-            cb.set_label(rf"$\log_{{10}}\,{field_lbl}$", fontsize=12)
+            field_expr = r"|M^{-1}b|" if field_key == "correction" else rf"|r_{{{k}}}|"
+            cb.set_label(rf"$\log_{{10}}\,{field_expr}$", fontsize=12)
 
     # ------------------------------------------------------------------ scatter (default)
     else:
@@ -1749,8 +1829,8 @@ def make_residual_3d(
                                                norm=matplotlib.colors.Normalize(vmin=lo, vmax=hi))
             sm.set_array([])
             cb = fig.colorbar(sm, ax=ax, shrink=0.65, pad=0.08, aspect=30)
-            field_lbl = r"$|M^{-1}b|$" if field_key == "correction" else rf"$|r_{{{k}}}|$"
-            cb.set_label(rf"$\log_{{10}}\,{field_lbl}$", fontsize=12)
+            field_expr = r"|M^{-1}b|" if field_key == "correction" else rf"|r_{{{k}}}|"
+            cb.set_label(rf"$\log_{{10}}\,{field_expr}$", fontsize=12)
 
     # Bounding-box wireframe / axis styling.
     if not clean_view:
@@ -1768,6 +1848,14 @@ def make_residual_3d(
         ax.set_box_aspect((1, 1, 1))
         ax.set_axis_off()
     ax.view_init(elev=elev, azim=azim)
+    # Force a noticeably stronger perspective camera.
+    try:
+        ax.set_proj_type("persp", focal_length=0.42)
+    except TypeError:
+        ax.set_proj_type("persp")
+    # Pull camera closer to amplify perspective on older Matplotlib builds.
+    if hasattr(ax, "dist"):
+        ax.dist = 7.0
     ax.set_facecolor("white")
     fig.patch.set_facecolor("white")
 
