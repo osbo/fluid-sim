@@ -1432,6 +1432,40 @@ def _pcg_step_k(A_csr, b, apply_M, k=1):
     return x, r
 
 
+def _scatter3d_field(ax, px, py, pz, mag, cmap, *,
+                     top_frac=0.45, alpha_power=2.4, alpha_scurve=True,
+                     elev=22.0, azim=-55.0, size_range=(4.0, 18.0), zorder=1):
+    """Depth-sorted 3-D scatter with log-opacity encoding.  Returns (lo, hi) log10 range."""
+    import math as _math
+    thresh = float(np.percentile(mag, 100.0 * (1.0 - top_frac)))
+    visible = mag >= thresh
+    mag_v = mag[visible]
+    log_v = np.log10(mag_v + 1e-30)
+    lo = float(np.percentile(log_v, 2))
+    hi = float(log_v.max())
+    alpha_lin = np.clip((log_v - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+    if alpha_scurve:
+        a = alpha_lin
+        alpha_lin_sm = (a * a * (3.0 - 2.0 * a)).astype(np.float32)
+    else:
+        alpha_lin_sm = alpha_lin
+    alpha_vals = np.clip(alpha_lin_sm, 0.0, 1.0) ** max(float(alpha_power), 1e-6)
+    rgba = cmap(alpha_lin)
+    rgba[:, 3] = alpha_vals
+    vx = px[visible]; vy = py[visible]; vz = pz[visible]
+    el_r = _math.radians(elev); az_r = _math.radians(azim)
+    view_vec = np.array([_math.cos(el_r) * _math.cos(az_r),
+                         _math.cos(el_r) * _math.sin(az_r),
+                         _math.sin(el_r)], dtype=np.float32)
+    depth = vx * view_vec[0] + vy * view_vec[1] + vz * view_vec[2]
+    order = np.argsort(depth)
+    s_lo, s_hi = size_range
+    sizes = s_lo + (s_hi - s_lo) * alpha_vals[order] ** 0.5
+    ax.scatter(vx[order], vy[order], vz[order],
+               c=rgba[order], s=sizes, linewidths=0, depthshade=False, zorder=zorder)
+    return lo, hi
+
+
 def make_residual_3d(
     frame_dir,
     out_path,
@@ -1444,6 +1478,7 @@ def make_residual_3d(
     azim: float = -55,
     dpi: int = 200,
     render_mode: str = "scatter",
+    field: str = "residual",
     clean_view: bool = False,
     show_colorbar: bool = True,
     alpha_power: float = 2.4,
@@ -1453,11 +1488,15 @@ def make_residual_3d(
     trace_step_size: float = 0.65,
     trace_sigma: float = 1.2,
 ):
-    """3-D scatter where opacity encodes log|r_k| — high residual = opaque, near-zero = invisible.
+    """3-D scatter / trace / dual figure for residual or preconditioner-correction fields.
 
-    Shows where the preconditioned Krylov step leaves un-resolved residual after ``k`` iteration(s).
-    Barrier voxels are rendered as a faint contextual overlay.
-    Buoyancy forcing (-∂ρ/∂z) is used as the RHS so impulses originate at barrier–fluid interfaces.
+    field="residual"   — existing behaviour: show |r_k| after k PCG steps.
+    field="correction" — show |M⁻¹b|: the GNN preconditioner's response to the RHS.
+                         Traces are seeded at high-|b| (barrier-interface) nodes and follow
+                         the gradient of |M⁻¹b|, making non-local transport visible.
+    field="dual"       — overlay both fields in one 3-D axis: cool-blue scatter for |b|
+                         (local, interface-bound) and inferno scatter for |M⁻¹b| (global).
+                         cmap_name controls the correction colourmap; source uses Blues.
     """
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
     import scipy.sparse as _sp_local
@@ -1466,12 +1505,11 @@ def make_residual_3d(
     info = load_frame_3d(frame_dir)
     N = info["N"]
     W, H, D = info["W"], info["H"], info["D"]
-    print(f"[residual-3d] frame {frame_dir}  N={N}  ratio={info['ratio']:.1f}x")
+    print(f"[residual-3d] frame {frame_dir}  N={N}  ratio={info['ratio']:.1f}x  field={field}")
 
     ours = OursPreconditioner(info, ours_weights)
-    viz_n = ours._viz_n  # leaf-aligned active count (may be < N)
+    viz_n = ours._viz_n
 
-    # Build sparse A for the active nodes.
     A_csr = _sp_local.csr_matrix(
         _sp_local.coo_matrix(
             (ours._batch["edge_values"].numpy(),
@@ -1479,54 +1517,40 @@ def make_residual_3d(
             shape=(N, N),
         )
     )
-    # Restrict to viz_n active nodes.
     A_act = A_csr[:viz_n, :viz_n]
     b_full = buoyancy_rhs_3d(info)[:viz_n]
 
-    print(f"[residual-3d] running {k} PCG step(s) …", flush=True)
-    _x, r_k = _pcg_step_k(A_act, b_full, ours.apply_M, k=k)
-
-    # Positions of the active (viz_n) nodes: first viz_n in morton order.
+    # Positions of the active nodes.
     raw_nodes = np.fromfile(Path(frame_dir) / "nodes.bin", dtype=NODE_DTYPE)[:viz_n]
     px = raw_nodes["position"][:, 0].astype(np.float32)
     py = raw_nodes["position"][:, 1].astype(np.float32)
     pz = raw_nodes["position"][:, 2].astype(np.float32)
 
-    r_mag = np.abs(r_k).astype(np.float64)
-    # Only render nodes whose residual is in the top (1 - visible_frac) of the distribution.
-    # This keeps the lower-residual body from occluding the interesting high-residual regions.
-    visible_frac = 0.45   # show top 45% by residual magnitude
-    r_thresh = float(np.percentile(r_mag, 100 * (1 - visible_frac)))
-    visible = r_mag >= r_thresh
+    field_key = str(field).lower()
 
-    r_vis = r_mag[visible]
-    log_r = np.log10(r_vis + 1e-30)
-    lo = float(np.percentile(log_r, 2))
-    hi = float(log_r.max())
-    alpha_lin = np.clip((log_r - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
-    # Optional S-curve remap + power curve: suppress mid-opacity clutter while preserving extremes.
-    if alpha_scurve:
-        a = alpha_lin
-        alpha_curve = (a * a * (3.0 - 2.0 * a)).astype(np.float32)  # smoothstep in [0,1]
+    # --- compute the scalar field(s) to visualise ---
+    if field_key == "residual":
+        print(f"[residual-3d] running {k} PCG step(s) …", flush=True)
+        _x, r_k = _pcg_step_k(A_act, b_full, ours.apply_M, k=k)
+        scalar_main = np.abs(r_k).astype(np.float64)
+        seed_source = scalar_main          # seeds from high-residual nodes
+        cmap_main = matplotlib.colormaps[cmap_name]
+    elif field_key in ("correction", "dual"):
+        print("[residual-3d] applying M⁻¹b …", flush=True)
+        correction = np.abs(ours.apply_M(b_full)).astype(np.float64)
+        b_mag = np.abs(b_full).astype(np.float64)
+        scalar_main = correction
+        seed_source = b_mag                # seeds from high-|b| (barrier interface) nodes
+        cmap_main = matplotlib.colormaps[cmap_name]
     else:
-        alpha_curve = alpha_lin
-    alpha_vals = np.clip(alpha_curve, 0.0, 1.0) ** max(float(alpha_power), 1e-6)
-
-    cmap = matplotlib.colormaps[cmap_name]
-    rgba_vis = cmap(alpha_lin)      # (n_vis, 4)
-    rgba_vis[:, 3] = alpha_vals
-
-    n_vis = int(visible.sum())
-    print(f"[residual-3d]   {n_vis}/{viz_n} nodes shown (top {100*visible_frac:.0f}% residual)")
+        raise ValueError(f"Unknown field '{field}' — choose residual | correction | dual")
 
     fig = plt.figure(figsize=(8.0, 7.2))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Half-cell shifted voxel corners so cubes are centered on integer grid coordinates.
+    # Half-cell shifted voxel corners.
     xg, yg, zg = np.indices((W + 1, H + 1, D + 1), dtype=np.float32)
-    xg -= 0.5
-    yg -= 0.5
-    zg -= 0.5
+    xg -= 0.5; yg -= 0.5; zg -= 0.5
 
     # Faint barrier context.
     if info["barrier"].any() and barrier_alpha > 0:
@@ -1537,8 +1561,59 @@ def make_residual_3d(
         ax.voxels(xg, yg, zg, info["barrier"], facecolors=bfc, edgecolors=bec, linewidth=0.0, zorder=0)
 
     mode = str(render_mode).lower()
-    if mode == "voxels":
-        # Residual-as-voxels: one semi-transparent cube per active visible node.
+
+    # ------------------------------------------------------------------ dual
+    if field_key == "dual":
+        # Layer 1 — source |b|: cool blue, shows local barrier-interface forcing.
+        cmap_src = matplotlib.colormaps.get_cmap("Blues")
+        # Flip so high-|b| = saturated blue (Blues maps 0→white, 1→dark blue).
+        lo_b, hi_b = _scatter3d_field(
+            ax, px, py, pz, b_mag, cmap_src,
+            top_frac=0.15,          # only top 15%: the thin interface shell
+            alpha_power=3.0, alpha_scurve=True,
+            elev=elev, azim=azim, size_range=(3.0, 12.0), zorder=1,
+        )
+        print(f"[residual-3d]   |b| log10 range [{lo_b:.2f}, {hi_b:.2f}]")
+
+        # Layer 2 — correction |M⁻¹b|: inferno, shows non-local GNN spread.
+        lo_c, hi_c = _scatter3d_field(
+            ax, px, py, pz, correction, cmap_main,
+            top_frac=0.40,          # top 40%: the global correction cloud
+            alpha_power=float(alpha_power), alpha_scurve=bool(alpha_scurve),
+            elev=elev, azim=azim, size_range=(4.0, 18.0), zorder=2,
+        )
+        print(f"[residual-3d]   |M⁻¹b| log10 range [{lo_c:.2f}, {hi_c:.2f}]")
+
+        if show_colorbar:
+            # Two mini colourbars stacked vertically.
+            sm_src = matplotlib.cm.ScalarMappable(
+                cmap=cmap_src,
+                norm=matplotlib.colors.Normalize(vmin=lo_b, vmax=hi_b),
+            )
+            sm_src.set_array([])
+            sm_cor = matplotlib.cm.ScalarMappable(
+                cmap=cmap_main,
+                norm=matplotlib.colors.Normalize(vmin=lo_c, vmax=hi_c),
+            )
+            sm_cor.set_array([])
+            cb1 = fig.colorbar(sm_src, ax=ax, shrink=0.38, pad=0.08, aspect=22, location="right")
+            cb1.set_label(r"$\log_{10}\,|b|$", fontsize=10)
+            cb2 = fig.colorbar(sm_cor, ax=ax, shrink=0.38, pad=0.16, aspect=22, location="right")
+            cb2.set_label(r"$\log_{10}\,|M^{-1}b|$", fontsize=10)
+
+        lo, hi = lo_c, hi_c   # used by title / print below
+
+    # ------------------------------------------------------------------ voxels
+    elif mode == "voxels":
+        thresh = float(np.percentile(scalar_main, 100.0 * (1 - 0.45)))
+        visible = scalar_main >= thresh
+        log_s = np.log10(scalar_main[visible] + 1e-30)
+        lo = float(np.percentile(log_s, 2)); hi = float(log_s.max())
+        alpha_lin = np.clip((log_s - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+        if alpha_scurve:
+            a = alpha_lin; alpha_lin = (a * a * (3.0 - 2.0 * a)).astype(np.float32)
+        alpha_vals = np.clip(alpha_lin, 0.0, 1.0) ** max(float(alpha_power), 1e-6)
+        rgba_vis = cmap_main(alpha_lin); rgba_vis[:, 3] = alpha_vals
         vis_grid = np.zeros((W, H, D), dtype=bool)
         color_grid = np.zeros((W, H, D, 4), dtype=np.float32)
         vx_i = px[visible].astype(np.int32, copy=False)
@@ -1546,45 +1621,44 @@ def make_residual_3d(
         vz_i = pz[visible].astype(np.int32, copy=False)
         vis_grid[vx_i, vy_i, vz_i] = True
         color_grid[vx_i, vy_i, vz_i, :] = rgba_vis
-        edge_rgba = np.zeros_like(color_grid)
-        edge_rgba[..., 3] = 0.0
-        ax.voxels(
-            xg, yg, zg,
-            vis_grid,
-            facecolors=color_grid,
-            edgecolors=edge_rgba,
-            linewidth=0.0,
-            shade=False,
-            zorder=1,
-        )
+        edge_rgba = np.zeros_like(color_grid); edge_rgba[..., 3] = 0.0
+        ax.voxels(xg, yg, zg, vis_grid, facecolors=color_grid,
+                  edgecolors=edge_rgba, linewidth=0.0, shade=False, zorder=1)
+
+        if show_colorbar:
+            sm = matplotlib.cm.ScalarMappable(cmap=cmap_main,
+                                               norm=matplotlib.colors.Normalize(vmin=lo, vmax=hi))
+            sm.set_array([])
+            cb = fig.colorbar(sm, ax=ax, shrink=0.65, pad=0.08, aspect=30)
+            cb.set_label(rf"$\log_{{10}}\,|\cdot|$", fontsize=12)
+
+    # ------------------------------------------------------------------ traces
     elif mode == "traces":
-        # 3D line traces from a smoothed residual-derived vector field.
         from scipy import ndimage as _ndi
 
-        r_grid = np.zeros((W, H, D), dtype=np.float32)
+        # Build the scalar grid for tracing (scalar_main) and the seed-source grid.
+        s_grid = np.zeros((W, H, D), dtype=np.float32)
+        src_grid = np.zeros((W, H, D), dtype=np.float32)
         px_i = px.astype(np.int32, copy=False)
         py_i = py.astype(np.int32, copy=False)
         pz_i = pz.astype(np.int32, copy=False)
-        r_grid[px_i, py_i, pz_i] = r_mag.astype(np.float32, copy=False)
+        s_grid[px_i, py_i, pz_i] = scalar_main.astype(np.float32)
+        src_grid[px_i, py_i, pz_i] = seed_source.astype(np.float32)
 
-        log_r_grid = np.log10(np.maximum(r_grid, 1e-30))
-        log_r_s = _ndi.gaussian_filter(log_r_grid, sigma=max(float(trace_sigma), 1e-6))
+        log_s_grid = np.log10(np.maximum(s_grid, 1e-30))
+        log_s_smooth = _ndi.gaussian_filter(log_s_grid, sigma=max(float(trace_sigma), 1e-6))
 
-        gx, gy, gz = np.gradient(log_r_s)
-        # Flow from high residual toward lower residual.
-        vx_f = (-gx).astype(np.float32)
-        vy_f = (-gy).astype(np.float32)
-        vz_f = (-gz).astype(np.float32)
-        nrm_f = np.sqrt(vx_f * vx_f + vy_f * vy_f + vz_f * vz_f) + 1e-12
-        vx_f /= nrm_f
-        vy_f /= nrm_f
-        vz_f /= nrm_f
+        gx, gy, gz = np.gradient(log_s_smooth)
+        # Traces flow *toward* higher scalar (uphill gradient) — from seed toward high-correction.
+        vx_f = gx.astype(np.float32); vy_f = gy.astype(np.float32); vz_f = gz.astype(np.float32)
+        nrm_f = np.sqrt(vx_f**2 + vy_f**2 + vz_f**2) + 1e-12
+        vx_f /= nrm_f; vy_f /= nrm_f; vz_f /= nrm_f
 
-        # Seed from top residual nodes.
+        # Seeds: top percentile of seed_source (interface nodes for correction field).
         seed_q = 97.0
-        seed_pool = np.flatnonzero(r_mag >= float(np.percentile(r_mag, seed_q)))
+        seed_pool = np.flatnonzero(seed_source >= float(np.percentile(seed_source, seed_q)))
         if seed_pool.size == 0:
-            seed_pool = np.arange(r_mag.shape[0], dtype=np.int64)
+            seed_pool = np.arange(seed_source.shape[0], dtype=np.int64)
         if seed_pool.size > int(trace_seeds):
             pick = np.linspace(0, seed_pool.size - 1, num=int(trace_seeds)).round().astype(np.int64)
             seed_idx = seed_pool[pick]
@@ -1597,24 +1671,23 @@ def make_residual_3d(
             x0 = int(np.floor(x)); y0 = int(np.floor(y)); z0 = int(np.floor(z))
             x1 = min(x0 + 1, W - 1); y1 = min(y0 + 1, H - 1); z1 = min(z0 + 1, D - 1)
             tx = float(x - x0); ty = float(y - y0); tz = float(z - z0)
-            c000 = float(F[x0, y0, z0]); c100 = float(F[x1, y0, z0]); c010 = float(F[x0, y1, z0]); c110 = float(F[x1, y1, z0])
-            c001 = float(F[x0, y0, z1]); c101 = float(F[x1, y0, z1]); c011 = float(F[x0, y1, z1]); c111 = float(F[x1, y1, z1])
-            c00 = c000 * (1 - tx) + c100 * tx
-            c10 = c010 * (1 - tx) + c110 * tx
-            c01 = c001 * (1 - tx) + c101 * tx
-            c11 = c011 * (1 - tx) + c111 * tx
-            c0 = c00 * (1 - ty) + c10 * ty
-            c1 = c01 * (1 - ty) + c11 * ty
-            return c0 * (1 - tz) + c1 * tz
+            c000 = float(F[x0, y0, z0]); c100 = float(F[x1, y0, z0])
+            c010 = float(F[x0, y1, z0]); c110 = float(F[x1, y1, z0])
+            c001 = float(F[x0, y0, z1]); c101 = float(F[x1, y0, z1])
+            c011 = float(F[x0, y1, z1]); c111 = float(F[x1, y1, z1])
+            c00 = c000*(1-tx)+c100*tx; c10 = c010*(1-tx)+c110*tx
+            c01 = c001*(1-tx)+c101*tx; c11 = c011*(1-tx)+c111*tx
+            c0 = c00*(1-ty)+c10*ty;    c1 = c01*(1-ty)+c11*ty
+            return c0*(1-tz)+c1*tz
 
         def _sample_vec(x, y, z):
             vx = _sample_scalar(vx_f, x, y, z)
             vy = _sample_scalar(vy_f, x, y, z)
             vz = _sample_scalar(vz_f, x, y, z)
-            nn = (vx * vx + vy * vy + vz * vz) ** 0.5
+            nn = (vx*vx + vy*vy + vz*vz)**0.5
             if nn < 1e-8:
                 return None
-            return (vx / nn, vy / nn, vz / nn)
+            return (vx/nn, vy/nn, vz/nn)
 
         def _trace(seed_x, seed_y, seed_z, sign):
             xs = [float(seed_x)]; ys = [float(seed_y)]; zs = [float(seed_z)]
@@ -1624,18 +1697,19 @@ def make_residual_3d(
                 v = _sample_vec(x, y, z)
                 if v is None:
                     break
-                x += h * v[0]; y += h * v[1]; z += h * v[2]
-                if x < 0 or y < 0 or z < 0 or x > W - 1 or y > H - 1 or z > D - 1:
+                x += h*v[0]; y += h*v[1]; z += h*v[2]
+                if x < 0 or y < 0 or z < 0 or x > W-1 or y > H-1 or z > D-1:
                     break
                 xs.append(x); ys.append(y); zs.append(z)
             return xs, ys, zs
 
-        seed_vals = r_mag[seed_idx]
+        # Colour traces by the *correction* magnitude at the seed.
+        seed_vals = scalar_main[seed_idx]
         s_lo = float(np.percentile(seed_vals, 5.0))
         s_hi = max(float(np.percentile(seed_vals, 99.0)), s_lo + 1e-12)
         s_t = np.clip((seed_vals - s_lo) / (s_hi - s_lo), 0.0, 1.0)
-        seed_cols = cmap(s_t)
-        seed_cols[:, 3] = 0.58
+        seed_cols = cmap_main(s_t)
+        seed_cols[:, 3] = 0.62
 
         for i, si in enumerate(seed_idx):
             sx = float(px[si]); sy = float(py[si]); sz = float(pz[si])
@@ -1643,37 +1717,42 @@ def make_residual_3d(
             xf, yf, zf = _trace(sx, sy, sz, +1.0)
             xb, yb, zb = _trace(sx, sy, sz, -1.0)
             if len(xf) > 1:
-                ax.plot(xf, yf, zf, color=c, linewidth=1.2, alpha=0.55, zorder=2)
+                ax.plot(xf, yf, zf, color=c, linewidth=1.2, alpha=0.58, zorder=2)
             if len(xb) > 1:
-                ax.plot(xb, yb, zb, color=c, linewidth=1.2, alpha=0.55, zorder=2)
+                ax.plot(xb, yb, zb, color=c, linewidth=1.2, alpha=0.58, zorder=2)
             ax.scatter([sx], [sy], [sz], c=[c], s=10.0, linewidths=0, depthshade=False, zorder=3)
 
-    else:
-        # Sort visible nodes back-to-front (approximate depth sort in view direction).
-        vx = px[visible]; vy = py[visible]; vz = pz[visible]
-        va = alpha_vals; vc = rgba_vis
-        # Proxy depth: project onto view vector (elev, azim) for back-to-front ordering.
-        import math as _math
-        el_r = _math.radians(elev); az_r = _math.radians(azim)
-        view_vec = np.array([
-            _math.cos(el_r) * _math.cos(az_r),
-            _math.cos(el_r) * _math.sin(az_r),
-            _math.sin(el_r),
-        ], dtype=np.float32)
-        depth = vx * view_vec[0] + vy * view_vec[1] + vz * view_vec[2]
-        order = np.argsort(depth)   # back → front
-        # Marker size proportional to alpha for extra emphasis on high-residual nodes.
-        sizes = 4.0 + 14.0 * va[order] ** 0.5
-        ax.scatter(
-            vx[order], vy[order], vz[order],
-            c=vc[order],
-            s=sizes,
-            linewidths=0,
-            depthshade=False,
-            zorder=1,
-        )
+        log_s = np.log10(seed_vals + 1e-30)
+        lo = float(log_s.min()); hi = float(log_s.max())
 
-    # Bounding-box wireframe.
+        if show_colorbar:
+            sm = matplotlib.cm.ScalarMappable(cmap=cmap_main,
+                                               norm=matplotlib.colors.Normalize(vmin=lo, vmax=hi))
+            sm.set_array([])
+            cb = fig.colorbar(sm, ax=ax, shrink=0.65, pad=0.08, aspect=30)
+            field_lbl = r"$|M^{-1}b|$" if field_key == "correction" else rf"$|r_{{{k}}}|$"
+            cb.set_label(rf"$\log_{{10}}\,{field_lbl}$", fontsize=12)
+
+    # ------------------------------------------------------------------ scatter (default)
+    else:
+        lo, hi = _scatter3d_field(
+            ax, px, py, pz, scalar_main, cmap_main,
+            top_frac=0.45,
+            alpha_power=float(alpha_power), alpha_scurve=bool(alpha_scurve),
+            elev=elev, azim=azim, size_range=(4.0, 18.0), zorder=1,
+        )
+        n_vis = int((scalar_main >= float(np.percentile(scalar_main, 55.0))).sum())
+        print(f"[residual-3d]   {n_vis}/{viz_n} nodes shown")
+
+        if show_colorbar:
+            sm = matplotlib.cm.ScalarMappable(cmap=cmap_main,
+                                               norm=matplotlib.colors.Normalize(vmin=lo, vmax=hi))
+            sm.set_array([])
+            cb = fig.colorbar(sm, ax=ax, shrink=0.65, pad=0.08, aspect=30)
+            field_lbl = r"$|M^{-1}b|$" if field_key == "correction" else rf"$|r_{{{k}}}|$"
+            cb.set_label(rf"$\log_{{10}}\,{field_lbl}$", fontsize=12)
+
+    # Bounding-box wireframe / axis styling.
     if not clean_view:
         _panel_bbox_lines(ax, W, H, D, color=(0.3, 0.3, 0.3, 0.5), lw=0.6)
         ax.set_xlim(0, W); ax.set_ylim(0, H); ax.set_zlim(0, D)
@@ -1692,28 +1771,31 @@ def make_residual_3d(
     ax.set_facecolor("white")
     fig.patch.set_facecolor("white")
 
-    # Colorbar: maps normalised log10|r_k| → colour.
-    if show_colorbar:
-        sm = matplotlib.cm.ScalarMappable(
-            cmap=cmap,
-            norm=matplotlib.colors.Normalize(vmin=lo, vmax=hi),
-        )
-        sm.set_array([])
-        cb = fig.colorbar(sm, ax=ax, shrink=0.65, pad=0.08, aspect=30)
-        cb.set_label(rf"$\log_{{10}}\,|r_{{{k}}}|$", fontsize=12)
-
     frame_name = Path(frame_dir).name
     if not clean_view:
-        ax.set_title(
-            rf"Residual at $k={k}$ — {frame_name}  ($\rho_H/\rho_L\!\approx\!{info['ratio']:.0f}\times$)",
-            pad=6,
-        )
+        if field_key == "dual":
+            ax.set_title(
+                rf"$|b|$ (blue) vs $|M^{{-1}}b|$ (orange) — {frame_name}"
+                rf"  ($\rho_H/\rho_L\!\approx\!{info['ratio']:.0f}\times$)",
+                pad=6,
+            )
+        elif field_key == "correction":
+            ax.set_title(
+                rf"Preconditioner correction $|M^{{-1}}b|$ — {frame_name}"
+                rf"  ($\rho_H/\rho_L\!\approx\!{info['ratio']:.0f}\times$)",
+                pad=6,
+            )
+        else:
+            ax.set_title(
+                rf"Residual at $k={k}$ — {frame_name}"
+                rf"  ($\rho_H/\rho_L\!\approx\!{info['ratio']:.0f}\times$)",
+                pad=6,
+            )
 
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     print(f"[residual-3d] -> {out_path}")
-    print(f"[residual-3d]   |r_{k}| range: {float(r_mag.min()):.3e} … {float(r_mag.max()):.3e}")
-    print(f"[residual-3d]   shown (top {100*visible_frac:.0f}%): log10 norm [{lo:.2f}, {hi:.2f}]")
+    print(f"[residual-3d]   log10 range [{lo:.2f}, {hi:.2f}]")
 
 
 def make_residual_3d_propagation(
@@ -2459,6 +2541,11 @@ def main():
                    help="Apply smoothstep S-curve before opacity power (default true).")
     p.add_argument("--residual-3d-render", choices=["scatter", "voxels", "traces"], default="scatter",
                    help="Render mode for residuals: scatter points, voxels, or trace lines.")
+    p.add_argument("--residual-3d-field", choices=["residual", "correction", "dual"],
+                   default="residual",
+                   help="Scalar field to visualise: residual=|r_k| (default), "
+                        "correction=|M⁻¹b| (non-local precond response), "
+                        "dual=overlay both with blue/inferno colormaps.")
     p.add_argument("--residual-3d-clean", action="store_true",
                    help="Hide axis, labels, title, and wireframe box for residual-3d export.")
     p.add_argument("--residual-3d-no-colorbar", action="store_true",
@@ -2533,15 +2620,19 @@ def main():
         if not args.residual_3d_frame_dir:
             raise SystemExit("--fig residual-3d requires --residual-3d-frame-dir")
         k = int(args.residual_3d_k)
+        field_arg = str(args.residual_3d_field)
+        # "dual" is a field mode, not a render mode — render_mode is ignored for dual.
+        out_stem = f"residual_3d_{field_arg}_k{k:03d}" if field_arg != "residual" else f"residual_3d_k{k:03d}"
         make_residual_3d(
             args.residual_3d_frame_dir,
-            out_dir / f"residual_3d_k{k:03d}.png",
+            out_dir / f"{out_stem}.png",
             args.ours_weights,
             k=k,
             cmap_name=args.residual_3d_cmap,
             elev=float(args.residual_3d_elev),
             azim=float(args.residual_3d_azim),
             render_mode=str(args.residual_3d_render),
+            field=field_arg,
             clean_view=bool(args.residual_3d_clean),
             show_colorbar=not bool(args.residual_3d_no_colorbar),
             alpha_power=float(args.residual_3d_alpha_power),
