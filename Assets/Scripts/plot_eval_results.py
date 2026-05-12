@@ -235,9 +235,9 @@ def _print_ablation_leaf_data_audit(kept: pd.DataFrame, excluded: pd.DataFrame, 
 def _load_neural_spai_rows(results_dir: pathlib.Path) -> pd.DataFrame:
     """Read Neural SPAI (CUDA) timings from the lsp_scale_infer_summary CSV.
 
-    The neural-SPAI sweep records mean totals only (no per-frame std), so the
-    returned rows fill total_ms_std/iters_std with NaN — the plotting code
-    handles missing std gracefully (no ribbon).
+    Newer summaries include per-scale std columns across frames; when present
+    they are propagated so Neural SPAI receives uncertainty ribbons exactly
+    like the other methods.
     """
     p = results_dir / "lsp_scale_infer_summary.csv"
     if not p.exists():
@@ -248,7 +248,10 @@ def _load_neural_spai_rows(results_dir: pathlib.Path) -> pd.DataFrame:
             ]
         )
     raw = pd.read_csv(p)
-    rows = raw[raw["method"].astype(str) == "Neural+CUDA"].copy()
+    rows = raw[
+        (raw["method"].astype(str) == "Neural+CUDA")
+        & (raw.get("status", pd.Series(index=raw.index, dtype=object)).astype(str) == "ok")
+    ].copy()
     if rows.empty:
         return pd.DataFrame(
             columns=[
@@ -263,9 +266,9 @@ def _load_neural_spai_rows(results_dir: pathlib.Path) -> pd.DataFrame:
             "method": "neural_spai",
             "device": "gpu",
             "total_ms": pd.to_numeric(rows["total_time_ms"], errors="coerce"),
-            "total_ms_std": float("nan"),
+            "total_ms_std": pd.to_numeric(rows.get("total_time_ms_std"), errors="coerce"),
             "iters": pd.to_numeric(rows["iterations"], errors="coerce"),
-            "iters_std": float("nan"),
+            "iters_std": pd.to_numeric(rows.get("iterations_std"), errors="coerce"),
         }
     )
     return out

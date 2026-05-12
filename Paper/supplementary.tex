@@ -83,9 +83,9 @@ hyperparameter configurations (smoother type, coarsening strategy, maximum level
 and verified that none meaningfully reduces total time relative to the default.
 CPU PyAMG uses its default classical AMG cycle. AMGX SPAI is included as the
 sparse-approximate-inverse data point; we keep its vendor defaults because the
-neural SPAI baseline whose public implementation does not currently support our
-problem class (main paper, footnote in \S7.1) would be the natural learned
-comparison, not AMGX SPAI's hand-tuned variants.
+neural SPAI learned baseline is evaluated separately with per-scale retraining
+on the same benchmark distribution; AMGX SPAI here remains the classical
+sparse-approximate-inverse reference rather than a proxy for the learned model.
 
 \paragraph{Convergence criterion.}
 All reported solve times and iteration counts are to a relative residual tolerance
@@ -322,7 +322,7 @@ Unprec.~CG (GPU)             & $497\!\pm\!144$ & $650\!\pm\!240$ & $1153\!\pm\!4
 Jacobi (GPU)                 & $325\!\pm\!83$  & $429\!\pm\!112$ & $839\!\pm\!476$  & $968\!\pm\!261$   & $1543\!\pm\!1137$ \\
 IC / DILU (GPU)              & $11\!\pm\!1$    & $15\!\pm\!1$    & $22\!\pm\!4$     & $30\!\pm\!5$      & $40\!\pm\!4$ \\
 AMG / AMGX (GPU)             & $1\!\pm\!0$     & $1\!\pm\!0$     & $1\!\pm\!1$      & $2\!\pm\!0$       & $3\!\pm\!0$ \\
-Neural SPAI (GPU)~\cite{Yang2025sparse} & $122$           & $170$           & $305$            & $343$             & $495$ \\
+Neural SPAI (GPU)~\cite{Yang2025sparse} & $118\!\pm\!6$   & $167\!\pm\!8$   & $246\!\pm\!41$   & $338\!\pm\!24$    & $496\!\pm\!107$ \\
 IC (CPU)                     & $59\!\pm\!18$   & $96\!\pm\!23$   & $113\!\pm\!31$   & $170\!\pm\!47$    & $254\!\pm\!61$ \\
 AMG (CPU)                    & $5\!\pm\!6$     & $9\!\pm\!6$     & $5\!\pm\!7$      & $7\!\pm\!8$       & $10\!\pm\!8$ \\
 \textbf{Ours (GPU)}          & $\mathbf{47\!\pm\!9}$ & $\mathbf{66\!\pm\!16}$ & $\mathbf{80\!\pm\!24}$ & $\mathbf{168\!\pm\!26}$ & $\mathbf{394\!\pm\!68}$ \\
@@ -333,8 +333,8 @@ AMG (CPU)                    & $5\!\pm\!6$     & $9\!\pm\!6$     & $5\!\pm\!7$  
 \noindent
 The neural SPAI baseline is re-trained per scale (one network per $N$) using
 the SAI loss of~\cite{Yang2025sparse} on the same training distribution as
-ours; the row reports the mean iteration count from a single inference run
-per scale (no across-frame std). CPU AMG and GPU AMGX achieve very low
+ours; the row reports mean$\pm$std across the same per-scale test-frame
+evaluation as the other methods. CPU AMG and GPU AMGX achieve very low
 iteration counts ($\le\!10$) but pay for it in per-iteration V-cycle
 synchronization, putting them above the interactive budget at every scale
 (main paper, Fig.~5). GPU IC/DILU sits at $11$--$40$ iterations, with each
