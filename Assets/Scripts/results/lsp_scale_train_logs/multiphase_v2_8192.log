@@ -9,34 +9,34 @@
 /home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-sparse'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_sparse/_spmm_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
   import torch_geometric.typing
 [rank: 0] Seed set to 42
-2026-05-12 12:34:22.130 | INFO     | __main__:main:37 - Use multidata: False
-2026-05-12 12:34:22.136 | INFO     | neural_cg.data:__init__:375 - Found 100 matrices, 0 lhs, 0 rhs, 0 masks, 0 features
-2026-05-12 12:34:22.181 | INFO     | neural_cg.data:__init__:451 - Fixed Topology, matrix shape=(8192, 8192), nnz=40596
-2026-05-12 12:34:22.182 | INFO     | neural_cg.data:__init__:452 - Dataset folder: generated/multiphase_v2_8192
-Load Folder generated/multiphase_v2_8192:   0%|          | 0/100 [00:00<?, ?it/s]Load Folder generated/multiphase_v2_8192:  52%|█████▏    | 52/100 [00:00<00:00, 518.32it/s]Load Folder generated/multiphase_v2_8192: 100%|██████████| 100/100 [00:00<00:00, 544.05it/s]
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - x: torch.Size([8192, 1])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - edge_index: torch.Size([2, 40596])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - edge_attr: torch.Size([40596, 1])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - mask: torch.Size([8192, 1])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - matrix_values: torch.Size([40596, 1, 1])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - diagonal: torch.Size([8192, 1])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - inv_diag: torch.Size([8192, 1])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - rsqrt_diag: torch.Size([8192, 1])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:463 - residual: torch.Size([8192, 1])
-2026-05-12 12:34:22.447 | INFO     | neural_cg.data:__init__:464 - Loaded 100 samples into memory.
-2026-05-12 12:34:22.447 | INFO     | neural_cg.utils.datamodule:__init__:39 - Splitting dataset into train/val/test with ratios: 0.8, 0.19999999999999996
-2026-05-12 12:34:22.448 | INFO     | __main__:main:49 - Edge input features: 1
-2026-05-12 12:34:22.448 | INFO     | __main__:main:50 - Node input features: 1
-2026-05-12 12:34:22.448 | INFO     | __main__:main:51 - Block size: 1
-2026-05-12 12:34:22.448 | INFO     | __main__:main:54 - Using workspace: simple
-2026-05-12 12:34:22.599 | INFO     | __main__:main:71 - Initialized model.
+2026-05-12 13:29:27.164 | INFO     | __main__:main:37 - Use multidata: False
+2026-05-12 13:29:27.165 | INFO     | neural_cg.data:__init__:375 - Found 100 matrices, 0 lhs, 0 rhs, 0 masks, 0 features
+2026-05-12 13:29:27.177 | INFO     | neural_cg.data:__init__:451 - Fixed Topology, matrix shape=(8192, 8192), nnz=40596
+2026-05-12 13:29:27.177 | INFO     | neural_cg.data:__init__:452 - Dataset folder: generated/multiphase_v2_8192
+Load Folder generated/multiphase_v2_8192:   0%|          | 0/100 [00:00<?, ?it/s]Load Folder generated/multiphase_v2_8192: 100%|██████████| 100/100 [00:00<00:00, 1027.51it/s]
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - x: torch.Size([8192, 1])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - edge_index: torch.Size([2, 40596])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - edge_attr: torch.Size([40596, 1])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - mask: torch.Size([8192, 1])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - matrix_values: torch.Size([40596, 1, 1])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - diagonal: torch.Size([8192, 1])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - inv_diag: torch.Size([8192, 1])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - rsqrt_diag: torch.Size([8192, 1])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:463 - residual: torch.Size([8192, 1])
+2026-05-12 13:29:27.277 | INFO     | neural_cg.data:__init__:464 - Loaded 100 samples into memory.
+2026-05-12 13:29:27.277 | INFO     | neural_cg.utils.datamodule:__init__:39 - Splitting dataset into train/val/test with ratios: 0.8, 0.19999999999999996
+2026-05-12 13:29:27.278 | INFO     | __main__:main:49 - Edge input features: 1
+2026-05-12 13:29:27.278 | INFO     | __main__:main:50 - Node input features: 1
+2026-05-12 13:29:27.278 | INFO     | __main__:main:51 - Block size: 1
+2026-05-12 13:29:27.278 | INFO     | __main__:main:54 - Using workspace: simple
+2026-05-12 13:29:27.386 | INFO     | __main__:main:71 - Initialized model.
 /home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/mlflow/tracking/_tracking_service/utils.py:184: FutureWarning: The filesystem tracking backend (e.g., './mlruns') is deprecated as of February 2026. Consider transitioning to a database backend (e.g., 'sqlite:///mlflow.db') to take advantage of the latest MLflow features. See https://mlflow.org/docs/latest/self-hosting/migrate-from-file-store for migration guidance.
   return FileStore(store_uri, store_uri)
 Trainer already configured with model summary callbacks: [<class 'lightning.pytorch.callbacks.rich_model_summary.RichModelSummary'>]. Skipping setting a default `ModelSummary` callback.
 GPU available: True (cuda), used: True
 TPU available: False, using: 0 TPU cores
 💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
-2026-05-12 12:34:25.353 | INFO     | __main__:main:104 - Dataset Length: 100
+2026-05-12 13:29:28.841 | INFO     | __main__:main:104 - Dataset Length: 100
 LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
 ┏━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
 ┃   ┃ Name                ┃ Type                 ┃ Params ┃ Mode  ┃ FLOPs ┃
@@ -57,7 +57,7 @@ SLURM auto-requeueing enabled. Setting signal handlers.
 /home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/lightning/pytorch/trainer/connectors/data_connector.py:434: The 'train_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=15` in the `DataLoader` to improve performance.
 /home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/lightning/pytorch/loops/fit_loop.py:317: The number of training batches (10) is smaller than the logging interval Trainer(log_every_n_steps=50). Set a lower value for log_every_n_steps if you want to see logs for the training epoch.
 `Trainer.fit` stopped: `max_epochs=500` reached.
-Epoch 499/499 ━━━━━━━━━━━━━━━━ 10/10 0:00:00 •       27.03it/s v_num: 5ad3      
+Epoch 499/499 ━━━━━━━━━━━━━━━━ 10/10 0:00:00 •       26.17it/s v_num: c5a2      
                                      0:00:00                   Train/Loss: 0.073
 LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
 SLURM auto-requeueing enabled. Setting signal handlers.
@@ -65,20 +65,8 @@ SLURM auto-requeueing enabled. Setting signal handlers.
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃        Test metric        ┃       DataLoader 0        ┃
 ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│         Test/Loss         │    0.07221708446741104    │
-│    Test/boo_entry_norm    │    127.67683410644531     │
-│    Test/cpu_ainv_iter     │     399.952392578125      │
-│    Test/cpu_ainv_solve    │    0.06160273030400276    │
-│  Test/cpu_diagonal_iter   │           757.0           │
-│  Test/cpu_diagonal_solve  │    0.04408172890543938    │
-│    Test/cpu_fsai_iter     │     381.5238037109375     │
-│    Test/cpu_fsai_solve    │    0.0549764409661293     │
-│     Test/cpu_ic_iter      │    221.90475463867188     │
-│     Test/cpu_ic_solve     │    0.04074714705348015    │
-│   Test/cpu_neural_iter    │     352.0952453613281     │
-│   Test/cpu_neural_solve   │    0.04922349005937576    │
-│    Test/cpu_none_iter     │     1555.09521484375      │
-│    Test/cpu_none_solve    │    0.08632711321115494    │
-│   Test/time_neural_prec   │   0.0016954779857769608   │
+│         Test/Loss         │    0.07217665016651154    │
+│    Test/boo_entry_norm    │    127.67767333984375     │
+│   Test/time_neural_prec   │   0.001692438148893416    │
 └───────────────────────────┴───────────────────────────┘
-Testing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 20/20 0:00:21 • 0:00:00 0.93it/s 
+Testing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 20/20 0:00:00 • 0:00:00 127.46it/s 

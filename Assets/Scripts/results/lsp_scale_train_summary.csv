@@ -1,2 +1,6 @@
-scale,exp_name,batch_size,loaded_samples,matrix_rows,matrix_cols,matrix_nnz,epoch_done,epoch_max,final_train_loss,elapsed_sec,train_log
-8192,multiphase_v2_8192,8,100,8192,8192,40596,499,499,0.073,319,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_logs/multiphase_v2_8192.log
+scale,exp_name,batch_size,loaded_samples,matrix_rows,matrix_cols,matrix_nnz,epoch_done,epoch_max,final_train_loss,elapsed_sec,train_log,status
+1024,multiphase_v2_1024,16,100,1024,1024,4992,499,499,0.079,60,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_logs/multiphase_v2_1024.log,ok
+2048,multiphase_v2_2048,12,100,2048,2048,10058,499,499,0.075,80,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_logs/multiphase_v2_2048.log,ok
+4096,multiphase_v2_4096,8,100,4096,4096,20224,499,499,0.072,124,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_logs/multiphase_v2_4096.log,ok
+8192,multiphase_v2_8192,8,100,8192,8192,40596,499,499,0.073,219,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_logs/multiphase_v2_8192.log,ok
+16384,multiphase_v2_16384,4,100,16384,16384,81408,499,499,0.07,391,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_logs/multiphase_v2_16384.log,ok

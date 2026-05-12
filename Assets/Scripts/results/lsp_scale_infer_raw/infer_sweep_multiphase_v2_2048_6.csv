@@ -1,0 +1,11 @@
+Key,Total Time (ms),Solve Time (ms),Precond Time (ms),#Iteration
+PCG-none-cpu,7.2231,7.2209,0.0022,487.75
+PCG-none-cuda,65.6623,62.0625,3.5998,480.0
+PCG-diagonal-cpu,7.4665,7.4503,0.0162,432.5
+PCG-diagonal-cuda,49.2158,48.3642,0.8516,441.5
+PCG-ainv-cpu,9.8264,7.3651,2.4613,176.5
+PCG-ainv-cuda,25.0329,22.7349,2.298,176.5
+PCG-ic-cpu,6.697,6.1439,0.5531,119.25
+PCG-ic-cuda,58.1001,37.8636,20.2365,106.0
+Neural,27.0365,6.8001,20.2365,170.0
+Neural+CUDA,41.8057,21.5692,20.2365,170.0

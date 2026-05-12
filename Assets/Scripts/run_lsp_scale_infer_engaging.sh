@@ -155,6 +155,7 @@ PRETRAINED_ESC="${CKPT//=/\\=}"
 echo "Checkpoint: ${CKPT}"
 
 T0="$(date +%s)"
+set +e
 python3.12 -u infer.py \
   exp_name="${EXP_NAME}" \
   "pretrained=${PRETRAINED_ESC}" \
@@ -162,11 +163,69 @@ python3.12 -u infer.py \
   data.is_fixed_topology=true \
   data.has_shared_features=false \
   data.use_node_features=false \
-  out_dir="${RAW_OUT_DIR}" \
-  infer_prefix="sweep_" \
+  "+out_dir=${RAW_OUT_DIR}" \
+  "+infer_prefix=sweep_" \
   2>&1 | tee "${INFER_LOG}"
+INFER_RC=$?
+set -e
 T1="$(date +%s)"
 ELAPSED_SEC="$((T1 - T0))"
+
+if [ "${INFER_RC}" -ne 0 ]; then
+  echo "Inference failed (rc=${INFER_RC}) for ${EXP_NAME}; writing failed task CSV." >&2
+  python3.12 - <<'PY' "${TASK_CSV}" "${SCALE}" "${EXP_NAME}" "${CKPT}" "${INFER_LOG}" "${ELAPSED_SEC}" "${INFER_RC}"
+import csv
+import sys
+from pathlib import Path
+
+task_csv = Path(sys.argv[1])
+scale = int(sys.argv[2])
+exp_name = sys.argv[3]
+ckpt = sys.argv[4]
+infer_log = sys.argv[5]
+elapsed_sec = int(sys.argv[6])
+infer_rc = int(sys.argv[7])
+
+fieldnames = [
+    "scale",
+    "exp_name",
+    "method",
+    "total_time_ms",
+    "solve_time_ms",
+    "precond_time_ms",
+    "iterations",
+    "checkpoint",
+    "elapsed_sec",
+    "infer_csv",
+    "all_infer_csv",
+    "infer_log",
+    "status",
+]
+task_csv.parent.mkdir(parents=True, exist_ok=True)
+with task_csv.open("w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=fieldnames)
+    w.writeheader()
+    w.writerow(
+        {
+            "scale": scale,
+            "exp_name": exp_name,
+            "method": "",
+            "total_time_ms": "",
+            "solve_time_ms": "",
+            "precond_time_ms": "",
+            "iterations": "",
+            "checkpoint": ckpt,
+            "elapsed_sec": elapsed_sec,
+            "infer_csv": "",
+            "all_infer_csv": "",
+            "infer_log": infer_log,
+            "status": f"infer_failed_rc_{infer_rc}",
+        }
+    )
+print(f"[summary] wrote failed row to {task_csv}")
+PY
+  exit 0
+fi
 
 python3.12 - <<'PY' "${RAW_OUT_DIR}" "${TASK_CSV}" "${SCALE}" "${EXP_NAME}" "${CKPT}" "${INFER_LOG}" "${ELAPSED_SEC}"
 import csv

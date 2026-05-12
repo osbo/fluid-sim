@@ -1,0 +1,2 @@
+scale,exp_name,batch_size,loaded_samples,matrix_rows,matrix_cols,matrix_nnz,epoch_done,epoch_max,final_train_loss,elapsed_sec,train_log,status
+2048,multiphase_v2_2048,12,100,2048,2048,10058,499,499,0.075,80,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_logs/multiphase_v2_2048.log,ok

@@ -1,3 +1,10 @@
+================================================================
+Job 13830888, task 2 on node3203
+Started: Tue May 12 13:29:19 EDT 2026
+Scale: 4096
+Batch size: 8
+Repo: /orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU
+================================================================
 /home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
   import pynvml  # type: ignore[import]
 /home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'pyg-lib'. Disabling its usage. Stacktrace: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/libpyg.so)
@@ -71,3 +78,10 @@ SLURM auto-requeueing enabled. Setting signal handlers.
 │   Test/time_neural_prec   │   0.0017595052486285567   │
 └───────────────────────────┴───────────────────────────┘
 Testing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 20/20 0:00:00 • 0:00:00 134.01it/s 
+[summary] wrote /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_task_2.csv
+================================================================
+Finished: Tue May 12 13:31:23 EDT 2026
+Elapsed: 124s
+Train log: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_logs/multiphase_v2_4096.log
+Summary CSV: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_train_task_2.csv
+================================================================

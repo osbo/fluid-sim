@@ -76,6 +76,8 @@ RESULTS_DIR="${FLUID_SIM_ROOT}/Assets/Scripts/results"
 LOG_DIR="${RESULTS_DIR}/lsp_scale_train_logs"
 CSV_OUT="${RESULTS_DIR}/lsp_scale_train_task_${TASK_ID}.csv"
 TRAIN_LOG="${LOG_DIR}/${EXP_NAME}.log"
+SRC_DATA_DIR="${FLUID_SIM_ROOT}/Assets/Scripts/data/${EXP_NAME}"
+GEN_DATA_DIR="${LSP_REPO}/generated/${EXP_NAME}"
 
 mkdir -p "${LOG_DIR}" "${FLUID_SIM_ROOT}/Assets/Scripts/slurm_logs"
 
@@ -93,7 +95,81 @@ echo "================================================================"
 
 cd "${LSP_REPO}"
 
+MAT_COUNT="$(
+python3.12 - <<'PY' "${GEN_DATA_DIR}"
+from pathlib import Path
+import sys
+
+gen_dir = Path(sys.argv[1])
+mat_dir = gen_dir / "mat"
+if mat_dir.exists():
+    print(len(list(mat_dir.glob("*.npy"))))
+else:
+    print(0)
+PY
+)"
+
+if [ "${MAT_COUNT}" -eq 0 ]; then
+  echo "Converted dataset missing for ${EXP_NAME}; generating from ${SRC_DATA_DIR}..."
+  if [ ! -d "${SRC_DATA_DIR}/train" ] || [ ! -d "${SRC_DATA_DIR}/test" ]; then
+    echo "Source dataset missing train/test folders at ${SRC_DATA_DIR}" >&2
+    python3.12 - <<'PY' "${CSV_OUT}" "${SCALE}" "${EXP_NAME}" "${BATCH_SIZE}" "${TRAIN_LOG}"
+import csv
+import sys
+from pathlib import Path
+
+csv_out = Path(sys.argv[1])
+scale = int(sys.argv[2])
+exp_name = sys.argv[3]
+batch_size = int(sys.argv[4])
+train_log = sys.argv[5]
+fieldnames = [
+    "scale",
+    "exp_name",
+    "batch_size",
+    "loaded_samples",
+    "matrix_rows",
+    "matrix_cols",
+    "matrix_nnz",
+    "epoch_done",
+    "epoch_max",
+    "final_train_loss",
+    "elapsed_sec",
+    "train_log",
+    "status",
+]
+csv_out.parent.mkdir(parents=True, exist_ok=True)
+with csv_out.open("w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=fieldnames)
+    w.writeheader()
+    w.writerow(
+        {
+            "scale": scale,
+            "exp_name": exp_name,
+            "batch_size": batch_size,
+            "loaded_samples": "",
+            "matrix_rows": "",
+            "matrix_cols": "",
+            "matrix_nnz": "",
+            "epoch_done": "",
+            "epoch_max": "",
+            "final_train_loss": "",
+            "elapsed_sec": "",
+            "train_log": train_log,
+            "status": "missing_source_data",
+        }
+    )
+print(f"[summary] wrote {csv_out}")
+PY
+    exit 0
+  fi
+  python3.12 "${LSP_REPO}/datagen/multiphase_v2.py" \
+    --src "${SRC_DATA_DIR}" \
+    --exp_name "${EXP_NAME}"
+fi
+
 T0="$(date +%s)"
+set +e
 python3.12 -u train.py \
   exp_name="${EXP_NAME}" \
   data.prefix="generated/${EXP_NAME}" \
@@ -101,12 +177,15 @@ python3.12 -u train.py \
   data.has_shared_features=false \
   data.use_node_features=false \
   data.load_into_memory=true \
+  check_converge=false \
   batch_size="${BATCH_SIZE}" \
   2>&1 | tee "${TRAIN_LOG}"
+TRAIN_RC=$?
+set -e
 T1="$(date +%s)"
 ELAPSED_SEC="$((T1 - T0))"
 
-python3.12 - <<'PY' "${TRAIN_LOG}" "${CSV_OUT}" "${SCALE}" "${EXP_NAME}" "${BATCH_SIZE}" "${ELAPSED_SEC}"
+python3.12 - <<'PY' "${TRAIN_LOG}" "${CSV_OUT}" "${SCALE}" "${EXP_NAME}" "${BATCH_SIZE}" "${ELAPSED_SEC}" "${TRAIN_RC}"
 import csv
 import re
 import sys
@@ -118,6 +197,7 @@ scale = int(sys.argv[3])
 exp_name = sys.argv[4]
 batch_size = int(sys.argv[5])
 elapsed_sec = int(sys.argv[6])
+train_rc = int(sys.argv[7])
 
 text = log_path.read_text(encoding="utf-8", errors="ignore")
 
@@ -157,6 +237,7 @@ fieldnames = [
     "final_train_loss",
     "elapsed_sec",
     "train_log",
+    "status",
 ]
 row = {
     "scale": scale,
@@ -171,6 +252,7 @@ row = {
     "final_train_loss": final_train_loss,
     "elapsed_sec": elapsed_sec,
     "train_log": str(log_path),
+    "status": "ok" if train_rc == 0 else f"train_failed_rc_{train_rc}",
 }
 
 csv_out.parent.mkdir(parents=True, exist_ok=True)
@@ -181,6 +263,11 @@ with csv_out.open("w", newline="", encoding="utf-8") as f:
 
 print(f"[summary] wrote {csv_out}")
 PY
+
+if [ "${TRAIN_RC}" -ne 0 ]; then
+  echo "Training failed for ${EXP_NAME} (rc=${TRAIN_RC}); task CSV recorded failure status." >&2
+  exit 0
+fi
 
 echo "================================================================"
 echo "Finished: $(date)"

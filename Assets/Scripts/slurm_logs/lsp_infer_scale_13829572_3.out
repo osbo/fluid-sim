@@ -1,0 +1,24 @@
+================================================================
+Job 13829572, task 3 on node3407
+Started: Tue May 12 13:09:51 EDT 2026
+Scale: 8192
+Repo: /orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU
+================================================================
+Checkpoint: /orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/mlruns/918585692480090173/620027f08bde43609ab25fa1f0c55ad3/checkpoints/multiphase_v2_8192-simple-epoch=499.ckpt
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'pyg-lib'. Disabling its usage. Stacktrace: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/libpyg.so)
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-scatter'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_scatter/_scatter_cuda.so: undefined symbol: _ZN2at4_ops16div__Tensor_mode4callERNS_6TensorERKS2_St8optionalISt17basic_string_viewIcSt11char_traitsIcEEE
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-spline-conv'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_spline_conv/_basis_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-sparse'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_sparse/_spmm_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+Could not override 'out_dir'.
+To append to your config use +out_dir=/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_infer_raw
+Key 'out_dir' is not in struct
+    full_key: out_dir
+    object_type=dict
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
