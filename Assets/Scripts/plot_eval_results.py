@@ -69,6 +69,10 @@ METHOD_STYLES: dict[tuple[str, str], MethodStyle] = {
     ("ic_amgx", "gpu"): MethodStyle("IC+CUDA", "#00BA38", ":"),
     ("jacobi", "gpu"): MethodStyle("Diag+CUDA", C_RED, "--"),
     ("cg", "gpu"): MethodStyle("None+CUDA", C_PURPLE, "-."),
+    # Neural SPAI baseline (Yang2025sparse, re-trained per scale; CUDA solve path)
+    # is loaded from lsp_scale_infer_summary.csv and injected as a synthetic
+    # (method, device) tuple in _load_neural_spai_rows below.
+    ("neural_spai", "gpu"): MethodStyle("Neural SPAI (GPU)", C_ORANGE, (0, (4, 2))),
     ("leafonly", "gpu"): MethodStyle("Ours", C_BROWN, (0, (2, 1, 1, 1))),
 }
 
@@ -228,6 +232,45 @@ def _print_ablation_leaf_data_audit(kept: pd.DataFrame, excluded: pd.DataFrame, 
         print(kept[present].sort_values(["family", "config", "scale"]).to_string(index=False))
 
 
+def _load_neural_spai_rows(results_dir: pathlib.Path) -> pd.DataFrame:
+    """Read Neural SPAI (CUDA) timings from the lsp_scale_infer_summary CSV.
+
+    The neural-SPAI sweep records mean totals only (no per-frame std), so the
+    returned rows fill total_ms_std/iters_std with NaN — the plotting code
+    handles missing std gracefully (no ribbon).
+    """
+    p = results_dir / "lsp_scale_infer_summary.csv"
+    if not p.exists():
+        return pd.DataFrame(
+            columns=[
+                "scale", "config", "method", "device",
+                "total_ms", "total_ms_std", "iters", "iters_std",
+            ]
+        )
+    raw = pd.read_csv(p)
+    rows = raw[raw["method"].astype(str) == "Neural+CUDA"].copy()
+    if rows.empty:
+        return pd.DataFrame(
+            columns=[
+                "scale", "config", "method", "device",
+                "total_ms", "total_ms_std", "iters", "iters_std",
+            ]
+        )
+    out = pd.DataFrame(
+        {
+            "scale": pd.to_numeric(rows["scale"], errors="coerce"),
+            "config": rows["exp_name"].astype(str).str.replace("multiphase_v2_", "v2_") + "_neural_spai",
+            "method": "neural_spai",
+            "device": "gpu",
+            "total_ms": pd.to_numeric(rows["total_time_ms"], errors="coerce"),
+            "total_ms_std": float("nan"),
+            "iters": pd.to_numeric(rows["iterations"], errors="coerce"),
+            "iters_std": float("nan"),
+        }
+    )
+    return out
+
+
 def _load_results(results_dir: pathlib.Path) -> pd.DataFrame:
     task_files = sorted(results_dir.glob("ablation_sweep_task_*.csv"))
     if task_files:
@@ -339,7 +382,7 @@ def _build_leafonly_ablation_table(df: pd.DataFrame, cfg_map: dict[str, dict]) -
 def _plot_methods_across_scale(df: pd.DataFrame, out_path: pathlib.Path) -> None:
     # Baseline configs for method-vs-scale plot
     baseline = df[
-        df["config"].astype(str).str.contains(r"_d128_L3_hw$")
+        df["config"].astype(str).str.contains(r"_d128_L3_hw$|_neural_spai$")
         & df["scale"].isin([1024, 2048, 4096, 8192, 16384, 32768])
     ].copy()
 
@@ -727,6 +770,9 @@ def main() -> None:
 
     _apply_style()
     df = _load_results(args.results_dir)
+    neural_spai = _load_neural_spai_rows(args.results_dir)
+    if not neural_spai.empty:
+        df = pd.concat([df, neural_spai], ignore_index=True)
     cfg_map = _config_map()
     _plot_methods_across_scale(df, args.out_methods)
     if args.methods_only:
