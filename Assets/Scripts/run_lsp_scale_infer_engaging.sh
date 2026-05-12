@@ -173,7 +173,7 @@ python3.12 -u infer.py \
   data.is_fixed_topology=true \
   data.has_shared_features=false \
   data.use_node_features=false \
-  dataloader=infer \
+  "+dataloader=infer" \
   "+out_dir=${RAW_OUT_DIR}" \
   "+infer_prefix=sweep_" \
   2>&1 | tee "${INFER_LOG}"

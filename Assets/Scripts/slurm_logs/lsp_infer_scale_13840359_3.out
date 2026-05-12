@@ -1,3 +1,10 @@
+================================================================
+Job 13840359, task 3 on node3204
+Started: Tue May 12 15:43:03 EDT 2026
+Scale: 8192
+Repo: /orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU
+================================================================
+Checkpoint: /orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/mlruns/918585692480090173/05fa1ea11409439ea28203a0b841c5a2/checkpoints/multiphase_v2_8192-simple-epoch=499.ckpt
 /home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
   import pynvml  # type: ignore[import]
 /home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'pyg-lib'. Disabling its usage. Stacktrace: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/libpyg.so)
@@ -246,3 +253,10 @@ NeuralPCG+CUDA
 └───────────────┴────────────────┴───────────────┴────────────────┴────────────┘
 2026-05-12 15:43:30.992 | INFO     | __main__:main:397 - Inference statistics saved to /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_infer_raw/infer_sweep_multiphase_v2_8192_6.csv
 2026-05-12 15:43:30.994 | INFO     | __main__:main:402 - All inference statistics saved to /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_infer_raw/all_infer_sweep_multiphase_v2_8192_6.csv
+[summary] wrote /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_infer_task_3.csv
+================================================================
+Finished: Tue May 12 15:43:32 EDT 2026
+Elapsed: 29s
+Infer log: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_infer_logs/multiphase_v2_8192.log
+Task CSV: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_scale_infer_task_3.csv
+================================================================
