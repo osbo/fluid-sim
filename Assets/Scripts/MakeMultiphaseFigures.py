@@ -2,15 +2,21 @@
 
 Subfigures (one per --fig flag, or --fig all):
     hero        — 3-panel strip: density rho, right-hand side b, pressure + velocity quiver.
-    variety     — 4x3 grid sampling topology / contrast / orientation axes, with N, ratio, kappa.
-    convergence — 3×5 grid: top row = density, b, log₁₀|A|, |A⁻¹|, |M| (top-left 256²; |A⁻¹| and |M|
-                  share a single log-magnitude color scale so the learned preconditioner is directly
-                  comparable to the true inverse; dense matrices by default up to very large N—use
-                  --conv-matrix-max-n to cap if needed);
-                  rows 2–3 = ten |r_k| snapshots with one shared log colorbar (PCG is scale-invariant in A, b).
+    variety     — 4x6 grid sampling topology / contrast / orientation axes, with N, ratio, kappa.
+    matrices    — 1×3 three-view: log₁₀|A|, peak-relative log₁₀|A⁻¹|, peak-relative log₁₀|M|
+                  (top-left 256² by default). Companion to the rank-headroom figure;
+                  pinned to the hero frame so the matrix structure corresponds to the initial
+                  problem the reader has already seen.
+    convergence — Two-column-wide multi-method panel on a *different* frame from hero/matrices:
+                  top strip = density rho and RHS b; below, 5 method rows (unpreconditioned,
+                  Jacobi, IC, AMG, ours) × 5 |r_k| snapshots at geometrically-spaced PCG
+                  iterations (log-spaced from 1 to ~0.9*K of each method's own run). All
+                  residual panels share one log colorbar so spatial spread of the error
+                  (information propagation) is directly comparable across methods.
 
-Run on the slurm GPU node so the `fluid` conda env (numpy/scipy/pyamg/matplotlib/torch) is available.
-The convergence figure requires --ours-weights (trained .bytes matching the frame scale).
+Run on the slurm GPU node so the `fluid` conda env (numpy/scipy/pyamg/ilupp/matplotlib/torch)
+is available. matrices and convergence require --ours-weights (trained .bytes matching the
+frame scale).
 
 Usage:
     python3 MakeMultiphaseFigures.py --fig all \
@@ -684,6 +690,124 @@ def _finalize_conv_residual_snaps(snaps: dict[int, np.ndarray], K_final: int, n_
     return {k: snaps[k] for k in chosen}
 
 
+def _select_method_snap_iters(
+    snaps: dict[int, np.ndarray],
+    K_final: int,
+    n_panels: int = 5,
+    *,
+    end_frac: float = 0.9,
+) -> list[int]:
+    """Per-method snap selection: geometric (log-spaced) sampling from iter 1 to ``end_frac*K``.
+
+    Geometric spacing weights the early iterations more heavily — where the residual still
+    carries structure and the per-iteration change is large — while still spanning to a frame
+    near the end. We deliberately stop at ``end_frac*K`` (default 0.9) so the final panel does
+    not show the converged near-zero residual (which is just black). Falls back gracefully when
+    K is small: targets collapse to integers, duplicates are filled from available iterations.
+    Each target is snapped to the closest available recorded iter.
+    """
+    avail = sorted(snaps.keys())
+    if not avail:
+        return []
+    K = max(int(K_final), 1)
+    K_end = max(1, int(round(K * float(end_frac))))
+    if K_end < 2:
+        targets = np.array([1] * n_panels, dtype=np.float64)
+    else:
+        targets = np.geomspace(1.0, float(K_end), num=n_panels)
+    seen: list[int] = []
+    for t in targets:
+        ti = int(round(float(t)))
+        ti = max(1, min(K, ti))
+        if ti not in seen:
+            seen.append(ti)
+    # Fill with whatever's available if geometric collapse left us short (small K).
+    if len(seen) < n_panels:
+        for k in avail:
+            if k not in seen:
+                seen.append(int(k))
+            if len(seen) >= n_panels:
+                break
+    seen = sorted(seen)[:n_panels]
+    # Snap each target to the closest available iter.
+    out: list[int] = []
+    for t in seen:
+        closest = min(avail, key=lambda k: abs(int(k) - int(t)))
+        if int(closest) not in out:
+            out.append(int(closest))
+    if len(out) < n_panels:
+        for k in avail:
+            if int(k) not in out:
+                out.append(int(k))
+            if len(out) >= n_panels:
+                break
+    out = sorted(out)[:n_panels]
+    return out
+
+
+# ============================================================================
+# Baseline preconditioner builders (apply_M : np.ndarray (N,) -> np.ndarray (N,))
+# ============================================================================
+def _build_identity_apply(N):
+    """Unpreconditioned: z = r."""
+    def apply_I(r):
+        return np.asarray(r, dtype=np.float64).ravel().copy()
+    return apply_I
+
+
+def _build_jacobi_apply(A):
+    """Diagonal (Jacobi) preconditioner: z = D^{-1} r."""
+    d = np.asarray(A.diagonal(), dtype=np.float64).ravel()
+    inv = 1.0 / np.maximum(np.abs(d), 1e-30)
+
+    def apply_J(r):
+        return np.asarray(r, dtype=np.float64).ravel() * inv
+    return apply_J
+
+
+def _build_ic_apply(A):
+    """Incomplete-Cholesky-class preconditioner: ``ilupp.IChol0`` if available, else scipy
+    ``spilu`` (ILU(0)-ish) as a fallback. Operates on the (possibly indefinite-on-the-null-space)
+    SPD operator A; constant nullspace is handled implicitly via b having zero mean."""
+    A_csr = A if isinstance(A, sp.csr_matrix) else sp.csr_matrix(A)
+    A_csr.sort_indices()
+    try:
+        import ilupp
+
+        prec = ilupp.IChol0Preconditioner(A_csr.astype(np.float64))
+
+        def apply_ic(r):
+            return (prec @ np.asarray(r, dtype=np.float64).ravel()).astype(np.float64)
+        return apply_ic, "ilupp IChol0"
+    except Exception:
+        pass
+    from scipy.sparse.linalg import spilu
+    lu = spilu(
+        A_csr.astype(np.float64).tocsc(),
+        drop_tol=1e-8,
+        fill_factor=30,
+        permc_spec="COLAMD",
+        diag_pivot_thresh=0.0,
+    )
+
+    def apply_ilu(r):
+        return lu.solve(np.asarray(r, dtype=np.float64).ravel())
+    return apply_ilu, "scipy spilu"
+
+
+def _build_amg_apply(A):
+    """Smoothed-aggregation AMG, single V-cycle as a preconditioner (maxiter=1)."""
+    ml = amg_solver(A)
+    N = A.shape[0]
+
+    def apply_amg(r):
+        r_flat = np.asarray(r, dtype=np.float64).ravel()
+        x0 = np.zeros(N, dtype=np.float64)
+        z = ml.solve(r_flat, x0=x0, maxiter=1, cycle='V', tol=1e-6)
+        return np.asarray(z, dtype=np.float64).ravel()
+    return apply_amg
+
+
 def _shared_log_abs_limits(
     matrices,
     *,
@@ -735,6 +859,10 @@ def _imshow_matrix_log10_abs(
     vmin_log: Optional[float] = None,
     vmax_log: Optional[float] = None,
     subtract_log_max: bool = False,
+    rank_normalize: bool = False,
+    rank_from_nonzero: bool = False,
+    rank_nonzero_color_floor: float = 0.1,
+    cmap: str = "magma",
 ):
     """log₁₀|·| heatmap of the top-left ``crop``×``crop`` block (square aspect).
 
@@ -746,6 +874,22 @@ def _imshow_matrix_log10_abs(
     When ``subtract_log_max`` is True, the displayed values are ``log10(|M| / max|M|)`` instead
     of ``log10|M|`` — this peak-normalizes each matrix so two panels can share a single
     structure-revealing colorbar even when their absolute magnitudes differ by orders.
+
+    When ``rank_normalize`` is True, the displayed value is the per-panel percentile rank of
+    log10|·| computed from the panel's *own* off-diagonal entries (CDF / histogram-equalize
+    tonemap). The mapping is monotonic — entry ordering is preserved — but each panel's
+    contrast is rescaled so two structurally-similar matrices with very different magnitude
+    distributions (e.g. true ``A^{-1}`` clustered in ~0.3 dex, learned ``M`` spread over
+    ~2 dex) render with comparable visual contrast. The shared output range [0, 1] is then
+    interpretable as "fraction of off-diagonal entries with smaller |·|".
+
+    When ``rank_from_nonzero`` is True (only meaningful with ``rank_normalize``), the CDF is
+    built from *nonzero* entries (zeros stay at rank 0 → colormap black) and the nonzero
+    ranks are remapped from ``[0, 1]`` to ``[rank_nonzero_color_floor, 1]`` so the smallest
+    nonzero is visibly off-black instead of indistinguishable from a true zero. Use this for
+    matrices that are sparse in the structural sense (the operator ``A`` itself) so off-
+    diagonal entries get colormap budget instead of being crushed against magma's very dark
+    end.
     """
     M = np.asarray(M, dtype=np.float64)
     c = max(1, min(int(crop), M.shape[0], M.shape[1]))
@@ -753,6 +897,57 @@ def _imshow_matrix_log10_abs(
     logm = np.log10(M_abs + 1e-9)
     if subtract_log_max:
         logm = logm - float(np.log10(max(float(M_abs.max()), 1e-30)))
+
+    if rank_normalize:
+        if rank_from_nonzero:
+            # CDF over nonzero entries only. Zeros (structural sparsity) are marked NaN so the
+            # colormap's set_bad("black") renders them as solid black background — independent
+            # of the colormap's value-0 color (e.g. turbo(0) is dark purple, not black).
+            # Nonzero ranks are remapped to [rank_nonzero_color_floor, 1] so the smallest
+            # nonzero lands in a visibly-saturated region of the colormap (e.g. blue in turbo)
+            # rather than the very-dark low end.
+            nz_mask = M_abs > 0
+            nz_logm = logm[nz_mask]
+            ranks = np.full(logm.shape, np.nan, dtype=np.float64)
+            if nz_logm.size >= 2:
+                ref_sorted = np.sort(nz_logm.ravel())
+                idx = np.searchsorted(ref_sorted, nz_logm, side="right").astype(np.float64)
+                nz_ranks = idx / float(ref_sorted.size)
+                floor = float(rank_nonzero_color_floor)
+                ranks[nz_mask] = floor + (1.0 - floor) * nz_ranks
+        else:
+            # Empirical CDF built from off-diagonal entries (so the dominant diagonal does not
+            # consume rank budget). Monotonic: ordering is preserved, only the spacing changes.
+            if diag_band_exclude_for_scale is not None and int(diag_band_exclude_for_scale) > 0:
+                b = int(diag_band_exclude_for_scale)
+                off = np.abs(np.arange(c, dtype=np.int32)[:, None] - np.arange(c, dtype=np.int32)[None, :]) > b
+                ref = logm[off]
+            else:
+                ref = logm
+            ref_sorted = np.sort(ref.ravel())
+            if ref_sorted.size < 2:
+                ranks = np.zeros_like(logm)
+            else:
+                # searchsorted gives, for every entry, the count of reference values it exceeds;
+                # divide by N to land in [0, 1] (mid-point convention via 'left' + 0.5 / N would
+                # only shift the colorbar by half a bin, not worth it here).
+                idx = np.searchsorted(ref_sorted, logm.ravel(), side="left").astype(np.float64)
+                ranks = (idx / float(ref_sorted.size)).reshape(logm.shape)
+        cmap_obj = matplotlib.colormaps[cmap].copy()
+        cmap_obj.set_bad("black")
+        im = ax.imshow(
+            ranks,
+            cmap=cmap_obj,
+            aspect="equal",
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="nearest",
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(title)
+        return im
+
     if vmin_log is not None and vmax_log is not None:
         lo, hi = float(vmin_log), float(vmax_log)
     elif diag_band_exclude_for_scale is not None and int(diag_band_exclude_for_scale) > 0:
@@ -773,7 +968,7 @@ def _imshow_matrix_log10_abs(
         hi = float(np.max(logm)) + 1e-12
     im = ax.imshow(
         logm,
-        cmap="magma",
+        cmap=cmap,
         aspect="equal",
         vmin=lo,
         vmax=hi,
@@ -901,9 +1096,10 @@ def make_hero(frame_dir, out_path):
     b_masked = np.where(active, b_grid, np.nan)
     P_masked = np.where(active, P, np.nan)
 
-    # Canvas saved at full text-width so the on-page rendering puts text at ~50% the relative
-    # size of the previous half-scale layout (i.e. plot panels twice as large per inch of text).
-    fig, axes = plt.subplots(1, 3, figsize=(11.6, 4.2), constrained_layout=True)
+    # Four panels: density, RHS, pressure (alone), velocity (HSV-encoded RGB). The quiver
+    # overlay was overwhelming the pressure panel, so velocity gets its own picture; direction
+    # is read by hue (color-wheel legend inset) and magnitude by brightness.
+    fig, axes = plt.subplots(1, 4, figsize=(15.0, 4.2), constrained_layout=True)
 
     im0 = imshow_density(
         axes[0], info,
@@ -911,7 +1107,7 @@ def make_hero(frame_dir, out_path):
     )
     fig.colorbar(im0, ax=axes[0], shrink=0.85)
 
-    # Middle panel: buoyancy right-hand side b = -∂ρ/∂y (mean-removed; actually solved for).
+    # Panel 1: buoyancy right-hand side b = -∂ρ/∂y (mean-removed; actually solved for).
     b_abs = max(float(np.percentile(np.abs(b), 99)), 1e-30) if b.size else 1.0
     cmap_b = matplotlib.colormaps["RdBu_r"].copy()
     cmap_b.set_bad(color="lightgray")
@@ -923,6 +1119,7 @@ def make_hero(frame_dir, out_path):
     axes[1].set_title(fr"RHS $b = -\partial_y \rho$")
     fig.colorbar(im1, ax=axes[1], shrink=0.85)
 
+    # Panel 2: pressure on its own (no overlay), shared RdBu_r diverging scale.
     P_abs = max(float(np.percentile(np.abs(p), 99)), 1e-30)
     cmap_p = matplotlib.colormaps["RdBu_r"].copy()
     cmap_p.set_bad(color="lightgray")
@@ -930,32 +1127,65 @@ def make_hero(frame_dir, out_path):
         P_masked, origin="lower", cmap=cmap_p,
         vmin=-P_abs, vmax=P_abs, interpolation="nearest",
     )
-    # Downsample velocity for quiver; skip inactive grid points so we don't draw spurious arrows.
-    H, W = P.shape
-    step = max(1, min(H, W) // 24)
-    ys_q, xs_q = np.mgrid[0:H:step, 0:W:step]
-    q_mask = active[ys_q, xs_q]
-    axes[2].quiver(
-        xs_q[q_mask], ys_q[q_mask],
-        vx[ys_q, xs_q][q_mask], vy[ys_q, xs_q][q_mask],
-        color="black", scale_units="xy", scale=None, width=0.0025, alpha=0.7,
-    )
     axes[2].set_xticks([]); axes[2].set_yticks([])
-    axes[2].set_title(r"Pressure $p$ with velocity")
+    axes[2].set_title(r"Pressure $p$")
     fig.colorbar(im2, ax=axes[2], shrink=0.85)
+
+    # Panel 3: velocity v = -∇p/ρ. Background = |v| on a log colormap (compresses the huge
+    # dynamic range between bulk flow and jet-near-corner peaks, so we don't get the prior
+    # blown-out / pitch-black split). Streamline overlay encodes direction without the visual
+    # noise of a dense quiver. Inactive cells render as 'no data' (gray).
+    mag = np.hypot(vx, vy)
+    mag_masked = np.where(active, mag, np.nan)
+    if active.any():
+        v_hi = float(np.percentile(mag[active], 99.5))
+        v_lo_pos = mag[active & (mag > 0)]
+        v_lo = float(np.percentile(v_lo_pos, 5.0)) if v_lo_pos.size else v_hi * 1e-3
+    else:
+        v_hi = max(float(mag.max()), 1e-30)
+        v_lo = v_hi * 1e-3
+    v_hi = max(v_hi, 1e-30)
+    v_lo = max(min(v_lo, v_hi * 0.5), v_hi * 1e-3)  # at most 3 orders of dynamic range
+    cmap_v = matplotlib.colormaps["viridis"].copy()
+    cmap_v.set_bad(color="lightgray")
+    im3 = axes[3].imshow(
+        mag_masked, origin="lower", cmap=cmap_v,
+        norm=LogNorm(vmin=v_lo, vmax=v_hi), interpolation="nearest",
+    )
+    # Streamline overlay: matplotlib needs a regular Y, X grid and finite vx/vy everywhere.
+    H, W = vx.shape
+    Yg, Xg = np.mgrid[0:H, 0:W]
+    vx_safe = np.where(active, vx, 0.0)
+    vy_safe = np.where(active, vy, 0.0)
+    try:
+        axes[3].streamplot(
+            Xg, Yg, vx_safe, vy_safe,
+            color="white", linewidth=0.7, density=1.4, arrowsize=0.7,
+        )
+    except Exception as e:
+        print(f"  [hero] streamplot failed ({e}); skipping streamlines", file=sys.stderr)
+    axes[3].set_xticks([]); axes[3].set_yticks([])
+    axes[3].set_title(r"Velocity $|v|=|{-}\nabla p/\rho|$")
+    axes[3].set_xlim(-0.5, W - 0.5)
+    axes[3].set_ylim(-0.5, H - 0.5)
+    fig.colorbar(im3, ax=axes[3], shrink=0.85)
 
     # No suptitle: paper.tex caption already gives full context (N, contrast, etc.),
     # and dropping it lets the three panels fill the limited vertical budget.
     _savefig_paper(fig, out_path)
     plt.close(fig)
-    print(f"[hero] -> {out_path}")
+    print(f"[hero] -> {out_path}  (|v| range≈[{v_lo:.3g}, {v_hi:.3g}])")
 
 
 # ============================================================================
 # Figure 2: variety grid (3 rows x 4 cols)
 # ============================================================================
-def make_variety(data_root, out_path, scales=(2048, 4096, 8192), n_cells=12, condnum=True, seed=0):
-    """Sample n_cells frames across topology / contrast axes, both splits, multiple scales."""
+def make_variety(data_root, out_path, scales=(2048, 4096, 8192), n_cells=24, condnum=True, seed=0):
+    """Sample n_cells frames across topology / contrast axes, both splits, multiple scales.
+
+    Default layout is 4 rows × 6 cols (24 cells). For other ``n_cells`` we keep 6 columns and
+    set ``rows = ceil(n_cells / 6)``.
+    """
     _apply_paper_style_compact()
     data_root = Path(data_root)
     candidates = []
@@ -1001,8 +1231,8 @@ def make_variety(data_root, out_path, scales=(2048, 4096, 8192), n_cells=12, con
         else:
             kappas.append(float("nan"))
 
-    rows = 3 if n_cells == 12 else max(1, int(math.ceil(n_cells / 4)))
-    cols = 4
+    cols = 6
+    rows = 4 if n_cells == 24 else max(1, int(math.ceil(n_cells / cols)))
     # Doubled per-panel canvas so on-page text reads ~50% the relative size of the previous
     # half-scale layout (i.e. plot cells twice as large for the same absolute pt fonts).
     fig, axes = plt.subplots(rows, cols, figsize=(3.4 * cols, 3.3 * rows), constrained_layout=True)
@@ -1062,6 +1292,99 @@ def pick_stiff_frame(data_root, scale, n_probe=8, seed=0):
     return best
 
 
+def make_matrices(
+    frame_dir,
+    out_path,
+    ours_weights,
+    *,
+    matrix_max_n: int = 65536,
+    crop: int = 256,
+):
+    """Three-view ``A`` / ``A^{-1}`` / ``M`` heatmap. Companion to fig:rank-headroom.
+
+    Renders the top-left ``crop x crop`` of each matrix at log10 |·|; the inverse and learned M
+    panels share a peak-relative log scale so their off-diagonal multiscale structure can be
+    compared directly. Intended as a single-row figure that sits next to the rank-headroom plot.
+    """
+    _apply_paper_style_compact()
+    if not ours_weights:
+        raise SystemExit(
+            "The matrices figure requires --ours-weights (a trained .bytes checkpoint for this frame scale)."
+        )
+    info = load_frame(frame_dir)
+    print(f"[matrices] frame {frame_dir}  N={info['N']}  ratio={info['ratio']:.1f}x")
+
+    ours = OursPreconditioner(info, ours_weights)
+    viz_n = ours._viz_n
+
+    if viz_n > matrix_max_n:
+        raise SystemExit(
+            f"[matrices] padded n={viz_n} exceeds --matrices-matrix-max-n={matrix_max_n}; "
+            "use a smaller scale or raise the cap."
+        )
+
+    t0 = time.time()
+    A_dense = ours.dense_A_numpy()
+    print(f"[matrices]   dense A in {time.time() - t0:.1f}s")
+    t1 = time.time()
+    A_inv = _dense_inv_numpy_or_torch(A_dense, ours.device)
+    print(f"[matrices]   inv(A) in {time.time() - t1:.1f}s")
+    t2 = time.time()
+    M_dense = ours.assembled_dense_M_numpy()
+    print(f"[matrices]   assembled M in {time.time() - t2:.1f}s")
+
+    mc = min(int(crop), viz_n)
+    band_m = max(8, mc // 8)
+
+    fig = plt.figure(figsize=(11.5, 4.0), constrained_layout=True)
+    axes = [fig.add_subplot(1, 3, j + 1) for j in range(3)]
+
+    # A: pure binary sparsity pattern (nonzero → white, zero → black). The interesting
+    # story for A is the 5-point Laplacian stencil shape, not the coefficient magnitudes,
+    # so we deliberately discard all numerical info and show only "is this entry nonzero".
+    A_binary = (np.abs(np.asarray(A_dense)[:mc, :mc]) > 0).astype(np.float64)
+    im_a = axes[0].imshow(
+        A_binary,
+        cmap="gray",
+        aspect="equal",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+    )
+    axes[0].set_xticks([])
+    axes[0].set_yticks([])
+    axes[0].set_title(rf"$A$ (sparsity pattern)" + "\n" + rf"top-left ${mc}\times{mc}$")
+    axes[0].set_box_aspect(1)
+
+    im_ai = _imshow_matrix_log10_abs(
+        axes[1],
+        A_inv,
+        rf"$A^{{-1}}$ (rank-normalized)" + "\n" + rf"top-left ${mc}\times{mc}$",
+        crop=mc,
+        diag_band_exclude_for_scale=band_m,
+        rank_normalize=True,
+    )
+    axes[1].set_box_aspect(1)
+    im_m = _imshow_matrix_log10_abs(
+        axes[2],
+        M_dense,
+        rf"Learned $M$ (rank-normalized)" + "\n" + rf"top-left ${mc}\times{mc}$",
+        crop=mc,
+        diag_band_exclude_for_scale=band_m,
+        rank_normalize=True,
+    )
+    axes[2].set_box_aspect(1)
+
+    # Single shared colorbar for the two rank-normalized panels (both are on [0, 1]).
+    cb_rn = fig.colorbar(im_m, ax=[axes[1], axes[2]], shrink=0.85, pad=0.02)
+    cb_rn.ax.tick_params(labelsize=10)
+    cb_rn.set_label(r"off-diagonal rank of $\log_{10}|\cdot|$", fontsize=11)
+
+    _savefig_paper(fig, out_path)
+    plt.close(fig)
+    print(f"[matrices] -> {out_path}")
+
+
 def make_convergence(
     data_root,
     scale,
@@ -1071,11 +1394,16 @@ def make_convergence(
     seed=0,
     override_frame=None,
     rtol=1e-8,
-    max_iter=10000,
-    max_snapshots=36,
-    snap_iters_explicit: Optional[list[int]] = None,
-    matrix_max_n: int = 65536,
+    max_iter=5000,
 ):
+    """Multi-method convergence figure. Two-column-wide; top row is rho + b (the *problem*),
+    then five method rows each showing five |r_k| snapshots taken at geometrically-spaced
+    iterations (log-spaced from 1 to ~0.9*K) of *that method's* own PCG run. Early iterations
+    get more representation (where structure is richest); the last panel pulls back from K so
+    it does not just render as black. Methods (top → bottom): unpreconditioned, Jacobi, IC,
+    AMG, ours. A single global log colorbar spans all residual panels so spatial spread of
+    error (impulse propagation) is comparable across methods.
+    """
     _apply_paper_style_compact()
     if not ours_weights:
         raise SystemExit(
@@ -1092,72 +1420,121 @@ def make_convergence(
     A = info["A"]
     b = buoyancy_rhs(info)
 
+    # Build every preconditioner up front (so a setup failure aborts before any solve).
+    print(f"[conv] building baselines: identity / Jacobi / IC / AMG …")
+    apply_identity = _build_identity_apply(info["N"])
+    apply_jacobi = _build_jacobi_apply(A)
+    apply_ic, ic_backend = _build_ic_apply(A)
+    print(f"[conv]   IC backend: {ic_backend}")
+    apply_amg_fn = _build_amg_apply(A)
+
     print(f"[conv] loading preconditioner weights {ours_weights}")
     ours = OursPreconditioner(info, ours_weights)
     viz_n = ours._viz_n
     if info["N"] != viz_n:
         print(
             f"[conv] note: frame N={info['N']} vs padded operator n={viz_n} "
-            "(matrix row uses padded graph; PCG uses physical A).",
+            "(PCG runs on physical A; ours uses the padded preconditioner).",
             file=sys.stderr,
         )
 
-    print(f"[conv] running preconditioned CG (full log below)")
-    snaps, meta = pcg_preconditioned_full(
-        A,
-        b,
-        ours.apply_M,
-        rtol=rtol,
-        max_iter=max_iter,
-        snap_iters_explicit=snap_iters_explicit,
-        max_snapshots=max_snapshots,
-    )
-    K_final = int(meta["iters"])
-    if snap_iters_explicit is None:
-        snaps = _finalize_conv_residual_snaps(snaps, K_final, _CONV_RESIDUAL_GRID_SLOTS)
-    else:
-        keys_e = sorted(snaps.keys())
-        if len(keys_e) > _CONV_RESIDUAL_GRID_SLOTS:
-            snaps = {k: snaps[k] for k in _subsample_sorted(keys_e, _CONV_RESIDUAL_GRID_SLOTS)}
-    print(
-        f"[conv] PCG summary: iters={meta['iters']}  converged={meta['converged']}  "
-        f"final rel={meta['final_rel']:.6e}"
-    )
+    # Methods listed top → bottom. Display labels match the paper text.
+    methods = [
+        ("Unpreconditioned", apply_identity),
+        ("Jacobi", apply_jacobi),
+        ("IC", apply_ic),
+        ("AMG", apply_amg_fn),
+        ("Ours", ours.apply_M),
+    ]
+    n_methods = len(methods)
+    n_panels_per_method = 5
 
-    keys = sorted(snaps.keys())
-    n_resid = len(keys)
-    if n_resid < 1:
-        raise RuntimeError("no residual snapshots to plot")
+    # Per-method PCG runs. We keep a generous candidate list during the solve, then prune to
+    # the (1, 2, 3, mid, near-end) selection after we know each method's own K.
+    snap_candidates_long = tuple(sorted(set(_PCG_SNAP_CANDIDATES + tuple(range(1, 32)))))
+    method_runs = []  # list of dicts: name, snaps (dict iter→r), K, iters_chosen, converged, final_rel
+    for (name, apply_M) in methods:
+        print(f"[conv] PCG running: method='{name}' (max_iter={max_iter}, rtol={rtol:g})")
+        snaps_full, meta = pcg_preconditioned_full(
+            A,
+            b,
+            apply_M,
+            rtol=rtol,
+            max_iter=max_iter,
+            snap_candidates=snap_candidates_long,
+            snap_iters_explicit=None,
+            max_snapshots=10_000,  # don't prune yet; we'll pick exactly 5 after.
+        )
+        K = int(meta["iters"])
+        chosen = _select_method_snap_iters(snaps_full, K, n_panels=n_panels_per_method)
+        snaps_chosen = {k: snaps_full[k] for k in chosen}
+        method_runs.append({
+            "name": name,
+            "K": K,
+            "converged": bool(meta["converged"]),
+            "final_rel": float(meta["final_rel"]),
+            "iters_chosen": chosen,
+            "snaps": snaps_chosen,
+        })
+        print(
+            f"[conv]   '{name}': K={K} converged={meta['converged']} "
+            f"final_rel={meta['final_rel']:.2e}  snap iters={chosen}"
+        )
 
-    # Nested layout: 3×5 heatmaps + dedicated colorbar column. Doubled canvas vs the
-    # earlier half-scale layout — per-panel labels and the suptitle render at ~50% the
-    # previous relative size, giving plot cells twice the area per inch of text. Absolute
-    # font knobs (in points) are kept the same as the half-scale version.
+    # Shared log color scale across every residual panel (so the spatial extent of the error
+    # is directly comparable). Pool all snapshot magnitudes, exclude exact zeros.
+    all_pos = []
+    for run in method_runs:
+        for r in run["snaps"].values():
+            v = np.abs(gridify(r, info)).ravel()
+            v = v[v > 0]
+            if v.size:
+                all_pos.append(v)
+    if not all_pos:
+        raise RuntimeError("no residual snapshot values to plot")
+    cat = np.concatenate(all_pos)
+    r_vmax = float(np.percentile(cat, 99.5))
+    r_vmin = max(float(np.percentile(cat, 0.5)), r_vmax * 1e-8)
+
+    # Layout: 2-column-wide figure. Top strip = (rho, b) only. Below = n_methods × n_panels.
+    # Heights: 1 unit for top strip, 1 unit each for method rows.
     _t_top = 13.5
-    _t_res = 12.5
+    _t_res = 12.0
+    _t_meth = 14.0
     _t_cbar = 11.5
     _t_cbar_lab = 13.0
-    fig = plt.figure(figsize=(14.2, 7.9), constrained_layout=True)
-    outer = GridSpec(1, 2, figure=fig, width_ratios=(1.0, 0.032), wspace=0.011)
-    inner = GridSpecFromSubplotSpec(3, 5, outer[0, 0], wspace=0.011, hspace=0.038)
-    ax_top = [fig.add_subplot(inner[0, j]) for j in range(5)]
-    ax_mid = [fig.add_subplot(inner[1, j]) for j in range(5)]
-    ax_bot = [fig.add_subplot(inner[2, j]) for j in range(5)]
-    cax = fig.add_subplot(outer[0, 1])
-    # No suptitle anymore (info is in the paper.tex caption); use the full canvas height.
 
-    # --- Top row: frame, b, A, A^-1, M ---
-    im_rho = imshow_density(
-        ax_top[0],
+    cell_in = 2.4  # roughly per-panel size in inches; figure is much bigger than before
+    fig_w = cell_in * n_panels_per_method + 1.2  # + colorbar gutter
+    fig_h = cell_in * (1 + n_methods) + 0.9
+    fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=True)
+
+    outer = GridSpec(2, 2, figure=fig,
+                     height_ratios=(1.0, float(n_methods)),
+                     width_ratios=(1.0, 0.025),
+                     hspace=0.05, wspace=0.012)
+
+    # --- Top strip: rho on the left half, b on the right half ---
+    top_inner = GridSpecFromSubplotSpec(1, n_panels_per_method, outer[0, 0], wspace=0.04)
+    # Place rho and b in the middle three slots so they aren't squashed: rho at col 1, b at col 3.
+    ax_rho = fig.add_subplot(top_inner[0, 1])
+    ax_b = fig.add_subplot(top_inner[0, 3])
+    # Spacer axes (blank) to keep the visual rhythm with the residual grid below.
+    for j in (0, 2, 4):
+        ax_blank = fig.add_subplot(top_inner[0, j])
+        ax_blank.axis("off")
+
+    imshow_density(
+        ax_rho,
         info,
-        title=rf"Density $\rho$" + "\n" + rf"($N\!=\!{info['N']}$)",
+        title=rf"Density $\rho$  ($N\!=\!{info['N']}$)",
     )
-    ax_top[0].set_box_aspect(1)
+    ax_rho.set_box_aspect(1)
 
     b_grid = gridify(b, info)
     b_abs = float(np.percentile(np.abs(b_grid), 99.0))
     b_abs = max(b_abs, 1e-30)
-    imb = ax_top[1].imshow(
+    ax_b.imshow(
         b_grid,
         origin="lower",
         cmap="RdBu_r",
@@ -1166,122 +1543,60 @@ def make_convergence(
         interpolation="nearest",
         aspect="equal",
     )
-    ax_top[1].set_xticks([])
-    ax_top[1].set_yticks([])
-    ax_top[1].set_title(r"Input $b$" + "\n" + r"(RHS)", fontsize=_t_top)
-    ax_top[1].set_box_aspect(1)
-
-    im_a = im_ai = im_m = None
-    if viz_n <= matrix_max_n:
-        print(f"[conv] dense matrix panels (n={viz_n} ≤ {matrix_max_n}) …")
-        t0 = time.time()
-        A_dense = ours.dense_A_numpy()
-        mc = min(256, viz_n)
-        im_a = _imshow_matrix_log10_abs(
-            ax_top[2],
-            A_dense,
-            rf"$A$ (log$_{{10}}$|·|)" + "\n" + rf"top-left ${mc}\times{mc}$",
-            crop=mc,
-        )
-        ax_top[2].set_box_aspect(1)
-        A_inv = _dense_inv_numpy_or_torch(A_dense, ours.device)
-        print(f"[conv]   inv(A) in {time.time() - t0:.1f}s")
-        t1 = time.time()
-        M_dense = ours.assembled_dense_M_numpy()
-        print(f"[conv]   assembled M in {time.time() - t1:.1f}s")
-        # Same scaling recipe for A^-1 and M: peak-normalize each by its own max (so both
-        # peak at 0 in log space), then percentile-clip with diagonal-band exclusion. A^-1
-        # spans ~1–2 orders of magnitude (slowly-decaying Green's function) while M spans
-        # ~7 (block-sparse with near-zero off-blocks). A literal shared (vmin, vmax) is
-        # incompatible — one always blows out — so we apply identical normalization +
-        # percentile logic to each and let each panel render its full structure. Colors map
-        # consistently as "peak-relative magnitude" within each panel.
-        band_m = max(8, mc // 8)
-        im_ai = _imshow_matrix_log10_abs(
-            ax_top[3],
-            A_inv,
-            rf"$A^{{-1}}$  (log$_{{10}}\,|\cdot|/\max$)" + "\n" + rf"top-left ${mc}\times{mc}$",
-            crop=mc,
-            vmin_pct=0.5,
-            vmax_pct=99.8,
-            diag_band_exclude_for_scale=band_m,
-            subtract_log_max=True,
-        )
-        ax_top[3].set_box_aspect(1)
-        im_m = _imshow_matrix_log10_abs(
-            ax_top[4],
-            M_dense,
-            rf"Learned $M$  (log$_{{10}}\,|\cdot|/\max$)" + "\n" + rf"top-left ${mc}\times{mc}$",
-            crop=mc,
-            vmin_pct=0.5,
-            vmax_pct=99.8,
-            diag_band_exclude_for_scale=band_m,
-            subtract_log_max=True,
-        )
-        ax_top[4].set_box_aspect(1)
-    else:
-        msg = (
-            f"Dense $A$, $A^{{-1}}$, $M$ heatmaps skipped:\n"
-            f"padded $n={viz_n} >$ --conv-matrix-max-n={matrix_max_n}$.\n"
-            "Use a smaller --conv-scale for these panels."
-        )
-        for j in range(2, 5):
-            ax_top[j].axis("off")
-            ax_top[j].text(
-                0.5, 0.5, msg, ha="center", va="center",
-                fontsize=_t_res, transform=ax_top[j].transAxes,
-            )
-
-    for ax in ax_top:
+    ax_b.set_xticks([])
+    ax_b.set_yticks([])
+    ax_b.set_title(r"Input $b$  (RHS)")
+    ax_b.set_box_aspect(1)
+    for ax in (ax_rho, ax_b):
         ttl = ax.title
         if ttl.get_text():
             ttl.set_fontsize(_t_top)
             ttl.set_linespacing(0.92)
 
-    # --- Rows 2–3: |r_k| on shared log scale ---
-    all_pos = []
-    for r in snaps.values():
-        v = np.abs(gridify(r, info)).ravel()
-        v = v[v > 0]
-        if v.size:
-            all_pos.append(v)
-    if not all_pos:
-        raise RuntimeError("no residual snapshot values to plot")
-    cat = np.concatenate(all_pos)
-    r_vmax = float(np.percentile(cat, 99.5))
-    r_vmin = max(float(np.percentile(cat, 0.5)), r_vmax * 1e-8)
+    # --- Method grid: n_methods rows × n_panels_per_method cols ---
+    grid = GridSpecFromSubplotSpec(
+        n_methods, n_panels_per_method, outer[1, 0], wspace=0.04, hspace=0.10,
+    )
+    cax = fig.add_subplot(outer[:, 1])
 
-    resid_axes = ax_mid + ax_bot
     im_last = None
-    for idx, k in enumerate(keys):
-        if idx >= len(resid_axes):
-            break
-        ax = resid_axes[idx]
-        r_grid = np.abs(gridify(snaps[k], info)) + 1e-30
-        im_last = ax.imshow(
-            r_grid,
-            origin="lower",
-            cmap=RESIDUAL_CMAP,
-            norm=LogNorm(vmin=r_vmin, vmax=r_vmax),
-            interpolation="nearest",
-            aspect="equal",
-        )
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_title(fr"$|r_k|$, $k={k}$", fontsize=_t_res)
-        ax.set_box_aspect(1)
-    for idx in range(n_resid, len(resid_axes)):
-        resid_axes[idx].axis("off")
-
-    # No colorbars on the top row: magnitudes are qualitative here, and PCG iterates are
-    # invariant to diagonal scaling of (A, b); only the residual row needs a shared scale.
+    for mi, run in enumerate(method_runs):
+        keys = run["iters_chosen"]
+        for j in range(n_panels_per_method):
+            ax = fig.add_subplot(grid[mi, j])
+            if j < len(keys):
+                k = keys[j]
+                r_grid = np.abs(gridify(run["snaps"][k], info)) + 1e-30
+                im_last = ax.imshow(
+                    r_grid,
+                    origin="lower",
+                    cmap=RESIDUAL_CMAP,
+                    norm=LogNorm(vmin=r_vmin, vmax=r_vmax),
+                    interpolation="nearest",
+                    aspect="equal",
+                )
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_title(fr"$k={k}$", fontsize=_t_res)
+            else:
+                ax.axis("off")
+            ax.set_box_aspect(1)
+            # Row label: method name + total iteration count, on the leftmost panel.
+            if j == 0:
+                K = run["K"]
+                conv = "" if run["converged"] else r" (no conv.)"
+                ax.set_ylabel(
+                    f"{run['name']}\n$K\\!=\\!{K}${conv}",
+                    fontsize=_t_meth,
+                    rotation=90,
+                    labelpad=8,
+                )
 
     if im_last is not None:
         cb = fig.colorbar(im_last, cax=cax)
         cb.ax.tick_params(labelsize=_t_cbar)
         cb.set_label(r"$|r_k|$", fontsize=_t_cbar_lab)
 
-    # Suptitle dropped: N, contrast, and kappa are already in the paper.tex caption.
     _savefig_paper(fig, out_path)
     plt.close(fig)
     print(f"[conv] -> {out_path}")
@@ -1305,53 +1620,61 @@ def _resolve_frame(data_root, scale, split, frame_idx):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--fig", choices=["hero", "variety", "convergence", "all"],
+    p.add_argument("--fig", choices=["hero", "variety", "matrices", "convergence", "all"],
                    default="all")
     p.add_argument("--data-root", default=str(_default_data_root()),
                    help="Root containing multiphase_v2_<N>/ subfolders.")
     p.add_argument("--out-dir", default=str(SCRIPTS_DIR.parent.parent / "Paper" / "figures"))
 
-    # Hero (defaults match the convergence frame so both figures show the same system).
-    p.add_argument("--hero-scale", type=int, default=8192)
+    # Hero (defaults match the matrices/initial-problem frame so both figures show the same system).
+    p.add_argument("--hero-scale", type=int, default=16384)
     p.add_argument("--hero-split", choices=["train", "test"], default="train")
     p.add_argument("--hero-frame", type=int, default=73)
 
     # Variety
     p.add_argument("--variety-scales", type=int, nargs="+",
                    default=[2048, 4096, 8192])
-    p.add_argument("--variety-cells", type=int, default=12)
+    p.add_argument("--variety-cells", type=int, default=24)
     p.add_argument("--variety-no-condnum", action="store_true")
     p.add_argument("--variety-seed", type=int, default=0)
 
-    # Convergence — defaults pin to the same frame as the hero figure.
-    p.add_argument("--conv-scale", type=int, default=8192,
-                   help="multiphase_v2_<N> frame scale for the convergence figure (default 8192).")
-    p.add_argument("--conv-split", choices=["train", "test"], default="train",
-                   help="Dataset split for the convergence frame (default: train; mirrors --hero-split).")
-    p.add_argument("--conv-frame", type=int, default=73,
-                   help="Frame index within the split (default 73; mirrors --hero-frame). "
-                        "Set to -1 to fall back to pick_stiff_frame(--conv-seed).")
+    # Matrices (A, A^{-1}, M three-view; pinned to the hero frame so the matrix structure
+    # corresponds to the initial problem the reader has already seen).
+    p.add_argument("--matrices-scale", type=int, default=16384)
+    p.add_argument("--matrices-split", choices=["train", "test"], default="train")
+    p.add_argument("--matrices-frame", type=int, default=73)
+    p.add_argument("--matrices-frame-dir", default=None,
+                   help="Explicit frame directory; overrides --matrices-scale/--matrices-split/--matrices-frame.")
+    p.add_argument("--matrices-crop", type=int, default=256,
+                   help="Top-left crop size for each matrix panel (default 256).")
+    p.add_argument("--matrices-matrix-max-n", type=int, default=65536,
+                   help="Refuse to assemble dense matrices when padded n exceeds this.")
+
+    # Convergence — deliberately picks a *different* frame than the matrices/hero so the
+    # multi-method residual story is on a fresh problem (one where multiscale information
+    # propagation is visually pronounced). Override via --conv-frame / --conv-frame-dir.
+    p.add_argument("--conv-scale", type=int, default=16384,
+                   help="multiphase_v2_<N> frame scale for the convergence figure (default 16384).")
+    p.add_argument("--conv-split", choices=["train", "test"], default="train")
+    p.add_argument("--conv-frame", type=int, default=42,
+                   help="Frame index within the split (default 42; deliberately differs from "
+                        "the hero/matrices frame). Set to -1 to fall back to pick_stiff_frame(--conv-seed).")
     p.add_argument("--conv-seed", type=int, default=0,
                    help="Only used when --conv-frame=-1 (pick_stiff_frame).")
     p.add_argument("--conv-frame-dir", default=None,
                    help="Explicit frame directory; overrides --conv-scale/--conv-split/--conv-frame.")
     p.add_argument("--conv-rtol", type=float, default=1e-8,
                    help="PCG stopping tolerance on ||r||_2 / ||b||_2.")
-    p.add_argument("--conv-max-iter", type=int, default=10000)
-    p.add_argument("--conv-max-snap-panels", type=int, default=36,
-                   help="Max distinct PCG iterations to retain as residual snapshots during the solve (then 10 are chosen for the 2×5 grid).")
-    p.add_argument("--conv-snap-iters", type=int, nargs="*", default=None,
-                   help="Optional explicit PCG iterations to plot; default uses an automatic snapshot grid.")
-    p.add_argument("--conv-matrix-max-n", type=int, default=65536,
-                   help="Skip dense A / A⁻¹ / M heatmaps when padded n exceeds this (default includes N=8192; lower to save time/RAM).")
+    p.add_argument("--conv-max-iter", type=int, default=5000,
+                   help="Per-method max PCG iterations (unpreconditioned/Jacobi can be slow on stiff frames).")
     p.add_argument("--ours-weights", default=None,
-                   help="Required for convergence: trained preconditioner .bytes matching the frame scale.")
+                   help="Required for matrices/convergence: trained preconditioner .bytes matching the frame scale.")
 
     args = p.parse_args()
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    figs = {args.fig} if args.fig != "all" else {"hero", "variety", "convergence"}
+    figs = {args.fig} if args.fig != "all" else {"hero", "variety", "matrices", "convergence"}
 
     if "hero" in figs:
         fr = _resolve_frame(args.data_root, args.hero_scale, args.hero_split, args.hero_frame)
@@ -1367,13 +1690,21 @@ def main():
             seed=args.variety_seed,
         )
 
+    if "matrices" in figs:
+        mat_frame = args.matrices_frame_dir
+        if mat_frame is None:
+            mat_frame = str(_resolve_frame(args.data_root, args.matrices_scale, args.matrices_split, args.matrices_frame))
+        make_matrices(
+            mat_frame,
+            out_dir / "multiphase_matrices.png",
+            args.ours_weights,
+            matrix_max_n=args.matrices_matrix_max_n,
+            crop=args.matrices_crop,
+        )
+
     if "convergence" in figs:
-        snap_explicit = args.conv_snap_iters
-        if snap_explicit is not None and len(snap_explicit) == 0:
-            snap_explicit = None
         # Resolution priority: explicit --conv-frame-dir > deterministic split/frame index >
-        # pick_stiff_frame (--conv-frame=-1). The default (frame 51 at train/8192) mirrors hero so
-        # both figures show the same Poisson system.
+        # pick_stiff_frame (--conv-frame=-1).
         conv_override = args.conv_frame_dir
         if conv_override is None and args.conv_frame is not None and args.conv_frame >= 0:
             conv_override = str(_resolve_frame(args.data_root, args.conv_scale, args.conv_split, args.conv_frame))
@@ -1386,9 +1717,6 @@ def main():
             override_frame=conv_override,
             rtol=args.conv_rtol,
             max_iter=args.conv_max_iter,
-            max_snapshots=args.conv_max_snap_panels,
-            snap_iters_explicit=snap_explicit,
-            matrix_max_n=args.conv_matrix_max_n,
         )
 
 
