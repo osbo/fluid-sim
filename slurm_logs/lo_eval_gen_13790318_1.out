@@ -1,0 +1,50 @@
+================================================================
+Job 13790318, task 1 on node3504
+Started: Tue May 12 00:51:47 EDT 2026
+================================================================
+Task 1: g4096_topo_no_closed_d128_L3_hw -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/generalization_sweep_task_001.csv
+
+[1/1] g4096_topo_no_closed_d128_L3_hw
+  cell=g4096_eval_id frames=100
+    [1/100] frame 0 -> LeafOnly 90 iters, total=9.20 ms
+    [2/100] frame 1 -> LeafOnly 63 iters, total=7.12 ms
+    [3/100] frame 2 -> LeafOnly 78 iters, total=8.29 ms
+    [4/100] frame 3 -> LeafOnly 72 iters, total=7.73 ms
+    [5/100] frame 4 -> LeafOnly 48 iters, total=5.94 ms
+    [6/100] frame 5 -> LeafOnly 96 iters, total=9.69 ms
+    [7/100] frame 6 -> LeafOnly 72 iters, total=7.80 ms
+    [8/100] frame 7 -> LeafOnly 84 iters, total=8.72 ms
+    [9/100] frame 8 -> LeafOnly 51 iters, total=6.14 ms
+    [10/100] frame 9 -> LeafOnly 96 iters, total=9.65 ms
+    [11/100] frame 10 -> LeafOnly 87 iters, total=8.99 ms
+    [12/100] frame 11 -> LeafOnly 57 iters, total=6.62 ms
+    [13/100] frame 12 -> LeafOnly 72 iters, total=7.77 ms
+    [14/100] frame 13 -> LeafOnly 87 iters, total=8.94 ms
+    [15/100] frame 14 -> LeafOnly 144 iters, total=13.41 ms
+    [16/100] frame 15 -> LeafOnly 66 iters, total=7.38 ms
+    [17/100] frame 16 -> LeafOnly 54 iters, total=6.39 ms
+    [18/100] frame 17 -> LeafOnly 87 iters, total=8.93 ms
+    [19/100] frame 18 -> LeafOnly 57 iters, total=6.72 ms
+    [20/100] frame 19 -> LeafOnly 81 iters, total=8.50 ms
+    [21/100] frame 20 -> LeafOnly 69 iters, total=7.49 ms
+    [22/100] frame 21 -> LeafOnly 51 iters, total=6.17 ms
+    [23/100] frame 22 -> LeafOnly 51 iters, total=6.17 ms
+    [24/100] frame 23 -> LeafOnly 75 iters, total=8.10 ms
+    [25/100] frame 24 -> LeafOnly 63 iters, total=7.10 ms
+    [26/100] frame 25 -> LeafOnly 63 iters, total=7.06 ms
+    [27/100] frame 26 -> LeafOnly 72 iters, total=7.76 ms
+    [28/100] frame 27 -> LeafOnly 66 iters, total=7.31 ms
+    [29/100] frame 28 -> LeafOnly 51 iters, total=6.17 ms
+    [30/100] frame 29 -> LeafOnly 60 iters, total=6.87 ms
+    [31/100] frame 30 -> LeafOnly 51 iters, total=6.17 ms
+    [32/100] frame 31 -> LeafOnly 75 iters, total=8.03 ms
+    [33/100] frame 32 -> LeafOnly 93 iters, total=9.40 ms
+    [34/100] frame 33 -> LeafOnly 66 iters, total=7.32 ms
+    [35/100] frame 34 -> LeafOnly 60 iters, total=6.85 ms
+    [36/100] frame 35 -> LeafOnly 93 iters, total=9.41 ms
+    [37/100] frame 36 -> LeafOnly 75 iters, total=8.02 ms
+    [38/100] frame 37 -> LeafOnly 54 iters, total=6.43 ms
+    [39/100] frame 38 -> LeafOnly 99 iters, total=9.87 ms
+    [40/100] frame 39 -> LeafOnly 48 iters, total=5.92 ms
+    [41/100] frame 40 -> LeafOnly 75 iters, total=8.05 ms
+    [42/100] frame 41

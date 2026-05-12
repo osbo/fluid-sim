@@ -1,0 +1,32 @@
+================================================================
+Job 13790318, task 0 on node3406
+Started: Tue May 12 00:51:48 EDT 2026
+================================================================
+Task 0: g4096_id_d128_L3_hw -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/generalization_sweep_task_000.csv
+
+[1/1] g4096_id_d128_L3_hw
+  cell=g4096_eval_id frames=100
+    [1/100] frame 0 -> LeafOnly 72 iters, total=8.41 ms
+    [2/100] frame 1 -> LeafOnly 69 iters, total=7.95 ms
+    [3/100] frame 2 -> LeafOnly 63 iters, total=7.33 ms
+    [4/100] frame 3 -> LeafOnly 78 iters, total=11.40 ms
+    [5/100] frame 4 -> LeafOnly 57 iters, total=6.85 ms
+    [6/100] frame 5 -> LeafOnly 102 iters, total=10.26 ms
+    [7/100] frame 6 -> LeafOnly 75 iters, total=8.12 ms
+    [8/100] frame 7 -> LeafOnly 93 iters, total=9.64 ms
+    [9/100] frame 8 -> LeafOnly 54 iters, total=6.41 ms
+    [10/100] frame 9 -> LeafOnly 72 iters, total=8.01 ms
+    [11/100] frame 10 -> LeafOnly 99 iters, total=10.04 ms
+    [12/100] frame 11 -> LeafOnly 60 iters, total=7.09 ms
+    [13/100] frame 12 -> LeafOnly 114 iters, total=10.96 ms
+    [14/100] frame 13 -> LeafOnly 114 iters, total=11.31 ms
+    [15/100] frame 14 -> LeafOnly 165 iters, total=15.04 ms
+    [16/100] frame 15 -> LeafOnly 93 iters, total=9.66 ms
+    [17/100] frame 16 -> LeafOnly 81 iters, total=8.64 ms
+    [18/100] frame 17 -> LeafOnly 96 iters, total=10.09 ms
+    [19/100] frame 18 -> LeafOnly 66 iters, total=7.43 ms
+    [20/100] frame 19 -> LeafOnly 87 iters, total=9.26 ms
+    [21/100] frame 20 -> LeafOnly 54 iters, total=6.88 ms
+    [22/100] frame 21 -> LeafOnly 105 iters, total=10.64 ms
+    [23/100] frame 22 -> LeafOnly 54 iters, total=6.69 ms
+    [24/100] frame 23
