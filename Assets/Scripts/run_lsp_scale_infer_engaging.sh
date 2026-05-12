@@ -114,9 +114,14 @@ fieldnames = [
     "exp_name",
     "method",
     "total_time_ms",
+    "total_time_ms_std",
     "solve_time_ms",
+    "solve_time_ms_std",
     "precond_time_ms",
+    "precond_time_ms_std",
     "iterations",
+    "iterations_std",
+    "n_frames",
     "checkpoint",
     "elapsed_sec",
     "infer_csv",
@@ -134,9 +139,14 @@ with task_csv.open("w", newline="", encoding="utf-8") as f:
             "exp_name": exp_name,
             "method": "",
             "total_time_ms": "",
+            "total_time_ms_std": "",
             "solve_time_ms": "",
+            "solve_time_ms_std": "",
             "precond_time_ms": "",
+            "precond_time_ms_std": "",
             "iterations": "",
+            "iterations_std": "",
+            "n_frames": "",
             "checkpoint": "",
             "elapsed_sec": "",
             "infer_csv": "",
@@ -163,6 +173,7 @@ python3.12 -u infer.py \
   data.is_fixed_topology=true \
   data.has_shared_features=false \
   data.use_node_features=false \
+  dataloader=infer \
   "+out_dir=${RAW_OUT_DIR}" \
   "+infer_prefix=sweep_" \
   2>&1 | tee "${INFER_LOG}"
@@ -191,9 +202,14 @@ fieldnames = [
     "exp_name",
     "method",
     "total_time_ms",
+    "total_time_ms_std",
     "solve_time_ms",
+    "solve_time_ms_std",
     "precond_time_ms",
+    "precond_time_ms_std",
     "iterations",
+    "iterations_std",
+    "n_frames",
     "checkpoint",
     "elapsed_sec",
     "infer_csv",
@@ -211,9 +227,14 @@ with task_csv.open("w", newline="", encoding="utf-8") as f:
             "exp_name": exp_name,
             "method": "",
             "total_time_ms": "",
+            "total_time_ms_std": "",
             "solve_time_ms": "",
+            "solve_time_ms_std": "",
             "precond_time_ms": "",
+            "precond_time_ms_std": "",
             "iterations": "",
+            "iterations_std": "",
+            "n_frames": "",
             "checkpoint": ckpt,
             "elapsed_sec": elapsed_sec,
             "infer_csv": "",
@@ -230,6 +251,7 @@ fi
 python3.12 - <<'PY' "${RAW_OUT_DIR}" "${TASK_CSV}" "${SCALE}" "${EXP_NAME}" "${CKPT}" "${INFER_LOG}" "${ELAPSED_SEC}"
 import csv
 import sys
+import math
 from pathlib import Path
 
 raw_dir = Path(sys.argv[1])
@@ -248,24 +270,67 @@ all_files = sorted(
     raw_dir.glob(f"all_infer_sweep_{exp_name}_*.csv"),
     key=lambda p: p.stat().st_mtime
 )
-if not infer_files:
-    raise SystemExit(f"No infer_sweep CSV found for {exp_name} in {raw_dir}")
+if not infer_files or not all_files:
+    raise SystemExit(f"Missing infer/all_infer CSV for {exp_name} in {raw_dir}")
 
 infer_csv = infer_files[-1]
-all_csv = all_files[-1] if all_files else None
+all_csv = all_files[-1]
 
-with infer_csv.open(newline="", encoding="utf-8") as fin:
+def _f(v: str) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return float("nan")
+
+def _mean_std(vals):
+    vals = [float(x) for x in vals if math.isfinite(float(x))]
+    n = len(vals)
+    if n == 0:
+        return ("", "", 0)
+    mean = sum(vals) / n
+    if n < 2:
+        return (f"{mean:.4f}", "", n)
+    var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+    std = var ** 0.5
+    return (f"{mean:.4f}", f"{std:.4f}", n)
+
+# Build per-method aggregates from the per-frame CSV.
+by_method = {}
+with all_csv.open(newline="", encoding="utf-8") as fin:
     reader = csv.DictReader(fin)
-    rows = list(reader)
+    for r in reader:
+        m = r.get("Key", "")
+        if not m:
+            continue
+        d = by_method.setdefault(
+            m,
+            {"solve": [], "pre": [], "iter": [], "total": []},
+        )
+        s = _f(r.get("Solve Time (ms)", "nan"))
+        p = _f(r.get("Precond Time (ms)", "nan"))
+        it = _f(r.get("#Iteration", "nan"))
+        if math.isfinite(s):
+            d["solve"].append(s)
+        if math.isfinite(p):
+            d["pre"].append(p)
+        if math.isfinite(it):
+            d["iter"].append(it)
+        if math.isfinite(s) and math.isfinite(p):
+            d["total"].append(s + p)
 
 fieldnames = [
     "scale",
     "exp_name",
     "method",
     "total_time_ms",
+    "total_time_ms_std",
     "solve_time_ms",
+    "solve_time_ms_std",
     "precond_time_ms",
+    "precond_time_ms_std",
     "iterations",
+    "iterations_std",
+    "n_frames",
     "checkpoint",
     "elapsed_sec",
     "infer_csv",
@@ -277,20 +342,30 @@ task_csv.parent.mkdir(parents=True, exist_ok=True)
 with task_csv.open("w", newline="", encoding="utf-8") as fout:
     writer = csv.DictWriter(fout, fieldnames=fieldnames)
     writer.writeheader()
-    for r in rows:
+    for method, d in sorted(by_method.items()):
+        t_mu, t_std, n_t = _mean_std(d["total"])
+        s_mu, s_std, n_s = _mean_std(d["solve"])
+        p_mu, p_std, n_p = _mean_std(d["pre"])
+        i_mu, i_std, n_i = _mean_std(d["iter"])
+        n_frames = max(n_t, n_s, n_p, n_i)
         writer.writerow(
             {
                 "scale": scale,
                 "exp_name": exp_name,
-                "method": r.get("Key", ""),
-                "total_time_ms": r.get("Total Time (ms)", ""),
-                "solve_time_ms": r.get("Solve Time (ms)", ""),
-                "precond_time_ms": r.get("Precond Time (ms)", ""),
-                "iterations": r.get("#Iteration", ""),
+                "method": method,
+                "total_time_ms": t_mu,
+                "total_time_ms_std": t_std,
+                "solve_time_ms": s_mu,
+                "solve_time_ms_std": s_std,
+                "precond_time_ms": p_mu,
+                "precond_time_ms_std": p_std,
+                "iterations": i_mu,
+                "iterations_std": i_std,
+                "n_frames": n_frames,
                 "checkpoint": ckpt,
                 "elapsed_sec": elapsed_sec,
                 "infer_csv": str(infer_csv),
-                "all_infer_csv": str(all_csv) if all_csv else "",
+                "all_infer_csv": str(all_csv),
                 "infer_log": infer_log,
                 "status": "ok",
             }

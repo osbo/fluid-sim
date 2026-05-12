@@ -1487,6 +1487,8 @@ def make_residual_3d(
     trace_steps: int = 48,
     trace_step_size: float = 0.65,
     trace_sigma: float = 1.2,
+    zoom: float = 1.0,
+    tight_image: bool = False,
 ):
     """3-D scatter / trace / dual figure for residual or preconditioner-correction fields.
 
@@ -1855,9 +1857,17 @@ def make_residual_3d(
         ax.set_proj_type("persp")
     # Pull camera closer to amplify perspective on older Matplotlib builds.
     if hasattr(ax, "dist"):
-        ax.dist = 7.0
+        ax.dist = max(0.5, 7.0 / max(float(zoom), 1e-6))
     ax.set_facecolor("white")
     fig.patch.set_facecolor("white")
+
+    # Optional edge-to-edge framing for figure exports.
+    if tight_image:
+        fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
+        try:
+            ax.set_position([0.0, 0.0, 1.0, 1.0])
+        except Exception:
+            pass
 
     frame_name = Path(frame_dir).name
     if not clean_view:
@@ -1880,7 +1890,10 @@ def make_residual_3d(
                 pad=6,
             )
 
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    if tight_image:
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight", pad_inches=0.0)
+    else:
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     print(f"[residual-3d] -> {out_path}")
     print(f"[residual-3d]   log10 range [{lo:.2f}, {hi:.2f}]")
@@ -2646,6 +2659,10 @@ def main():
                    help="Step size in voxel units for trace integration.")
     p.add_argument("--residual-3d-trace-sigma", type=float, default=1.2,
                    help="Gaussian smoothing sigma for residual-derived trace field.")
+    p.add_argument("--residual-3d-zoom", type=float, default=1.0,
+                   help="Camera zoom factor for residual-3d (>=1 zooms in by reducing camera distance).")
+    p.add_argument("--residual-3d-tight-image", action="store_true",
+                   help="For residual-3d: export with near-zero outer padding (content fills figure bounds).")
     p.add_argument("--residual-prop-frame-dir", default=None,
                    help="Frame directory for residual-3d-propagation.")
     p.add_argument("--residual-prop-ks", type=int, nargs="+", default=[1, 2, 4, 8],
@@ -2729,6 +2746,8 @@ def main():
             trace_steps=int(args.residual_3d_trace_steps),
             trace_step_size=float(args.residual_3d_trace_step_size),
             trace_sigma=float(args.residual_3d_trace_sigma),
+            zoom=float(args.residual_3d_zoom),
+            tight_image=bool(args.residual_3d_tight_image),
         )
 
     if "residual-3d-propagation" in figs:
