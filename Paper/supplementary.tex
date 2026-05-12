@@ -64,8 +64,8 @@ from a fixed Conda environment, using \verb|torch.compile| for graph capture. CP
 baselines use Eigen, SciPy, and PyAMG. Sparse matrix-vector products on the GPU use
 the CSR layout produced by the dataset generator (Sec.~\ref{supp:dataset}). PCG
 timing uses single-graph CUDA Graph replay for methods that admit it
-(unpreconditioned CG, Jacobi, AMGX SPAI, ours); IC- and AMG-class methods are timed
-per launch since their sequential triangular solves and V-cycle synchronization
+(unpreconditioned CG, Jacobi, AMGX SPAI, neural SPAI, ours); IC- and AMG-class methods
+are timed per launch since their sequential triangular solves and V-cycle synchronization
 preclude single-graph capture.
 
 \paragraph{Default model configuration.}
@@ -177,8 +177,8 @@ tiles satisfies $M_{\mathcal{H}}\!=\!K\!-\!1$ (geometric sum
 $K/2 + K/4 + \cdots + 1$ over the strict upper triangle); the symmetric lower
 triangle reuses the same $B_m$ via the transposed apply
 $\mathbf{t}^{\mathrm{c}}_m\!=\!B_m^\top\mathbf{s}^{\mathrm{r}}_m$ of main
-paper Eq.~(5). Concrete factor-tensor sizes at the scales in
-Table~\ref{tab:full_perf_table} are listed in Sec.~\ref{supp:precision}.
+paper Eq.~(5). Concrete factor-tensor sizes at the scales of the main paper's
+performance table (main paper Table~2) are listed in Sec.~\ref{supp:precision}.
 
 % ===========================================================================
 \section{Training Procedure}
@@ -298,18 +298,18 @@ practical neural preconditioners but an $\mathcal{H}$-matrix far-block
 representation can.
 
 % ===========================================================================
-\section{Full Performance Table with Iteration Counts}
+\section{Per-frame Iteration-count Variability}
 \label{supp:full_perf_table}
 % ===========================================================================
 
-Table~1 in the main paper (apply-path access patterns) and Fig.~5 (per-frame
-solve time vs.\ $N$) omit per-method iteration counts to fit the column budget.
-Table~\ref{tab:full_perf_table} lists them here for completeness across the
-seven baselines and our method, on the same $20$ test frames per scale.
+The consolidated per-scale times and mean iteration counts have moved to the
+main paper, Table~2. This section reports the across-frame variability
+($\pm 1\sigma$ over the same $20$ test frames per scale) that the main table
+omits to fit the column budget.
 
 \begin{table}[H]
 \centering
-\caption{Per-frame mean$\pm$std PCG iterations on the multiphase Poisson
+\caption{Per-frame mean$\pm$std PCG iteration counts on the multiphase Poisson
 benchmark ($\mathrm{rtol}\!=\!10^{-8}$, $20$ frames per scale). Bold row marks
 the proposed method.}
 \label{tab:full_perf_table}
@@ -318,26 +318,31 @@ the proposed method.}
 \toprule
 Method & $N\!=\!1\,024$ & $N\!=\!2\,048$ & $N\!=\!4\,096$ & $N\!=\!8\,192$ & $N\!=\!16\,384$ \\
 \midrule
-Unprec.~CG (GPU)             & $497\!\pm\!144$ & $650\!\pm\!240$ & $1153\!\pm\!434$ & $1765\!\pm\!1744$ & $2002\!\pm\!921$ \\
-Jacobi (GPU)                 & $325\!\pm\!83$  & $429\!\pm\!112$ & $839\!\pm\!476$  & $968\!\pm\!261$   & $1480\!\pm\!913$ \\
-IC (CPU)                     & $59\!\pm\!18$   & $96\!\pm\!23$   & $113\!\pm\!31$   & $170\!\pm\!47$    & $254\!\pm\!61$ \\
-IC / DILU (GPU)              & $11\!\pm\!1$    & $15\!\pm\!1$    & $22\!\pm\!4$     & $30\!\pm\!5$      & $40\!\pm\!3$ \\
-AMG (CPU)                    & $5\!\pm\!6$     & $9\!\pm\!6$     & $5\!\pm\!7$      & $7\!\pm\!8$       & $10\!\pm\!8$ \\
+Unprec.~CG (GPU)             & $497\!\pm\!144$ & $650\!\pm\!240$ & $1153\!\pm\!434$ & $1765\!\pm\!1744$ & $2103\!\pm\!1113$ \\
+Jacobi (GPU)                 & $325\!\pm\!83$  & $429\!\pm\!112$ & $839\!\pm\!476$  & $968\!\pm\!261$   & $1543\!\pm\!1137$ \\
+IC / DILU (GPU)              & $11\!\pm\!1$    & $15\!\pm\!1$    & $22\!\pm\!4$     & $30\!\pm\!5$      & $40\!\pm\!4$ \\
 AMG / AMGX (GPU)             & $1\!\pm\!0$     & $1\!\pm\!0$     & $1\!\pm\!1$      & $2\!\pm\!0$       & $3\!\pm\!0$ \\
-\textbf{Ours (GPU)}          & $\mathbf{50\!\pm\!11}$ & $\mathbf{66\!\pm\!16}$ & $\mathbf{83\!\pm\!24}$ & $\mathbf{174\!\pm\!27}$ & $\mathbf{386\!\pm\!69}$ \\
+Neural SPAI (GPU)~\cite{Yang2025sparse} & $122$           & $170$           & $305$            & $343$             & $495$ \\
+IC (CPU)                     & $59\!\pm\!18$   & $96\!\pm\!23$   & $113\!\pm\!31$   & $170\!\pm\!47$    & $254\!\pm\!61$ \\
+AMG (CPU)                    & $5\!\pm\!6$     & $9\!\pm\!6$     & $5\!\pm\!7$      & $7\!\pm\!8$       & $10\!\pm\!8$ \\
+\textbf{Ours (GPU)}          & $\mathbf{47\!\pm\!9}$ & $\mathbf{66\!\pm\!16}$ & $\mathbf{80\!\pm\!24}$ & $\mathbf{168\!\pm\!26}$ & $\mathbf{394\!\pm\!68}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \noindent
-CPU AMG and GPU AMGX achieve very low iteration counts ($\le\!10$) but pay for
-it in per-iteration V-cycle synchronization, putting them above the interactive
-budget at every scale (main paper, Fig.~5). GPU IC/DILU sits at $11$--$40$
-iterations, with each iteration carrying a sequential triangular solve.
-Jacobi and unpreconditioned CG show $\sigma/\mu$ approaching unity at the
-larger $N$ because individual frames span the full $[5, 100]$ contrast range
-and stiff frames inflate iteration counts disproportionately; our $\sigma/\mu$
-stays at $\le\!21\%$ across all scales.
+The neural SPAI baseline is re-trained per scale (one network per $N$) using
+the SAI loss of~\cite{Yang2025sparse} on the same training distribution as
+ours; the row reports the mean iteration count from a single inference run
+per scale (no across-frame std). CPU AMG and GPU AMGX achieve very low
+iteration counts ($\le\!10$) but pay for it in per-iteration V-cycle
+synchronization, putting them above the interactive budget at every scale
+(main paper, Fig.~5). GPU IC/DILU sits at $11$--$40$ iterations, with each
+iteration carrying a sequential triangular solve. Jacobi and unpreconditioned
+CG show $\sigma/\mu$ approaching unity at the larger $N$ because individual
+frames span the full $[5, 100]$ contrast range and stiff frames inflate
+iteration counts disproportionately; our $\sigma/\mu$ stays at $\le\!21\%$
+across all scales.
 
 % ===========================================================================
 \section{Generalization Robustness}
