@@ -9,10 +9,10 @@
 #SBATCH -p mit_normal_gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH -G h200:1
+#SBATCH -G 1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH -t 4:00:00
+#SBATCH -t 2:00:00
 #SBATCH -o slurm_logs/lo_eval_gen_%A_%a.out
 #SBATCH -e slurm_logs/lo_eval_gen_%A_%a.err
 
@@ -46,7 +46,7 @@ echo "Job ${SLURM_ARRAY_JOB_ID}, task ${SLURM_ARRAY_TASK_ID} on $(hostname)"
 echo "Started: $(date)"
 echo "================================================================"
 
-python3 -u EvalGeneralization.py --index "${SLURM_ARRAY_TASK_ID}"
+python3 -u EvalGeneralization.py --index "${SLURM_ARRAY_TASK_ID}" --max-frames 20
 
 echo "================================================================"
 echo "Finished: $(date)"

@@ -285,6 +285,12 @@ def main() -> None:
     parser.add_argument("--index", type=int, default=None, help="Run a single model config index.")
     parser.add_argument("--merge", action="store_true", help="Merge per-task CSVs and exit.")
     parser.add_argument("--frames", nargs="+", type=int, default=None, help="Optional frame subset.")
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Cap evaluation to the first N detected test frames (ignored when --frames is provided).",
+    )
     parser.add_argument("--out", type=str, default=None, help="Output CSV path.")
     parser.add_argument(
         "--pcg-backend",
@@ -364,7 +370,12 @@ def main() -> None:
                     print(f"  [SKIP cell={eval_cell}] missing folder: {data_folder}", file=sys.stderr)
                     continue
 
-                frames = args.frames if args.frames is not None else _detect_frames(data_folder)
+                if args.frames is not None:
+                    frames = args.frames
+                else:
+                    frames = _detect_frames(data_folder)
+                    if args.max_frames is not None:
+                        frames = frames[: max(0, int(args.max_frames))]
                 print(f"  cell={eval_cell} frames={len(frames)}", flush=True)
 
                 per_frame_rows = []

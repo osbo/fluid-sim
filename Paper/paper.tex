@@ -135,9 +135,7 @@ neural operators, physics simulation, real-time graphics}
     {\footnotesize (c) Visual showcase}
   \end{minipage}\hfill
   \begin{minipage}[t]{0.245\linewidth}\centering
-    \figplaceholder{\linewidth}{1.65in}{3D multiphase pressure-Poisson: volumetric density,
-      buoyancy-driven plume, interface sharpening. Shown as a forward visualisation;
-      quantitative 3D evaluation is future work.}\\[1pt]
+    \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{3 fluid.jpg}\\[1pt]
     {\footnotesize (d) 3D extension}
   \end{minipage}
   \caption{Our preconditioner is designed for the SPD solves that bottleneck interactive
@@ -1387,7 +1385,7 @@ recipe is the right tool.
 \renewcommand{\textfraction}{0.0}
 \renewcommand{\floatpagefraction}{0.6}
 
-\begin{figure}[!ht]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=0.90\linewidth]{multiphase_convergence.png}
   \caption{Residual propagation across preconditioner families on a deliberately hard
@@ -1408,7 +1406,7 @@ recipe is the right tool.
   \label{fig:convergence}
 \end{figure}
 
-\begin{figure}[!ht]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=0.55\linewidth]{solver_spectral_clustering.png}
   \caption{Spectra of $MA$ at $N\!=\!1{,}024$ on a representative multiphase Poisson frame
@@ -1422,13 +1420,10 @@ recipe is the right tool.
   \label{fig:loss:eigenvalues}
 \end{figure}
 
-\FloatBarrier
-\clearpage
 % ---------------------------------------------------------------------------
-% Figures-only page 2: training + probe alignment
+% Additional figures-only content (allow normal float packing across pages).
 % ---------------------------------------------------------------------------
-
-\begin{figure}[!ht]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=0.72\linewidth]{probe_alignment_8192_L3_hw_8k_24k.png}
   \caption{Probe-alignment dynamics during training at $N\!=\!8\,192$
@@ -1441,7 +1436,7 @@ recipe is the right tool.
   \label{fig:probe-alignment}
 \end{figure}
 
-\begin{figure}[!ht]
+\begin{figure}[!htbp]
   \centering
   \includegraphics[width=0.65\linewidth]{training.png}
   \caption{Training profile at $N\!=\!8\,192$ (default config, $d\!=\!128$, $n_l\!=\!3$,
