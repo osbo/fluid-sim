@@ -220,12 +220,16 @@ def main(out_path: pathlib.Path) -> None:
     ax_loss.spines["left"].set_edgecolor(C_LOSS)
     ax_loss.yaxis.set_minor_locator(ticker.AutoMinorLocator(4))
 
-    # SAI axis — capped at 3 so the late-training rise stays readable without compressing the
-    # main range; transients above 3 (early-training spike) plot outside the visible area.
-    ax_sai.set_ylabel("SAI loss (linear)", color=C_SAI, labelpad=6)
+    # SAI axis — log scale so the dip-and-rebound pattern is clearly visible: the trace
+    # falls from ~22 to ~0.15 around step ~10k and then climbs back to ~0.5, which on a
+    # linear axis compressed against the cosine-loss range visually flattens to a line
+    # right on top of the cosine curve. Log makes the rebound a visibly distinct second
+    # phase and keeps the curve on its own band, well above the cosine-loss range.
+    ax_sai.set_ylabel("SAI loss (log)", color=C_SAI, labelpad=6)
     ax_sai.tick_params(axis="y", colors=C_SAI)
     ax_sai.spines["left"].set_edgecolor(C_SAI)
-    ax_sai.set_ylim(bottom=0, top=3.0)
+    ax_sai.set_yscale("log")
+    ax_sai.set_ylim(bottom=0.1, top=30.0)
 
     # PCG axis (log): explicit {1,2,5}×10^k majors + plain integers — LogLocator on twinx often
     # drops to a single $10^k$ label in practice.
@@ -285,7 +289,7 @@ def main(out_path: pathlib.Path) -> None:
         Line2D([0], [0], color=C_SAI, lw=1.5, ls=(0, (5, 2)),
                marker="s", markersize=4.5, markerfacecolor="white",
                markeredgecolor=C_SAI, markeredgewidth=1.0,
-               label="SAI loss (linear)"),
+               label="SAI loss (log)"),
         Line2D([0], [0], color=C_PCG, lw=1.8,
                marker="o", markersize=5.5, markerfacecolor="white",
                markeredgecolor=C_PCG, markeredgewidth=1.2,

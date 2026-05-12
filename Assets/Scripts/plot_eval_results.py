@@ -59,14 +59,16 @@ class MethodStyle:
     linestyle: str
 
 
-# Order preserved for legend. AMG+CPU from InspectModel "AMG (CPU):" rows — notable classical MG baseline.
+# Order preserved for legend. AMG+CPU intentionally excluded from the scale-sweep plot:
+# its setup cost scales nonlinearly with contrast under PyAMG, which makes the curve
+# noisy and not directly comparable to the GPU-resident methods that dominate the
+# interactive regime we evaluate. Numbers are preserved in the supplementary table.
 METHOD_STYLES: dict[tuple[str, str], MethodStyle] = {
     ("amgx_gpu", "gpu"): MethodStyle("AMGX SPAI (GPU)", C_BLUE, "-"),
     ("ic", "cpu"): MethodStyle("IC+CPU", C_GOLD, "--"),
     ("ic_amgx", "gpu"): MethodStyle("IC+CUDA", "#00BA38", ":"),
     ("jacobi", "gpu"): MethodStyle("Diag+CUDA", C_RED, "--"),
     ("cg", "gpu"): MethodStyle("None+CUDA", C_PURPLE, "-."),
-    ("amg_cpu", "cpu"): MethodStyle("AMG+CPU", "#757575", (0, (4, 2))),
     ("leafonly", "gpu"): MethodStyle("Ours", C_BROWN, (0, (2, 1, 1, 1))),
 }
 

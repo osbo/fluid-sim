@@ -41,6 +41,48 @@ Cross-references from the main PDF use the \texttt{xr-hyper} package with prefix
 build this file before \texttt{paper.tex} so \texttt{supplementary.aux} is current.
 
 % ===========================================================================
+\section{Experimental Setup --- Full Details}
+\label{supp:experimental-setup}
+% ===========================================================================
+
+\paragraph{Hardware.} All GPU experiments run under a batch scheduler on a shared
+institutional GPU cluster. Each job allocates one NVIDIA H200 (140\,GB HBM3), eight
+Intel Xeon Platinum 8580 host cores, and 32\,GiB host DRAM alongside the device
+(partial-node slice on dual-socket nodes with eight GPUs per node).
+
+\paragraph{Software stack.} GPU code is built with the CUDA~12 toolchain and a
+PyTorch \texttt{2.6.x} build from a fixed Conda environment on the cluster, using
+\verb|torch.compile| for graph capture. CPU baselines use Eigen, SciPy, and PyAMG on the
+same eight host cores. PCG timing uses single-graph CUDA Graph replay for methods that
+admit it (unpreconditioned CG, Jacobi, AMGX SPAI, ours); IC- and AMG-class methods are
+timed per launch since their sequential triangular solves and V-cycle synchronization
+preclude single-graph capture.
+
+\paragraph{Precision.} PCG scalar accumulators (dot products, residual norms, step
+sizes) use float64; preconditioner weights and the apply path use float32. We found this
+sufficient to prevent residual drift on stiff systems without paying for full
+mixed-precision GEMMs. Further precision discussion appears in
+\S\ref{supp:precision}.
+
+\paragraph{Default model configuration.} Unless noted, our model uses $d\!=\!128$,
+$n_l\!=\!3$, $L\!=\!128$, $p_{\mathrm{diag}}\!=\!1$, $p_{\mathrm{off}}\!=\!4$,
+$n_{\mathrm{gcn}}\!=\!2$, highways enabled (\textsf{d128\_L3\_hw} in figures). This
+single checkpoint is reused at every $N$ in the main performance table.
+
+\paragraph{Baseline tuning.} GPU IC (\textsc{multicolor\_dilu}) and GPU AMG settings
+follow AMGX vendor defaults. At $N\!=\!8\,192$ we additionally swept the nearest
+neighbouring AMGX hyperparameter configurations (smoother type, coarsening strategy,
+maximum levels) and verified that none meaningfully reduces total time relative to the
+default. CPU PyAMG uses its default classical AMG cycle.
+
+\paragraph{Convergence criterion.} All reported solve times and iteration counts are to
+a relative residual tolerance of
+$\|\mathbf{r}_k\|_2 / \|\mathbf{r}_0\|_2 \!\le\! 10^{-8}$. This is two to three orders of
+magnitude tighter than the $\sim\!10^{-3}$ accuracy typical of graphics-grade pressure
+projection; the looser tolerance shrinks every method's iteration count proportionally
+but does not change the ordering or relative gaps we report.
+
+% ===========================================================================
 \section{Full Performance Table with Iteration Counts}
 \label{supp:full_perf_table}
 % ===========================================================================

@@ -27,6 +27,7 @@ public class FluidRenderer : MonoBehaviour
     public Material normalMaterial;
     public Material compositeMaterial;
     public Material debugDisplayMaterial;
+    public Material velocityBackdropMaterial;
 
     public Color fluidColor = new Color(0.2f, 0.6f, 1.0f);
     public bool useSkybox = true;
@@ -54,6 +55,17 @@ public class FluidRenderer : MonoBehaviour
     public bool particleVelocityNormalizePerFrame;
     [Range(1, 120)] public int particleVelocityNormalizeSmoothingFrames = 10;
     public ComputeShader particleVelocityReduceShader;
+    [Header("Velocity View Backdrop")]
+    public Color velocityBackdropTopColor = new Color(0.95f, 0.95f, 0.95f, 1f);
+    public Color velocityBackdropBottomColor = new Color(0.90f, 0.90f, 0.90f, 1f);
+    public Color velocityFloorTileColorA = new Color(0.96f, 0.96f, 0.96f, 1f);
+    public Color velocityFloorTileColorB = new Color(0.88f, 0.88f, 0.88f, 1f);
+    [Range(4f, 80f)] public float velocityFloorTilesPerAxis = 18f;
+    [Range(0f, 10.0f)] public float velocityFloorYOffset = 5.0f;
+    [Range(1f, 4f)] public float velocityFloorWidthScaleX = 1.1f;
+    [Range(1f, 4f)] public float velocityFloorWidthScaleZ = 1.1f;
+    [Range(0f, 2f)] public float velocityBackdropVerticalGradientStrength = 1f;
+    [Range(0f, 1f)] public float velocityBackdropDirectionalBias = 0.25f;
     [Range(0.0001f, 1.0f)] public float depthRadius = 0.279f;
     [Range(0.0001f, 1.0f)] public float thicknessRadius = 0.776f;
     [Range(0, 20)] public float absorptionStrength = 5.8f;
@@ -173,6 +185,7 @@ public class FluidRenderer : MonoBehaviour
         EnsureMaterial(ref normalMaterial, "Custom/NormalsFromDepth");
         EnsureMaterial(ref compositeMaterial, "Custom/FluidRender");
         EnsureMaterial(ref debugDisplayMaterial, "Custom/DebugTextureDisplay");
+        EnsureMaterial(ref velocityBackdropMaterial, "Custom/ParticleVelocityBackdrop");
     }
 
     static void EnsureMaterial(ref Material mat, string shaderName)
@@ -331,6 +344,10 @@ public class FluidRenderer : MonoBehaviour
         mode == RenderingMode.Particles
         || mode == RenderingMode.ParticlesVelocity
         || mode == RenderingMode.ParticlesPhase
+        || mode == RenderingMode.ParticlesPhaseVelocity;
+
+    static bool IsParticleVelocityView(RenderingMode mode) =>
+        mode == RenderingMode.ParticlesVelocity
         || mode == RenderingMode.ParticlesPhaseVelocity;
 
     static bool IsNodeOrColliderVoxelView(RenderingMode mode) =>
@@ -618,6 +635,9 @@ public class FluidRenderer : MonoBehaviour
 
         if (currentMaterial == null) return;
 
+        if (IsParticleVelocityView(renderingMode))
+            RenderParticleVelocityBackdrop(cam);
+
         if (quadMesh == null)
             CreateQuadMesh();
 
@@ -754,6 +774,41 @@ public class FluidRenderer : MonoBehaviour
                 Graphics.ExecuteCommandBuffer(depthCmd);
             }
         }
+    }
+
+    void RenderParticleVelocityBackdrop(Camera cam)
+    {
+        if (cam == null || velocityBackdropMaterial == null)
+            return;
+
+        Bounds bounds = SimBounds;
+        float floorY = bounds.min.y - Mathf.Max(0f, velocityFloorYOffset);
+        Vector3 center = bounds.center;
+        Vector3 size = bounds.size;
+        float floorSizeX = Mathf.Max(1e-4f, size.x * Mathf.Max(1f, velocityFloorWidthScaleX));
+        float floorSizeZ = Mathf.Max(1e-4f, size.z * Mathf.Max(1f, velocityFloorWidthScaleZ));
+        Vector2 halfSize = new Vector2(floorSizeX * 0.5f, floorSizeZ * 0.5f);
+        Vector2 minXZ = new Vector2(center.x - halfSize.x, center.z - halfSize.y);
+        Vector2 maxXZ = new Vector2(center.x + halfSize.x, center.z + halfSize.y);
+
+        float spanX = Mathf.Max(1e-4f, maxXZ.x - minXZ.x);
+        float spanZ = Mathf.Max(1e-4f, maxXZ.y - minXZ.y);
+        float maxSpan = Mathf.Max(spanX, spanZ);
+        float tilesPerAxis = Mathf.Max(1f, velocityFloorTilesPerAxis);
+        float cellSize = Mathf.Max(1e-4f, maxSpan / tilesPerAxis);
+
+        velocityBackdropMaterial.SetColor("_BackgroundTopColor", velocityBackdropTopColor);
+        velocityBackdropMaterial.SetColor("_BackgroundBottomColor", velocityBackdropBottomColor);
+        velocityBackdropMaterial.SetColor("_TileColorA", velocityFloorTileColorA);
+        velocityBackdropMaterial.SetColor("_TileColorB", velocityFloorTileColorB);
+        velocityBackdropMaterial.SetFloat("_FloorY", floorY);
+        velocityBackdropMaterial.SetVector("_FloorMinXZ", minXZ);
+        velocityBackdropMaterial.SetVector("_FloorMaxXZ", maxXZ);
+        velocityBackdropMaterial.SetFloat("_CellSize", cellSize);
+        velocityBackdropMaterial.SetFloat("_VerticalGradientStrength", Mathf.Max(0f, velocityBackdropVerticalGradientStrength));
+        velocityBackdropMaterial.SetFloat("_DirectionalBias", Mathf.Clamp01(velocityBackdropDirectionalBias));
+
+        Graphics.Blit(null, (RenderTexture)null, velocityBackdropMaterial);
     }
 
     void RenderThickness(Camera cam)
