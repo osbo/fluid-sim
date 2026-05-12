@@ -1320,6 +1320,61 @@ The cosine-Hutchinson loss delivers a $4.3\times$ better-conditioned system than
 both spectra reflects the two-phase density contrast: the light and heavy regions
 induce two eigenvalue groups whose relative spread sets the condition number.
 
+% ---------------------------------------------------------------------------
+\subsection{Generalization}
+\label{sec:results:generalization}
+% ---------------------------------------------------------------------------
+
+We probe robustness to two out-of-distribution axes within the multiphase Poisson
+family: \emph{topology} (closed barriers withheld from training) and \emph{density
+contrast} (training capped at $\rho_\text{heavy}\!\le\!25$, test frames drawn from
+the full $[25,100]$ range). Table~\ref{tab:generalization} reports GPU results at
+$N\!=\!4{,}096$ for the four most informative (train, eval) pairs.
+
+\paragraph{Topology generalization.}
+A model trained entirely without closed-barrier frames matches---and marginally
+exceeds---in-distribution iteration counts when evaluated on a closed-barrier-only
+test set ($68$ vs.\ $82$ iters), preserving the $3.3\times$ total-time speedup over
+Jacobi. The $\mathcal{H}$-matrix partition is defined purely by the spatial indexing
+of degrees of freedom and encodes no barrier geometry, so the network adapts without
+retraining.
+
+\paragraph{Contrast generalization.}
+Training on low-contrast frames ($\rho_\text{heavy}\!\in\![5,25]$) and evaluating on
+high-contrast frames ($\rho_\text{heavy}\!\in\!(25,100]$) roughly doubles iteration
+count ($142$ vs.\ $82$) and raises total solve time from $8.8$ to $13.1$\,ms, while
+preserving a $1.9\times$ speedup over Jacobi. Variance grows substantially
+($\pm\!10$\,ms vs.\ $\pm\!2$\,ms in-distribution), reflecting that a subset of
+high-contrast frames fall outside the learned eigenvalue cluster. Training on the
+combined OOD regime (no closed barriers, low contrast) and evaluating on the hardest
+test case (closed barriers, high contrast) yields the same $1.9\times$ speedup,
+confirming that the two axes shift performance independently and that topology
+generalization remains essentially free.
+
+\begin{table}[h!]
+\centering
+\caption{Generalization across restricted training distributions at $N\!=\!4{,}096$
+  (GPU; $\mathrm{rtol}\!=\!10^{-8}$, $20$ frames).
+  \emph{Iters}: mean PCG iterations;
+  \emph{ms}: mean total solve time;
+  \emph{Speedup}: Jacobi / Ours total-time ratio.}
+\label{tab:generalization}
+\footnotesize\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}ll rr rr c@{}}
+\toprule
+Train distribution & Eval distribution
+  & \multicolumn{2}{c}{Ours (GPU)} & \multicolumn{2}{c}{Jacobi (GPU)} & Speedup \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}
+ & & Iters & ms & Iters & ms & \\
+\midrule
+Full                            & Full (in-dist.)          &  82 &  8.8 & 758 & 29.4 & $3.4\times$ \\
+Excl.\ closed barriers          & Closed barriers only     &  68 &  7.4 & 662 & 24.7 & $3.3\times$ \\
+Low contrast                    & High contrast            & 142 & 13.1 & 650 & 24.4 & $1.9\times$ \\
+Excl.\ closed $+$ low $\rho$   & Closed $+$ high contrast & 147 & 13.5 & 671 & 25.1 & $1.9\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 % ===========================================================================
 \section{Discussion and Future Work}
 \label{sec:limitations}
@@ -1343,7 +1398,7 @@ pipelines, and non-fluid SPD families like cloth and contact stiffness. Quantify
 that transfer, including a head-to-head against the sparse-approximate-inverse GNN
 of Yang \emph{et al.}~\cite{Yang2025sparse} on a shared benchmark (in progress), is
 the most important follow-up. Out-of-distribution sensitivity within the multiphase
-Poisson family is reported in Supplementary \S\ref{SX-supp:generalization}.
+Poisson family is reported in \S\ref{sec:results:generalization}.
 
 \paragraph{Problem-size flexibility.} Training pre-sizes the partition and apply-path
 workspace to a maximum $N$. Inference at smaller $N$ remains time-efficient
