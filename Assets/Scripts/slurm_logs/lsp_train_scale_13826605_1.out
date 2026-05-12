@@ -1,0 +1,34 @@
+================================================================
+Job 13826605, task 1 on node3507
+Started: Tue May 12 12:30:58 EDT 2026
+Scale: 2048
+Batch size: 12
+Repo: /orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU
+================================================================
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'pyg-lib'. Disabling its usage. Stacktrace: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/libpyg.so)
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-scatter'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_scatter/_scatter_cuda.so: undefined symbol: _ZN2at4_ops16div__Tensor_mode4callERNS_6TensorERKS2_St8optionalISt17basic_string_viewIcSt11char_traitsIcEEE
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-spline-conv'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_spline_conv/_basis_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-sparse'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_sparse/_spmm_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+[rank: 0] Seed set to 42
+2026-05-12 12:31:13.386 | INFO     | __main__:main:37 - Use multidata: False
+2026-05-12 12:31:13.387 | INFO     | neural_cg.data:__init__:375 - Found 0 matrices, 0 lhs, 0 rhs, 0 masks, 0 features
+Error executing job with overrides: ['exp_name=multiphase_v2_2048', 'data.prefix=generated/multiphase_v2_2048', 'data.is_fixed_topology=true', 'data.has_shared_features=false', 'data.use_node_features=false', 'data.load_into_memory=true', 'batch_size=12']
+Traceback (most recent call last):
+  File "/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/train.py", line 40, in main
+    data = DataModule(
+           ^^^^^^^^^^^
+  File "/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/neural_cg/utils/datamodule.py", line 33, in __init__
+    self.dataset = FolderDataset(**data_config)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/neural_cg/data.py", line 385, in __init__
+    assert len(all_matrices) > 0
+           ^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
