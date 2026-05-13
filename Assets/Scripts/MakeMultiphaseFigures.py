@@ -13,6 +13,9 @@ Subfigures (one per --fig flag, or --fig all):
                   iterations (log-spaced from 1 to ~0.9*K of each method's own run). All
                   residual panels share one log colorbar so spatial spread of the error
                   (information propagation) is directly comparable across methods.
+    residual-3d-compare — 3D Fig-1c-style panel: top problem row (rho, |b|, |p|, |v| + white
+                  traces, NeuralSPAI M) and method rows (Jacobi, AMG, NeuralSPAI) with
+                  particle-based |r_k| snapshots at geometric iterations until convergence.
 
 Run on the slurm GPU node so the `fluid` conda env (numpy/scipy/pyamg/ilupp/matplotlib/torch)
 is available. matrices and convergence require --ours-weights (trained .bytes matching the
@@ -189,6 +192,11 @@ def load_frame_3d(frame_dir):
     rho_heavy = float(np.percentile(mass_flat, 99))
     thr = math.sqrt(max(rho_light, 1e-6) * max(rho_heavy, 1e-6))
     barrier = mass_grid > thr
+    rows = np.fromfile(p / "edge_index_rows.bin", dtype=np.uint32).astype(np.int64)
+    cols = np.fromfile(p / "edge_index_cols.bin", dtype=np.uint32).astype(np.int64)
+    vals = np.fromfile(p / "A_values.bin", dtype=np.float32).astype(np.float64)
+    A = sp.coo_matrix((vals, (rows, cols)), shape=(N, N)).tocsr()
+    A = 0.5 * (A + A.T)
     return {
         "frame_dir": str(p),
         "N": N, "W": W, "H": H, "D": D,
@@ -199,6 +207,7 @@ def load_frame_3d(frame_dir):
         "rho_light": rho_light,
         "rho_heavy": rho_heavy,
         "ratio": rho_heavy / max(rho_light, 1e-12),
+        "A": A,
     }
 
 
@@ -2184,6 +2193,504 @@ def make_residual_3d_propagation(
     print(f"[residual-3d-prop] -> {out_path}")
 
 
+def _pressure_velocity_fields_3d(info):
+    """Return buoyancy RHS, pressure, and velocity components/magnitude on a 3D frame."""
+    A = info["A"]
+    b = buoyancy_rhs_3d(info)
+    ml = amg_solver(A)
+    p = ml.solve(b, tol=1e-8, accel="cg", maxiter=2500).astype(np.float64)
+    p -= p.mean()
+
+    W, H, D = info["W"], info["H"], info["D"]
+    xs, ys, zs = info["xs"], info["ys"], info["zs"]
+    rho = info["mass_grid"].astype(np.float64) + 1e-6
+
+    P = np.zeros((W, H, D), dtype=np.float64)
+    P[xs, ys, zs] = p
+
+    dpdx = np.zeros_like(P)
+    dpdy = np.zeros_like(P)
+    dpdz = np.zeros_like(P)
+    dpdx[1:-1, :, :] = 0.5 * (P[2:, :, :] - P[:-2, :, :])
+    dpdy[:, 1:-1, :] = 0.5 * (P[:, 2:, :] - P[:, :-2, :])
+    dpdz[:, :, 1:-1] = 0.5 * (P[:, :, 2:] - P[:, :, :-2])
+
+    vx = -dpdx / rho
+    vy = -dpdy / rho
+    vz = -dpdz / rho
+    vmag = np.sqrt(vx * vx + vy * vy + vz * vz)
+    return b, P, vx, vy, vz, vmag
+
+
+def _scatter3d_particles(
+    ax,
+    px,
+    py,
+    pz,
+    mag,
+    *,
+    cmap,
+    log_lo,
+    log_hi,
+    top_frac=0.45,
+    alpha_power=2.4,
+    elev=22.0,
+    azim=-55.0,
+    size_range=(3.0, 14.0),
+):
+    """Draw depth-sorted particle scatter for a scalar node field."""
+    mag = np.asarray(mag, dtype=np.float64).ravel()
+    pos = mag > 0
+    if not np.any(pos):
+        return
+    thr = float(np.percentile(mag[pos], 100.0 * (1.0 - float(top_frac))))
+    vis = pos & (mag >= thr)
+    if not np.any(vis):
+        return
+
+    vv = mag[vis]
+    logv = np.log10(vv + 1e-30)
+    t = np.clip((logv - float(log_lo)) / max(float(log_hi) - float(log_lo), 1e-9), 0.0, 1.0).astype(np.float32)
+    t_s = t * t * (3.0 - 2.0 * t)
+    alpha = np.clip(t_s, 0.0, 1.0) ** max(float(alpha_power), 1e-6)
+    rgba = cmap(t)
+    rgba[:, 3] = alpha
+
+    vx = px[vis]
+    vy = py[vis]
+    vz = pz[vis]
+    el_r = math.radians(float(elev))
+    az_r = math.radians(float(azim))
+    view_vec = np.array(
+        [math.cos(el_r) * math.cos(az_r), math.cos(el_r) * math.sin(az_r), math.sin(el_r)],
+        dtype=np.float32,
+    )
+    depth = vx * view_vec[0] + vy * view_vec[1] + vz * view_vec[2]
+    order = np.argsort(depth)
+    s_lo, s_hi = size_range
+    sizes = s_lo + (s_hi - s_lo) * (alpha[order] ** 0.55)
+    ax.scatter(vx[order], vy[order], vz[order], c=rgba[order], s=sizes, linewidths=0, depthshade=False)
+
+
+def _draw_velocity_traces_3d(ax, vx, vy, vz, seeds_xyz, *, steps=34, step_size=0.55):
+    """Overlay short white streamline-like traces on a 3D velocity field."""
+    W, H, D = vx.shape
+
+    def _sample_trilinear(F, x, y, z):
+        if x < 0 or y < 0 or z < 0 or x > W - 1 or y > H - 1 or z > D - 1:
+            return 0.0
+        x0 = int(np.floor(x)); y0 = int(np.floor(y)); z0 = int(np.floor(z))
+        x1 = min(x0 + 1, W - 1); y1 = min(y0 + 1, H - 1); z1 = min(z0 + 1, D - 1)
+        tx = float(x - x0); ty = float(y - y0); tz = float(z - z0)
+        c000 = float(F[x0, y0, z0]); c100 = float(F[x1, y0, z0])
+        c010 = float(F[x0, y1, z0]); c110 = float(F[x1, y1, z0])
+        c001 = float(F[x0, y0, z1]); c101 = float(F[x1, y0, z1])
+        c011 = float(F[x0, y1, z1]); c111 = float(F[x1, y1, z1])
+        c00 = c000 * (1 - tx) + c100 * tx
+        c10 = c010 * (1 - tx) + c110 * tx
+        c01 = c001 * (1 - tx) + c101 * tx
+        c11 = c011 * (1 - tx) + c111 * tx
+        c0 = c00 * (1 - ty) + c10 * ty
+        c1 = c01 * (1 - ty) + c11 * ty
+        return c0 * (1 - tz) + c1 * tz
+
+    for sx, sy, sz in seeds_xyz:
+        xs = [float(sx)]
+        ys = [float(sy)]
+        zs = [float(sz)]
+        x = float(sx)
+        y = float(sy)
+        z = float(sz)
+        for _ in range(int(steps)):
+            vx_s = _sample_trilinear(vx, x, y, z)
+            vy_s = _sample_trilinear(vy, x, y, z)
+            vz_s = _sample_trilinear(vz, x, y, z)
+            nrm = float(np.sqrt(vx_s * vx_s + vy_s * vy_s + vz_s * vz_s))
+            if nrm < 1e-8:
+                break
+            x += float(step_size) * vx_s / nrm
+            y += float(step_size) * vy_s / nrm
+            z += float(step_size) * vz_s / nrm
+            if x < 0 or y < 0 or z < 0 or x > W - 1 or y > H - 1 or z > D - 1:
+                break
+            xs.append(x)
+            ys.append(y)
+            zs.append(z)
+        if len(xs) > 2:
+            ax.plot(xs, ys, zs, color=(1.0, 1.0, 1.0, 0.52), linewidth=0.62)
+
+
+def _draw_pressure_slices_3d(ax, P_grid, *, cmap_name="magma", alpha=0.90):
+    """Render 3 orthogonal pressure slices to emphasize field structure."""
+    W, H, D = P_grid.shape
+    mx, my, mz = W // 2, H // 2, D // 2
+    P_abs = np.abs(P_grid).astype(np.float64)
+    v = P_abs[P_abs > 0]
+    if v.size:
+        lo = max(float(np.percentile(v, 1.0)), 1e-30)
+        hi = max(float(np.percentile(v, 99.5)), lo * 1.01)
+    else:
+        lo, hi = 1e-9, 1e-6
+    norm = LogNorm(vmin=lo, vmax=hi)
+    cmap = matplotlib.colormaps[cmap_name]
+
+    yg, zg = np.meshgrid(np.arange(H), np.arange(D), indexing="ij")
+    xg, zg2 = np.meshgrid(np.arange(W), np.arange(D), indexing="ij")
+    xg2, yg2 = np.meshgrid(np.arange(W), np.arange(H), indexing="ij")
+
+    c_x = cmap(norm(np.abs(P_grid[mx, :, :])))
+    c_y = cmap(norm(np.abs(P_grid[:, my, :])))
+    c_z = cmap(norm(np.abs(P_grid[:, :, mz])))
+    c_x[..., 3] = alpha
+    c_y[..., 3] = alpha
+    c_z[..., 3] = alpha
+
+    ax.plot_surface(
+        np.full_like(yg, mx, dtype=np.float64),
+        yg.astype(np.float64),
+        zg.astype(np.float64),
+        facecolors=c_x,
+        linewidth=0,
+        antialiased=False,
+        shade=False,
+    )
+    ax.plot_surface(
+        xg.astype(np.float64),
+        np.full_like(xg, my, dtype=np.float64),
+        zg2.astype(np.float64),
+        facecolors=c_y,
+        linewidth=0,
+        antialiased=False,
+        shade=False,
+    )
+    ax.plot_surface(
+        xg2.astype(np.float64),
+        yg2.astype(np.float64),
+        np.full_like(xg2, mz, dtype=np.float64),
+        facecolors=c_z,
+        linewidth=0,
+        antialiased=False,
+        shade=False,
+    )
+
+
+def _draw_velocity_quiver_3d(ax, vx, vy, vz, *, step=4, cmap_name="magma"):
+    """Subsampled 3D velocity quiver, color-coded by speed."""
+    W, H, D = vx.shape
+    xs = np.arange(0, W, max(1, int(step)))
+    ys = np.arange(0, H, max(1, int(step)))
+    zs = np.arange(0, D, max(1, int(step)))
+    gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
+    u = vx[gx, gy, gz]
+    v = vy[gx, gy, gz]
+    w = vz[gx, gy, gz]
+    speed = np.sqrt(u * u + v * v + w * w)
+    good = speed > 1e-10
+    if not np.any(good):
+        return
+
+    gxx = gx[good].astype(np.float64)
+    gyy = gy[good].astype(np.float64)
+    gzz = gz[good].astype(np.float64)
+    uu = u[good].astype(np.float64)
+    vv = v[good].astype(np.float64)
+    ww = w[good].astype(np.float64)
+    ss = speed[good].astype(np.float64)
+
+    lo = max(float(np.percentile(ss, 5.0)), 1e-30)
+    hi = max(float(np.percentile(ss, 99.5)), lo * 1.01)
+    norm = LogNorm(vmin=lo, vmax=hi)
+    cols = matplotlib.colormaps[cmap_name](norm(ss))
+    cols[:, 3] = 0.86
+
+    nrm = np.sqrt(uu * uu + vv * vv + ww * ww) + 1e-12
+    uu /= nrm
+    vv /= nrm
+    ww /= nrm
+    ax.quiver(gxx, gyy, gzz, uu, vv, ww, length=1.55, normalize=False, colors=cols, linewidths=0.55)
+
+
+def make_residual_3d_compare(
+    frame_dir,
+    out_path,
+    *,
+    ours_weights,
+    neuralspai_checkpoint,
+    lsp_repo="/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU",
+    rtol=1e-8,
+    max_iter=6000,
+    n_panels=5,
+    elev=22.0,
+    azim=-55.0,
+):
+    """3D Fig-1c-style panel with problem row + residual rows for Jacobi/AMG/NeuralSPAI/Ours."""
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    _apply_paper_style_compact()
+    info = load_frame_3d(frame_dir)
+    print(f"[residual-3d-compare] frame={frame_dir} N={info['N']} ratio={info['ratio']:.1f}x")
+
+    A = info["A"]
+    b = buoyancy_rhs_3d(info)
+    nodes = np.fromfile(Path(frame_dir) / "nodes.bin", dtype=NODE_DTYPE)
+    px = nodes["position"][:, 0].astype(np.float32)
+    py = nodes["position"][:, 1].astype(np.float32)
+    pz = nodes["position"][:, 2].astype(np.float32)
+    rho = np.asarray(info["mass_flat"], dtype=np.float64)
+    b_mag = np.abs(b).astype(np.float64)
+
+    print("[residual-3d-compare] solving pressure/velocity via AMG ...", flush=True)
+    _, P_grid, vx_grid, vy_grid, vz_grid, vmag_grid = _pressure_velocity_fields_3d(info)
+    p_mag = np.abs(P_grid[info["xs"], info["ys"], info["zs"]]).astype(np.float64)
+    vmag = np.abs(vmag_grid[info["xs"], info["ys"], info["zs"]]).astype(np.float64)
+
+    if not neuralspai_checkpoint:
+        raise SystemExit(
+            "make_residual_3d_compare requires --neuralspai-checkpoint "
+            "(explicit LearningSparsePreconditioner4GPU checkpoint path)."
+        )
+    if not ours_weights:
+        raise SystemExit(
+            "make_residual_3d_compare requires --ours-weights "
+            "(LeafOnly/Ours .bytes checkpoint for the same scale/domain)."
+        )
+    print(f"[residual-3d-compare] loading NeuralSPAI checkpoint {neuralspai_checkpoint}", flush=True)
+    neural_spai = NeuralSPAIPreconditioner(info, neuralspai_checkpoint, lsp_repo=lsp_repo)
+    print(f"[residual-3d-compare] loading Ours weights {ours_weights}", flush=True)
+    ours = OursPreconditioner(info, ours_weights)
+
+    def _infer_ours_effective_n(ours_prec, full_n: int) -> int:
+        """Infer input size expected by ``ours_prec.apply_M`` on this frame."""
+        n_full = int(full_n)
+        # Fast path: full size works.
+        try:
+            _ = ours_prec.apply_M(np.zeros(n_full, dtype=np.float64))
+            return n_full
+        except ValueError as e:
+            import re as _re
+
+            msg = str(e)
+            # Typical failure: "could not broadcast input array from shape (8000,) into shape (7936,)"
+            m = _re.search(r"into shape \((\d+),\)", msg)
+            if m:
+                n = int(m.group(1))
+                n = max(1, min(n, n_full))
+                return n
+            # Fallback to the internal attribute when available.
+            n_attr = int(getattr(ours_prec, "_real_n", n_full))
+            n_attr = max(1, min(n_attr, n_full))
+            return n_attr
+
+    ours_real_n = _infer_ours_effective_n(ours, int(info["N"]))
+    print(f"[residual-3d-compare] Ours effective system size={ours_real_n}", flush=True)
+    A_ours = A[:ours_real_n, :ours_real_n].tocsr()
+    b_ours = np.asarray(b[:ours_real_n], dtype=np.float64)
+
+    methods = [
+        {"name": "Jacobi", "apply": _build_jacobi_apply(A), "A": A, "b": b, "lift_n": int(info["N"])},
+        {"name": "AMG", "apply": _build_amg_apply(A), "A": A, "b": b, "lift_n": int(info["N"])},
+        {"name": "NeuralSPAI", "apply": neural_spai.apply_M, "A": A, "b": b, "lift_n": int(info["N"])},
+        {"name": "Ours", "apply": ours.apply_M, "A": A_ours, "b": b_ours, "lift_n": ours_real_n},
+    ]
+    n_panels = max(3, int(n_panels))
+    snap_candidates_long = tuple(sorted(set(_PCG_SNAP_CANDIDATES + tuple(range(1, 40)))))
+    method_runs = []
+    for method in methods:
+        name = str(method["name"])
+        apply_M = method["apply"]
+        A_use = method["A"]
+        b_use = np.asarray(method["b"], dtype=np.float64).ravel()
+        lift_n = int(method["lift_n"])
+        print(
+            f"[residual-3d-compare] PCG method={name} ... "
+            f"(system size {A_use.shape[0]})",
+            flush=True,
+        )
+        snaps, meta = pcg_preconditioned_full(
+            A_use,
+            b_use,
+            apply_M,
+            rtol=float(rtol),
+            max_iter=int(max_iter),
+            snap_candidates=snap_candidates_long,
+            max_snapshots=10000,
+        )
+        chosen = _select_method_snap_iters(snaps, int(meta["iters"]), n_panels=n_panels)
+        snaps_lifted = {}
+        full_n = int(info["N"])
+        for k in chosen:
+            r_k = np.asarray(snaps[k], dtype=np.float64).ravel()
+            if lift_n == full_n:
+                snaps_lifted[k] = r_k
+            else:
+                r_full = np.zeros(full_n, dtype=np.float64)
+                n_copy = min(lift_n, r_k.shape[0], full_n)
+                r_full[:n_copy] = r_k[:n_copy]
+                snaps_lifted[k] = r_full
+        method_runs.append(
+            {
+                "name": name,
+                "K": int(meta["iters"]),
+                "converged": bool(meta["converged"]),
+                "snaps": snaps_lifted,
+                "iters_chosen": chosen,
+            }
+        )
+        print(
+            f"[residual-3d-compare]   {name}: K={int(meta['iters'])} "
+            f"converged={bool(meta['converged'])} snaps={chosen}"
+        )
+
+    all_pos = []
+    for run in method_runs:
+        for r in run["snaps"].values():
+            rr = np.abs(np.asarray(r, dtype=np.float64).ravel())
+            rr = rr[rr > 0]
+            if rr.size:
+                all_pos.append(rr)
+    if not all_pos:
+        raise RuntimeError("No positive residual magnitudes available for residual-3d-compare.")
+    cat = np.concatenate(all_pos)
+    r_vmin = max(float(np.percentile(cat, 0.5)), 1e-30)
+    r_vmax = max(float(np.percentile(cat, 99.5)), r_vmin * 1.01)
+    r_log_lo = float(np.log10(r_vmin))
+    r_log_hi = float(np.log10(r_vmax))
+
+    magma = matplotlib.colormaps["magma"]
+
+    def _field_log_bounds(v):
+        vv = np.asarray(v, dtype=np.float64).ravel()
+        vv = vv[vv > 0]
+        if vv.size == 0:
+            return -8.0, -6.0
+        lo = float(np.log10(max(np.percentile(vv, 1.0), 1e-30)))
+        hi = float(np.log10(max(np.percentile(vv, 99.5), 1e-29)))
+        if hi <= lo:
+            hi = lo + 1e-6
+        return lo, hi
+
+    rho_lo, rho_hi = _field_log_bounds(rho)
+    b_lo, b_hi = _field_log_bounds(b_mag)
+    p_lo, p_hi = _field_log_bounds(p_mag)
+    v_lo, v_hi = _field_log_bounds(vmag)
+
+    fig_w = 3.2 * n_panels + 1.25
+    fig_h = 3.0 * (1 + len(method_runs)) + 0.9
+    fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=True)
+    outer = GridSpec(1, 2, figure=fig, width_ratios=(1.0, 0.026), wspace=0.015)
+    all_grid = GridSpecFromSubplotSpec(
+        1 + len(method_runs),
+        n_panels,
+        outer[0, 0],
+        wspace=0.05,
+        hspace=0.10,
+        height_ratios=(1.0,) + tuple(1.0 for _ in method_runs),
+    )
+
+    top_3d = [
+        fig.add_subplot(all_grid[0, 0], projection="3d"),
+        fig.add_subplot(all_grid[0, 1], projection="3d"),
+        fig.add_subplot(all_grid[0, 2], projection="3d"),
+        fig.add_subplot(all_grid[0, 3], projection="3d"),
+    ]
+    ax_m = fig.add_subplot(all_grid[0, 4])
+
+    _scatter3d_particles(top_3d[0], px, py, pz, rho, cmap=magma, log_lo=rho_lo, log_hi=rho_hi, top_frac=0.62, elev=elev, azim=azim)
+    _scatter3d_particles(top_3d[1], px, py, pz, b_mag, cmap=magma, log_lo=b_lo, log_hi=b_hi, top_frac=0.48, elev=elev, azim=azim)
+    _draw_pressure_slices_3d(top_3d[2], P_grid, cmap_name="magma", alpha=0.90)
+    _draw_velocity_quiver_3d(top_3d[3], vx_grid, vy_grid, vz_grid, step=4, cmap_name="magma")
+    _scatter3d_particles(top_3d[3], px, py, pz, vmag, cmap=magma, log_lo=v_lo, log_hi=v_hi, top_frac=0.30, elev=elev, azim=azim, size_range=(2.5, 9.0))
+
+    # White velocity traces over the velocity-magnitude panel.
+    seed_count = 64
+    v_rank = np.argsort(vmag)
+    seed_idx = v_rank[-seed_count:] if v_rank.size > seed_count else v_rank
+    seeds_xyz = np.stack([px[seed_idx], py[seed_idx], pz[seed_idx]], axis=1)
+    _draw_velocity_traces_3d(top_3d[3], vx_grid, vy_grid, vz_grid, seeds_xyz, steps=34, step_size=0.55)
+
+    for ax, ttl in zip(
+        top_3d,
+        [r"Topology $\rho$", r"RHS $|b|$", r"Pressure $|p|$", r"Velocity $|v|$ + traces"],
+    ):
+        ax.set_xlim(0, info["W"])
+        ax.set_ylim(0, info["H"])
+        ax.set_zlim(0, info["D"])
+        ax.set_box_aspect((1, 1, 1))
+        ax.set_axis_off()
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(ttl, fontsize=12.8, pad=4)
+        ax.set_facecolor("white")
+
+    M_dense = ours.assembled_dense_M_numpy()
+    mc = max(16, min(256, int(M_dense.shape[0])))
+    _imshow_matrix_log10_abs(
+        ax_m,
+        M_dense,
+        rf"Ours $M$" + "\n" + rf"top-left ${mc}\times{mc}$",
+        crop=mc,
+        cmap="magma",
+        rank_normalize=True,
+    )
+    ax_m.set_box_aspect(1)
+
+    cax = fig.add_subplot(outer[0, 1])
+    for mi, run in enumerate(method_runs):
+        keys = run["iters_chosen"]
+        for j in range(n_panels):
+            ax = fig.add_subplot(all_grid[mi + 1, j], projection="3d")
+            if j < len(keys):
+                k = keys[j]
+                rr = np.abs(np.asarray(run["snaps"][k], dtype=np.float64).ravel())
+                _scatter3d_particles(
+                    ax,
+                    px,
+                    py,
+                    pz,
+                    rr,
+                    cmap=magma,
+                    log_lo=r_log_lo,
+                    log_hi=r_log_hi,
+                    top_frac=0.45,
+                    alpha_power=2.5,
+                    elev=elev,
+                    azim=azim,
+                )
+                ax.set_title(rf"$k={k}$", fontsize=11.5, pad=3)
+            else:
+                ax.set_axis_off()
+            ax.set_xlim(0, info["W"])
+            ax.set_ylim(0, info["H"])
+            ax.set_zlim(0, info["D"])
+            ax.set_box_aspect((1, 1, 1))
+            ax.set_axis_off()
+            ax.view_init(elev=elev, azim=azim)
+            if j == 0:
+                conv = "" if run["converged"] else " (no conv.)"
+                ax.text2D(
+                    -0.24,
+                    0.52,
+                    f"{run['name']}\nK={run['K']}{conv}",
+                    transform=ax.transAxes,
+                    fontsize=12.5,
+                    ha="left",
+                    va="center",
+                )
+
+    sm = matplotlib.cm.ScalarMappable(cmap="magma", norm=LogNorm(vmin=r_vmin, vmax=r_vmax))
+    sm.set_array([])
+    cb = fig.colorbar(sm, cax=cax)
+    cb.set_label(r"$|r_k|$")
+
+    fig.suptitle(
+        rf"3D multiscale residual transport (particles, opacity-coded)  "
+        rf"($\rho_H/\rho_L\!\approx\!{info['ratio']:.0f}\times$)",
+        y=0.995,
+    )
+    _savefig_paper(fig, out_path)
+    plt.close(fig)
+    print(f"[residual-3d-compare] -> {out_path}")
+
+
 # Figure 2b: full 3D variety grid (all train + test frames in a 3D bundle)
 # ============================================================================
 def _panel_bbox_lines(ax, W, H, D, color=(0.45, 0.45, 0.45, 0.55), lw=0.4):
@@ -2755,11 +3262,20 @@ def _resolve_frame(data_root, scale, split, frame_idx):
     return frames[min(frame_idx, len(frames) - 1)]
 
 
+def _resolve_frame_3d(data_root, bundle, split, frame_idx):
+    d = Path(data_root) / str(bundle) / split
+    frames = sorted(f for f in d.iterdir() if (f / "nodes.bin").exists())
+    if not frames:
+        raise SystemExit(f"No frames in {d}")
+    return frames[min(int(frame_idx), len(frames) - 1)]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--fig",
                    choices=["hero", "variety", "variety-3d", "m-zoom-strip", "residual-3d", "residual-3d-propagation",
+                            "residual-3d-compare",
                             "matrices", "convergence", "all"],
                    default="all")
     p.add_argument("--data-root", default=str(_default_data_root()),
@@ -2885,13 +3401,27 @@ def main():
                    help="Colormap for residual-3d-propagation.")
     p.add_argument("--residual-prop-voxel-quantile", type=float, default=98.5,
                    help="Only voxels above this residual percentile are shown in 3D row.")
+    p.add_argument("--residual-compare-3d-frame-dir", default=None,
+                   help="Explicit frame directory for residual-3d-compare.")
+    p.add_argument("--residual-compare-3d-bundle", default="multiphase_v2_3d_8000",
+                   help="3D data bundle under --data-root used when --residual-compare-3d-frame-dir is not set.")
+    p.add_argument("--residual-compare-3d-split", choices=["train", "test"], default="train")
+    p.add_argument("--residual-compare-3d-frame", type=int, default=73,
+                   help="Default 73 to mirror the paper's Fig. 1c scene selection.")
+    p.add_argument("--residual-compare-3d-rtol", type=float, default=1e-8)
+    p.add_argument("--residual-compare-3d-max-iter", type=int, default=6000)
+    p.add_argument("--residual-compare-3d-panels", type=int, default=5,
+                   help="Snapshots per method row for residual-3d-compare.")
+    p.add_argument("--residual-compare-3d-elev", type=float, default=22.0)
+    p.add_argument("--residual-compare-3d-azim", type=float, default=-55.0)
 
     args = p.parse_args()
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     figs = {args.fig} if args.fig != "all" else {"hero", "variety", "matrices", "convergence"}
-    # "variety-3d", "m-zoom-strip", "residual-3d", and "residual-3d-propagation"
+    # "variety-3d", "m-zoom-strip", "residual-3d", "residual-3d-propagation",
+    # and "residual-3d-compare"
     # are not part of "all" (require explicit flags).
 
     if "hero" in figs:
@@ -2973,6 +3503,30 @@ def main():
             method=str(args.residual_prop_method),
             cmap_name=str(args.residual_prop_cmap),
             voxel_quantile=float(args.residual_prop_voxel_quantile),
+        )
+
+    if "residual-3d-compare" in figs:
+        frame_3d = args.residual_compare_3d_frame_dir
+        if frame_3d is None:
+            frame_3d = str(
+                _resolve_frame_3d(
+                    args.data_root,
+                    args.residual_compare_3d_bundle,
+                    args.residual_compare_3d_split,
+                    args.residual_compare_3d_frame,
+                )
+            )
+        make_residual_3d_compare(
+            frame_3d,
+            out_dir / "residual_3d_compare.png",
+            ours_weights=args.ours_weights,
+            neuralspai_checkpoint=args.neuralspai_checkpoint,
+            lsp_repo=args.lsp_repo,
+            rtol=float(args.residual_compare_3d_rtol),
+            max_iter=int(args.residual_compare_3d_max_iter),
+            n_panels=int(args.residual_compare_3d_panels),
+            elev=float(args.residual_compare_3d_elev),
+            azim=float(args.residual_compare_3d_azim),
         )
 
     if "matrices" in figs:

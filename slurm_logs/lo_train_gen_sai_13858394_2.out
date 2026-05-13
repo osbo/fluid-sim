@@ -1,0 +1,435 @@
+================================================================
+Job 13858394, task 2 on node3204
+Started: Tue May 12 21:19:55 EDT 2026
+Training mode: SAI loss (--loss-mode sai)
+================================================================
+[2/3] g4096_param_low_d128_L3_hw_sai (g4096_train_param_low)
+Using device: cuda
+  [startup] Random sample of 100 frames (--num-frames 100)
+  [startup] Loaded 100 training contexts from disk cache (11201.67 ms) → .leafonly_training_context_cache/
+  [startup] global_max_edges = 20224
+  [startup] contexts_per_step = 4 (gradient accumulation)
+  [startup] Ablation config: layers=3, gcn_layers=2, jacobi=True (node_scalar), attention_layout=128x129, off_diag_dense_attn=True, diag_dense_attn=True, use_highways=True
+  [startup] torch.compile(model): enabled (CUDA)
+  [startup] LR scheduler: ReduceLROnPlateau (factor=0.5, patience=5, threshold=5e-3, min_lr=1.00e-06, auto-stop (patience=10, threshold=5e-3 at min_lr))
+  Block preconditioner: 32 leaves, diag 128×128, off 32×32 (128 nodes/leaf)
+  Probe vectors (loss MC columns): auto max(64, ⌈√n_pad⌉) per step (override with --probe-vectors K)
+  Probe MAZ path: --leafonly-pcg=matrix_free (A@Z: sparse block-diagonal A@Z (all devices; dense bmm only if context cache has use_dense_A); apply_block_diagonal_M torch.compile (matrix_free))
+  Loss mode: sai (mean_k ||M(A w_k) - w_k||^2 = Hutchinson ||MA-I||_F^2; --loss-mode sai)
+
+=== Startup timing (wall clock, ms) ===
+  Dataset + run folder scan:         127.49
+  Load training contexts (disk→device):   11201.67 ms  (100 contexts)
+  LeafOnlyNet + .to(device):          24.39
+  torch.compile(model) call:        2615.93  (CUDA; Inductor runs on 1st forward/backward)
+  load_leaf_only_weights:         skipped
+  AdamW + ReduceLROnPlateau:           0.44
+  ---
+  Total before training loop:      13983.17
+  Note: First loss line’s (elapsed) is wall time for that step only (after startup); with torch.compile, the first forward+backward triggers Inductor codegen (often ~10–20s).
+  At step 299, a one-time detailed breakdown (zero_grad / forward / apply M / backward / …) is printed.
+
+  [track] Training profile CSV: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/weights/g4096_param_low_d128_L3_hw_sai_training_profile.csv
+00000: Loss avg=927.8568 ± 0.0000  (43.353s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step000000.bytes
+00100: Loss avg=883.4938 ± 52.3389  (18.893s) lr=2.00e-04
+00200: Loss avg=864.4126 ± 9.4693  (2.754s) lr=2.00e-04
+
+--- Detailed timing for step 300 (contexts_per_step=4, batched forward) ---
+  batch: B=4, n_pad=4096, batch_vectors=256
+--- Step 300 detailed timing (ms) ---
+  zero_grad:            0.26
+  batch assembly:       0.63
+  model forward:       10.20
+  probe Z+Jacobi:       0.08
+  A @ Z (sparse block-mm):     0.78
+  apply M (MAZ):        0.61
+  residual + loss:      0.17
+  backward:            16.02
+  clip_grad_norm:       1.14
+  optimizer.step:       1.55
+  total:               31.44
+  full iter (wall):    38.65 ms  (Python / scheduler / print overhead ≈ +7.20 ms vs sum above)
+----------------------------------------
+
+00300: Loss avg=857.0863 ± 8.5801  (2.763s, avg: 2.763s) lr=2.00e-04
+00400: Loss avg=852.3860 ± 8.2144  (2.761s, avg: 2.761s) lr=2.00e-04
+00500: Loss avg=847.1789 ± 8.2782  (2.753s, avg: 2.757s) lr=2.00e-04
+00600: Loss avg=852.4177 ± 47.2515  (2.767s, avg: 2.760s) lr=2.00e-04
+00700: Loss avg=854.2974 ± 78.9096  (2.748s, avg: 2.757s) lr=2.00e-04
+00800: Loss avg=837.1041 ± 7.2480  (2.761s, avg: 2.758s) lr=2.00e-04
+00900: Loss avg=832.7755 ± 8.6859  (2.750s, avg: 2.757s) lr=2.00e-04
+01000: Loss avg=830.7394 ± 8.5806  (2.736s, avg: 2.754s) lr=2.00e-04
+01100: Loss avg=826.2516 ± 7.7799  (2.740s, avg: 2.756s) lr=2.00e-04
+01200: Loss avg=821.0260 ± 7.9599  (2.749s, avg: 2.755s) lr=2.00e-04
+01300: Loss avg=816.1561 ± 8.1782  (2.757s, avg: 2.756s) lr=2.00e-04
+01400: Loss avg=813.2075 ± 7.2653  (2.748s, avg: 2.755s) lr=2.00e-04
+01500: Loss avg=808.7216 ± 8.0623  (2.734s, avg: 2.753s) lr=2.00e-04
+01600: Loss avg=803.8476 ± 7.5016  (2.740s, avg: 2.752s) lr=2.00e-04
+01700: Loss avg=802.2669 ± 7.5519  (2.737s, avg: 2.751s) lr=2.00e-04
+01800: Loss avg=797.8038 ± 8.6358  (2.755s, avg: 2.752s) lr=2.00e-04
+01900: Loss avg=795.7280 ± 8.4203  (2.769s, avg: 2.753s) lr=2.00e-04
+02000: Loss avg=792.4300 ± 9.3055  (2.753s, avg: 2.753s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step002000.bytes
+02100: Loss avg=791.4303 ± 8.4131  (2.754s, avg: 2.756s) lr=2.00e-04
+02200: Loss avg=786.9966 ± 9.0901  (2.761s, avg: 2.756s) lr=2.00e-04
+02300: Loss avg=783.1180 ± 7.4006  (2.760s, avg: 2.757s) lr=2.00e-04
+02400: Loss avg=782.1735 ± 9.2741  (2.773s, avg: 2.757s) lr=2.00e-04
+02500: Loss avg=777.7598 ± 8.8726  (2.761s, avg: 2.758s) lr=2.00e-04
+02600: Loss avg=775.5810 ± 8.1574  (2.762s, avg: 2.758s) lr=2.00e-04
+02700: Loss avg=773.3467 ± 8.1673  (2.768s, avg: 2.758s) lr=2.00e-04
+02800: Loss avg=770.8163 ± 8.0039  (2.760s, avg: 2.758s) lr=2.00e-04
+02900: Loss avg=770.0626 ± 8.9897  (2.769s, avg: 2.759s) lr=2.00e-04
+03000: Loss avg=764.9130 ± 7.4044  (2.764s, avg: 2.759s) lr=2.00e-04
+03100: Loss avg=764.1685 ± 8.8703  (2.754s, avg: 2.760s) lr=2.00e-04
+03200: Loss avg=762.4648 ± 8.9566  (2.771s, avg: 2.760s) lr=2.00e-04
+03300: Loss avg=760.3075 ± 7.5993  (2.762s, avg: 2.760s) lr=2.00e-04
+03400: Loss avg=756.2887 ± 8.2638  (2.760s, avg: 2.760s) lr=2.00e-04
+03500: Loss avg=755.1799 ± 8.2661  (2.771s, avg: 2.761s) lr=2.00e-04
+03600: Loss avg=754.5433 ± 8.9752  (2.760s, avg: 2.761s) lr=2.00e-04
+03700: Loss avg=751.7449 ± 8.5140  (2.743s, avg: 2.760s) lr=2.00e-04
+03800: Loss avg=748.6057 ± 8.5894  (2.749s, avg: 2.760s) lr=2.00e-04
+03900: Loss avg=747.2737 ± 8.9067  (2.740s, avg: 2.759s) lr=2.00e-04
+04000: Loss avg=744.9157 ± 8.4948  (2.748s, avg: 2.759s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step004000.bytes
+04100: Loss avg=743.6598 ± 8.6360  (2.739s, avg: 2.760s) lr=2.00e-04
+04200: Loss avg=742.2216 ± 8.7069  (2.741s, avg: 2.760s) lr=2.00e-04
+04300: Loss avg=741.3427 ± 8.7058  (2.751s, avg: 2.759s) lr=2.00e-04
+04400: Loss avg=737.6718 ± 8.1363  (2.737s, avg: 2.759s) lr=2.00e-04
+04500: Loss avg=737.0772 ± 9.0141  (2.748s, avg: 2.759s) lr=2.00e-04
+04600: Loss avg=737.0615 ± 8.4846  (2.743s, avg: 2.758s) lr=2.00e-04
+04700: Loss avg=735.1652 ± 7.9920  (2.737s, avg: 2.758s) lr=2.00e-04
+04800: Loss avg=731.3843 ± 8.0093  (2.752s, avg: 2.758s) lr=2.00e-04
+04900: Loss avg=729.0911 ± 8.9969  (2.745s, avg: 2.757s) lr=2.00e-04
+05000: Loss avg=721.5086 ± 9.2361  (2.739s, avg: 2.757s) lr=2.00e-04
+05100: Loss avg=717.4334 ± 9.6604  (2.748s, avg: 2.758s) lr=2.00e-04
+05200: Loss avg=713.7897 ± 10.0113  (2.737s, avg: 2.757s) lr=2.00e-04
+05300: Loss avg=710.2912 ± 8.7944  (2.744s, avg: 2.757s) lr=2.00e-04
+05400: Loss avg=704.2313 ± 9.3369  (2.743s, avg: 2.757s) lr=2.00e-04
+05500: Loss avg=699.7309 ± 9.3823  (2.732s, avg: 2.756s) lr=2.00e-04
+05600: Loss avg=698.5390 ± 10.2810  (2.755s, avg: 2.756s) lr=2.00e-04
+05700: Loss avg=699.8411 ± 10.0619  (2.736s, avg: 2.756s) lr=2.00e-04
+05800: Loss avg=693.7023 ± 11.2079  (2.748s, avg: 2.756s) lr=2.00e-04
+05900: Loss avg=692.3039 ± 11.9497  (2.745s, avg: 2.755s) lr=2.00e-04
+06000: Loss avg=689.4267 ± 10.6078  (2.736s, avg: 2.755s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step006000.bytes
+06100: Loss avg=688.0520 ± 11.2753  (2.748s, avg: 2.756s) lr=2.00e-04
+06200: Loss avg=683.8828 ± 10.0982  (2.737s, avg: 2.756s) lr=2.00e-04
+06300: Loss avg=683.1176 ± 10.4864  (2.749s, avg: 2.756s) lr=2.00e-04
+06400: Loss avg=679.7227 ± 11.7296  (2.744s, avg: 2.755s) lr=2.00e-04
+06500: Loss avg=679.0217 ± 11.5912  (2.737s, avg: 2.755s) lr=2.00e-04
+06600: Loss avg=678.6485 ± 12.3260  (2.752s, avg: 2.755s) lr=2.00e-04
+06700: Loss avg=677.8444 ± 10.4313  (2.734s, avg: 2.755s) lr=2.00e-04
+06800: Loss avg=676.0168 ± 11.9196  (2.745s, avg: 2.755s) lr=2.00e-04
+06900: Loss avg=672.4716 ± 11.5382  (2.745s, avg: 2.754s) lr=2.00e-04
+07000: Loss avg=668.3308 ± 10.8400  (2.756s, avg: 2.754s) lr=2.00e-04
+07100: Loss avg=663.6782 ± 12.3895  (2.759s, avg: 2.755s) lr=2.00e-04
+07200: Loss avg=662.5175 ± 11.5367  (2.763s, avg: 2.755s) lr=2.00e-04
+07300: Loss avg=660.9578 ± 12.7615  (2.761s, avg: 2.755s) lr=2.00e-04
+07400: Loss avg=663.7813 ± 11.5753  (2.765s, avg: 2.755s) lr=2.00e-04
+07500: Loss avg=662.1354 ± 11.6659  (2.753s, avg: 2.755s) lr=2.00e-04
+07600: Loss avg=659.6180 ± 12.5677  (2.762s, avg: 2.755s) lr=2.00e-04
+07700: Loss avg=654.5401 ± 12.3543  (2.754s, avg: 2.755s) lr=2.00e-04
+07800: Loss avg=655.9870 ± 11.5030  (2.752s, avg: 2.755s) lr=2.00e-04
+07900: Loss avg=653.5155 ± 12.0016  (2.764s, avg: 2.755s) lr=2.00e-04
+08000: Loss avg=654.3639 ± 11.2841  (2.755s, avg: 2.755s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step008000.bytes
+08100: Loss avg=648.9479 ± 12.6882  (2.753s, avg: 2.756s) lr=2.00e-04
+08200: Loss avg=649.4087 ± 13.4285  (2.754s, avg: 2.756s) lr=2.00e-04
+08300: Loss avg=643.8132 ± 11.5192  (2.751s, avg: 2.756s) lr=2.00e-04
+08400: Loss avg=644.8651 ± 12.3440  (2.765s, avg: 2.756s) lr=2.00e-04
+08500: Loss avg=643.7755 ± 14.0205  (2.754s, avg: 2.756s) lr=2.00e-04
+08600: Loss avg=636.3592 ± 15.5148  (2.758s, avg: 2.756s) lr=2.00e-04
+08700: Loss avg=637.1111 ± 11.4695  (2.767s, avg: 2.756s) lr=2.00e-04
+08800: Loss avg=632.1031 ± 14.3951  (2.756s, avg: 2.756s) lr=2.00e-04
+08900: Loss avg=632.5655 ± 12.4038  (2.766s, avg: 2.757s) lr=2.00e-04
+09000: Loss avg=632.9339 ± 14.1382  (2.756s, avg: 2.757s) lr=2.00e-04
+09100: Loss avg=628.4007 ± 13.0106  (2.747s, avg: 2.757s) lr=2.00e-04
+09200: Loss avg=627.4742 ± 14.6556  (2.762s, avg: 2.757s) lr=2.00e-04
+09300: Loss avg=621.5333 ± 12.4401  (2.751s, avg: 2.757s) lr=2.00e-04
+09400: Loss avg=618.4917 ± 11.9654  (2.755s, avg: 2.757s) lr=2.00e-04
+09500: Loss avg=611.1392 ± 12.3519  (2.755s, avg: 2.757s) lr=2.00e-04
+09600: Loss avg=607.2739 ± 13.8990  (2.750s, avg: 2.757s) lr=2.00e-04
+09700: Loss avg=602.0029 ± 12.8196  (2.759s, avg: 2.757s) lr=2.00e-04
+09800: Loss avg=602.4513 ± 13.5236  (2.743s, avg: 2.757s) lr=2.00e-04
+09900: Loss avg=596.4614 ± 13.8075  (2.743s, avg: 2.756s) lr=2.00e-04
+10000: Loss avg=590.9505 ± 14.9063  (2.757s, avg: 2.756s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step010000.bytes
+10100: Loss avg=588.7866 ± 16.2399  (2.754s, avg: 2.757s) lr=2.00e-04
+10200: Loss avg=583.4724 ± 16.5151  (2.752s, avg: 2.757s) lr=2.00e-04
+10300: Loss avg=583.2348 ± 16.0238  (2.762s, avg: 2.757s) lr=2.00e-04
+10400: Loss avg=577.8567 ± 17.4192  (2.748s, avg: 2.757s) lr=2.00e-04
+10500: Loss avg=579.2098 ± 15.8574  (2.761s, avg: 2.757s) lr=2.00e-04
+10600: Loss avg=569.5387 ± 16.0955  (2.757s, avg: 2.757s) lr=2.00e-04
+10700: Loss avg=570.1074 ± 17.2567  (2.751s, avg: 2.757s) lr=2.00e-04
+10800: Loss avg=561.4340 ± 16.0492  (2.762s, avg: 2.757s) lr=2.00e-04
+10900: Loss avg=555.9109 ± 18.2838  (2.754s, avg: 2.757s) lr=2.00e-04
+11000: Loss avg=555.7691 ± 16.4159  (2.761s, avg: 2.757s) lr=2.00e-04
+11100: Loss avg=554.6964 ± 18.9063  (2.750s, avg: 2.757s) lr=2.00e-04
+11200: Loss avg=543.4614 ± 17.9810  (2.753s, avg: 2.757s) lr=2.00e-04
+11300: Loss avg=545.7247 ± 17.6565  (2.763s, avg: 2.757s) lr=2.00e-04
+11400: Loss avg=537.5762 ± 21.4850  (2.751s, avg: 2.757s) lr=2.00e-04
+11500: Loss avg=522.2132 ± 21.0666  (2.750s, avg: 2.757s) lr=2.00e-04
+11600: Loss avg=519.2192 ± 17.7534  (2.756s, avg: 2.757s) lr=2.00e-04
+11700: Loss avg=520.7390 ± 22.7610  (2.749s, avg: 2.757s) lr=2.00e-04
+11800: Loss avg=509.4176 ± 22.2185  (2.760s, avg: 2.757s) lr=2.00e-04
+11900: Loss avg=499.8905 ± 21.1184  (2.750s, avg: 2.757s) lr=2.00e-04
+12000: Loss avg=492.6127 ± 19.8996  (2.755s, avg: 2.757s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step012000.bytes
+12100: Loss avg=490.8123 ± 22.6143  (2.757s, avg: 2.758s) lr=2.00e-04
+12200: Loss avg=473.4464 ± 19.5964  (2.748s, avg: 2.757s) lr=2.00e-04
+12300: Loss avg=472.9736 ± 24.4690  (2.757s, avg: 2.757s) lr=2.00e-04
+12400: Loss avg=461.8981 ± 22.9435  (2.760s, avg: 2.757s) lr=2.00e-04
+12500: Loss avg=458.0936 ± 23.9953  (2.751s, avg: 2.757s) lr=2.00e-04
+12600: Loss avg=452.3367 ± 20.9827  (2.765s, avg: 2.757s) lr=2.00e-04
+12700: Loss avg=445.6160 ± 20.7131  (2.764s, avg: 2.758s) lr=2.00e-04
+12800: Loss avg=446.7321 ± 22.7291  (2.764s, avg: 2.758s) lr=2.00e-04
+12900: Loss avg=437.2373 ± 23.5237  (2.771s, avg: 2.758s) lr=2.00e-04
+13000: Loss avg=427.1445 ± 21.5921  (2.763s, avg: 2.758s) lr=2.00e-04
+13100: Loss avg=428.0690 ± 24.2981  (2.767s, avg: 2.758s) lr=2.00e-04
+13200: Loss avg=419.2010 ± 21.2710  (2.771s, avg: 2.758s) lr=2.00e-04
+13300: Loss avg=426.0363 ± 27.1918  (2.760s, avg: 2.758s) lr=2.00e-04
+13400: Loss avg=410.8622 ± 21.6784  (2.772s, avg: 2.758s) lr=2.00e-04
+13500: Loss avg=413.6163 ± 22.4149  (2.763s, avg: 2.758s) lr=2.00e-04
+13600: Loss avg=406.0284 ± 21.4612  (2.771s, avg: 2.758s) lr=2.00e-04
+13700: Loss avg=400.7465 ± 20.1864  (2.765s, avg: 2.758s) lr=2.00e-04
+13800: Loss avg=396.4424 ± 22.5869  (2.757s, avg: 2.758s) lr=2.00e-04
+13900: Loss avg=397.0797 ± 20.1123  (2.772s, avg: 2.759s) lr=2.00e-04
+14000: Loss avg=393.5675 ± 24.7097  (2.759s, avg: 2.759s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step014000.bytes
+14100: Loss avg=389.0135 ± 19.6573  (2.755s, avg: 2.759s) lr=2.00e-04
+14200: Loss avg=384.3452 ± 22.4147  (2.768s, avg: 2.759s) lr=2.00e-04
+14300: Loss avg=378.6433 ± 21.4706  (2.755s, avg: 2.759s) lr=2.00e-04
+14400: Loss avg=378.0203 ± 23.1816  (2.763s, avg: 2.759s) lr=2.00e-04
+14500: Loss avg=367.3294 ± 18.1798  (2.759s, avg: 2.759s) lr=2.00e-04
+14600: Loss avg=373.7211 ± 22.1960  (2.752s, avg: 2.759s) lr=2.00e-04
+14700: Loss avg=374.8342 ± 21.4891  (2.765s, avg: 2.759s) lr=2.00e-04
+14800: Loss avg=367.9035 ± 22.9320  (2.755s, avg: 2.759s) lr=2.00e-04
+14900: Loss avg=365.7728 ± 23.5938  (2.764s, avg: 2.759s) lr=2.00e-04
+15000: Loss avg=350.7092 ± 22.6387  (2.770s, avg: 2.759s) lr=2.00e-04
+15100: Loss avg=350.6961 ± 20.1537  (2.758s, avg: 2.759s) lr=2.00e-04
+15200: Loss avg=359.5184 ± 25.8684  (2.767s, avg: 2.759s) lr=2.00e-04
+15300: Loss avg=345.1775 ± 21.2414  (2.759s, avg: 2.759s) lr=2.00e-04
+15400: Loss avg=347.3612 ± 25.4968  (2.758s, avg: 2.759s) lr=2.00e-04
+15500: Loss avg=337.5619 ± 22.2857  (2.772s, avg: 2.759s) lr=2.00e-04
+15600: Loss avg=334.8917 ± 22.9890  (2.763s, avg: 2.760s) lr=2.00e-04
+15700: Loss avg=330.4802 ± 22.2213  (2.761s, avg: 2.760s) lr=2.00e-04
+15800: Loss avg=333.2843 ± 24.8213  (2.769s, avg: 2.760s) lr=2.00e-04
+15900: Loss avg=320.9963 ± 24.9181  (2.763s, avg: 2.760s) lr=2.00e-04
+16000: Loss avg=323.6778 ± 26.3003  (2.768s, avg: 2.760s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step016000.bytes
+16100: Loss avg=314.6265 ± 22.7933  (2.755s, avg: 2.760s) lr=2.00e-04
+16200: Loss avg=325.7113 ± 24.5105  (2.754s, avg: 2.760s) lr=2.00e-04
+16300: Loss avg=316.8700 ± 25.9112  (2.768s, avg: 2.760s) lr=2.00e-04
+16400: Loss avg=322.7687 ± 27.2003  (2.756s, avg: 2.760s) lr=2.00e-04
+16500: Loss avg=313.2918 ± 26.3154  (2.766s, avg: 2.760s) lr=2.00e-04
+16600: Loss avg=307.0164 ± 22.0834  (2.764s, avg: 2.760s) lr=2.00e-04
+16700: Loss avg=301.4964 ± 22.1480  (2.762s, avg: 2.760s) lr=2.00e-04
+16800: Loss avg=300.9859 ± 32.3652  (2.765s, avg: 2.760s) lr=2.00e-04
+16900: Loss avg=292.2111 ± 24.2543  (2.756s, avg: 2.760s) lr=2.00e-04
+17000: Loss avg=295.0086 ± 26.2020  (2.770s, avg: 2.760s) lr=2.00e-04
+17100: Loss avg=294.8565 ± 24.2860  (2.754s, avg: 2.760s) lr=2.00e-04
+17200: Loss avg=285.5328 ± 21.0836  (2.759s, avg: 2.760s) lr=2.00e-04
+17300: Loss avg=293.8022 ± 26.1929  (2.768s, avg: 2.760s) lr=2.00e-04
+17400: Loss avg=289.8496 ± 23.6133  (2.755s, avg: 2.760s) lr=2.00e-04
+17500: Loss avg=281.4239 ± 21.5225  (2.765s, avg: 2.760s) lr=2.00e-04
+17600: Loss avg=276.1034 ± 25.8342  (2.761s, avg: 2.760s) lr=2.00e-04
+17700: Loss avg=272.1869 ± 24.5337  (2.759s, avg: 2.760s) lr=2.00e-04
+17800: Loss avg=277.2765 ± 33.4452  (2.767s, avg: 2.760s) lr=2.00e-04
+17900: Loss avg=269.5709 ± 24.4616  (2.761s, avg: 2.760s) lr=2.00e-04
+18000: Loss avg=260.9460 ± 20.1693  (2.763s, avg: 2.760s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step018000.bytes
+18100: Loss avg=272.2435 ± 26.7445  (2.768s, avg: 2.761s) lr=2.00e-04
+18200: Loss avg=253.1268 ± 22.9838  (2.765s, avg: 2.761s) lr=2.00e-04
+18300: Loss avg=253.0755 ± 22.7277  (2.762s, avg: 2.761s) lr=2.00e-04
+18400: Loss avg=254.9664 ± 22.8693  (2.767s, avg: 2.761s) lr=2.00e-04
+18500: Loss avg=264.0484 ± 26.8751  (2.759s, avg: 2.761s) lr=2.00e-04
+18600: Loss avg=253.4812 ± 22.7132  (2.772s, avg: 2.761s) lr=2.00e-04
+18700: Loss avg=245.4529 ± 22.5678  (2.763s, avg: 2.761s) lr=2.00e-04
+18800: Loss avg=248.3300 ± 24.1797  (2.763s, avg: 2.761s) lr=2.00e-04
+18900: Loss avg=242.7373 ± 23.8449  (2.771s, avg: 2.761s) lr=2.00e-04
+19000: Loss avg=245.9922 ± 27.1278  (2.762s, avg: 2.761s) lr=2.00e-04
+19100: Loss avg=234.7755 ± 22.4405  (2.762s, avg: 2.761s) lr=2.00e-04
+19200: Loss avg=233.9516 ± 21.3390  (2.762s, avg: 2.761s) lr=2.00e-04
+19300: Loss avg=254.7032 ± 47.3102  (2.763s, avg: 2.761s) lr=2.00e-04
+19400: Loss avg=231.5748 ± 23.5027  (2.770s, avg: 2.761s) lr=2.00e-04
+19500: Loss avg=237.3070 ± 24.3375  (2.759s, avg: 2.761s) lr=2.00e-04
+19600: Loss avg=222.6716 ± 22.4204  (2.767s, avg: 2.761s) lr=2.00e-04
+19700: Loss avg=217.3404 ± 24.9438  (2.765s, avg: 2.761s) lr=2.00e-04
+19800: Loss avg=216.4704 ± 25.3527  (2.759s, avg: 2.761s) lr=2.00e-04
+19900: Loss avg=205.4607 ± 22.9868  (2.772s, avg: 2.761s) lr=2.00e-04
+20000: Loss avg=214.4380 ± 26.0369  (2.762s, avg: 2.761s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step020000.bytes
+20100: Loss avg=204.9151 ± 25.7129  (2.765s, avg: 2.762s) lr=2.00e-04
+20200: Loss avg=193.9366 ± 18.8377  (2.772s, avg: 2.762s) lr=2.00e-04
+20300: Loss avg=195.3601 ± 22.6717  (2.752s, avg: 2.762s) lr=2.00e-04
+20400: Loss avg=201.2387 ± 23.6413  (2.751s, avg: 2.762s) lr=2.00e-04
+20500: Loss avg=187.3177 ± 21.2104  (2.744s, avg: 2.762s) lr=2.00e-04
+20600: Loss avg=190.7368 ± 23.5234  (2.742s, avg: 2.761s) lr=2.00e-04
+20700: Loss avg=198.3206 ± 31.7063  (2.755s, avg: 2.761s) lr=2.00e-04
+20800: Loss avg=196.9400 ± 24.2933  (2.747s, avg: 2.761s) lr=2.00e-04
+20900: Loss avg=187.2089 ± 21.4295  (2.742s, avg: 2.761s) lr=2.00e-04
+21000: Loss avg=181.1135 ± 21.7373  (2.759s, avg: 2.761s) lr=2.00e-04
+21100: Loss avg=172.9570 ± 17.5331  (2.738s, avg: 2.761s) lr=2.00e-04
+21200: Loss avg=173.2449 ± 18.7812  (2.749s, avg: 2.761s) lr=2.00e-04
+21300: Loss avg=178.0135 ± 21.1029  (2.753s, avg: 2.761s) lr=2.00e-04
+21400: Loss avg=189.2925 ± 32.6248  (2.740s, avg: 2.761s) lr=2.00e-04
+21500: Loss avg=169.3535 ± 17.1062  (2.758s, avg: 2.761s) lr=2.00e-04
+21600: Loss avg=169.9277 ± 17.8816  (2.750s, avg: 2.761s) lr=2.00e-04
+21700: Loss avg=171.5281 ± 22.1887  (2.742s, avg: 2.761s) lr=2.00e-04
+21800: Loss avg=172.6819 ± 21.8608  (2.753s, avg: 2.761s) lr=2.00e-04
+21900: Loss avg=165.6864 ± 16.2234  (2.736s, avg: 2.761s) lr=2.00e-04
+22000: Loss avg=174.7044 ± 23.8407  (2.745s, avg: 2.761s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step022000.bytes
+22100: Loss avg=165.8594 ± 17.2373  (2.734s, avg: 2.761s) lr=2.00e-04
+22200: Loss avg=169.8204 ± 20.8709  (2.738s, avg: 2.761s) lr=2.00e-04
+22300: Loss avg=164.7893 ± 19.1469  (2.760s, avg: 2.761s) lr=2.00e-04
+22400: Loss avg=175.1038 ± 21.3168  (2.743s, avg: 2.761s) lr=2.00e-04
+22500: Loss avg=159.7003 ± 16.1627  (2.749s, avg: 2.761s) lr=2.00e-04
+22600: Loss avg=159.4803 ± 19.1286  (2.757s, avg: 2.761s) lr=2.00e-04
+22700: Loss avg=154.3331 ± 16.4815  (2.740s, avg: 2.761s) lr=2.00e-04
+22800: Loss avg=161.3199 ± 17.8902  (2.757s, avg: 2.761s) lr=2.00e-04
+22900: Loss avg=156.8321 ± 17.9718  (2.753s, avg: 2.760s) lr=2.00e-04
+23000: Loss avg=150.2949 ± 15.7080  (2.749s, avg: 2.760s) lr=2.00e-04
+23100: Loss avg=158.1640 ± 19.7634  (2.758s, avg: 2.761s) lr=2.00e-04
+23200: Loss avg=161.3707 ± 24.5790  (2.739s, avg: 2.760s) lr=2.00e-04
+23300: Loss avg=181.3596 ± 51.5000  (2.752s, avg: 2.760s) lr=2.00e-04
+23400: Loss avg=160.7435 ± 23.1928  (2.752s, avg: 2.760s) lr=2.00e-04
+23500: Loss avg=149.1748 ± 16.3794  (2.746s, avg: 2.760s) lr=2.00e-04
+23600: Loss avg=163.9738 ± 20.0800  (2.755s, avg: 2.760s) lr=2.00e-04
+23700: Loss avg=158.8087 ± 24.2856  (2.753s, avg: 2.760s) lr=2.00e-04
+23800: Loss avg=151.3080 ± 16.9887  (2.744s, avg: 2.760s) lr=2.00e-04
+23900: Loss avg=156.1355 ± 19.6888  (2.752s, avg: 2.760s) lr=2.00e-04
+24000: Loss avg=174.8025 ± 50.0846  (2.758s, avg: 2.760s) lr=2.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step024000.bytes
+  [lr] plateau detected: lr 2.00e-04 -> 1.00e-04
+24100: Loss avg=152.3981 ± 18.0590  (2.767s, avg: 2.760s) lr=1.00e-04
+24200: Loss avg=143.1712 ± 15.4485  (2.770s, avg: 2.761s) lr=1.00e-04
+24300: Loss avg=140.5123 ± 12.8907  (2.768s, avg: 2.761s) lr=1.00e-04
+24400: Loss avg=138.3856 ± 14.3988  (2.778s, avg: 2.761s) lr=1.00e-04
+24500: Loss avg=141.1905 ± 14.0436  (2.760s, avg: 2.761s) lr=1.00e-04
+24600: Loss avg=138.2837 ± 14.3899  (2.768s, avg: 2.761s) lr=1.00e-04
+24700: Loss avg=136.9221 ± 14.4983  (2.771s, avg: 2.761s) lr=1.00e-04
+24800: Loss avg=141.8565 ± 16.7456  (2.767s, avg: 2.761s) lr=1.00e-04
+24900: Loss avg=138.0810 ± 14.2934  (2.774s, avg: 2.761s) lr=1.00e-04
+25000: Loss avg=138.9675 ± 16.5074  (2.763s, avg: 2.761s) lr=1.00e-04
+25100: Loss avg=134.9753 ± 15.0768  (2.762s, avg: 2.761s) lr=1.00e-04
+25200: Loss avg=138.2548 ± 14.7171  (2.767s, avg: 2.761s) lr=1.00e-04
+25300: Loss avg=141.4405 ± 17.5664  (2.765s, avg: 2.761s) lr=1.00e-04
+25400: Loss avg=141.1148 ± 14.4517  (2.779s, avg: 2.761s) lr=1.00e-04
+25500: Loss avg=132.9208 ± 13.7883  (2.765s, avg: 2.761s) lr=1.00e-04
+25600: Loss avg=134.8999 ± 17.3247  (2.767s, avg: 2.761s) lr=1.00e-04
+25700: Loss avg=138.5816 ± 16.7806  (2.774s, avg: 2.761s) lr=1.00e-04
+25800: Loss avg=134.3177 ± 13.6826  (2.765s, avg: 2.761s) lr=1.00e-04
+25900: Loss avg=132.0604 ± 14.1412  (2.769s, avg: 2.761s) lr=1.00e-04
+26000: Loss avg=142.5190 ± 18.9720  (2.769s, avg: 2.761s) lr=1.00e-04
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step026000.bytes
+26100: Loss avg=129.4308 ± 12.0082  (2.759s, avg: 2.761s) lr=1.00e-04
+26200: Loss avg=135.7303 ± 13.8876  (2.751s, avg: 2.761s) lr=1.00e-04
+26300: Loss avg=130.1203 ± 14.0307  (2.772s, avg: 2.761s) lr=1.00e-04
+26400: Loss avg=134.6307 ± 15.3441  (2.773s, avg: 2.761s) lr=1.00e-04
+26500: Loss avg=130.6572 ± 14.6114  (2.764s, avg: 2.762s) lr=1.00e-04
+26600: Loss avg=128.5432 ± 12.0268  (2.772s, avg: 2.762s) lr=1.00e-04
+26700: Loss avg=127.1435 ± 12.7560  (2.763s, avg: 2.762s) lr=1.00e-04
+26800: Loss avg=127.0589 ± 12.2611  (2.771s, avg: 2.762s) lr=1.00e-04
+26900: Loss avg=131.8130 ± 14.0589  (2.771s, avg: 2.762s) lr=1.00e-04
+27000: Loss avg=128.8089 ± 13.4315  (2.765s, avg: 2.762s) lr=1.00e-04
+27100: Loss avg=131.0143 ± 15.5109  (2.773s, avg: 2.762s) lr=1.00e-04
+27200: Loss avg=130.8592 ± 15.2385  (2.762s, avg: 2.762s) lr=1.00e-04
+  [lr] plateau detected: lr 1.00e-04 -> 5.00e-05
+27300: Loss avg=131.1851 ± 12.7361  (2.770s, avg: 2.762s) lr=5.00e-05
+27400: Loss avg=127.1823 ± 13.2235  (2.770s, avg: 2.762s) lr=5.00e-05
+27500: Loss avg=126.5793 ± 13.1729  (2.763s, avg: 2.762s) lr=5.00e-05
+27600: Loss avg=125.4145 ± 13.8625  (2.777s, avg: 2.762s) lr=5.00e-05
+27700: Loss avg=126.8988 ± 13.6282  (2.765s, avg: 2.762s) lr=5.00e-05
+27800: Loss avg=122.9114 ± 12.0956  (2.770s, avg: 2.762s) lr=5.00e-05
+27900: Loss avg=120.9379 ± 11.1382  (2.772s, avg: 2.762s) lr=5.00e-05
+28000: Loss avg=123.6354 ± 12.5070  (2.769s, avg: 2.762s) lr=5.00e-05
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step028000.bytes
+28100: Loss avg=120.8270 ± 10.4114  (2.770s, avg: 2.762s) lr=5.00e-05
+28200: Loss avg=120.2706 ± 11.4474  (2.768s, avg: 2.762s) lr=5.00e-05
+28300: Loss avg=121.3296 ± 11.5817  (2.767s, avg: 2.762s) lr=5.00e-05
+28400: Loss avg=122.3430 ± 12.6012  (2.778s, avg: 2.762s) lr=5.00e-05
+28500: Loss avg=121.1833 ± 11.3259  (2.764s, avg: 2.762s) lr=5.00e-05
+28600: Loss avg=120.5504 ± 11.5396  (2.771s, avg: 2.762s) lr=5.00e-05
+28700: Loss avg=119.2226 ± 10.7446  (2.770s, avg: 2.762s) lr=5.00e-05
+28800: Loss avg=120.8077 ± 10.9334  (2.765s, avg: 2.762s) lr=5.00e-05
+28900: Loss avg=125.1512 ± 13.0881  (2.779s, avg: 2.763s) lr=5.00e-05
+29000: Loss avg=121.3360 ± 12.0803  (2.757s, avg: 2.763s) lr=5.00e-05
+29100: Loss avg=120.5757 ± 11.7750  (2.765s, avg: 2.763s) lr=5.00e-05
+29200: Loss avg=121.8860 ± 11.4314  (2.767s, avg: 2.763s) lr=5.00e-05
+29300: Loss avg=118.2984 ± 10.8826  (2.760s, avg: 2.763s) lr=5.00e-05
+29400: Loss avg=120.5944 ± 11.2284  (2.774s, avg: 2.763s) lr=5.00e-05
+29500: Loss avg=118.6572 ± 9.4683  (2.758s, avg: 2.763s) lr=5.00e-05
+29600: Loss avg=118.2686 ± 12.6559  (2.767s, avg: 2.763s) lr=5.00e-05
+29700: Loss avg=120.1523 ± 11.5022  (2.765s, avg: 2.763s) lr=5.00e-05
+29800: Loss avg=119.9057 ± 11.2987  (2.761s, avg: 2.763s) lr=5.00e-05
+  [lr] plateau detected: lr 5.00e-05 -> 2.50e-05
+29900: Loss avg=121.1594 ± 11.0748  (2.770s, avg: 2.763s) lr=2.50e-05
+30000: Loss avg=118.7266 ± 10.9734  (2.761s, avg: 2.763s) lr=2.50e-05
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step030000.bytes
+30100: Loss avg=116.3038 ± 10.2203  (2.769s, avg: 2.763s) lr=2.50e-05
+30200: Loss avg=114.8809 ± 9.2957  (2.771s, avg: 2.763s) lr=2.50e-05
+30300: Loss avg=117.1647 ± 10.5057  (2.763s, avg: 2.763s) lr=2.50e-05
+30400: Loss avg=116.8345 ± 11.9438  (2.779s, avg: 2.763s) lr=2.50e-05
+30500: Loss avg=118.0284 ± 11.8228  (2.764s, avg: 2.763s) lr=2.50e-05
+30600: Loss avg=116.9934 ± 9.7045  (2.770s, avg: 2.763s) lr=2.50e-05
+30700: Loss avg=117.9508 ± 11.5724  (2.767s, avg: 2.763s) lr=2.50e-05
+  [lr] plateau detected: lr 2.50e-05 -> 1.25e-05
+30800: Loss avg=115.7891 ± 9.4202  (2.762s, avg: 2.763s) lr=1.25e-05
+30900: Loss avg=115.4228 ± 8.7536  (2.776s, avg: 2.763s) lr=1.25e-05
+31000: Loss avg=114.8348 ± 10.2543  (2.763s, avg: 2.763s) lr=1.25e-05
+31100: Loss avg=115.9895 ± 10.5952  (2.764s, avg: 2.763s) lr=1.25e-05
+31200: Loss avg=115.5783 ± 10.5529  (2.762s, avg: 2.763s) lr=1.25e-05
+31300: Loss avg=116.5835 ± 11.4647  (2.756s, avg: 2.763s) lr=1.25e-05
+31400: Loss avg=115.5670 ± 9.6317  (2.771s, avg: 2.763s) lr=1.25e-05
+  [lr] plateau detected: lr 1.25e-05 -> 6.25e-06
+31500: Loss avg=115.3008 ± 10.7461  (2.764s, avg: 2.763s) lr=6.25e-06
+31600: Loss avg=116.1316 ± 10.9612  (2.776s, avg: 2.763s) lr=6.25e-06
+31700: Loss avg=114.7257 ± 10.2522  (2.762s, avg: 2.763s) lr=6.25e-06
+31800: Loss avg=116.4053 ± 11.1800  (2.774s, avg: 2.763s) lr=6.25e-06
+31900: Loss avg=114.7680 ± 10.1768  (2.771s, avg: 2.763s) lr=6.25e-06
+32000: Loss avg=113.8800 ± 10.5547  (2.765s, avg: 2.763s) lr=6.25e-06
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step032000.bytes
+32100: Loss avg=113.1377 ± 9.9885  (2.769s, avg: 2.764s) lr=6.25e-06
+32200: Loss avg=115.5042 ± 10.1675  (2.764s, avg: 2.764s) lr=6.25e-06
+32300: Loss avg=112.7916 ± 10.0934  (2.766s, avg: 2.764s) lr=6.25e-06
+32400: Loss avg=112.8432 ± 9.8604  (2.776s, avg: 2.764s) lr=6.25e-06
+32500: Loss avg=113.0060 ± 9.6752  (2.762s, avg: 2.764s) lr=6.25e-06
+32600: Loss avg=115.4577 ± 11.2830  (2.772s, avg: 2.764s) lr=6.25e-06
+  [lr] plateau detected: lr 6.25e-06 -> 3.13e-06
+32700: Loss avg=112.8653 ± 10.0423  (2.766s, avg: 2.764s) lr=3.13e-06
+32800: Loss avg=114.7362 ± 10.1276  (2.766s, avg: 2.764s) lr=3.13e-06
+32900: Loss avg=115.2535 ± 11.1111  (2.775s, avg: 2.764s) lr=3.13e-06
+33000: Loss avg=114.6095 ± 10.2672  (2.764s, avg: 2.764s) lr=3.13e-06
+33100: Loss avg=113.2877 ± 11.1989  (2.769s, avg: 2.764s) lr=3.13e-06
+33200: Loss avg=113.4719 ± 10.3368  (2.766s, avg: 2.764s) lr=3.13e-06
+33300: Loss avg=112.8939 ± 10.7626  (2.767s, avg: 2.764s) lr=3.13e-06
+  [lr] plateau detected: lr 3.13e-06 -> 1.56e-06
+33400: Loss avg=114.0031 ± 10.5959  (2.778s, avg: 2.764s) lr=1.56e-06
+33500: Loss avg=112.5133 ± 11.5147  (2.753s, avg: 2.764s) lr=1.56e-06
+33600: Loss avg=113.3180 ± 10.2569  (2.768s, avg: 2.764s) lr=1.56e-06
+33700: Loss avg=113.2243 ± 10.0489  (2.765s, avg: 2.764s) lr=1.56e-06
+33800: Loss avg=112.3702 ± 9.1968  (2.763s, avg: 2.764s) lr=1.56e-06
+33900: Loss avg=112.1194 ± 9.8630  (2.767s, avg: 2.764s) lr=1.56e-06
+34000: Loss avg=114.1719 ± 10.1295  (2.762s, avg: 2.764s) lr=1.56e-06
+  [track] Checkpoint -> g4096_param_low_d128_L3_hw_sai_step034000.bytes
+  [lr] plateau detected: lr 1.56e-06 -> 1.00e-06
+34100: Loss avg=116.2446 ± 10.7665  (2.765s, avg: 2.764s) lr=1.00e-06
+34200: Loss avg=113.6547 ± 9.6546  (2.764s, avg: 2.764s) lr=1.00e-06
+34300: Loss avg=112.1437 ± 9.0369  (2.769s, avg: 2.764s) lr=1.00e-06
+34400: Loss avg=114.8824 ± 10.7570  (2.763s, avg: 2.764s) lr=1.00e-06
+34500: Loss avg=115.8386 ± 11.4807  (2.768s, avg: 2.764s) lr=1.00e-06
+34600: Loss avg=111.9051 ± 10.0657  (2.779s, avg: 2.764s) lr=1.00e-06
+34700: Loss avg=112.5554 ± 10.3581  (2.765s, avg: 2.764s) lr=1.00e-06
+34800: Loss avg=112.9240 ± 9.8783  (2.770s, avg: 2.764s) lr=1.00e-06
+34900: Loss avg=112.7419 ± 10.8109  (2.770s, avg: 2.764s) lr=1.00e-06
+35000: Loss avg=113.1207 ± 10.8459  (2.763s, avg: 2.764s) lr=1.00e-06
+35100: Loss avg=114.1458 ± 10.0553  (2.767s, avg: 2.764s) lr=1.00e-06
+35200: Loss avg=111.6766 ± 9.4485  (2.766s, avg: 2.764s) lr=1.00e-06
+35300: Loss avg=113.0076 ± 9.9079  (2.766s) lr=1.00e-06
+  [auto-stop] plateau at min_lr=1.00e-06 (10/10 steps without >5e-03 improvement); stopping.
+Saved to /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/weights/g4096_param_low_d128_L3_hw_sai.bytes
+================================================================
+Finished: Tue May 12 21:37:29 EDT 2026
+================================================================

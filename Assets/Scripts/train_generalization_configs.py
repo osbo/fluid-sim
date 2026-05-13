@@ -18,7 +18,7 @@ DATA_BASE = SCRIPTS_DIR / "data" / "generalization_4096"
 WEIGHTS_DIR = SCRIPTS_DIR / "weights"
 
 
-CONFIGS = [
+BASE_CONFIGS = [
     dict(
         name="g4096_id_d128_L3_hw",
         train_split="g4096_train_id",
@@ -58,7 +58,16 @@ CONFIGS = [
 ]
 
 
-def build_cmd(cfg):
+def _configs_with_suffix(name_suffix: str):
+    out = []
+    for cfg in BASE_CONFIGS:
+        c = dict(cfg)
+        c["name"] = f"{c['name']}{name_suffix}"
+        out.append(c)
+    return out
+
+
+def build_cmd(cfg, *, loss_mode: str):
     weights_out = WEIGHTS_DIR / f"{cfg['name']}.bytes"
     data_folder = DATA_BASE / cfg["train_split"] / "train"
     cmd = [
@@ -85,6 +94,8 @@ def build_cmd(cfg):
         str(weights_out),
         "--track-training",
         "--auto-stop",
+        "--loss-mode",
+        str(loss_mode),
     ]
     if not cfg["hw"]:
         cmd.append("--no-use-highways")
@@ -95,34 +106,48 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index", type=int, default=None, help="Run a single config by 0-based index.")
     parser.add_argument("--list", action="store_true", help="Print all configs and exit.")
+    parser.add_argument(
+        "--loss-mode",
+        choices=("hutchinson", "sai"),
+        default="hutchinson",
+        help="LeafOnly loss mode for training.",
+    )
+    parser.add_argument(
+        "--name-suffix",
+        type=str,
+        default="",
+        help="Optional suffix appended to each output model name (example: _sai).",
+    )
     args = parser.parse_args()
+    configs = _configs_with_suffix(args.name_suffix)
 
     if args.list:
         print(f"{'Idx':>3}  {'Name':<42}  {'Train Split':<32}  d  L  hw")
         print("-" * 100)
-        for i, cfg in enumerate(CONFIGS):
+        for i, cfg in enumerate(configs):
             print(
                 f"[{i:2d}]  {cfg['name']:<42}  {cfg['train_split']:<32}  "
                 f"{cfg['d']:>3}  {cfg['L']}  {'yes' if cfg['hw'] else 'no'}"
             )
+        print(f"\nloss_mode={args.loss_mode}, name_suffix='{args.name_suffix}'")
         return
 
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.index is not None:
-        n = len(CONFIGS)
+        n = len(configs)
         if not (0 <= args.index < n):
             print(f"Error: --index {args.index} out of range [0, {n - 1}]", file=sys.stderr)
             sys.exit(1)
-        cfg = CONFIGS[args.index]
+        cfg = configs[args.index]
         print(f"[{args.index}/{n - 1}] {cfg['name']} ({cfg['train_split']})", flush=True)
-        subprocess.run(build_cmd(cfg), check=True)
+        subprocess.run(build_cmd(cfg, loss_mode=args.loss_mode), check=True)
     else:
-        for i, cfg in enumerate(CONFIGS):
+        for i, cfg in enumerate(configs):
             print(f"\n{'=' * 72}", flush=True)
-            print(f"[{i + 1}/{len(CONFIGS)}] {cfg['name']} ({cfg['train_split']})", flush=True)
+            print(f"[{i + 1}/{len(configs)}] {cfg['name']} ({cfg['train_split']})", flush=True)
             print(f"{'=' * 72}", flush=True)
-            subprocess.run(build_cmd(cfg), check=True)
+            subprocess.run(build_cmd(cfg, loss_mode=args.loss_mode), check=True)
 
 
 if __name__ == "__main__":

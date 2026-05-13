@@ -1,0 +1,10 @@
+model_name,train_split,eval_cell,method,device,setup_ms,setup_ms_std,inference_ms,inference_ms_std,solve_ms,solve_ms_std,iters,iters_std,total_ms,total_ms_std,n_frames
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,cg,gpu,0.0000,0.0000,,,46.1800,19.3197,1179.7500,494.5150,46.1800,19.3197,20
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,cg,cpu,0.0000,0.0000,,,460.8945,167.0052,501.6000,184.4381,460.8945,167.0052,20
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,jacobi,gpu,0.0000,0.0000,,,29.8055,7.8709,757.5000,200.3438,29.8055,7.8709,20
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,jacobi,cpu,0.0000,0.0000,,,328.3825,76.0874,355.0000,83.8482,328.3825,76.0874,20
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,ic_amgx,gpu,11.5185,20.0392,,,294.9955,79.0632,23.8500,6.3683,306.5145,78.6434,20
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,ic,cpu,4.9855,3.7502,,,108.8800,25.5928,107.5500,26.0636,113.8675,25.1431,20
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,leafonly,gpu,,,2.4890,0.0706,31.7805,5.4832,405.1500,71.1494,34.2695,5.4569,20
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,amg_cpu,cpu,14.5325,9.9415,,,7.7860,11.9472,3.3000,5.8947,22.3180,14.7128,20
+g4096_id_d128_L3_hw_sai,g4096_train_id,g4096_eval_id,amgx_gpu,gpu,21.5145,26.0231,,,108.4075,33.8647,1.6000,0.5026,129.9225,36.6620,20

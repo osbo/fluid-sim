@@ -1,0 +1,57 @@
+================================================================
+Job 13858396, task 1 on node3302
+Started: Tue May 12 21:39:46 EDT 2026
+Eval mode: SAI-trained weights (model suffix _sai)
+================================================================
+Task 1: g4096_topo_no_closed_d128_L3_hw_sai -> /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/generalization_sweep_sai_task_001.csv
+
+[1/1] g4096_topo_no_closed_d128_L3_hw_sai
+  cell=g4096_eval_id frames=20
+    [1/20] frame 0 -> LeafOnly 240 iters, total=21.24 ms
+    [2/20] frame 1 -> LeafOnly 171 iters, total=16.24 ms
+    [3/20] frame 2 -> LeafOnly 777 iters, total=63.48 ms
+    [4/20] frame 3 -> LeafOnly 225 iters, total=20.09 ms
+    [5/20] frame 4 -> LeafOnly 153 iters, total=14.41 ms
+    [6/20] frame 5 -> LeafOnly 270 iters, total=23.52 ms
+    [7/20] frame 6 -> LeafOnly 201 iters, total=18.09 ms
+    [8/20] frame 7 -> LeafOnly 336 iters, total=28.73 ms
+    [9/20] frame 8 -> LeafOnly 141 iters, total=13.51 ms
+    [10/20] frame 9 -> LeafOnly 264 iters, total=23.04 ms
+    [11/20] frame 10 -> LeafOnly 1080 iters, total=85.35 ms
+    [12/20] frame 11 -> LeafOnly 189 iters, total=16.88 ms
+    [13/20] frame 12 -> LeafOnly 231 iters, total=19.99 ms
+    [14/20] frame 13 -> LeafOnly 249 iters, total=21.51 ms
+    [15/20] frame 14 -> LeafOnly 327 iters, total=27.52 ms
+    [16/20] frame 15 -> LeafOnly 252 iters, total=21.79 ms
+    [17/20] frame 16 -> LeafOnly 165 iters, total=15.01 ms
+    [18/20] frame 17 -> LeafOnly 228 iters, total=19.80 ms
+    [19/20] frame 18 -> LeafOnly 171 iters, total=15.37 ms
+    [20/20] frame 19 -> LeafOnly 258 iters, total=22.21 ms
+  avg LeafOnly on g4096_eval_id: iters=296.4000 total_ms=25.3890 over 20 frames
+  cell=g4096_eval_closed_only frames=20
+    [1/20] frame 0 -> LeafOnly 219 iters, total=19.22 ms
+    [2/20] frame 1 -> LeafOnly 216 iters, total=18.91 ms
+    [3/20] frame 2 -> LeafOnly 252 iters, total=21.75 ms
+    [4/20] frame 3 -> LeafOnly 180 iters, total=16.38 ms
+    [5/20] frame 4 -> LeafOnly 198 iters, total=17.68 ms
+    [6/20] frame 5 -> LeafOnly 321 iters, total=27.60 ms
+    [7/20] frame 6 -> LeafOnly 204 iters, total=18.26 ms
+    [8/20] frame 7 -> LeafOnly 216 iters, total=19.64 ms
+    [9/20] frame 8 -> LeafOnly 273 iters, total=23.76 ms
+    [10/20] frame 9 -> LeafOnly 279 iters, total=23.83 ms
+    [11/20] frame 10 -> LeafOnly 162 iters, total=14.98 ms
+    [12/20] frame 11 -> LeafOnly 156 iters, total=14.66 ms
+    [13/20] frame 12 -> LeafOnly 183 iters, total=16.49 ms
+    [14/20] frame 13 -> LeafOnly 195 iters, total=17.28 ms
+    [15/20] frame 14 -> LeafOnly 150 iters, total=14.11 ms
+    [16/20] frame 15 -> LeafOnly 192 iters, total=17.23 ms
+    [17/20] frame 16 -> LeafOnly 210 iters, total=18.56 ms
+    [18/20] frame 17 -> LeafOnly 222 iters, total=19.92 ms
+    [19/20] frame 18 -> LeafOnly 189 iters, total=16.93 ms
+    [20/20] frame 19 -> LeafOnly 153 iters, total=14.24 ms
+  avg LeafOnly on g4096_eval_closed_only: iters=208.5000 total_ms=18.5715 over 20 frames
+
+Results written to: /orcd/home/002/osbo/ondemand/fluid-sim/Assets/Scripts/results/generalization_sweep_sai_task_001.csv
+================================================================
+Finished: Tue May 12 21:52:08 EDT 2026
+================================================================

@@ -1,0 +1,39 @@
+================================================================
+Job 13864244, task 2 on node3202
+Started: Tue May 12 23:06:52 EDT 2026
+Eval cell: g4096_eval_param_high
+Data: /home/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_param_high/test
+================================================================
+Checkpoint: /orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/mlruns/910367005070732457/f8093ddca1854cdf823fd9be16ec01bd/checkpoints/multiphase_v2_4096-simple-epoch=499.ckpt
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'pyg-lib'. Disabling its usage. Stacktrace: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/libpyg.so)
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-scatter'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_scatter/_scatter_cuda.so: undefined symbol: _ZN2at4_ops16div__Tensor_mode4callERNS_6TensorERKS2_St8optionalISt17basic_string_viewIcSt11char_traitsIcEEE
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-spline-conv'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_spline_conv/_basis_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-sparse'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_sparse/_spmm_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+2026-05-12 23:07:20.159 | INFO     | neural_cg.data:__init__:375 - Found 0 matrices, 0 lhs, 0 rhs, 0 masks, 0 features
+Error executing job with overrides: ['exp_name=generalization_4096_g4096_eval_param_high', 'pretrained=/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/mlruns/910367005070732457/f8093ddca1854cdf823fd9be16ec01bd/checkpoints/multiphase_v2_4096-simple-epoch\\=499.ckpt', 'data.prefix=/home/osbo/ondemand/fluid-sim/Assets/Scripts/data/generalization_4096/g4096_eval_param_high/test', 'data.is_fixed_topology=true', 'data.has_shared_features=false', 'data.use_node_features=false', '+dataloader=infer', '+out_dir=/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_infer_raw', '+infer_prefix=generalization_']
+Traceback (most recent call last):
+  File "/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/infer.py", line 201, in main
+    data = FolderDataModule(
+           ^^^^^^^^^^^^^^^^^
+  File "/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/neural_cg/utils/datamodule.py", line 33, in __init__
+    self.dataset = FolderDataset(**data_config)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/neural_cg/data.py", line 385, in __init__
+    assert len(all_matrices) > 0
+           ^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+[summary] wrote failed row to /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/generalization_neural_spai_sweep_task_2.csv
+================================================================
+Finished: Tue May 12 23:07:23 EDT 2026
+Elapsed: 26s
+Log: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_infer_logs/g4096_eval_param_high.log
+Task CSV: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/generalization_neural_spai_sweep_task_2.csv
+================================================================

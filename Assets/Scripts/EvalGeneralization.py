@@ -48,7 +48,7 @@ _SECTION_HEADERS = [
     ("AMGX (GPU)", "amgx_gpu"),
 ]
 
-MODEL_CONFIGS = [
+BASE_MODEL_CONFIGS = [
     dict(
         model_name="g4096_id_d128_L3_hw",
         train_split="g4096_train_id",
@@ -79,6 +79,15 @@ MODEL_CONFIGS = [
         ],
     ),
 ]
+
+
+def _model_configs_with_suffix(model_suffix: str):
+    out = []
+    for cfg in BASE_MODEL_CONFIGS:
+        c = dict(cfg)
+        c["model_name"] = f"{c['model_name']}{model_suffix}"
+        out.append(c)
+    return out
 
 
 def _parse_output(stdout):
@@ -293,6 +302,18 @@ def main() -> None:
     )
     parser.add_argument("--out", type=str, default=None, help="Output CSV path.")
     parser.add_argument(
+        "--out-stem",
+        type=str,
+        default="generalization_sweep",
+        help="Output stem for task/merged CSV names (default: generalization_sweep).",
+    )
+    parser.add_argument(
+        "--model-suffix",
+        type=str,
+        default="",
+        help="Optional suffix appended to model_name when resolving weights (example: _sai).",
+    )
+    parser.add_argument(
         "--pcg-backend",
         choices=("cudagraph", "compile", "eager"),
         default="cudagraph",
@@ -308,14 +329,14 @@ def main() -> None:
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(exist_ok=True)
-    stem = "generalization_sweep"
+    stem = args.out_stem
     out_path = Path(args.out) if args.out else RESULTS_DIR / f"{stem}.csv"
 
     if args.merge:
         _merge(RESULTS_DIR, stem, out_path)
         return
 
-    configs = MODEL_CONFIGS
+    configs = _model_configs_with_suffix(args.model_suffix)
     if args.index is not None:
         n = len(configs)
         if not (0 <= args.index < n):
