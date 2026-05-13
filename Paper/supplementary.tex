@@ -41,7 +41,7 @@
 
 This document collects the implementation details, dataset construction,
 per-scale performance numbers, full train$\,\times\,$eval generalization grid
-behind Table~5, and the precision/apply-path discussion that did not fit the
+behind Table~6, and the precision/apply-path discussion that did not fit the
 main-paper page budget. Section numbering is independent of the main paper;
 cross-references in either direction use \texttt{xr-hyper} (prefix \texttt{SX-}
 when read from the main PDF).
@@ -131,7 +131,7 @@ residual connections. Attention logits carry a learned per-head bias produced by
 a two-layer MLP from the four-dimensional edge descriptor
 $(\Delta\mathbf{x}_{ij}, A_{ij})$.
 
-\paragraph{Off-diagonal attention stack (Sec.~4.3).}
+\paragraph{Off-diagonal attention stack (Sec.~4.2).}
 The same encoder embeddings are pooled along each tile's row- and column-strip
 $\mathcal{I}_m, \mathcal{J}_m$ to obtain per-leaf coarse summaries, then
 condensed along the in-strip axis to $L_s\!=\!L/p_{\mathrm{off}}\!=\!32$ tokens
@@ -143,7 +143,7 @@ normalization). Edge biases for each in-tile token pair are computed from the
 mean of $(\Delta\mathbf{x}_{ij}, A_{ij})$ over all node pairs spanning the
 corresponding sub-strips.
 
-\paragraph{Highway buffers (Sec.~4.4).}
+\paragraph{Highway buffers (Sec.~4.3).}
 After every attention sublayer in either stack, block-token embeddings are
 scatter-added into per-layer row, column, and global buffers
 $\mathbf{r}_{\mathrm{hw}}, \mathbf{c}_{\mathrm{hw}}\!\in\!\mathbb{R}^{B\times N\times d}$
@@ -156,7 +156,7 @@ projection. The four-channel mix (2D local + 1D row + 1D column + 0D broadcast)
 is repeated independently in every transformer block; the buffers themselves are
 not residual across blocks.
 
-\paragraph{Decoder heads (Sec.~4.5).}
+\paragraph{Decoder heads (Sec.~4.4).}
 Three lightweight heads project token embeddings to the factor tensors that the
 apply path consumes. The leaf head is a two-layer MLP per diagonal-stream token
 followed by a reshape into $F_k\!\in\!\mathbb{R}^{L\times L}$. The two
@@ -176,9 +176,32 @@ admissibility parameter $\eta\!=\!1$, the number of \emph{unique} off-diagonal
 tiles satisfies $M_{\mathcal{H}}\!=\!K\!-\!1$ (geometric sum
 $K/2 + K/4 + \cdots + 1$ over the strict upper triangle); the symmetric lower
 triangle reuses the same $B_m$ via the transposed apply
-$\mathbf{t}^{\mathrm{c}}_m\!=\!B_m^\top\mathbf{s}^{\mathrm{r}}_m$ of main
-paper Eq.~(5). Concrete factor-tensor sizes at the scales of the main paper's
-performance table (main paper Table~2) are listed in Sec.~\ref{supp:precision}.
+$\mathbf{t}^{\mathrm{c}}_m\!=\!B_m^\top\mathbf{s}^{\mathrm{r}}_m$ from the
+main-paper Sec.~5 equations. Concrete factor-tensor sizes at the scales of the main paper's
+performance table (main paper Table~4) are listed in Sec.~\ref{supp:precision}.
+
+\paragraph{Explicit off-diagonal apply equations (main paper Sec.~5).}
+For leaf residual $\mathbf{r}_k\!\in\!\mathbb{R}^{L}$ and tile leaf-ranges
+$\mathcal{R}_m,\mathcal{C}_m$, the off-diagonal contribution follows the same
+FMM-style chain used in the main text:
+\begin{align}
+  \hat{\mathbf{u}}_k &= \tilde U_k^\top\mathbf{r}_k,\qquad
+  \hat{\mathbf{v}}_k = \tilde V_k^\top\mathbf{r}_k && \text{(restriction)} \\
+  \mathbf{s}^{\mathrm{r}}_m &= \sum_{k\in\mathcal{R}_m}\hat{\mathbf{u}}_k,\qquad
+  \mathbf{s}^{\mathrm{c}}_m = \sum_{k\in\mathcal{C}_m}\hat{\mathbf{v}}_k
+  && \text{(strip aggregation)} \\
+  \mathbf{t}^{\mathrm{c}}_m &= B_m^\top\mathbf{s}^{\mathrm{r}}_m,\qquad
+  \mathbf{t}^{\mathrm{r}}_m = B_m\mathbf{s}^{\mathrm{c}}_m && \text{(coarse coupling)} \\
+  \Delta\mathbf{y}_k &= \tilde U_k\,{\textstyle\sum_{m:k\in\mathcal{R}_m}\!\mathbf{t}^{\mathrm{r}}_m}
+                    +  \tilde V_k\,{\textstyle\sum_{m:k\in\mathcal{C}_m}\!\mathbf{t}^{\mathrm{c}}_m}
+  && \text{(prolongation).}
+\end{align}
+The stage-wise shape progression for one tile of span $S_mL$ is
+$S_mL \rightarrow S_mL_s \rightarrow L_s \rightarrow L_s \rightarrow S_mL_s \rightarrow S_mL$.
+In implementation this is four batched GEMMs with shapes
+$(K,L,L_s)$, $(M_{\mathcal{H}},L_s,L_s)$, $(K,L,L_s)$ (restriction, coupling,
+prolongation; two directional bridge passes share the same launch shape), plus two
+partition-indexed scatter-adds for strip aggregation and redistribution.
 
 % ===========================================================================
 \section{Training Procedure}
@@ -198,7 +221,7 @@ Training proceeds for at most $10^5$ optimizer steps but is terminated early onc
 the LR scheduler reaches \texttt{min\_lr} \emph{and} the cosine-Hutchinson loss
 has failed to improve by the same $5\!\times\!10^{-3}$ relative threshold over
 $10$ consecutive log steps (twice the LR-scheduler patience). At our default
-configuration this fires at roughly $24\,300$ steps (main paper, \S7.5).
+configuration this fires at roughly $24\,300$ steps (main paper, \S7.3).
 
 \paragraph{Probe vectors.}
 At each step we draw a batch of $K_z\!=\!\max(64, \lceil\sqrt{N}\rceil)$ probe
@@ -227,7 +250,7 @@ End-to-end training of the default configuration is $\sim\!16$\,min on one
 H200 at $N\!=\!8\,192$, with the model overtaking GPU Jacobi at step
 $\sim\!2\,000$ ($\sim\!1.3$\,min) and dropping under $200$ PCG iterations by
 step $\sim\!12\,000$ ($\sim\!8$\,min). The training profile is plotted in main
-paper Fig.~9.
+paper Fig.~4.
 
 % ===========================================================================
 \section{Multiphase Poisson Benchmark Generation}
@@ -303,7 +326,7 @@ representation can.
 % ===========================================================================
 
 The consolidated per-scale times and mean iteration counts have moved to the
-main paper, Table~2. This section reports the across-frame variability
+main paper, Table~4. This section reports the across-frame variability
 ($\pm 1\sigma$ over the same $20$ test frames per scale) that the main table
 omits to fit the column budget.
 
@@ -351,7 +374,7 @@ across all scales.
 \label{supp:generalization}
 % ===========================================================================
 
-Table~5 in the main paper reports four cells of a wider train$\,\times\,$eval
+Table~6 in the main paper reports four cells of a wider train$\,\times\,$eval
 grid that probes within-family robustness at $N\!=\!4\,096$.
 Table~\ref{tab:supp_generalization} reports the full grid for \emph{our}
 method, adding both the in-distribution row (\emph{Full} training,
@@ -457,7 +480,7 @@ cuSPARSE and AMGX.
 
 \paragraph{Factor-tensor memory footprint.}
 The packed factor tensor of width $P\!=\!KL^2 + M_{\mathcal{H}} L_s^2 + 2NL_s + N$
-(main paper~\S4.5) determines the apply-path memory budget. With $L\!=\!128$,
+(main paper~\S4.4) determines the apply-path memory budget. With $L\!=\!128$,
 $L_s\!=\!32$, and $M_{\mathcal{H}}\!=\!K\!-\!1$ at $\eta\!=\!1$
 weak admissibility, Table~\ref{tab:supp_memory} lists the absolute numbers at
 the scales in Table~\ref{tab:full_perf_table}.
@@ -479,19 +502,16 @@ $1\,024$  & $8$            & $7$   & $0.131$\,M & $0.20$\,M & $0.82$ \\
 $2\,048$  & $16$           & $15$  & $0.262$\,M & $0.41$\,M & $1.64$ \\
 $4\,096$  & $32$           & $31$  & $0.524$\,M & $0.82$\,M & $3.29$ \\
 $8\,192$  & $64$           & $63$  & $1.049$\,M & $1.65$\,M & $6.58$ \\
-$16\,384$ & $64^{\dagger}$ & $63$  & $4.194$\,M & $6.57$\,M & $26.3$ \\
+$16\,384$ & $128$          & $127$ & $2.097$\,M & $3.29$\,M & $13.2$ \\
 \bottomrule
-\multicolumn{6}{l}{\footnotesize $^{\dagger}$At $N\!=\!16\,384$ the leaf size doubles to $L\!=\!256$ (with}\\
-\multicolumn{6}{l}{\footnotesize $L_s\!=\!64$) to keep $K$ bounded --- the discretization-refinement}\\
-\multicolumn{6}{l}{\footnotesize regime discussed in main paper~\S4.3.}\\
 \end{tabular}
 \end{table}
 
 \noindent
 The factor tensor scales linearly in $N$ at fixed $L$ and stays below
-$10$\,MB through $N\!=\!8\,192$; at $N\!=\!16\,384$ the doubled leaf size
-inflates $KL^2$ four-fold, but the apply still fits comfortably in a single
-H200's HBM. The dominant term at every scale is $KL^2$ (the dense diagonal
+$10$\,MB through $N\!=\!8\,192$; at $N\!=\!16\,384$ it reaches
+$13.2$\,MB and still fits comfortably in a single H200's HBM. The dominant term
+at every scale is $KL^2$ (the dense diagonal
 leaves), not $M_{\mathcal{H}} L_s^2$: distant tiles are compressed so
 aggressively that the entire off-diagonal contribution costs less than the
 diagonal even though it covers $1\!-\!1/K$ of the matrix.
@@ -515,6 +535,192 @@ or stricter, the apply path would either need a full float64 pass (doubling
 device-memory and halving Tensor-Core throughput) or an outer iterative
 refinement loop that uses the float32 apply as an inner preconditioner. We did
 not implement either since they fall outside the regime we target.
+
+% ===========================================================================
+\section{Additional Figures and Tables Referenced from the Main Paper}
+\label{supp:floats}
+% ===========================================================================
+
+For space, several explanatory figures and detailed-breakdown tables that the
+main paper points to live here. The main-paper cross-references resolve to the
+\emph{Figure}/\emph{Table} number that appears next to each caption below.
+
+% --- partition + highways graphic (was Fig. 2 in earlier drafts) ---
+\begin{figure}[H]
+  \centering
+  \begin{minipage}[t]{0.49\linewidth}\centering
+    \includegraphics[width=\linewidth]{hmatrixgraphic.png}\\
+    \small (a) $\mathcal{H}$-matrix partition.
+  \end{minipage}\hfill
+  \begin{minipage}[t]{0.49\linewidth}\centering
+    \includegraphics[width=\linewidth]{highwaysgraphic.png}\\
+    \small (b) Highway channels.
+  \end{minipage}
+  \caption{\emph{Left:} weak-admissibility $\mathcal{H}$-matrix partition. Dense
+    diagonal leaves along the main diagonal; admissible off-diagonal tiles
+    double in size with separation. \emph{Right:} per-layer highway channels.
+    One red overlay marks the row- and column-index sets of a representative
+    off-diagonal tile; this tile contributes scatter-adds to those strips and
+    to a single global token --- four communication channels of dimensions
+    2D / 1D / 1D / 0D per layer.}
+  \label{supp-fig:partition-and-highways}
+\end{figure}
+
+% --- assembled-matrix panel (panel (a) of the earlier combined figure;
+%     the rank-fraction audit (panel (b)) has been promoted to the main
+%     paper's figure-only pages and is referenced from there). ---
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.85\linewidth]{multiphase_matrices.png}
+  \caption{The sparse operator $A$, its dense inverse $A^{-1}$, and the
+    assembled learned $M\!\approx\!A^{-1}$ (top-left $256\!\times\!256$)
+    on a multiphase pressure-Poisson frame, on a shared rank-normalized
+    color scale. All three share the weak-admissibility block-and-tile
+    pattern: full-rank diagonal blocks plus off-diagonal tiles whose
+    magnitude decays with separation. This pattern is exactly the prior
+    quantified by main paper Fig.~3.}
+  \label{supp-fig:matrices}
+\end{figure}
+
+% --- benchmark frame (was Fig. 4 in earlier drafts) ---
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{multiphase_hero.png}
+  \caption{A representative frame from our multiphase pressure-Poisson
+    benchmark at $N\!=\!16\,384$. \emph{Left:} heterogeneous density $\rho$ with
+    $27\!\times$ contrast, separated by closed and partially-closed barriers
+    (yellow). \emph{Middle:} buoyancy-driven right-hand side
+    $b\!=\!-\partial_y\rho$, concentrated on horizontal density interfaces.
+    \emph{Right:} recovered pressure $p$ with velocity $-\nabla p/\rho$
+    overlaid.}
+  \label{supp-fig:bench-frame}
+\end{figure}
+
+% --- subsystem breakdown (was main-paper Table 2) ---
+\begin{table}[H]
+\centering
+\caption{Subsystem breakdown of the forward pass at $N\!=\!8\,192$. Attention
+layers scale with $n_l$; everything else is independent of depth.}
+\label{supp-tab:breakdown-subsystem}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Subsystem & \% device time & Scales with \\
+\midrule
+Diagonal attention stack     & $36\%$ & $n_l$ \\
+Off-diagonal attention stack & $23\%$ & $n_l$ \\
+Decoder heads                & $18\%$ & --- \\
+Encoder (MLP + GCN)          & $16\%$ & --- \\
+Layout helpers / scatter     & $<\!4\%$ & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% --- kernel breakdown (was main-paper Table 3) ---
+\begin{table}[H]
+\centering
+\caption{Kernel-level breakdown at $N\!=\!8\,192$. Dominant kernels are
+compute-bound Tensor-Core GEMMs and fused attention; no SpMV or indexed-gather
+kernel appears.}
+\label{supp-tab:breakdown-kernel}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Kernel family & \% device time \\
+\midrule
+CUTLASS Tensor-Op GEMMs (\texttt{s1688gemm}, \texttt{sm90\_xmma}, TF32) & $31\%$ \\
+CUTLASS fused attention (\texttt{fmha\_cutlassF}) & $14\%$ \\
+Elementwise / normalization                       & $17\%$ \\
+Copies / reshapes / layout                        & $17\%$ \\
+Other                                             & $21\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% --- hyperparameter ablation (main-paper Table 5 core rows; full grid here) ---
+\begin{table}[H]
+\centering
+\caption{Hyperparameter ablations on multiphase Poisson ($\mathrm{rtol}\!=\!10^{-8}$,
+$20$~frames per scale, neural preconditioner only). Train = wall-clock to
+convergence; Infer.\ = preconditioner forward pass; Iters = mean PCG iters;
+Total = inference $+$ PCG solve; $\Delta$ solve time = fractional change vs.\
+the ``---'' row.}
+\label{supp-tab:ablation}
+\footnotesize\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}l rr rr r@{}}
+\toprule
+Configuration & Train & Infer. & Iters & Total & $\Delta$ solve \\
+              & (min) & (ms)   &       & (ms)  & time \\
+\midrule
+\multicolumn{6}{l}{\emph{Width} (avg.\ $N\!\in\!\{2048,4096,8192\}$):}\\
+$d{=}64,\;n_l{=}3$, hw     &  9.5 & 3.0 & 147 & 15.4 & $+28\%$  \\
+$d{=}128,\;n_l{=}3$, hw    & 10.7 & 3.1 & 105 & 12.0 & ---      \\
+$d{=}256,\;n_l{=}3$, hw    & 12.3 & 3.2 & 191 & 19.3 & $+61\%$  \\
+\midrule
+\multicolumn{6}{l}{\emph{Depth} ($N\!=\!8192$):}\\
+$d{=}128,\;n_l{=}1$, hw    &  6.1 & 1.3 & 421 & 36.9 & $+106\%$ \\
+$d{=}128,\;n_l{=}2$, hw    &  9.6 & 2.3 & 218 & 20.8 & $+16\%$  \\
+$d{=}128,\;n_l{=}3$, hw    & 16.2 & 3.4 & 168 & 17.9 & ---      \\
+\midrule
+\multicolumn{6}{l}{\emph{Highways} ($N\!=\!2048$):}\\
+$d{=}128,\;n_l{=}3$, hw    &  6.0 & 3.3 &  66 &  8.8 & ---      \\
+$d{=}128,\;n_l{=}3$, no-hw &  4.8 & 2.2 & 149 & 13.8 & $+58\%$  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% --- generalization summary (main-paper Table 6; full grid here) ---
+\begin{table}[H]
+\centering
+\caption{Within-family deployment robustness across restricted training
+distributions at $N\!=\!4\,096$ (GPU; $\mathrm{rtol}\!=\!10^{-8}$). Speedup is
+Jacobi / Ours total-time ratio.}
+\label{supp-tab:generalization}
+\footnotesize\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}ll rr rr c@{}}
+\toprule
+Train distribution & Eval distribution
+  & \multicolumn{2}{c}{Ours (GPU)} & \multicolumn{2}{c}{Jacobi (GPU)} & Speedup \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}
+ & & Iters & ms & Iters & ms & \\
+\midrule
+Full                           & Full (in-dist.)          &  82 &  8.8 & 758 & 29.4 & $3.4\times$ \\
+Excl.\ closed barriers         & Closed barriers only     &  68 &  7.4 & 662 & 24.7 & $3.3\times$ \\
+Low contrast                   & High contrast            & 142 & 13.1 & 650 & 24.4 & $1.9\times$ \\
+Excl.\ closed $+$ low $\rho$  & Closed $+$ high contrast & 147 & 13.5 & 671 & 25.1 & $1.9\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% --- neural runtime components (supplementary; complements main Table~4) ---
+\begin{table}[H]
+\centering
+\caption{Neural-method runtime components by scale: preconditioner inference
+and PCG solve time (ms), plus total time and iterations aligned with the
+main-paper performance table. Neural SPAI uses the re-trained-per-scale CUDA
+apply path of~\cite{Yang2025sparse}.}
+\label{supp-tab:neural_time_components}
+\footnotesize\setlength{\tabcolsep}{5pt}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Scale $N$ & Infer. (ms) & Solve (ms) & Total (ms) & Iters \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{Neural SPAI (GPU, CUDA apply)~\cite{Yang2025sparse}}}\\
+$1\,024$  & 4.6  & 13.8 & 18.4 & 118 \\
+$2\,048$  & 3.8  & 22.2 & 26.0 & 167 \\
+$4\,096$  & 6.6  & 31.7 & 38.3 & 246 \\
+$8\,192$  & 4.4  & 43.8 & 48.1 & 338 \\
+$16\,384$ & 4.9  & 66.0 & 70.9 & 496 \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{Ours (GPU)}}\\
+$1\,024$  & 1.9  & 5.1  & 7.0  & 47  \\
+$2\,048$  & 1.9  & 6.9  & 8.8  & 66  \\
+$4\,096$  & 2.2  & 7.0  & 9.2  & 80  \\
+$8\,192$  & 4.0  & 13.9 & 17.9 & 168 \\
+$16\,384$ & 17.0 & 30.6 & 47.6 & 394 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}

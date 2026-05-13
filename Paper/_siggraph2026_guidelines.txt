@@ -1,0 +1,2301 @@
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Mark SIGGRAPH Asia 2026 on your calendar! The Call for submission portal is now up!
+
+HOME(HTTPS://ASIA.SIGGRAPH.ORG/2026)  SUBMIT YOUR WORK (HTTPS://ASIA.SIGGRAPH.ORG/2026/SUBMISSIONS/)  TECHNICAL
+PAPERS
+
+TECHNICAL PAPERS
+
+Share this page
+
+Important Deadlines:
+Stage 1, Submission Form
+– Abstract Deadline: 5 May 2026
+Stage 2, Full Submission
+– Paper Deadline: 12 May 2026
+– Upload Deadline: 13 May 2026
+
+Submit To the Technical Papers program!
+Technical Papers is the premier venue for disseminating and
+discussing scholarly work in computer graphics and interactive
+techniques. This core conference program features
+researchers who unveil the most exciting breakthroughs that
+contribute to shaping and improving our collective future.
+The SIGGRAPH Asia 2026 Technical Papers program spans areas including but not limited to animation, simulation,
+imaging, geometry, modeling, rendering, human-computer interaction, VR/AR/MR, haptics, fabrication, robotics,
+visualization, audio, optics, programming languages, immersive experiences, generative AI, and machine learning for
+graphics and visual computing.
+Building a desirable future through computer graphics and interactive techniques starts with you and your
+contributions to and participation in SIGGRAPH Asia 2026. We are excited that you are submi"ing your paper for
+consideration.
+At SIGGRAPH Asia 2026, the Technical Papers program will have two integrated paper tracks: Journal (ACM
+Transactions on Graphics) and Conference.
+Journal Papers are expected to satisfy the ACM TOG criteria of excellence established over the years, and
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 1 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+present novel, well-validated, and comprehensively described research advancing computer graphics and
+interactive techniques. Papers accepted to the Journal track will be published in the SIGGRAPH Asia 2026 issue
+of ACM Transactions on Graphics (TOG).
+Conference Papers are expected to present novel research advancing computer graphics and interactive
+techniques. However, the evidence supporting these advances might not be as comprehensive as expected for
+Journal Papers. The length of papers accepted to this track is capped as outlined in the “Journal vs. Conference”
+table below. Papers accepted to the conference track will be published in the SIGGRAPH Asia 2026 Conference
+Proceedings.
+At submission time, authors can indicate if their submission should be considered for the Journal track only or whether
+they want the submission to be considered for both tracks, i.e., as a “dual-track” submission.
+
+The review process, deadline, and papers commi!ee are the same for both tracks. Papers considered for both
+tracks are first evaluated to determine if the contribution is of su"icient quality for SIGGRAPH Asia. If judged to
+be of su"icient quality, they are then assessed based on the criteria above to determine the track to be accepted
+into.
+The di!erences in the submission process for the two options are outlined below.
+
+JOURNAL-ONLY SUBMISSIONS
+
+DUAL-TRACK SUBMISSIONS
+
+The submitted work is expected to be novel and advance the state of the art.
+Ideas are extensively tried and tested, and the
+paper is complete and comprehensive.
+
+The work can be less complete (e.g., have shorter
+validation and fewer comparisons).
+
+When submitting, use the “acmtog” article style, double column. The file size of supplementary materials
+is limited to 500MB.
+No maximum (or minimum) page length.
+
+Submissions are required to adhere to the
+following length constraints: Papers must be no
+longer than 7 pages excluding references and
+figures-only pages. There is no limit on the length
+of the reference section. Each paper can have at
+most two figures-only pages, placed at the end
+of the submission, after references. Figures-only
+pages can contain only figures and their captions
+(i.e., no tables). Authors can also include as many
+figures as they wish within the core 7 pages.
+Appendices are to be provided as supplemental
+material, and not as part of the paper itself.
+
+ACM OPEN ACCESS – new for 2026!
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 2 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Starting January 1, 2026, ACM will fully transition to Open Access.
+See “ACMs New Open Access Publishing Model” below.
+
+Published in ACM Transactions on Graphics (TOG)
+
+If accepted as a Conference Paper: Published in
+SIGGRAPH Asia Conference Proceedings
+If accepted as a Journal Paper: Published in ACM
+Transactions on Graphics (TOG)
+
+Both tracks have an Abstract Submission Deadline of 5 May 2026,
+and Full Submission Deadline of 12 May 2026.
+
+Technical Papers Chair
+Ravi Ramamoorthi (h"ps://asia.siggraph.org/2026/about-the-event/contact-us/?
+topic_of_interest=Conference+Program+%E2%80%93+Technical+Papers)
+University of California, San Diego, NVIDIA
+United States of America
+
+Technical Papers Assistant Chair
+Huamin Wang (h"ps://asia.siggraph.org/2026/about-the-event/contact-us/?
+topic_of_interest=Conference+Program+%E2%80%93+Technical+Papers)
+Style3D Research
+China
+
+SUBMIT HERE 
+
+TECHNICAL PAPERS COMMITTEE 
+
+(HTTPS://SSL.LINKLINGS.NET/CONFERENCES/SIGGRAPHASIA/)
+(HTTPS://ASIA.SIGGRAPH.ORG/2026/ABOUT-THE-EVENT/SIGGRAPH-ASIA-2026COMMITTEE/TECHNICAL-PAPERS-COMMITTEE/)
+
+ETHICS OF REVIEW & REVIEW INSTRUCTIONS 
+
+CONFLICT OF INTEREST RULES FOR AUTHORS 
+
+ANONYMITY POLICY 
+
+(HTTPS://ASIA.SIGGRAPH.ORG/2026/SUBMISSIONS/TECHNICAL(HTTPS://ASIA.SIGGRAPH.ORG/2026/SUBMISSIONS/TECHNICAL(HTTPS://ASIA.SIGGRAPH.ORG/2026/SUBMISSION
+PAPERS/ETHICS-OF-REVIEW-AND-REVIEW-INSTRUCTIONS/)
+PAPERS/CONFLICT-OF-INTEREST-RULES-FOR-AUTHORS/)
+PAPERS/ANONYMITY-POLICY/)
+
+COLLAPSE ALL +
+
+
+
+How To Submit
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 3 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+To start, read the information below about how to prepare your submission, including information on
+forma"ing, anonymity, and resubmissions. Then log into the Submission Portal
+(h"ps://ssl.linklings.net/conferences/siggraphasia), select the “New Submission” tab, and select the
+Technical Papers submission form. You will be asked for basic information about your submission.
+To see what you will need to submit, view the Sample Form
+(h"ps://ssl.linklings.net/conferences/siggraphasia/?
+page=SampleForm&id=TechnicalPapersFullSubmission&site=siggraphasia2026) (Stage 1). Creating a
+submission form will assign your submission a paper ID, which must be included in your submi"ed paper.
+Deadlines
+All deadlines are 23:59 AoE (Anywhere on Earth) unless otherwise noted.
+Tuesday, 5 May 2026: Submission form deadline
+Deadline for creating the submission form with the title, abstract, topic areas and complete list of coauthors. Note that once the submission form deadline has passed, authors can no longer be added or
+edited. Exceptions can be made in special circumstances but are expected to be rare and are up to the
+discretion of the Technical Papers Chair. Other elements of the submission can still be modified.
+No new submissions can be added after the submission form deadline.
+Tuesday, 12 May 2026: Paper deadline
+Deadline for the complete submission, including either the actual PDF paper or an MD5 checksum (which will
+be required in lieu of the actual files starting at some point on this day). If you wish to submit supplemental
+material (additional details or comparisons, movies, code, data, etc.) as well, these files (or their MD5
+checksums) must also be uploaded by this date and time. To see what you will need to submit, view the
+Sample Form (h"ps://ssl.linklings.net/conferences/siggraphasia/?
+page=SampleForm&id=TechnicalPapersFullSubmission&site=siggraphasia2026) (Stage 2).
+Wednesday, 13 May 2026: Upload deadline
+Deadline for uploading all materials if you used MD5 checksums. No new or changed material may be
+uploaded. Only files matching MD5 checksums submi"ed the previous day are valid. Furthermore, by this
+time, each co-author has to specify conflicts of interest and expertise keywords. If the authors do not fill the
+conflicts form, the paper will be automatically desk-rejected!
+English Review Service
+Non-native English speakers may optionally use the English Review Service
+(h"ps://asia.siggraph.org/2025/submissions/submission-information/) to help improve the text of
+submissions. Please note that this process takes time, so plan far ahead in order to meet the submission
+deadline.
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 4 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+
+
+5/13/26, 2:49 AM
+
+Review Process
+
+All submi"ed papers (independent of the track they are submi"ed to) will receive four full reviews, all doubleblind,
+When deciding which track a dual-track submission is suitable for, reviewers will be instructed to consider how
+compelling the evidence supporting the advances presented in the paper is. In particular, they will be
+instructed to be less demanding about formal completeness, validation, and experimental evaluation when it
+comes to accepting papers to the Conference track, thereby allowing publication of riskier/earlier-stage
+work.
+Both tracks will continue the SIGGRAPH Asia tradition of publishing high-quality, groundbreaking research.
+Journal Papers will be published in the ACM Transactions on Graphics. Conference Papers will be published in
+the SIGGRAPH Asia Conference Proceedings in the ACM Digital Library.
+
+
+
+Submission Policy
+
+Double Submissions
+By submi"ing a manuscript to the SIGGRAPH Asia Technical Papers program, authors acknowledge that the
+technical contributions they claim have not been previously published or accepted for publication in another
+peer-reviewed venue and that no manuscript substantially similar in content is currently under review or will
+be submi"ed to any peer-reviewed venue during the SIGGRAPH Asia review period. Violations constitute
+grounds for immediate rejection. If you wish to submit revised or extended versions of Conference or
+workshop Papers, please directly submit to TOG instead of SIGGRAPH Asia.
+Plagiarism
+A submission to the SIGGRAPH Asia Technical Papers program should describe an original work of the
+authors. Authors must not use ideas or content originating from others without properly crediting their
+original sources. Note that such sources are not limited to peer-reviewed publications, but also include
+patents, textbooks, technical reports, theses, unpublished work posted on arXiv, as well as posts on the World
+Wide Web. Failure to comply with this requirement will be considered plagiarism and result in rejection. For
+more details, please consult the Guidance (h"ps://www.acm.org/publications/policies/plagiarismoverview) provided by ACM.
+Anonymity
+The SIGGRAPH Asia review process is fully double-blind: The commi"ee members and external reviewers do
+not know the identity of the authors, and the authors do not know the identity of the reviewers. This
+anonymity is an integral part of an objective and fair review process, so authors are required to take all
+reasonable measures to preserve their anonymity. Specific instructions for preserving anonymity in your
+submission are discussed in the Submission Requirement section. Rules on how to preserve anonymity before
+and after submission when communicating about the work with others are set forth in the SIGGRAPH Asia
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 5 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+2026 Anonymity Policy (h"ps://asia.siggraph.org/2026/submissions/technical-papers/anonymitypolicy/). Authors are expected to familiarize themselves with the policy and strictly adhere to it.
+Citing and Comparing to Prior Art, including Prepublications
+Authors are expected to cite, discuss di#erences and novelty, and compare results, if applicable and feasible,
+with respect to relevant existing publications, provided they have been published in a peer-reviewed venue
+before the SIGGRAPH Asia submission deadline. This also applies to patents, which undergo a professional
+reviewing process. While quantitative and qualitative comparisons to published results can be reasonably
+requested by reviewers, authors are NOT required to compare to methods without published code or data,
+e.g., by reimplementing the methods.
+Prebublications include technical reports and other non-peer-reviewed publications, especially papers posted
+on arXiv. With the rapid progress of search engines and the increased perusal of arXiv papers by the
+scientific community, asking authors to thoroughly compare their work to these prepublications imposes an
+unreasonable burden: A seemingly relevant report that is incomplete in its disclosure or validation might
+appear online shortly before the deadline. While peer-reviewed publications are certainly not immune to
+these shortcomings, they have, at least, been judged su#iciently complete and valid by a group of peers.
+Consequently, authors are not required to discuss and compare their work with recent prepublications (arXiv,
+technical reports, theses, etc.), although they must properly cite those that inspired them
+(see “Plagiarism” above). We nevertheless encourage authors to mention all related works they are aware of
+as good academic practice dictates. Note that with new works posted on arXiv on a daily basis, it is
+increasingly likely that reviewers might point out similarities between the submi"ed work and online reports
+that have been missed by the authors. In this case, authors of conditionally accepted papers should be
+prepared to cite these prepublications in their final revision as concurrent work, without the burden of having
+to detail how their work compares to or di#ers from these prepublications.
+Citing Own Prior Art
+When citing already published work by the same (or an overlapping) group of authors, the citation should
+refer to that work in the third person, just as it would refer to any other previously published work by a
+completely di#erent set of authors. For other relevant work from the same (or overlapping) author(s) as the
+submission, we distinguish between two cases: (A) works that have been submi"ed for publication to
+SIGGRAPH Asia or elsewhere, but have some relevance to and/or overlap with the submission; and (B) largely
+overlapping prepublications that are available online at the time of submission (arXiv, technical report, thesis,
+etc.).
+For case (A), the other work must be cited anonymously, as well as provided as anonymous
+supplementary material. The authors must convince the reviewers that the current submission is
+su#iciently di#erent from the other work, which can be done using an anonymous cover le"er that
+outlines the di#erences. Failure to follow this policy may lead to desk rejection without review.
+For case (B), these earlier or largely similar versions of the submission that are publicly available (on
+arXiv, as a technical report, etc.) should NOT be cited in the submission, as this would identify the
+authors. Instead, these prepublications must be listed in the appropriate field of the submission form,
+titled “Prepublication.” This field is not visible to reviewers.
+Ethics
+Computer graphics have an increasing societal impact. Authors should be aware of the ACM Code of Ethics
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 6 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Computer graphics have an increasing societal impact. Authors should be aware of the ACM Code of Ethics
+and Professional Conduct (h"ps://www.acm.org/code-of-ethics) and adhere to it. Authors should also
+adhere to the ACM Publications Policy on Research Involving Human Participants and Subjects
+(h"ps://www.acm.org/publications/policies/research-involving-human-participants-and-subjects) if
+human subjects are involved in their research. The Technical Papers Commi"ee will judge each submission
+solely based on its technical merits and novelty. If a submission that the Technical Papers Commi"ee
+recommends to accept raises an ethical issue, it will be forwarded to a relevant ACM body for ethics
+evaluation. This body can recommend changes to the submission or, in extreme cases, reject the work. The
+Technical Papers Chair will take the final decision in these cases.
+Use of Generative AI/LLMs
+ACM has strict policies on the use of Generative AI tools like LLMs when preparing manuscripts. Please refer
+to the ACM Policy on Authorship (h"ps://www.acm.org/publications/policies/new-acm-policy-onauthorship) and the Frequently Asked Questions for that policy for more details. In particular, the policy
+requires authors to disclose any use of Generative AI tools in the submission if they are used to generate new
+content (i.e., beyond the use of grammar corrections). Furthermore, authors are responsible for any
+misrepresentation, factual inaccuracy, or plagiarism in their submission. Papers containing citations of nonexistent material or obvious factual inaccuracies will be rejected when found, and may be rejected without
+review. Note that the injection of hidden text/prompts to influence reviewers/automated tools is strictly
+prohibited and may lead to rejection without review, with further sanctions/penalties for the authors.
+Lobbying Reviewers
+It is strictly prohibited to make any a"empt to intervene in the review process. For example, it is inappropriate
+for an author to contact a commi"ee member or a person they suspect to be a reviewer during the review
+process and mention the author’s own submission, even if the author does not explicitly ask for a favor.
+Commi"ee members and reviewers will be asked to report such incidents and subsequently may be marked
+as conflicted and removed from the review process for that submission. For the most serious interventions,
+the submission may be rejected without completing the review process.
+
+
+
+Submission Requirements
+
+Submission Format
+Technical Papers authors should prepare their documents according to the ACM SIGGRAPH Asia Publication
+Guidelines (h"ps://www.siggraph.org/learn/instructions-authors/). All submissions should be prepared in
+ACM double-column format. For convenience, we recommend using the provided “acmtog” LaTeX Article
+Template Style, which is already in the correct format. The other templates (e.g., Word, Overleaf) might need
+adaptation to obtain double-column format. Please pay particular a"ention to the citation format for prior
+ACM SIGGRAPH and SIGGRAPH Asia Conference Papers, as specified in the ACM SIGGRAPH Asia
+publication guidelines, because the proper format varies depending on the year of publication.
+If you use LaTeX, please anonymize your initial submission with the
+following \documentclass command:
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 7 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+\documentclass[acmtog,anonymous,review]{acmart}
+and add your assigned paper ID with:
+\acmSubmissionID{paper ID}
+Authors who use LaTeX must make certain that any packages they use in their paper are part of ACM’s list of
+accepted LaTeX packages – h"ps://authors.acm.org/proceedings/production-information/acceptedlatex-packages (h"ps://authors.acm.org/proceedings/production-information/accepted-latexpackages). TAPS will refuse submissions that use packages that are not part of this list. Authors can request
+that packages be added – see the documentation for information on that request process.
+Please use the same forma"ing for both Journal and dual-track submissions. For dual-track submissions,
+please follow the instructions in the section below regarding paper length and organization. Papers that do
+not conform to these instructions will not be considered for the conference track and may be desk rejected.
+Please ensure that you are using version 2.16 or higher of the “acmart” class; earlier versions of the article
+template will not produce a valid submission. Download the latest acmart class along with other necessary
+materials here (h"ps://www.siggraph.org/preparing-your-content/author-instructions/). A LaTeX
+submission template (h"ps://www.siggraph.org/preparing-your-content/author-instructions/) is
+provided for your convenience.
+Authors are required to submit fully forma"ed papers, with graphs, images, and other special areas
+arranged as intended for final publication, using the ACM SIGGRAPH Asia paper preparation guidelines. Be
+sure that all pages are numbered and contain your paper’s ID number. You should obtain this paper ID by
+completing the Online Submission Form before finalizing your paper. If your paper is accepted, you will
+receive instructions for forma"ing the final version, which will be di#erent because, among other things, the
+authors’ names and a#iliations will be included, and the pages will not be numbered.
+Authors must submit their papers electronically. The only allowable format is Adobe PDF. The supplemental
+materials (anything except the paper) should also be submi"ed electronically. See How to Submit for more
+information. For videos, we strongly encourage MP4, and for still images, we strongly encourage JPG or
+PNG. If you use another format, you are not guaranteed that reviewers will view them. In preparing videos,
+please choose a reasonable frame size and rate, but be prepared to submit a higher-resolution video if a
+section of your video is selected for the Papers Preview section of the Electronic Theater. If your
+supplemental materials amount to more than 500 MB of data, you are not guaranteed that reviewers will
+download and view them.
+
+Preserving Anonymity in the Submission
+Remove any information from your submission materials (paper, video, images, data, code, etc.) that
+identifies you, any of the other authors, and any of your institutions or places of work. In addition to not listing
+your names and a#iliations in the paper, omit acknowledgements (you will be able to add them back upon
+acceptance). If you are a well-known author with a possibly recognizable voice, do not narrate your video; get
+someone else to do it. You must reference all relevant work completely, including your own and that of the
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 8 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+other authors. The detailed policy on how to cite these papers, including prepublications (arXiv, technical
+reports, etc.), theses, submi"ed work, and published work, is described in the “Citing Own Prior Art” section in
+the Submission Policy. Please read the instructions carefully before submi"ing your work.
+We strongly discourage authors from including any URLs referring to websites that contain vital material for
+their submissions. We prefer that the code/data is submi"ed as part of the supplementary material. If this is
+not possible (e.g., a large data set beyond the capacity of the submission server), you may add a link to a fully
+anonymized code/data repository that provides a verifiable timestamp, which has to be before the
+submission deadline (e.g., a GitHub repository on a branch that is not modified after the deadline).
+SIGGRAPH Asia reviewers are instructed to ignore URLs in paper submissions unless the information is
+deemed absolutely necessary for their review. Such decisions are made completely at the reviewers’
+discretion. Furthermore, if reviewers discover the identity of authors through such an external link or notice
+that the material has been modified after the deadline, the paper may be desk-rejected.
+Please keep the PDF version anonymous; in particular, note that under some operating systems, the
+“properties” of a PDF file may contain the creator’s name. Also, Version 7 PDF files allow the inclusion of a
+script that will contact the author each time the file is opened. Do not include this script in your PDF file; if we
+find it, we will reject your paper without review. Make sure that no submi"ed files contain any information
+about the authors in the metadata.
+Paper Length
+Journal submissions have no maximum (or minimum) length. Have a look at previous proceedings to get a
+sense of the range of paper lengths,. For Journal Papers that are conditionally accepted, the final paper
+length may increase when approved by the primary reviewer.
+
+Dual-track submissions are required to adhere to the following length constraints: Papers must be no
+longer than 7 pages excluding references and figures-only pages. There is no limit on the length of the
+reference section. Each paper can have at most two figures-only pages, placed at the end of the
+submission, after references. Figures-only pages can contain only figures and their captions (i.e., no tables).
+Authors can also include as many figures as they wish within the core 7 pages. Papers should not include
+appendices in the main document. Any appendix can only be included as supplementary material and not
+as part of the main paper. Papers will not be considered for conference publication if they exceed the page
+limit, are not submi"ed using the forma"ing described in the section “Submission Format,” or appear to alter
+the format to bypass the page limit. Post-acceptance, authors of papers accepted to the Conference track
+can add one additional page to the final-format papers to accommodate the author list, author a#iliations,
+copyright, acknowledgements only, and in exceptional cases, changes requested by the reviewers. If a dualtrack submission exceeds the page limit, the Technical Papers chair may, upon their discretion, decide to
+consider the paper for the Journal track instead of desk-rejecting it. In this case, the authors will be informed
+and given the option to withdraw the paper should they prefer to submit elsewhere.
+The submi"ed paper should stand on its own, allowing evaluation of the main ideas without reliance on
+supplemental material. For example, the main results and discussion of the method must be in the submission;
+extra ablation studies, additional comparisons, implementation details, and similar material can be provided
+in the supplemental material. Animated results may be included as an accompanying video.
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 9 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Clarity of writing is considered vital to a high-quality submission. Papers may be perceived as too long if they
+are repetitive or verbose or too short if they omit important details or neglect relevant prior art.
+Companion Videos
+Papers may be accompanied by a video that is five minutes or less in duration. In recent years, well over half
+of the accepted papers were accompanied by some kind of video material. To the extent possible, accepted
+papers should stand on their own, with the video providing supplementary information or visual confirmation
+of results. However, it is fine to refer to the video in the paper, in which case the video should be submi"ed
+under Supplementary Materials, part A in the submission form, as described below. A video should not be
+included in a submission unless substantively similar footage can later publicly appear in the ACM Digital
+Library. If your paper is accepted and you cannot comply with this requirement because of copyright or
+permission problems, your paper’s acceptance will be rescinded.
+
+See also the Publication tab below that explains how the publication rights and licensing are handled for the
+companion videos.
+Supplemental Materials
+Authors are invited, but not required, to include supplemental materials such as additional implementation
+details, ablations, comparisons, additional images or videos, related papers, derivations, or results, as well as
+code and data files (so that reviewers can reproduce results in the paper). These materials will be viewed only
+at the discretion of the reviewers, who are only obligated to read the paper itself and watch the main
+accompanying video. These materials must be anonymized, so that they can be made available to all
+reviewers. There are two separate parts in the online submission form for uploading supplementary
+materials:
+1. Anonymous supplemental materials that are considered part of the submission, and that you are
+commi"ing to provide for the ACM Digital Library if your paper is accepted.
+2. Anonymous materials that you are submi"ing to help in the review process but do not plan to submit to
+the ACM Digital Library.
+For instance, in addition to videos, A) may include some code, and a .zip archive containing result images and
+some text files, such as detailed user-study results or other appendices associated with your submission. B)
+may include anonymized versions of related papers from the same authors currently under review or in press
+elsewhere, together with an anonymous cover le"er that outlines the di#erences between the submission and
+these other papers. In case of resubmission with reviewer continuity, the cover le"er explaining how you took
+into account previous reviews and listing the improvements in your method should be there, too.
+See also the Publication tab below that explains how the publication rights and licensing are handled for the
+supplemental materials.
+Resubmissions
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 10 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+If your paper is a revision of a paper that has previously been submi"ed to a SIGGRAPH or SIGGRAPH Asia
+conference, we recommend (but do not require) that when you fill out the submission form you identify it as a
+resubmission, and select the option that allows the previous review materials (reviews, reviewer discussions,
+summaries, etc.) to be made available to the Technical Papers Commi"ee. Please indicate the latest
+conference that your paper was submi"ed to and its paper ID at the time. If you choose to use this option,
+your paper may be assigned to some or all of the previous reviewers, and all reviewers will have access to
+suitably anonymized versions of the prior review materials. We encourage you to choose this option if you
+consider the paper to be derived from the previous version, even if the paper has been substantially rewri"en
+and authors have been added. It will result in more consistent reviews and decrease the chance that a new set
+of reviewers will want completely di#erent changes than those you made in response to the reviews of your
+earlier submissions. This option also has the added benefit of reducing the overall burden on the volunteer
+reviewing community. Note, however, that simply responding to all earlier criticisms will not guarantee
+acceptance. If you resubmit with reviewer continuity, you should include a cover le"er within the anonymous
+supplementary materials, part B, in order to explain the changes you made to the paper and how you
+improved your work and its exposition since the last review cycle. If you resubmit without continuity, you may
+still choose to submit a similar anonymous cover le"er to make it easier for recurring reviewers to understand
+the changes that have been made since the previous submission.
+
+
+Evaluation
+
+The Technical Papers Commi"ee and a set of external (i.e., tertiary) reviewers, both consisting of recognized
+experts, will review submi"ed papers. Then, at the commi"ee meeting, the commi"ee will select the papers to
+be presented at SIGGRAPH Asia 2026 and published in either a special issue of ACM Transactions on
+Graphics or in the SIGGRAPH Asia Conference Proceedings in the ACM Digital Library.
+The Technical Papers review process will be conducted by (1) the Technical Papers Chair, who was chosen by
+the SIGGRAPH Asia 2026 Conference Chair and approved by the ACM SIGGRAPH Executive Commi"ee and
+its Conference Advisory Group; (2) the Assistant Technical Papers Chair, chosen by the Technical Papers
+Chair; (3) the Technical Papers Advisory Board, consisting of past and future Technical Papers Chairs and
+other trusted and experienced advisors, chosen by the SIGGRAPH Asia 20265 Technical Papers Chair; (4) the
+Technical Papers Commi"ee, chosen by the Technical Papers Chair with the assistance of the members of the
+Technical Papers Advisory Board, and consisting of about 130 people whose expertise spans the entire field.
+Both Journal-only and dual-track submissions will be reviewed by the same Technical Papers Commi"ee. The
+Technical Papers Chair will work with the Technical Papers Commi"ee and the tertiary reviewers to evaluate
+each valid submission.
+The Review Process
+1. After the submission deadline, the Technical Papers Chair and several others selected by the Technical
+Papers Chair will conduct the paper sort. During this meeting, they assign each paper to two senior
+reviewers, called the primary and secondary reviewers, who are members of the Technical Papers
+Commi"ee. All parties participating in the review process enter their conflict-of-interest data into the
+submission system ahead of time. The Technical Papers Chair does not make assignments or review
+papers. Rather, it is the job of the chair to facilitate the process. Papers that are inappropriate may be
+desk-rejected during this assignment process without being sent to any senior reviewers. Papers rejected
+at this stage would include those that are clearly o# topic for SIGGRAPH Asia 2026, discovered to have
+been published previously or to have been submi"ed simultaneously to another conference or journal,
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 11 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+found to break anonymity or format requirements in the submission, or are clearly below the minimum
+quality standard of a SIGGRAPH paper. For more details, see Submission Policy and Frequently Asked
+Questions.
+2. The two assigned senior reviewers may, upon conferring with each other and the Technical Papers Chair,
+recommend a paper to be rejected without additional review. A paper will normally be rejected at this
+stage only if it falls into one of the categories listed in phase one, but this fact was not detected during the
+paper sort.
+3. Each paper is distributed to three or more additional experts, called tertiary reviewers. These reviewers
+are selected by the primary and the secondary reviewers. The identity of the authors is not revealed to
+any of the reviewers. The primary and the secondary reviewer are warned by the submission system,
+Linklings, if their selection of tertiary reviewers would result in a conflict of interest. For each reviewed
+paper, all tertiary reviewers and the secondary write full reviews (see the Review Form and Reviewer
+Instructions (h"ps://asia.siggraph.org/2026/submissions/technical-papers/ethics-of-review-andreview-instructions/) for the questions in the form). While the primary does not write a full review, they
+will still read the paper, all reviews, and rebu"al and will moderate the discussion among the four
+reviewers who wrote full reviews. Thus, at least four full reviews are wri"en for each paper that has not
+been rejected during phases one and two, and two senior reviewers will actively monitor the discussion of
+every paper. In unusual cases, such as when a tertiary reviewer fails to deliver a review on time, papers
+may receive fewer than four reviews. However, if a paper receives fewer than four reviews, additional
+reviewers will be found, possibly from the commi"ee. For more details, see the Review Process section in
+the Technical Papers FAQs.
+4. After all reviews are complete, the review system allows the authors access to the reviews and scores for
+their papers. Then, authors have a few days to enter rebu"als if they feel the reviewers have made
+substantive errors or to answer specific questions posed by the reviewers. The rebu"al is confined to
+1,000 words in length (plain text) and must be self-contained. For instance, URLs to additional material
+are not allowed. The rebu"al period is for addressing factual errors in the reviews and answering specific
+reviewer questions, not for providing revised text or new results that do not directly address reviewer
+questions. Any such novel material will be ignored by the reviewers. For more details, see the Rebu"al
+Process section of the Technical Papers FAQs.
+5. Between the end of the rebu"al period and the commi"ee meeting, the senior reviewers will read all the
+submi"ed reviews (at least four) as well as the author rebu"als, confer intensively about the paper, and
+prepare a recommendation for the commi"ee meeting. The three tertiary reviewers will see the author
+rebu"als and will participate in discussions about the paper. Due to the double-blind review process, the
+authors must maintain anonymity in their rebu"als. In addition, the tertiary reviewers do not know each
+other’s identities, so they too must maintain anonymity during the discussion. The preliminary
+recommendation agreed on at this stage will be either “conditionally accepted” or “rejected.” If an
+agreement on the recommendation cannot be reached, a third option is to “table” the paper for further
+review and discussion during the Technical Papers Commi"ee meeting.
+6. If a paper is tabled, the senior reviewers will select one or more other members of the Technical Papers
+Commi"ee to write extra reviews of the paper and be prepared to discuss it in detail at the meeting. The
+extra reviews will be wri"en during the week before the commi"ee meeting. If consensus still cannot be
+reached, it is even possible that additional extra reviews will be assigned during the meeting itself. An
+extra review can also be wri"en by the primary. This can happen at any point during the discussion phase
+if the primary has new insights that have not been raised by the other reviews. Any extra paper review
+will be provided to the authors after the meeting.
+7. The full Technical Papers Commi"ee meets to finalize conditional acceptance or rejection of each paper.
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 12 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+In cases where a consensus on a paper was not reached during the pre-meeting discussion phase,
+additional commi"ee members may read the paper, and their evaluations will be taken into account in
+the decision. Submissions will be accepted either as a Journal Paper or a Conference Paper.
+Members of the Technical Papers Commi"ee, including the chairs, are not present when papers for which
+they have conflicts of interest are discussed. Papers are judged solely on their merit, as determined by the
+reviews. Although the acceptance rate of SIGGRAPH Asia papers has remained stable in the range of ~2030%, there is no quota for the number of papers that should be accepted by the SIGGRAPH Asia 2026
+Technical Papers Commi"ee; this number will arise organically from the actions of the commi"ee.
+Possible Outcomes for a Paper
+Email notifications of the Technical Papers Commi"ee’s decisions will be sent following the commi"ee meeting
+(see the Timeline below). The notifications will place each paper in one of the following categories.
+1. Conditionally accepted Journal Paper for presentation at SIGGRAPH Asia 2026. The commi"ee
+provides a list of required changes that must be made to the paper for the work to be published.
+2. Conditionally accepted Conference Paper for presentation at SIGGRAPH Asia 2026. The commi"ee
+provides a list of required changes that must be made to the paper for the work to be published, limited
+to changes that are satisfiable within the current page limits or the supplementary material.
+3. Rejected from SIGGRAPH Asia 2026. Submissions that were deemed not suitable for the conference, or
+too flawed or incomplete to be accepted, will be rejected. In some cases, the reviewers may find enough
+merit in the submission that they encourage the authors to consider resubmi"ing to either ACM
+Transactions on Graphics or a future SIGGRAPH or SIGGRAPH Asia conference, with reviewer continuity.
+The review summary includes a set of suggested changes.
+Conditionally accepted papers undergo a second reviewing process, in which a member of the Technical
+Papers Commi"ee verifies that the final version of the paper is acceptable, i.e., that any required changes
+have been made, and that other changes made by the authors have not compromised the paper in any way.
+This second and final stage determines the final acceptance status of all papers. The referees’ decisions are
+final. Papers that do not satisfy the referees in the second stage of reviewing and/or that are not uploaded in
+final form by the final deadline, together with the original or revised versions of the submi"ed supplementary
+material, will be rejected.
+One author of the paper, or an author’s designate in the unlikely event that none of the authors could a"end
+the conference, must commit to presenting the paper in person at the SIGGRAPH Asia 2026 conference in
+Kuala Lumpur, Malaysia. New for 2026, we are implementing a deferral policy. See “Deferrals” below
+
+
+
+Upon Acceptance
+
+Notification
+Notification of conditional acceptances and rejections will be sent to authors, along with any extra reviews
+and possibly a list of required changes (see Timeline below). A member of the Technical Papers Commi"ee,
+typically the primary reviewer, will be assigned as shepherd for the revision cycle.
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 13 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Title changes and 50-word summary
+A few days after notification, any changes to the paper title along with a 50-word description of your paper
+suitable for the web site will be submi"ed in the “Stage 3 Program Material” form. Note: changes to the
+paper title must be approved by your referee/shepherd.
+Revisions
+Authors of papers conditionally accepted by the commi"ee must revise their submission for the second round
+of reviewing and deliver that material to Linklings.
+The deadlines for the revised version and camera ready final version of your paper are listed in the Timeline
+below. During the week between these two dates, the referees and authors will communicate via the bulletin
+board process about the adequacy of the changes in the revisions. Sometimes, changes are not initially
+considered adequate, or introduce new problems, so further revision may be required. It is recommended to
+submit the initial revised version sooner than the deadline in order to provide more time for iterated revisions.
+It is hoped that all conditionally accepted papers will be accepted by the end of this process, but this is not
+guaranteed. When writing successive revisions, the referee’s job is made easier if authors use a di#erent color
+for the added or revised text in each new version. (Please remember to remove these colors in the final
+version.) It also helps to describe the changes in the bulletin board post to which the revision is a"ached.
+For Journal Papers, changes to paper length must be approved by the referee, and extensions of more than
+one page are unlikely to be granted. Papers accepted to the conference program can be extended by one
+page in the camera-ready version only to accommodate the author list, author a#iliations,
+acknowledgements, and in exceptional cases, changes requested by the reviewers.
+Camera Ready Final Version
+Once the reviewers have approved the paper, authors will finalize the preparation of their camera-ready
+paper. The camera-ready materials are not uploaded to Linklings but are handled di#erently, depending on
+the paper track, as follows.
+Conference-track papers
+The authors may integrate figures included in the two figures-only pages of the submission into the main text,
+resulting in a total of at most 10 pages plus references. The authors should deliver the source of the paper to
+The ACM Production System (TAPS) for publication. TAPS accepts LaTeX or Word source documents and
+prepares the forma"ed PDF and HTML5 versions of one’s article for publication in the ACM Digital Library.
+Information on preparing and delivering materials to TAPS is here
+(h"ps://homes.cs.washington.edu/~spencer/taps/taps.html).
+
+Journal-track papers
+The authors should deliver the source material to Stephen Spencer, Publication Chair, who will deliver it to
+ACM for publication. This will be done using an email address that will be provided to the corresponding
+author upon acceptance.
+Supplementary materials submission (both Conference and Journal papers)
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 14 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Supplementary materials submission (both Conference and Journal papers)
+After the submission of the publication rights form (eRights), a link will be provided to the corresponding
+author to upload the supplementary materials directly to ACM.
+See also the Publication tab below that explains how the publication rights and licensing are handled.
+Papers Fast Forward Session
+For each accepted paper, one author is required to participate in the Papers Fast Forward session on-site in
+Kuala Lumpur, Tuesday, 1 December 2026. In addition to the material that is part of your publication, you will
+be asked to provide a short presentation for the Papers Fast Forward. The authors will be given a short
+amount of time to summarize the paper and entice a"endees to a"end their complete paper presentation
+during the conference week. The deadline for the Papers Fast Forward pre-recorded video is noted in the
+timeline below. Additional information will be provided upon acceptance
+In-Person Presentation
+For each accepted paper, one author is required to present in-person at SIGGRAPH Asia 2026 in Kuala
+Lumpur, Malaysia, 1-4 December 2026. The Technical Papers session will be livestreamed to virtual
+conference participants (with contributors’ permission). Following the oral presentations, the author is
+expected to participate in an interactive discussion poster session where they will have the opportunity to
+interact with participants in a more intimate se"ing. Additional information will be provided upon
+acceptance.
+New for 2026, we are implementing a deferral policy that allows authors who cannot a"end the
+conference for verifiable reasons to defer their presentation under certain circumstances. See
+“Deferrals” below for details.
+Presenter Recognition
+Contributor Registration Benefit: One author per accepted Paper receives a 25% discount on Full Conference
+registration.
+
+To present a Paper at SIGGRAPH Asia 2026, the author must be registered at the Full Conference
+registration level.
+You will receive an email by early September explaining how to access the registration discount code as well
+as instructions for registering. The author using the discount code is eligible for the early-bird registration
+rate regardless of when registration is completed. Any additional authors who will be presenting the paper
+are required to register at the appropriate registration level for the program, and prevailing registration
+rates will apply.
+Technical Papers Preview Trailer
+A Technical Papers Preview Trailer will be prepared from selected parts of the videos accompanying
+accepted papers. The preview will appear in the Electronic Theater at the conference and may also be used
+to publicize the Technical Papers program inside and outside the conference, like on the web. If a section of
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 15 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+your video is selected, you will be asked to provide a high-quality rendering of that clip. Therefore, if you
+submit a video accompanying your paper, please keep your raw data available for that purpose.
+
+
+
+Publication
+
+Accepted Conference Papers will appear in the conference proceedings, and Journal Papers will be published
+as a special issue of ACM Transactions on Graphics.
+See the ACM Publication Rights & Licensing Policy here
+(h"ps://www.acm.org/publications/policies/copyright-policy).
+ACM Rights Management Form
+If your work is accepted for presentation at SIGGRAPH Asia 2026, you must complete the ACM Rights
+Management Form. The form will be sent to the corresponding author per accepted paper. If the
+corresponding author for an accepted paper is a#iliated with an institution that is part of the ACM OPEN
+program, and their e-mail address is associated with that institution, their paper can be published Open
+Access without having to pay the APC (see more info under ACMs New Open Access Publishing Model). If
+you are the corresponding author for a paper and your institution is part of that program, make sure you
+are using your institution’s email address and not a personal email address for correspondence.
+Third Party Material
+You must have permission from the owner or copyright holder to use any images or video (or provide
+rationale for using them without permission) that you do not own in your submi"ed paper or supplementary
+material. ACM has a clear policy and procedures for handling Third-Party Material
+(h"ps://www.acm.org/publications/authors/third-party-material).
+Permissions and Copyrights
+If your submission is accepted, you will be asked to provide a signed rights form, which is required by ACM
+before your paper can be published. The contact author of each paper will receive an email message from
+ACM Rights Review containing instructions and a link to the rights form, which is completed online.
+Authors of accepted Technical Papers are required to complete the ACM Rights Form prior to publication.
+They are also required to upload final versions of all public supplementary materials (Part A) that were
+originally part of their submission.
+If the contact author for an accepted paper is a#iliated with an institution that is part of the ACM OPEN
+program, and their e-mail address is associated with that institution, their paper can be published Open
+Access without having to pay the APC. If you are the contact author for a paper and your institution is part of
+that program, make sure you are using your institution’s email address and not a personal email address for
+correspondence.
+
+Supplemental Materials
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 16 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Any material that supports a paper’s acceptance for publication must be available as part of the final
+publication. Thus, all material uploaded for review in the “Anonymous Supplementary Materials, Part of Your
+O#icial Submission” section of the submission form, including supplementary text, images, and videos, are
+subject to the ACM copyright policy, and the required permission forms must be completed upon acceptance.
+If it subsequently becomes apparent that the necessary permissions cannot be given for publication of
+material that is substantially similar to that submi"ed for review, acceptance of the paper may be withdrawn.
+Upon acceptance, authors must deliver final versions of their papers and their supplementary material. The
+material will be made available in the ACM Digital Library from the paper’s landing page.”
+For authors that promise to make code and data available, and/or where the release of this code/data is a
+condition of acceptance (regardless of whether or not it was originally included in submi"ed materials), that
+should also be included either in supplemental materials or on a publicly accessible website or repository. The
+deadline for this purpose is prior to the publication of the paper (see Timeline) and the paper may be
+withdrawn if the code/datasets are not available in time.
+For authors that promise to make code and data available, and/or where the release of this code/data is a
+condition of acceptance (regardless of whether or not it was originally included in submi"ed materials), that
+should also be included either in supplemental materials or on a publicly accessible website or repository. The
+deadline for this purpose is prior to the publication of the paper (see Timeline) and the paper may be
+withdrawn if the code/datasets are not available in time.
+ACMs New Open Access Publishing Model
+Important Update on ACMs New Open Access Publishing Model for 2026 ACM Conferences!
+Starting January 1, 2026, ACM will fully transition to Open Access. All ACM publications, including those from
+ACM-sponsored conferences, will be 100% Open Access. Authors will have two primary options for publishing
+Open Access articles with ACM: the ACM Open institutional model or by paying Article Processing Charges
+(APCs). With over 2,600 institutions already part of ACM Open, the majority of ACM-sponsored conference
+papers will not require APCs from authors or conferences (currently, around 76%).
+Authors from institutions not participating in ACM Open will need to pay an APC to publish their papers,
+unless they qualify for a financial waiver. To find out whether an APC applies to your article, please consult
+the list of participating institutions (h"ps://libraries.acm.org/acmopen/open-participants) in ACM Open
+and review the h"ps://www.acm.org/publications/policies/policy-on-discretionary-open-access-apcwaivers (h"ps://www.acm.org/publications/policies/policy-on-discretionary-open-access-apc-waivers).
+Keep in mind that waivers are rare and are granted based on specific criteria set by ACM.
+Understanding that this change could present financial challenges, ACM has approved a temporary subsidy
+for 2026 to ease the transition and allow more time for institutions to join ACM Open. The subsidy will o#er:
+$250 APC for ACM/SIG members
+$350 for non-members
+This represents a 65% discount (h"ps://www.acm.org/publications/openaccess), funded directly by ACM.
+Authors are encouraged to help advocate for their institutions to join ACM Open during this transition period.
+This temporary subsidized pricing will apply to all conferences scheduled for 2026.
+ORCID Mandate
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 17 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+ACM requires that all accepted journal authors register and provide ACM with valid ORCIDs prior to paper
+publication. Corresponding authors are responsible for collecting these ORCIDs from co-authors and
+providing them to ACM as part of the ACM eRights selection process. You and your co-authors can create
+and register your ORCIDs at h"ps://orcid.org/register (h"ps://orcid.org/register). ACM only requires you to
+complete the initial ORCID registration process. However, ACM encourages you to take the additional step to
+claim ownership of all of your published works via the ORCID site.
+Promotional Use
+Your representative image and text may be used for promotional purposes. Several SIGGRAPH Asia 2026
+programs may prepare preview videos for pre-conference promotion of accepted content, which may
+include a portion of the video you submi"ed for review. You have the option to grant or deny us the ability to
+use the representative image and submi"ed video for these purposes.
+
+
+
+Deferrals
+
+New for 2026!
+Authors of papers (conditionally) accepted to SIGGRAPH Asia 2026 may request deferring their in-person
+presentation to SIGGRAPH 2027 due to systemic hurdles associated with the Kuala Lumpur location, such as
+access constraints or substantiated safety concerns. See the full details of the new policy here
+(h"ps://www.siggraph.org/siggraph-events/conferences/deferred-paper-presentation/). To be
+considered for a deferred presentation the request should be submi"ed by August 12th 2026. Decisions
+will be announced by August 26th 2026.
+
+
+
+FAQs
+
+Click here to head over to:
+Should I submit?
+Journal and Conference Paper Tracks
+Deadlines
+Double Submissions
+Prior Publication
+Supplementary Materials
+Resubmission
+Formatting
+Uploading Files
+Representative Image Guidelines
+Anonymity
+Review Process
+Rebuttal Process
+Presentations
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 18 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Referrals to TOG
+Patents and Confidentiality
+Technical Papers Committee
+Contacts
+Copyright
+
+Should I submit?
+Q1. What types of papers should be submi!ed to SIGGRAPH ASIA Asia 2026?
+We are looking for high-quality research papers that cover a broad spectrum of areas including but not limited
+to animation, simulation, imaging, geometry, modeling, rendering, human-computer interaction, AR/VR/MR,
+haptics, fabrication, robotics, visualization, audio, optics, programming languages, immersive experiences,
+generative AI, and machine learning for graphics. We value a diverse set of contributions such as AI techniques,
+algorithms, perceptual studies, systems, benchmarks, data sets, and applications. We welcome fundamental
+ideas as well as applied contributions to the domains of arts, entertainment, games, scientific imaging, medical
+applications, design, photography, fashion, architecture, communication, forensics, and more. Last but not
+least, we encourage creative and original submissions that define their own new area: The scientific excellence
+of the ideas is the predominant acceptance criterion.
+
+Q2. How do I decide whether to submit my work as a Technical Paper, a Technical
+Communications paper, or a Poster?
+The Technical Papers program is the most competitive of these three categories. Technical Papers present the
+opportunity to work out your ideas at greater length and describe them in a citable archive. SIGGRAPH Asia
+Technical Communications and Posters provide an opportunity to disseminate ideas and get feedback from
+colleagues but do not represent a citable research paper. Authors of accepted Technical Papers also need to
+provide a 20-second pre-recorded video for the Papers Fast Forward.
+
+Q3. If I have previously presented a Technical Communication or Poster on my topic, or I have an
+online report about it already available on arXiv, can I then submit a full Technical Paper?
+Yes. Authors of a prepublication (Technical Communication, Poster, technical report, thesis, etc.) can later submit
+a full Technical Paper on the topic. However, other authors of submi"ed Technical Papers must consider such
+prepublications as non-peer-reviewed prior art and cite them as such. See Submission Policy for more
+information on plagiarism and prior art.
+
+Q4. Can I submit a Technical Paper and submit the same work to the General Submission process
+or to Posters?
+SIGGRAPH Asia does not allow simultaneous submission to the Technical Papers and Technical Communications
+tracks, though it does allow content related to a Technical Papers submission to also be submi"ed to the other
+General Submission venues. The General Submission form has a checkbox to indicate work submi"ed elsewhere.
+Please check this box and explain that the work was submi"ed as a Technical Paper for SIGGRAPH Asia 2026.
+Papers rejected from the SIGGRAPH Asia 2026 Technical Papers program may be submi"ed as Posters.
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 19 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Back To FAQs Links
+
+Journal and Conference Paper Tracks
+Q1. Which track should I submit to?
+If your paper cannot be 7 pages (not counting reference pages and two optional figure pages) without omi"ing
+crucial information, or you require journal publication for professional reasons, then you must submit to the
+Journal track. If your paper can meet the page limit and forma"ing requirements for a conference publication,
+then we encourage you to submit your paper as a dual-track submission.
+
+Q2. My paper fits in 7 pages, but I would only be happy with journal publication. Can I submit to
+the Journal Papers track only?
+Yes, you may submit a paper for journal consideration only.
+
+Q3. What’s the di"erence in acceptance criteria between Journal and Conference Paper Tracks?
+Journal Papers are expected to satisfy the ACM TOG criteria of excellence established over the years, and
+present novel, well-validated, and comprehensively described research advancing computer graphics and
+interactive techniques. Conference Papers are expected to present novel research advancing computer
+graphics and interactive techniques. However, the evidence supporting these advances might not be as
+comprehensive as expected for journal papers.
+
+Q4. My paper is longer than 7 pages. Can I just move excess content to the supplemental
+material for dual-track submission?
+Yes, as long as the main submission paper can be evaluated on its own, without unnecessary reliance on
+supplemental material. For example, main results and discussion of the method must be in the submission;
+additional ablations, implementation details, and additional comparisons may be in an accompanying
+document, and animated results can be in a supplementary video.
+
+Q5. If my paper is published in the Conference Papers track, will it later be possible to submit a
+revised version with new material to TOG or another journal?
+Conference Track papers are Conference Papers, and, after SIGGRAPH Asia publication, you may submit
+revised versions of your Conference Paper according to the rules of the submission venue. Many journals have
+guidelines of adding 30% new material for revised versions of Conference Papers; check with the journal for
+further information.
+Note, however, that papers presented at SIGGRAPH Asia as part of the Conference Papers track, and then
+revised and published in TOG, may not later have another public presentation at the conference itself.
+
+Q6. Can I submit a revised and extended journal version of a previously published Conference
+Paper to the SIGGRAPH Asia Journal Papers track?
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 20 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Paper to the SIGGRAPH Asia Journal Papers track?
+No, but many journals do allow this; check the submission guidelines for the relevant journal.
+
+Q7. May I submit a dual-track paper in which the references are mixed in with the other content,
+but the paper would be 7 pages if the references were removed?
+No. Please reformat your submission so that only references and figure-only pages — and no other content —
+appear after page 7.
+
+Q8. May I submit a dual-track paper in which the figure-only pages are mixed in with the other
+content, but the paper would be 7 pages if these figures were removed?
+No. Please reformat your submission so that the figure-only pages — and no other content — appear after the
+references. The figures in the additional pages may include only graphical and visual material and captions, no
+tables or excessive text.
+
+Q9. Can I submit the same work twice?
+No, one is not allowed to submit the same body of work to both the dual-track and the Journal-only track. That
+would be considered a double submission, which is not allowed.
+
+Q10. Can dual-track papers include appendices?
+Dual-track papers should not include appendices in the main document. Any appendix can only be included as
+supplementary material and not as part of the main paper.
+Back To FAQs Links
+
+Deadlines
+Q1. Please explain the di"erent Technical Papers deadlines.
+There are three deadlines in the Technical Papers program submission process.
+Of course, contributors are strongly advised to complete everything prior to the first deadline, but if you wish to
+wait until the final hours (and bear the risk of having to deal with hard-to-reach web servers), please read on.
+
+Q2. Submission Form and Conflicts Deadline (Stage 1), Tuesday, 5 May 2026, 23:59 AoE
+By the submission formdeadline, you must have created the submission form, entered the complete list of coauthors and their a#iliations.
+Note that after this deadline, you will not be able to open a new submission, nor be able to add or edit authors!
+
+Q3. Paper Deadline (Stage 2), Tuesday, 12 May 2026, 23:59 AoE
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 21 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Q3. Paper Deadline (Stage 2), Tuesday, 12 May 2026, 23:59 AoE
+By the paper deadline, you must have completed the following requirements:
+All basic information about the submission (title, abstract, supplementary material, etc.) must be finalized.
+Either the submission materials (paper PDF, optional video, and optional supplemental materials) must be
+uploaded, or the MD5 checksums of all the submission materials must be provided. The MD5 option will be
+required in the final hours before the deadline to lighten the web server load.
+
+Q4. Upload Deadline (Stage 3), Wednesday, 13 May 2026, 23:59 AoE
+Finally, if you uploaded an MD5 checksum by the Stage 2 deadline, you must upload the matching submission
+materials by the upload deadline. For more information about this MD5 option, please see the following
+question. In addition, all authors must complete the conflicts of interest (COI) form, specifying or updating a
+complete list of their conflicts of interest. Papers will be desk-rejected if all authors do not complete the COI
+form in time.
+
+Q5. What is the deal with MD5 checksums?
+If you upload all your files well before the deadline, you can ignore the MD5 checksum.
+If you are uploading in the last few hours before the submission deadline, server response may be slow. To make
+the deadline, you may then upload just the MD5 checksum for your files. In the final hours before the deadline,
+file upload will usually be turned o#, leaving only the MD5 option in order to lighten the server load.
+For each MD5 checksum received by the deadline, you will have 24 hours after the paper deadline to complete
+the upload of the files that matches this checksum; i.e., you will have another day to upload files matching the
+MD5 checksums previously uploaded (but, of course, not another 24 hours to do your work).
+We have tested the following MD5 calculators:
+Linux: md5sum command
+Mac: md5 command in Terminal
+Windows: FastSum
+
+Q6. Can I submit after the paper deadline?
+No. The deadline is absolute.
+
+Q7. But my equipment has failed just before the deadline, and I have no control over such events!
+The deadline is absolute. Equipment failures are common, and SIGGRAPH Asia 2026 cannot adapt its schedule
+to accommodate them, so please submit early to avoid equipment failure issues.
+
+Q8. But I was unable to upload my submission on time. The system was overloaded, and halfway
+through uploading my submission, the deadline passed.
+The deadline is absolute. Submissions that are in progress when the deadline passes, even if it’s because our
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 22 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+server has slowed down due to high load, will not be accepted. You should allow enough lead time to avoid this
+kind of problem. Please see How to Submit for explanations of the MD5 checksum process.
+
+Q9. Unfortunately, in our rush to meet the deadline, we incorrectly set the parameters for our
+video, resulting in a significantly lower quality result. I have since corrected the problem. May I
+substitute new videos for the ones I submi!ed? The video is identical, except for the gamma
+correction.
+No. The submission deadline is absolute. All materials must be submi"ed by the deadline. If your paper is
+accepted, you will have an opportunity to replace the video.
+
+Q10. But I’m using the SIGGRAPH Asia 2026 English Review Service, and they didn’t get back to
+me soon enough. So, it’s SIGGRAPH Asia’s fault that my paper isn’t ready.
+The deadline is absolute. The English Review Service makes no guarantees about turnaround, and it’s up to you
+to make contingency plans. Please see the English Review Service Deadlines
+(h"ps://asia.siggraph.org/2025/submissions/submission-information/#primaryHeading-12-f405bb2) to
+plan accordingly.
+
+Q11. Can I email my submission to the Technical Papers Chair if the online submission system is
+overloaded?
+No. Papers and submission materials emailed to the Technical Papers Chair or other conference representatives
+are not considered as having been submi"ed. You must use the online submission system. Please leave yourself
+enough time before the deadline to avoid problems.
+Back To FAQs Links
+
+Double Submissions
+Q1. I would like to submit my paper to conference X or journal Y as well as to SIGGRAPH Asia
+2026. Is this acceptable?
+You must submit to just SIGGRAPH Asia 2026 and await our response before submi"ing elsewhere (should your
+work not be accepted by SIGGRAPH Asia 2026). If you submit your paper to another conference or journal
+simultaneously, we will reject your paper without review. We will be in contact with the editors of several journals
+and chairs of other related conferences, exchanging information. Several double submissions to SIGGRAPH Asia
+have been found in recent years.
+
+Q2. But I want my paper to be in SIGGRAPH Asia 2026. I promise that if it is accepted by
+SIGGRAPH Asia 2026, I will withdraw it from the other conference or journal.
+Dual submissions are not allowed. Your submission will be rejected if it is under review by any other conference
+or journal during the SIGGRAPH Asia review process.
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 23 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Q3. I would like to submit my paper to conference X. Their submission deadline is after
+SIGGRAPH Asia 2026’s Technical Papers Commi!ee meeting, but they require abstracts to be
+submi!ed before the meeting. May I submit the abstract?
+Yes. The prohibition against dual submission kicks in when a full paper substantially equivalent to your
+SIGGRAPH Asia 2026 paper submission is submi"ed elsewhere. For conferences that require extended
+abstracts or other formats, you should ask the Technical Papers Chair before submi"ing to avoid risking your
+paper being rejected from SIGGRAPH Asia 2026. In cases where the SIGGRAPH Asia paper has received poor
+reviews prior to the rebu"al, you may also consider formally withdrawing your paper from SIGGRAPH Asia 2026
+prior to submission elsewhere (this is required if the submission deadline of the other conference is prior to the
+SIGGRAPH Asia decision).
+
+Q4. We have submi!ed a paper about a pilot study to conference X, and now we would like to
+submit a paper about the full-blown user study to SIGGRAPH Asia 2026. How should we go
+about that to avoid the perception that it is a dual submission?
+Anonymously cite the paper in your SIGGRAPH Asia 2026 submission with a note to the reviewers that either it
+will be accepted by conference X, or you will publish it as a tech report and make it freely available on the web.
+Include an anonymous version in your submission as supplemental material. Then when you write the SIGGRAPH
+Asia 2026 paper, treat the pilot study as already published and cite it as [Anonymous]. Do not repeat text or
+figures from that paper in the SIGGRAPH Asia 2026 version.
+
+Q5. I sent in a paper to workshop X with the understanding that it was for review purposes only,
+and the workshop would have no published proceedings. Now, four months later, they tell me
+that they are going to publish the proceedings and include it in the digital library. Unfortunately,
+there is a significant overlap between that paper and my submi!ed SIGGRAPH Asia 2026 paper.
+How should I handle this?
+We realize that you did not intend to do anything against the SIGGRAPH Asia 2026 rules, but now that the
+workshop rules have changed, you should either withdraw the workshop paper from the proceedings or
+withdraw your SIGGRAPH Asia 2026 submission.
+
+Q6. Can I submit the same work both as a Journal and a dual-track paper?
+No, one is not allowed to submit the same body of work both as a Journal and as a dual-track submission. That
+would be considered a double submission, which is not allowed.
+Back To FAQs Links
+
+Prior Publication
+Q1. I have a paper that was previously published in a li!le-known conference or in another
+language. Can I submit it to SIGGRAPH Asia 2026?
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 24 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Previously published papers in any language or submi"ed to any other conference or journal may not be
+submi"ed to SIGGRAPH Asia 2026. A paper is considered previously published if it has appeared in a peerreviewed journal or meeting proceedings that are visibly, reliably, and permanently available afterward in print
+or electronically to non-a"endees, regardless of the language of that publication.
+
+Q2. Can I submit a paper on my work that has previously appeared in my thesis, a tech report, a
+patent, and/or an abstract of a talk at another conference?
+Publications such as theses, tech reports, patents, or abstracts in other conferences do not preclude subsequent
+publication of a complete paper on the same topic by the same authors. However, such prepublications should
+be mentioned in your submission form. See Submission Policy for more precise instructions.
+
+Q3. How do I reference an ACM SIGGRAPH Asia Talk, Poster, or Sketch on the same topic as the
+paper that I am writing?
+Depending on the year of presentation, the Sketch or Talk might appear in the ACM Digital Library. If it does,
+you should use the ACM Digital Library as a reference. If it is not archived, you may refer to the oral presentation
+at the conference, or if it appeared in one of the conference publications, the abstract. If you were the author of
+the Sketch or Talk, then citation is not strictly necessary because publication of a Sketch or Talk does not
+preclude publication of a full paper. Do not cite it as your own work (in first person), so that anonymity is
+preserved. If you were not the author of the Sketch or Talk, then you should cite the Sketch or Talk to respect the
+author’s ideas. If the authors have published a subsequent paper, thesis, or tech report about their work, you
+should cite that instead of the Sketch or Talk, because it will be a more useful pointer for your readers.
+
+Q4. A month after submi!ing our paper, we obtained much be!er results. Can we withdraw our
+paper from review and submit it elsewhere (or wait until next year)?
+SIGGRAPH Asia submissions can be withdrawn at any time. However, authors should remember that the
+reviewers on their paper may have already spent considerable e#ort handling and reviewing their paper. If your
+paper is provisionally accepted, you may be able to add your new results, subject to approval by the senior
+reviewers.
+
+Q5. Will my submission be penalized if I put it on a repository like arXiv?
+Please check our anonymity policy (h"ps://asia.siggraph.org/2026/submissions/technicalpapers/anonymity-policy/) and the FAQ section on anonymity (below) for answers to this and related
+questions. The Technical Papers Commi"ee members and the reviewers will be instructed to familiarize
+themselves with this policy. We refer interested readers to the references below for more information on the
+topic of double-blind reviews.
+[1] Reviewer bias in single- versus double-blind peer review. A. Tomkins, M. Zhang, and W.D. Heavlin. PNAS,
+2017, 114 (48). h"ps://doi.org/10.1073/pnas.1707323114 (h"ps://doi.org/10.1073/pnas.1707323114)
+[2] E#ectiveness of Anonymization in Double-Blind Review. C. Le Goues, Y. Brun, S. Apel, E. Berger, S. Khurshid,
+Y. Smaragdakis. Communications of the ACM, 2018, 61 (6), h"ps://doi.org/10.1145/3208157
+(h"ps://doi.org/10.1145/3208157)
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 25 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Back To FAQs Links
+
+Supplementary Materials
+Q1. What supplemental material can be uploaded with my submission?
+Authors are invited, but not required, to include supplemental materials such as additional images and videos,
+results of a user study, executables, data for reproducibility of results, and a cover le"er explaining the list of
+changes in case of a resubmission, related papers, etc. Some of the supplemental materials can be uploaded as
+part of your submission, while others are there to support the reviewing process. For instance, if you have a
+related paper that is under review or in press elsewhere, you should upload a version of that paper as an
+anonymous supplementary document for the a"ention of the reviewers, with a note explaining di#erences with
+the current submission. For more information, see Submission Requirements. If your paper is a revision of a
+paper that was previously submi"ed to SIGGRAPH Asia, please see the Resubmission section.
+
+Although your paper should always stand alone, and supplemental materials are never required, past
+experience shows that certain kinds of submissions (especially those involving video or animation) tend to fare
+be"er if they are accompanied by a supplemental video. Similarly, if your paper is an interactive system and/or
+presents quantitative results, we recommend that you upload a .zip or .tar file with an executable, data, and
+scripts that can be used to reproduce the results presented in the paper. A README.txt file should be included to
+describe how to run the executable on the data and how to interpret the results. (Please make these descriptions
+as simple as possible). The instructions can be followed by the reviewers to run your code on the data you
+provide and (even be"er) on other data of the same type to validate the results presented in the paper. Clearly,
+reviewers will appreciate your claims of generality if they can validate those claims directly.
+
+Q2. Do I have to submit code and data with my paper?
+We encourage providing code and data in the supplemental material, but we understand that this may not
+always be possible. The reviewers will be instructed not to penalize submissions without code and data. In all
+cases, the paper should provide enough information for the code and data to be recreated by the readers.
+
+Q3. What if I promise in the paper (or rebu!al) that I will submit code or/and data with the final
+version of my paper but change my mind?
+Authors are expected to abide by such promises. If a paper where such a promise is made is accepted, authors
+are expected to provide in the body of the paper a link to an online repository that needs to contain the
+promised content.
+Back To FAQs Links
+
+Resubmission
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 26 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Q1. My submission is a revision of a paper that I submi!ed to an earlier SIGGRAPH Asia
+conference. Will the reviewers get to see the earlier reviews?
+Only if you authorize them to see them. When you submit your paper, you can optionally identify it as a
+resubmission, in which case all reviews (suitably anonymized) and discussions from all previous submissions will
+be made available to the current reviewers. The identity of the previous reviewers will also be made available to
+the sorters and the senior reviewers. If you do not choose this option, none of the materials from any previous
+submission will be known to this year’s reviewers. Note, however, that there is a non-negligible probability that
+some of the new reviewers have already reviewed a previous version of the paper. Such reviewers typically
+appreciate having detailed information of what changed in the paper. Therefore, even if you do not select the
+reviewer continuity option, it is advisable to accompany the paper with an anonymous cover le"er describing
+the changes that have been made since the previous submission in the supplemental material. For more details
+on these options, see Submission Requirements.
+
+Back To FAQs Links
+
+Forma!ing
+Q1. Do I have to prepare the paper in the final format?
+Please format your paper according to the SIGGRAPH Asia Technical Papers submission forma"ing guidelines
+(see Submission Requirements). This format is close to the final format but modified to preserve anonymity.
+
+Q2. What is the page limit for papers?
+See Submission Requirements.
+There is no hard maximum (or minimum) length imposed on Journal Papers. Have a look at previous proceedings
+to get a sense of the range of paper lengths.
+Dual-track submissions are required to adhere to the following length constraints: Papers must be no longer
+than 7 pages excluding references and figures-only pages. There is no limit on the length of the reference
+section. Each paper can have at most two figures-only pages, placed at the end of the submission, after
+references. The figures in the additional pages may include only graphical and visual material in figures, with
+figure captions, no tables or excessive additional texts. Authors can also include as many figures as they wish
+within the core 7 pages. Papers should not include appendices in the main document. For all papers, writing
+plays an important role in assessing the quality of the paper submission. Papers may be perceived as too long if
+they are repetitive or verbose or too short if they omit important details or tamper with forma"ing rules just to
+save on page count.
+
+Q3. Can I provide a video with my paper?
+Papers may be accompanied by a video that is five minutes or less in length. In recent years, well over half of
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 27 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+the accepted papers were accompanied by some kind of video material.
+
+Q4. What file formats are allowed?
+The paper must be submi"ed in Adobe PDF format with embedded fonts, and the representative image must be
+JPEG. Please see the submission form for the allowed formats of the other materials. You can upload a .zip/.gzip
+file as supplemental material that contains any format. There is no guarantee that the referees will view
+supplemental materials, especially if they are available only in an obscure format.
+
+Q5. What types of keywords should I include with my paper?
+Select one primary topic area and optionally one or more secondary topic areas from the list in the online
+submission form, as well as 1–7 keywords from the suggested list.
+
+Q6. As a non-native English speaker, I would appreciate help to improve the text in my paper
+submission.
+Non-native English speakers may optionally use the English Review Service to help improve the text of
+submissions. Please note that this process takes time, so plan far ahead.
+
+Q7. The details in my imagery are very subtle. I am concerned that the reviewers will not print my
+paper on a suitable printer or view my video with an appropriate codec.
+You still need to submit your paper as a PDF file. Reviewers can zoom in to see the details when viewing the
+paper electronically. You can encourage the reviewers to zoom in on the images of interest by suggesting they do
+so in the captions.
+
+Q8. Does the submi!ed video have to be of final quality? Or will people whose papers are
+accepted have the opportunity to prepare a more polished video?
+You will have the opportunity to prepare a more polished video. Of course, the be"er the submi"ed video looks,
+the more likely reviewers will be able to see the strengths of your work, so polishing may be a good investment of
+time and energy.
+Back To FAQs Links
+
+Uploading Files
+Q1. How do I upload my submission files?
+Uploading is not always perfectly smooth. To make sure that all submissions will get to us with minimal
+frustration, please follow these guidelines:
+
+Q2. Don’t Wait Until the Last Minute
+The online submission system uses a robust server with high-bandwidth access to the internet, but everything
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 28 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+The online submission system uses a robust server with high-bandwidth access to the internet, but everything
+has a limit. In previous years, we have observed exponential growth in the hours and minutes leading up to the
+deadline, leading to the need to close the system to all but MD5 uploads.
+
+Q3. Upload Early and Often
+Once your submission is complete, you are still allowed to edit it and add to or modify the supplementary
+materials right up to the deadline. This means you can upload some materials early and the remainder later,
+avoiding the need to upload everything at once. This also means you can upload a rough draft of your materials
+early and replace it with more polished versions later. Upload drafts that are roughly the same size as your final
+material. This will allow you to get a feel for the upload process, understand the time it takes to upload files of
+that size, and give you time to diagnose problems. Then, as you refine your draft, upload revisions. This way, if
+the last polish or final render encounters problems, you only lose the polish, not the entire submission.
+
+Q4. We Do Not Control the Internet
+In our tests in the past, we have found upload speeds of anywhere from 20 megabit/sec to five kilobit/sec. We
+have tested uploads from two gigabytes to 10 kilobytes. We have seen upload times from one second to 24
+hours. If you are traversing a path to our server that is through congested nodes, your upload may fail, and you
+will have to retry. You may even have to do the upload from work, school, home, or a local business services firm.
+Do not wait until the last minute to find out.
+
+Q5. Do Not Try to Upload Too Much
+Supplementary materials for the papers program are limited to 500MB. Upload limits for required materials are
+described in the online submission system.
+
+Q6. Do Not Wait Until the Last Minute
+Yes, we said this already, but it’s worth repeating! The deadlines are absolute. We are on a tight schedule, and
+we will not be able to extend the deadline to accommodate straggling uploads. Despite all these dire warnings,
+we are happy to report that the online submission process works very well. We do not anticipate major
+problems. Just do not wait until the last minute!
+
+Q7. MD5 Checksum of Uploaded Materials
+In an e#ort to conserve server resources and bandwidth, file uploading and downloading will be disabled
+temporarily as needed as each of our deadlines nears. If uploading and downloading are disabled, all submi"ers
+will be required to use the MD5 checksum mechanism. We do not know the exact time when this might take
+e#ect. It will be determined by server loads to ensure that all submi"ers are able to access their submissions. It
+may not apply to all programs. Check instructions on the online submission form for details.
+
+Q8. What Do I Have to Do?
+To be accepted as uploaded, all files must either be completely uploaded by the appropriate deadline or have an
+MD5 checksum computed and be submi"ed before the deadline. Files submi"ed before the deadline that do not
+match the MD5 checksum will not be accepted. If you choose to submit an MD5 checksum, you will then have 24
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 29 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+hours after the deadline to upload your files with the matching MD5 checksum previously uploaded by the
+appropriate deadline.
+Note: It might be a good idea to rename the file so the filename includes the MD5 checksum immediately after
+submission. This can prevent accidentally overwriting the file corresponding to the checksum, for example by
+starting another LateX compilation by accident.
+
+Q9. What Does an MD5 Checksum Look Like?
+If you use the MD5 option, the MD5 checksum should be submi"ed without additional characters surrounding it
+and without any breaking characters.
+An example of a correct MD5 checksum is:
+871A51785E2A6414DEB097C2CEE89743
+Examples of incorrect MD5 checksums:
+871A51785E2A6414DEB097C2CEE89743 filename.avi
+and
+871A 5178 5E2A 6414 DEB0 97C2 CEE8 9743
+Note that the le"er case is ignored.
+
+Q10. How do I calculate an MD5 checksum?
+You must use an MD5 calculator. We have tested the following MD5 calculators:
+Linux: md5sum command
+Mac: md5 command in Terminal
+Windows: FastSum
+
+Q11. How Can I Test This Process?
+We recommend that you try uploading a small test file well in advance of the 23:59 AoE deadline to ensure that
+you are familiar with the procedure, that the MD5 calculator you are using is working properly, and that it is
+compliant with the MD5 standard that we are using.
+
+Q12. What If I Do Not Want to Use MD5 Checksum?
+If you complete the uploading of all the necessary files by your deadline and before we revert to the checksumonly mechanism, you can ignore the MD5 checksum. However, the system will still compute and report MD5
+checksums for all the files you upload. You may find this useful if you want to check that your file has been
+uploaded without corruption. Just compare the MD5 checksum you compute for your file with the checksum
+computed by the submission system.
+Back To FAQs Links
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 30 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Representative Image Guidelines
+Q1. What are the image guidelines?
+Every submission must include at least one representative image.
+The image must be digital, of the highest quality possible, with a pixel resolution of at least 1500 x 1000, at
+least 300 dpi at 5 inches (12.7 cm) wide, with proportional height, or the highest possible resolution screen
+grab.
+Images must be 24-bit (RGB, 8 bits per channel) uncompressed, in the highest possible JPEG resolution.
+A standard ICC color profile of sRGB is also recommended and will be assumed if not specified.
+Horizontal (landscape) images are required. Vertical (portrait) images are not acceptable.
+Your image will appear in 3 x 2 ratio on the SIGGRAPH ASIA 2026 website. Images that do not conform to
+this proportion will be cropped from the center.
+Avoid embedded rules, layers, tags, masks, color models (for example, CMYK), etc. If in doubt, use an image
+editor to paste into a new file.
+Please also specify copyright and image credits for each image. The file upload manager o#ers an input
+field for this optional information.
+If your work is accepted, your representative image will be used both as an identifying image during the
+jurying and selection process and in publications or for media purposes.
+Higher resolution images are often favored by media for publication use, so the minimum-resolution
+requirement is only a guideline.
+It is important that you have permission to use this image.
+If you are not sure how to best represent your work with an image, you may consider an image that conveys
+the appropriate area of computer graphics or interactive techniques.
+
+Back To FAQs Links
+
+Anonymity
+Q1. What should I do to make my submission anonymous?
+Remove any information from the paper, video, and supplemental materials that identifies you, any of the other
+authors, or any of your institutions or places of work. In particular, replace the authors’ names with the paper ID
+(for example, papers_0000) in your submi"ed paper. Do not include any acknowledgement. See Submission
+Requirements. for more information.
+
+Q2. How do I include a reference to myself without identifying myself?
+The general rule is to use the third person. For example, if Fred Brooks and Holly Rushmeier were to write a
+paper, they might say in their “related work” section: “Brooks and Rushmeier [2001] discuss a system in which
+molecular visualizations are … Our work builds on some of the ideas presented there, and on the ideas of Smith
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 31 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+et al. [2003] and the interaction techniques described by Wolford [1999].” They would NOT say: “In our prior
+work [Brooks and Rushmeier 2001], we discussed a system in which molecular visualization… ” The only case in
+which anonymous references are appropriate are unpublished manuscripts, in which case they might write: “We
+have also developed closely related techniques for molecular manipulation [Anonymous 2026], but that work is
+outside the scope of this paper.” Reference [Anonymous 2026] would then read:
+
+[Anonymous 2026] Anonymous Authors. Molecular manipulations through computer graphics, submi!ed. 2026.
+You should submit the anonymous manuscript as supplemental material with your SIGGRAPH ASIA submission,
+along with an anonymous cover le"er (also submi"ed as supplemental material) that briefly explains the
+di#erences.
+
+Q3. My SIGGRAPH Asia 2026 submission needs to cite one of our own web pages, which cannot
+easily be anonymized. Now what should I do?
+The rules governing prepublication have been clarified (see Submission Policy). For other types of web content,
+if you can reasonably cite the web page in the third person, go ahead.
+
+Q4. My SIGGRAPH ASIA 2026 submission needs to cite another, concurrent SIGGRAPH Asia
+submission by our group. Now what should I do?
+Cite it as [Anonymous 2026] Anonymous Authors, A grand unified theory of computer graphics, submi"ed to
+SIGGRAPH ASIA 2026 and include the other submission as anonymous supplemental material.
+
+Q5. I know I am supposed to remove my name, company name, etc., from the document, but
+should I also remove names from the acknowledgements? If the paper is accepted, should I send
+another copy to you with this additional material?
+You must not include an “acknowledgements” section in the submission. If your paper is accepted, you will submit
+a revised version that identifies you and your co-authors, your a#iliations, and any appropriate
+acknowledgements. Keep in mind the additional space that will be required when stating how many pages the
+paper will require.
+
+Q6. I posted a version of my paper to arXiv. Can I share a link to my paper on Twi!er?
+No. As described in our Anonymity Policy (h"ps://asia.siggraph.org/2026/submissions/technicalpapers/anonymity-policy/), you may archive SIGGRAPH Asia submissions but not otherwise publicize them.
+
+Q7. But other people are linking to my arXiv paper! And I can think of ways to get around this
+policy.
+Please check our Anonymity Policy (h"ps://asia.siggraph.org/2026/submissions/technicalpapers/anonymity-policy/) for answers to this and related questions. We recognize there are gray areas in
+these rules, and our communities are still figuring out how to manage the trade-o#s between double-blind
+review and rapid dissemination of research. The SIGGRAPH Asia decision process is only about two months
+long, and, during this period, we ask authors to be good citizens and avoid finding loopholes in these rules, in
+order to preserve the spirit of double-blind review.
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 32 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Back To FAQs Links
+
+Review Process
+Q1. Can you give me some example reasons that my paper would get rejected without review?
+Submissions will be rejected without review if it is found that:
+The submission violates the ACM Policy and Procedures on Plagiarism, Misrepresentation, and
+Falsification (h"ps://www.acm.org/publications/policies/plagiarism-overview).
+The submission is a dual submission, that is if the submission is simultaneously under review for any other
+peer-reviewed conference or publication. For more details see the Prior Publication and Double Submissions
+sections.
+The paper is clearly below the minimum quality standard of a SIGGRAPH Asia paper.
+The paper focuses on the advertising of a company’s product(s).
+The paper is on a topic clearly outside the scope of SIGGRAPH Asia.
+Electronic files have been submi"ed that have been designed to have side e#ects other than presenting the
+submi"ed work to reviewers and commi"ee members (for example, a “phone home” script).
+1 – 4 December
+2026 | KLCC,
+Kuala
+Lumpur, Malaysia
+ |to#SIGGRAPHAsia
+| #SIGGRAPHAsia2026
+The paper
+misuses
+Generative
+AI/LLMs. Examples include but are not limited
+fictitious references
+or
+injection of prompts seeking to manipulate reviewers or automated tools.
+It appears that the paper contains material for which the submi"ers have not secured the necessary
+copyrights.
+Most of the paper’s content was published previously.
+(h"ps://asia.siggraph.org/2026)
+About The Event(h"ps://asia.siggraph.org/2026/about-the-event/about-siggraph-asia/)
+Q2. Where
+can I find advice on how to write a paper?
+Submit Your Work(h"ps://asia.siggraph.org/2026/submissions/)
+QUICK LINKSExhibit Or EXHIBIT
+NOW  (HTTPS://ASIA.SIGGRAPH.ORG/2026/EXHIBIT-OR-SPONSOR/DOWNLOADSponsor(h"ps://asia.siggraph.org/2026/exhibit-or-sponsor/)
+
+ The articles linked below are useful references. That said, these articles represent the point of view of their
+
+
+BROCHURE/)
+
+authors and areFor
+notThe
+partPress(h"ps://asia.siggraph.org/2026/for-the-press/press-centre/)
+of the actual Technical Papers policy. Submi"ers to the Technical Papers program
+Plan
+to A"end(h"ps://asia.siggraph.org/2026/plan-to-a"end/)
+should read carefully the
+Call
+for Papers and the Submission Policy.
+Collection on articles on writing your first ACM SIGGRAPH Asia/TOG paper: h"p://research.SIGGRAPH
+Asia.org/guides (h"p://research.siggraph.org/guides)
+Collection on articles on how to get rejected: h"p://wwwevasion.imag.fr/Membres/Fabrice.Neyret/debats/how-to-get-rejected.html (h"p://wwwevasion.imag.fr/Membres/Fabrice.Neyret/debats/how-to-get-rejected.html)
+
+Q3. Am I allowed to ask for my paper to not be reviewed by someone from whom I do not expect
+a fair review?
+No. The reviewer selection process includes no such provisions.
+
+Q4. I am submi!ing a paper on topic X, which I know is an area of expertise for commi!ee
+member Y. Can I ask that commi!ee member Y be a senior reviewer of my paper?
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 33 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+No.
+
+Q5. I am submi!ing a paper on topic X, which I know is an area of expertise for commi!ee
+member Y. Can I ask that commi!ee member Y not be a senior reviewer of my paper, because
+commi!ee member Y works for a competing company?
+No. Indeed, commi"ee member Y may well be the best qualified reviewer for your work, and if so, we may ask
+them to be the senior reviewer. However, we do take cross-reviewing conflicts into account. Please
+see Technical Papers: Ethics of Review (h"ps://asia.siggraph.org/2026/submissions/technicalpapers/ethics-of-review-and-review-instructions/).
+
+Q6. Who knows the identities of the authors, and how is that information used during the review
+process?
+The Technical Papers Chairs, sorters, and COI coordinators know the identity of the submissions’ authors. The
+sorters use this information to avoid conflicts of interest when assigning the senior reviewers, and the COI
+coordinators use this information to approve the tertiary reviewers suggested by the senior reviewers. No
+reviewers of any paper know the authors’ identities. Papers are judged solely on their merit, as determined by
+the reviews.
+
+Q7. Isn’t the commi!ee more likely to accept papers by commi!ee members and other insiders?
+How do you prevent a conflict of interest?
+Any paper on which a commi"ee member has a conflict of interest will not be discussed while that commi"ee
+member is in the room, and in fact, the commi"ee member will not receive any information about such papers
+throughout the entire review process and commi"ee meeting.
+
+Q8. Is there a quota for the number or percentage of papers accepted?
+There is no quota for the number of papers that should be accepted. This number arises organically each year
+from the actions of the commi"ee.
+
+Q9. I am a SIGGRAPH ASIA 2026 reviewer, and I would like to show this paper to one of my
+students, who frankly knows more about the topic of this paper than I do. May I?
+Yes, under certain strict conditions. You may show a paper under review to a small number of people, normally
+one or two, providing that you:
+1. List their name(s), title(s) (for example, “my Ph.D. student”), and a#iliation(s) in the “Private Comments”
+section of the review form, which is only seen by the commi"ee members.
+2. Clearly instruct them on the rules of confidentiality of the SIGGRAPH ASIA review process. “THIS IS
+IMPORTANT: Submissions are confidential!” For more information, see Ethics of Review.
+However, it is not appropriate for others to write the review for you. If this is your intention, then you must
+discuss it with the senior reviewer who assigned you the paper. At that person’s discretion, the paper may be
+o#icially reassigned to the other person.
+Back To FAQs Links
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 34 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Back To FAQs Links
+
+Rebu!al Process
+Q1. What is a rebu!al?
+There will be an opportunity to upload a rebu"al to address factual errors and specific questions in the reviews
+via the SIGGRAPH Asia online submission system during the rebu"al period. Reviews will be available via the
+online submission system. Then, authors may upload up to 1,000 words of text (no images, video, or URLs to
+external pages) in the system by the rebu"al deadline. The rebu"als will be read by the referees and factored
+into the discussion leading up to the decisions made at the Technical Papers Commi"ee meeting.
+
+Q2. Should I write a rebu!al?
+Any author may upload a rebu"al. The choice of whether to submit one and how much time to spend on it is up
+to each author. As a general guideline, submi"ing a rebu"al is a good idea if the paper seems to have a chance
+of being accepted, and if the reviews contain errors that can be corrected or specific questions that can be
+answered with short textual descriptions.
+
+Q3. What should be included in the rebu!al?
+The rebu"al is for addressing factual errors in the reviews and for answering specific questions posed by
+reviewers. It is limited to 1,000 words of text and must be self-contained. It cannot, for instance, contain URLs to
+external pages. There will be no uploads of images or videos during the rebu"al process. The rebu"al also can
+help clarify the merits and novelty of the paper with respect to prior work if it is felt that the reviewers
+misunderstood the paper’s contributions and scope.
+
+Q4. Now that I have read the reviews of my paper, I see how to be!er organize it so it will be
+clear to the reader. Can I do this reorganization and upload the new version during the rebu!al
+period?
+No. The rebu"al period is for addressing factual errors in the reviews, not for ge"ing revised text into the review
+process. The reviewers will have only a short time in which to read and act on your rebu"al, and it must be short
+and to the point. Hence, it will be limited to 1,000 words of text (no images or video).
+
+Q5. After the paper submission deadline, we have go!en some really cool new results for our
+paper. Can I upload those results during the rebu!al period? I am sure that they will make the
+reviewers realize the importance of our approach.
+No. The rebu"al period is for addressing factual errors in the reviews and for answering specific questions posed
+by the reviewers, not for ge"ing new results that do not directly address reviewer questions into the review
+process.
+
+Q6. Reviewer No. 2 says that our collision-detection algorithm will not work on concave objects.
+But it will, as we just demonstrated with the lid of the teapot. Can we upload an image or movie
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 35 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+But it will, as we just demonstrated with the lid of the teapot. Can we upload an image or movie
+showing this new result?
+No. Images and videos may not be uploaded with rebu"als. Many years ago, you could ask the primary referee
+for permission to upload additional material. However, that feature was eliminated in 2009 to provide greater
+fairness and less stress in the rebu"al process. You can, however, explain why your method does work on such
+data, and commit to provide relevant results in the final revision (note that failure to do so if the paper is
+accepted is grounds for rescinding the conditional acceptance).
+
+Q7. Reviewer No. 3 doubts that the method works on larger scenes, so we tested on the Sponza
+scene and it only takes 5ms, while Reviewer 2 asks about the PSNR values for our test scene,
+which I quickly computed. Can I include these results?
+Yes, you can discuss new text-based results to support your answers to the questions raised by the reviewers. But
+you should not add any new results that do not directly address reviewer questions.
+
+Q8. Reviewer No. 4 clearly did not read my paper carefully enough. Either that or this reviewer
+does not know anything about the field! How should I respond during the rebu!al period?
+We have all received SIGGRAPH Asia reviews that made us mad, particularly on first reading. The rebu"al
+period is short and does not allow for the cooling-o# period that authors have before they write a response to a
+journal review. As a result, authors need to be particularly careful to address only factual errors or reviewer
+questions in the rebu"als rather than le"ing their emotions show.
+Please do not say: “If reviewer No. 4 had just taken the time to read my paper carefully, they would have realized
+that our algorithm was rotation invariant.” Instead, say: “Unfortunately, Section 3 must not have been as clear as
+we had hoped because Reviewer No. 4 did not understand that our algorithm was rotation invariant; therefore,
+they were skeptical about the general applicability of our approach. Here is a revised version of the second
+paragraph in Section 3, which should clear up this confusion.”
+
+Q9. I uploaded a rebu!al but got no feedback. How can I be sure the reviewers received and
+actually read my rebu!al?
+If you can view your rebu"al comments in the online review system, so can your reviewers. Rest assured that
+rebu"al information is considered and can be very helpful in the selection process.
+
+Q10. Why can’t we upload images and videos as was possible prior to 2009?
+In previous years, authors could ask the commi"ee for permission to post images, audio, and/or videos on a
+public bulletin board system (BBS). Although this feature was sometimes helpful for providing examples that
+answer specific questions posed by referees, it was used very di#erently by di#erent authors and regulated
+di#erently by di#erent referees. In some cases, an author would be allowed to upload entirely new examples,
+while nothing was allowed in others. The instructions clearly stated that rebu"als are only for “addressing
+factual errors in reviews.” Yet, some authors would push the limits (for example, “The review said my method
+doesn’t work, so here are several new results to show that it does work …”), and some referees were more lenient
+than others in allowing such uploads. To improve the uniformity of the review process, rebu"als will be limited to
+only 1,000 words of text. No images and no video can be uploaded with the rebu"al for any paper. This change
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 36 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+has improved the fairness of the rebu"al process and also decreased the pressure on submi"ers to create new
+results during the short rebu"al process.
+
+Q11. Will we use the BBS for discussion during the rebu!al period?
+There will be no discussion back-and-forth between authors and referees on any BBS during the review process.
+Prior to 2009, referees could ask questions of authors on a public BBS at any time prior to the commi"ee
+meeting, and authors could provide extended answers, sometimes with new visual results in response to specific
+questions. Thus, the review process was di#erent for di#erent papers and unnecessarily stressful for all.
+Presently, there is no longer a public BBS. Instead, the authors have the opportunity to upload a single, text-only
+rebu"al. This change was made to increase fairness and reduce the stress of the rebu"al process. If your paper
+is accepted, the bulletin boards will be opened for discussions during the revision and shepherding process.
+Back To FAQs Links
+
+Presentations
+Q1. Are papers merely published digitally, or is there a presentation as well?
+There are presentations both for Journal and Conference track papers at the SIGGRAPH Asia conference. In
+recent years, the typical format of these presentations allocates about 10 minutes for both Journal and
+Conference papers, followed by an interactive discussion session that all authors a"end with poster display.
+
+Q2. Where can I get information about how ACM handles copyright transfers and publishing
+licenses? I need to show it to my employers before I submit.
+The various levels of the rights management form that ACM o#ers to authors can be found Here
+(h"ps://authors.acm.org/) under Author Resources.
+
+Q3. My paper was just accepted to SIGGRAPH Asia 2026, and I am thrilled. But now my boss
+points out that I cannot use Bart Simpson as the example in my paper because I do not have the
+rights to use him. What do I do now?
+The call for Technical Papers explicitly states that you must have permissions for all the images in your paper
+and the footage on your video at the time of submission. You should immediately tell the Technical Papers Chair
+what you propose to use as a replacement. If the new images or footage are not similar to that submi"ed for
+review in the judgment of the chair and the Papers Advisory Board, then acceptance of your paper will be
+rescinded. The archival record (conference proceedings) must contain material equivalent to what the reviewers
+saw at the time of review.
+Back To FAQs Links
+
+Referrals to TOG
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 37 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Referrals to TOG
+Q1. Is “referral to TOG” a possible outcome of the Technical Papers review process?
+No. In the past it was possible that papers got rejected from SIGGRAPH/Asia and accepted with major revisions
+to TOG, but this option has been eliminated starting with SIGGRAPH Asia 2018.
+Back To FAQs Links
+
+Patents and Continuity
+Q1. When will my accepted paper become publicly available?
+Public disclosure of a paper’s title, abstract, and contents can have important commercial and legal
+ramifications. The o#icial publication date of accepted papers for both Journal and Conference tracks is from 9
+November 2026. The SIGGRAPH Asia 2026 Journal paper proceedings will be published as Volume 45, Issue 6
+of ACM Transactions on Graphics.
+However, the paper’s title, abstract, 50-word summary, and possibly extracts from the supplemental video may
+be disclosed publicly already earlier, starting October, in SIGGRAPH Asia 2026 communications.
+
+Q2. What information about my rejected paper will become publicly available?
+No information about rejected papers will be made public.
+
+Q3. What about patents and confidentiality? Are the two senior reviewers and the three tertiary
+reviewers under a confidentiality agreement to not disclose the contents of the paper to others?
+Some organizations like IEEE have all reviewers sign a confidentiality agreement. It is very
+important that I know for sure, since my employer may want to apply for a patent, and it a"ects
+when I may submit the paper to the SIGGRAPH Asia conference. Can I, for example, get a
+wri!en guarantee of confidentiality?
+Reviewers are asked to keep confidential all materials sent to them for review, but they do not sign a
+confidentiality agreement. In general, there is wide respect for the confidentiality of submissions, but we cannot
+promise anything or provide a wri"en guarantee.
+It would not be wise for SIGGRAPH Asia 2026 to give you legal counsel on the ma"er of patents and publication.
+We urge you to seek independent legal advice. The main issue is that in di#erent jurisdictions (such as Europe),
+prior public disclosure could invalidate a patent application. The situation is di#erent in North America, where
+you have one year after public disclosure (for example, publication) to file a patent. It is a common practice for
+authors to prepare a patent filing coincidentally with their SIGGRAPH Asia submission.
+Back To FAQs Links
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 38 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Technical Papers Commi!ee
+Q1. Can I contact members of the Technical Papers Commi!ee with questions?
+Although search engines make it a simple ma"er to find email addresses for these people, we ask that you do
+not contact them directly about the review process. Instead, please send messages
+to papersadmin_asia@SIGGRAPH Asia.org (mailto:papersadmin@siggraph.org) regarding the papers review
+process.
+
+Q2. I have been doing graphics for years. May I be on the Technical Papers Commi!ee?
+The Technical Papers Chair selects the commi"ee with several goals in mind, including: coverage of areas in
+which we anticipate submissions, ge"ing some “old hands” who have been on the commi"ee before, bringing
+some new folks into the process, recruiting people who will work well together and treat papers with respect and
+enthusiasm, and ge"ing representation from diverse communities.
+
+Q3. I have volunteered to be on the commi!ee for three years now, and I’ve never been chosen.
+What’s up with that?
+It may be that we already have commi"ee members with expertise in your area, that others are be"er qualified,
+that the chairs do not feel that you’ve been in the field long enough to be an e#ective commi"ee member, or any
+number of other reasons. However, the commi"ee composition does change from year to year. Please keep
+o#ering your services, and gain experience, if necessary, by accepting service for other conferences.
+
+Q4. Just what sort of workload is involved in being on the Technical Papers Commi!ee?
+In general, the workload depends on the number of submissions received and the size of the commi"ee. In recent
+years, SIGGRAPH Asia has experienced significant growth, leading to adjustments in the workload. Currently, a
+commi"ee member is expected to write full reviews for about 10-12 papers and serve as an “area chair” or
+“journal editor” on a similar number of other papers. For about half of these papers, you must find two
+additional reviewers, and for the other half you must find one additional reviewer. You must a"end a Technical
+Papers Commi"ee meeting, during which you will discuss papers, possibly be called on to provide additional
+reviews of a couple of papers, and be expected to listen carefully to a lot of discussion that has li"le to do with
+you. You may also be asked to act as a referee/shepherd for a paper that has been conditionally accepted to
+verify that the final version meets the requirements. Finally, you may be asked to chair a Technical Papers
+session at the SIGGRAPH Asia 2026 conference.
+
+Q5. What do I get for all the work that I’ll be doing as a commi!ee member?
+In material terms, you get a discount when registering for SIGGRAPH Asia 2026. You also receive the recognition
+of your colleagues, the gratitude of authors, and the sense of satisfaction that comes from knowing you have
+given something back to the organization that helps disseminate research in graphics.
+Back To FAQs Links
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 39 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Contacts
+Q1. To whom should I send questions about the papers submission and review process?
+Do not send email directly to the Technical Papers Chair. Instead send questions
+to papersadmin_asia@SIGGRAPH.org (mailto:papersadmin_asia@SIGGRAPH.org).
+If you use the contact form, your email will go to the Technical Papers Chair and selected administrators of the
+papers review process. One of them may be able to answer your question, and they often do so promptly.
+If there is any possibility that the chair is conflicted on the topic of the question, do not use the question form,
+and instead send your question to papersadmin_asia@SIGGRAPH.org
+(mailto:papersadmin_asia@SIGGRAPH.org).
+
+Q2. Why not contact the Technical Papers Chair directly?
+First, the Technical Papers Chair might be unavailable for several days. Second, during parts of the submission
+and review process, the chair will be buried in email, and lastly, the chair may be conflicted on the relevant
+paper.
+
+Back To FAQs Links
+
+Copyright
+Q1. I believe that images in a scientific publication fall under the umbrella of the fair use rule.
+Why do I have to clarify the copyright issues?
+Fair use rules do not directly apply to all papers. A publication needs to satisfy certain conditions. See
+this Wikipedia summary (h"ps://en.wikipedia.org/wiki/Fair_use) and ACM’s policy
+(h"ps://www.acm.org/publications/authors/guidance-for-authors-on-fair-use) on fair use for more
+information. It is the author’s responsibility to make sure that the submi"ed paper satisfies the conditions when
+claiming fair use. This claim must be clearly stated in the submission form. Authors should email Barbara Ryan at
+ACM (barbara.ryan@hq.acm.org (mailto:barbara.ryan@hq.acm.org)) with questions and concerns about fair
+use and whether a particular image and its use in a paper falls under fair use.
+
+Q2. Can I use images in my submission with unclear copyright status and then secure the
+copyright or replace the images later if the paper is accepted?
+No. The reviewers can only judge the paper that is submi"ed, not a paper that includes material that might be
+changed after acceptance. Remember: You are declaring that you hold the rights for all materials when you
+submit your paper, which is why material with unclear copyrights may be rejected.
+Back To FAQs Links
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 40 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Back To FAQs Links
+
+
+
+Timeline
+
+All deadlines are 23:59 Anywhere on Earth (AoE), unless stated otherwise below.
+
+Tuesday, 5 May 2026
+Submission form Abstract deadline
+One of the authors must start a submission in the online submission system “Linklings” and provide basic
+information about the paper, including the complete list of authors and abstract. All authors must enter their
+complete and valid conflict of interest and research expertise data in Linklings by this deadline.
+No new submissions can be added after this deadline.
+
+Tuesday, 12 May 2026
+Full Submission Paper deadline
+Basic information about your submission such as contact details of the corresponding authors, paper title,
+paper length, are required. Additionally, the submi"ed paper in PDF format and a representative image must
+be uploaded, along with any video, code and data, and other supplemental material if applicable.
+Alternatively, MD5 checksums may be uploaded in lieu of any of the files involved in the submission.
+
+Wednesday, 13 May 2026
+Full Submission Upload deadline
+If MD5 checksums were submi"ed by the Paper deadline (as described above), files that match the checksums
+can be submi"ed until this deadline.
+All authors must enter their complete and valid conflicts of interest and research expertise data in Linklings by
+this deadline.
+
+Thursday, 25 June 2026
+Review Deadline for Reviewers
+
+Monday, 29 June 2026
+Reviews Available for Authors & Rebu"al Begins
+
+Friday, 3 July 2026
+Rebu"als Due
+
+Friday – Saturday, 17 – 18 July 2026
+Technical Papers Commi"ee Meeting
+
+Sunday, 19 July 2026
+Decisions announced
+
+Friday, 28 August 2026
+Revised paper submi"ed by authors for final review
+
+Thursday, 3 September 2026
+Final Version Deadline
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 41 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Final Version Deadline
+
+Thursday, 17 September 2026
+Deadline for 20-second pre-recorded Papers Fast Forward video.
+
+Monday, 2 November 2026
+Deadline for online repositories with promised code/data.
+
+Monday, 9 November 2026 (TBC)
+O#icial publication date for both the SIGGRAPH Asia 2026 Conference Papers Proceedings and the Technical
+Papers TOG Issue.
+Please Note: The o#icial publication date is the date the proceedings are made available in the ACM Digital
+Library. This date may be up to three weeks prior to the first day of your conference. The o#icial publication
+date a#ects the deadline for any patent filings related to published work. (For those rare conferences whose
+proceedings are published in the ACM Digital Library after the conference is over, the o#icial publication date
+remains the first day of the conference.)
+
+Tuesday, 1 December 2026 (TBC)
+Fast Forward Presentation
+
+1 – 4 December 2026
+SIGGRAPH Asia 2026 Event Days
+
+2 – 4 December 2026
+SIGGRAPH Asia 2026 Exhibition Days
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 42 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Art Gallery (https://asia.siggraph.org/2026/submissions/art-gallery/)
+Art Papers (https://asia.siggraph.org/2026/submissions/art-papers/)
+Birds Of A Feather (https://asia.siggraph.org/2026/submissions/birds-of-a-feather/)
+Computer Animation Festival (https://asia.siggraph.org/2026/submissions/computeranimation-festival/)
+Courses (https://asia.siggraph.org/2026/submissions/courses/)
+Educator’s Forum (https://asia.siggraph.org/2026/submissions/educators-forum/)
+Emerging Technologies (https://asia.siggraph.org/2026/submissions/emergingtechnologies/)
+Games (https://asia.siggraph.org/2026/submissions/games/)
+Posters (https://asia.siggraph.org/2026/submissions/posters/)
+Real-Time Live! (https://asia.siggraph.org/2026/submissions/real-time-live/)
+Terms of Reference and Code of Conduct (https://asia.siggraph.org/2026/wpcontent/uploads/2026/04/SA26-Real-Time-Live-Terms-of-Reference-and-Code-of-Conduct.pdf )
+Committee and Jury (https://asia.siggraph.org/2026/wp-content/uploads/2026/04/SA26-RealTime-Live-Committee-and-Jury.pdf)
+Code of Ethics and Professional Conduct Reference Links (https://asia.siggraph.org/2026/wpcontent/uploads/2026/04/SA26-Real-Time-Live-Code-of-Ethics-and-Professional-ConductReference-Links.pdf)
+
+Student Volunteers (https://asia.siggraph.org/2026/submissions/student-volunteers/)
+Technical Communications (https://asia.siggraph.org/2026/submissions/technicalcommunications/)
+Technical Papers (https://asia.siggraph.org/2026/submissions/technical-papers/)
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 43 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+5/13/26, 2:49 AM
+
+Technical Papers (https://asia.siggraph.org/2026/submissions/technical-papers/)
+Ethics of Review and Review Instructions (https://asia.siggraph.org/2026/submissions/technicalpapers/ethics-of-review-and-review-instructions/)
+Conflict of Interest Rules for Authors (https://asia.siggraph.org/2026/submissions/technicalpapers/conflict-of-interest-rules-for-authors/)
+Anonymity Policy (https://asia.siggraph.org/2026/submissions/technical-papers/anonymitypolicy/)
+
+Workshops (https://asia.siggraph.org/2026/submissions/workshops/)
+XR (https://asia.siggraph.org/2026/submissions/xr/)
+Submit Here (https://ssl.linklings.net/conferences/siggraphasia/)
+Submission Information (https://asia.siggraph.org/2026/submissions/submissioninformation/)
+
+(h
+"
+p
+s:
+//
+a
+si
+a.
+si
+g
+g
+ra
+p
+h.
+o
+(h
+rg
+"
+/2
+p
+0
+s:
+2
+//
+6/
+w
+w
+w
+pw
+c
+.f
+o
+
+(h
+"
+
+(h
+"
+p
+s:
+//
+w
+w
+w
+
+(h
+"
+p
+s:
+//
+w
+w
+w
+.li
+n
+k
+
+(ht
+tp
+s:/
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Page 44 of 46
+
+SIGGRAPH Asia 2026 | Technical Papers
+
+.f
+"
+o
+a
+p
+nt
+c
+s:
+e
+e
+//
+nt
+b
+x.
+/u
+o
+c
+pl
+o
+o
+o
+k.
+m
+a
+c
+/s
+d
+o
+ig
+s/
+m
+g
+2/
+r
+News
+0
+A
+a
+2
+C
+p
+5/
+M
+h
+11
+SI
+a
+/S
+G
+si
+I
+G
+a)
+G
+R
+G
+A
+R
+P
+A
+H
+P
+A
+H
+sia
+_)
+A
+si
+a
+_
+2
+0
+2
+6
+_
+M
+al
+a
+ys
+ia
+.i
+cs
+)
+
+w
+.i
+n
+st
+a
+g
+r
+a
+m
+.c
+o
+m
+/s
+ig
+g
+r
+a
+p
+h
+a
+si
+a/
+)
+
+k
+e
+di
+n.
+c
+o
+m
+/c
+o
+m
+p
+a
+n
+y/
+a
+c
+m
+si
+g
+g
+r
+a
+p
+h/
+)
+
+s:/
+/w
+w
+w.
+yo
+ut
+ub
+e.c
+o
+m/
+us
+er/
+AC
+M
+SI
+G
+G
+RA
+PH)
+
+5/13/26, 2:49 AM
+
+CONTACT US 
+JOIN MAILING LIST
+(HTTPS://ASIA.SIGGRAPH.ORG/2026/ABOUT(HTTPS://ASIA.SIGGRAPH.ORG/20
+
+Get In Touch
+
+Submissions
+
+Sponsor Or
+Exhibit
+
+THE-EVENT/CONTACT-US/)
+THE-EVENT/SUBSCRIBE-TO-MAIL
+
+Resources
+
+Directories
+
+Event Policies
+
+Programs(h!ps://asia.siggraph.org/2026/submissions/)
+Facts &(h!ps://asia.siggraph.org/2026/about(h!ps://asia.siggraph.org/2026/about(h!ps://www.acm
+Sitemap
+Figures
+the-event/fact-figures/)
+the-event/a-z-sitemap/)
+interest-groups/
+Why
+(h!ps://asia.siggraph.org/2026/exhibitKey Info
+Benefits
+
+https://asia.siggraph.org/2026/submissions/technical-papers/
+
+Antiresources/o"icer
+Participate?or-sponsor/why-participate/)
+For Speakers
+(h!ps://asia.siggraph.org/2026/abou
+2026
+Harassment
+manual/policy-a
+the-event/siggraph-asia-2026Download(h!ps://asia.siggraph.org/2026/exhibitFor (h!ps://asia.siggraph.org/2026/forCommi!ee
+discrimination-a
+Brochure or-sponsor/download-brochure/)
+Pressthe-press/press-centre/)commi!ee/)
+harassment)
+For Participants
+ACM
+(h!ps://www.acm.org
+Overall Venue
+Privacy
+acm/privacy-policy)
+Map
+Policy
+Exhibition
+Floorplan
+
+Registration
+Policy
+Sustainability
+
+(h!ps://asia.sig
+the-event/susta
+
+Page 45 of 46
+
+
