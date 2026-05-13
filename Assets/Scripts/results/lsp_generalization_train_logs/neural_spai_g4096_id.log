@@ -1,0 +1,73 @@
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'pyg-lib'. Disabling its usage. Stacktrace: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/libpyg.so)
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-scatter'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_scatter/_scatter_cuda.so: undefined symbol: _ZN2at4_ops16div__Tensor_mode4callERNS_6TensorERKS2_St8optionalISt17basic_string_viewIcSt11char_traitsIcEEE
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-spline-conv'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_spline_conv/_basis_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-sparse'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_sparse/_spmm_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+[rank: 0] Seed set to 42
+2026-05-13 01:09:48.948 | INFO     | __main__:main:37 - Use multidata: False
+2026-05-13 01:09:48.953 | INFO     | neural_cg.data:__init__:375 - Found 100 matrices, 0 lhs, 0 rhs, 0 masks, 0 features
+2026-05-13 01:09:48.962 | INFO     | neural_cg.data:__init__:451 - Fixed Topology, matrix shape=(4096, 4096), nnz=20224
+2026-05-13 01:09:48.962 | INFO     | neural_cg.data:__init__:452 - Dataset folder: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_generated_train/g4096_train_id
+Load Folder /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_generated_train/g4096_train_id:   0%|          | 0/100 [00:00<?, ?it/s]Load Folder /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_generated_train/g4096_train_id:  80%|████████  | 80/100 [00:00<00:00, 789.09it/s]Load Folder /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_generated_train/g4096_train_id: 100%|██████████| 100/100 [00:00<00:00, 798.51it/s]
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - x: torch.Size([4096, 1])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - edge_index: torch.Size([2, 20224])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - edge_attr: torch.Size([20224, 1])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - mask: torch.Size([4096, 1])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - matrix_values: torch.Size([20224, 1, 1])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - diagonal: torch.Size([4096, 1])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - inv_diag: torch.Size([4096, 1])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - rsqrt_diag: torch.Size([4096, 1])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:463 - residual: torch.Size([4096, 1])
+2026-05-13 01:09:49.090 | INFO     | neural_cg.data:__init__:464 - Loaded 100 samples into memory.
+2026-05-13 01:09:49.090 | INFO     | neural_cg.utils.datamodule:__init__:39 - Splitting dataset into train/val/test with ratios: 0.8, 0.19999999999999996
+2026-05-13 01:09:49.091 | INFO     | __main__:main:49 - Edge input features: 1
+2026-05-13 01:09:49.091 | INFO     | __main__:main:50 - Node input features: 1
+2026-05-13 01:09:49.091 | INFO     | __main__:main:51 - Block size: 1
+2026-05-13 01:09:49.091 | INFO     | __main__:main:54 - Using workspace: simple
+2026-05-13 01:09:49.173 | INFO     | __main__:main:71 - Initialized model.
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/mlflow/tracking/_tracking_service/utils.py:184: FutureWarning: The filesystem tracking backend (e.g., './mlruns') is deprecated as of February 2026. Consider transitioning to a database backend (e.g., 'sqlite:///mlflow.db') to take advantage of the latest MLflow features. See https://mlflow.org/docs/latest/self-hosting/migrate-from-file-store for migration guidance.
+  return FileStore(store_uri, store_uri)
+Trainer already configured with model summary callbacks: [<class 'lightning.pytorch.callbacks.rich_model_summary.RichModelSummary'>]. Skipping setting a default `ModelSummary` callback.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+💡 Tip: For seamless cloud logging and experiment tracking, try installing [litlogger](https://pypi.org/project/litlogger/) to enable LitLogger, which logs metrics and artifacts automatically to the Lightning Experiments platform.
+2026-05-13 01:09:50.674 | INFO     | __main__:main:104 - Dataset Length: 100
+Experiment with name generalization_4096_neural_spai_id not found. Creating it.
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+┏━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃   ┃ Name                ┃ Type                 ┃ Params ┃ Mode  ┃ FLOPs ┃
+┡━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ 0 │ loss_fn             │ RelativeL2Loss_ANorm │      0 │ train │     0 │
+│ 1 │ gnn                 │ NodeEdgeProcessing   │ 17.0 K │ train │     0 │
+│ 2 │ spai_preconditioner │ AATPE                │      0 │ train │     0 │
+└───┴─────────────────────┴──────────────────────┴────────┴───────┴───────┘
+Trainable params: 17.0 K                                                        
+Non-trainable params: 4                                                         
+Total params: 17.0 K                                                            
+Total estimated model params size (MB): 0                                       
+Modules in train mode: 205                                                      
+Modules in eval mode: 0                                                         
+Total FLOPs: 0                                                                  
+SLURM auto-requeueing enabled. Setting signal handlers.
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/lightning/pytorch/trainer/connectors/data_connector.py:434: The 'val_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=15` in the `DataLoader` to improve performance.
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/lightning/pytorch/trainer/connectors/data_connector.py:434: The 'train_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=15` in the `DataLoader` to improve performance.
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/lightning/pytorch/loops/fit_loop.py:317: The number of training batches (10) is smaller than the logging interval Trainer(log_every_n_steps=50). Set a lower value for log_every_n_steps if you want to see logs for the training epoch.
+`Trainer.fit` stopped: `max_epochs=500` reached.
+Epoch 499/499 ━━━━━━━━━━━━━━━━ 10/10 0:00:00 •       52.18it/s v_num: 3bba      
+                                     0:00:00                   Train/Loss: 0.073
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+SLURM auto-requeueing enabled. Setting signal handlers.
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/lightning/pytorch/trainer/connectors/data_connector.py:434: The 'test_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=15` in the `DataLoader` to improve performance.
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃        Test metric        ┃       DataLoader 0        ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│         Test/Loss         │    0.07281196117401123    │
+│    Test/boo_entry_norm    │     91.48335266113281     │
+│   Test/time_neural_prec   │   0.001558625721372664    │
+└───────────────────────────┴───────────────────────────┘
+Testing ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 20/20 0:00:00 • 0:00:00 150.35it/s 

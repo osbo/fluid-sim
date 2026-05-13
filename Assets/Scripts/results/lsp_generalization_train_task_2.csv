@@ -1,0 +1,2 @@
+model_name,train_split,exp_name,checkpoint,elapsed_sec,train_log,status
+neural_spai_g4096_param_low,g4096_train_param_low,generalization_4096_neural_spai_param_low,/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/mlruns/762001601658578031/6ec30bcb9867415baba0c834f8cbe3a9/checkpoints/generalization_4096_neural_spai_param_low-simple-epoch=499.ckpt,124,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_train_logs/neural_spai_g4096_param_low.log,ok

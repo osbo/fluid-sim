@@ -1,0 +1,2 @@
+model_name,train_split,exp_name,checkpoint,elapsed_sec,train_log,status
+neural_spai_g4096_topo_no_closed,g4096_train_topo_no_closed,generalization_4096_neural_spai_topo_no_closed,/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/mlruns/368202403445574234/d028b1be014843578cd0827a6e9a9138/checkpoints/generalization_4096_neural_spai_topo_no_closed-simple-epoch=499.ckpt,121,/home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_train_logs/neural_spai_g4096_topo_no_closed.log,ok

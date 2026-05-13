@@ -1,0 +1,1043 @@
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'pyg-lib'. Disabling its usage. Stacktrace: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/libpyg.so)
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-scatter'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_scatter/_scatter_cuda.so: undefined symbol: _ZN2at4_ops16div__Tensor_mode4callERNS_6TensorERKS2_St8optionalISt17basic_string_viewIcSt11char_traitsIcEEE
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-spline-conv'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_spline_conv/_basis_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_geometric/__init__.py:4: UserWarning: An issue occurred while importing 'torch-sparse'. Disabling its usage. Stacktrace: /orcd/home/002/osbo/.conda/envs/fluid/lib/python3.12/site-packages/torch_sparse/_spmm_cuda.so: undefined symbol: _ZN5torch8autograd12VariableInfoC1ERKN2at6TensorEb
+  import torch_geometric.typing
+2026-05-13 01:26:27.632 | INFO     | neural_cg.data:__init__:375 - Found 100 matrices, 0 lhs, 0 rhs, 0 masks, 0 features
+2026-05-13 01:26:27.643 | INFO     | neural_cg.data:__init__:451 - Fixed Topology, matrix shape=(4096, 4096), nnz=20224
+2026-05-13 01:26:27.643 | INFO     | neural_cg.data:__init__:452 - Dataset folder: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_generated/g4096_eval_combo_closed_high
+Load Folder /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_generated/g4096_eval_combo_closed_high:   0%|          | 0/100 [00:00<?, ?it/s]Load Folder /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_generated/g4096_eval_combo_closed_high:  78%|███████▊  | 78/100 [00:00<00:00, 778.17it/s]Load Folder /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_generated/g4096_eval_combo_closed_high: 100%|██████████| 100/100 [00:00<00:00, 782.11it/s]
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - x: torch.Size([4096, 1])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - edge_index: torch.Size([2, 20224])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - edge_attr: torch.Size([20224, 1])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - mask: torch.Size([4096, 1])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - matrix_values: torch.Size([20224, 1, 1])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - diagonal: torch.Size([4096, 1])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - inv_diag: torch.Size([4096, 1])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - rsqrt_diag: torch.Size([4096, 1])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:463 - residual: torch.Size([4096, 1])
+2026-05-13 01:26:27.773 | INFO     | neural_cg.data:__init__:464 - Loaded 100 samples into memory.
+2026-05-13 01:26:27.773 | INFO     | neural_cg.utils.datamodule:__init__:39 - Splitting dataset into train/val/test with ratios: 0.8, 0.19999999999999996
+AMGX version 2.5.0
+Built on Apr  5 2026, 15:53:56
+Compiled with CUDA Runtime 13.1, using CUDA driver 13.1
+The AMGX_initialize_plugins API call is deprecated and can be safely removed.
+2026-05-13 01:26:27.838 | INFO     | __main__:main:221 - Output directory: /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_infer_raw_split
+2026-05-13 01:26:27.838 | INFO     | __main__:main:224 - Edge input features: 1
+2026-05-13 01:26:27.838 | INFO     | __main__:main:225 - Node input features: 1
+2026-05-13 01:26:27.838 | INFO     | __main__:main:226 - Block size: 1
+2026-05-13 01:26:27.838 | INFO     | __main__:main:228 - Using workspace: simple
+/home/osbo/.conda/envs/fluid/lib/python3.12/site-packages/lightning/fabric/utilities/cloud_io.py:73: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+2026-05-13 01:26:28.149 | INFO     | __main__:main:238 - Loaded pretrained model from /orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU/mlruns/222192843463907154/a9eaf7385c4340cdaefe20175ec66482/checkpoints/generalization_4096_neural_spai_combo_no_closed_low-simple-epoch=499.ckpt
+2026-05-13 01:26:28.150 | INFO     | __main__:main:264 - Repeat each sample for 1 times.
+2026-05-13 01:26:28.150 | INFO     | __main__:main:267 - Relative tolerance: 1e-06
+2026-05-13 01:26:28.150 | INFO     | __main__:main:268 - model.epsilon=3.0000e-03
+Warmup Torch:   0%|          | 0/20 [00:00<?, ?it/s]Warmup Torch:  15%|█▌        | 3/20 [00:00<00:00, 29.92it/s]Warmup Torch: 100%|██████████| 20/20 [00:00<00:00, 145.61it/s]
+Inference on infer:   0%|          | 0/100 [00:00<?, ?it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   1%|          | 1/100 [00:00<00:49,  2.01it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   2%|▏         | 2/100 [00:01<00:59,  1.66it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   3%|▎         | 3/100 [00:01<01:00,  1.60it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   4%|▍         | 4/100 [00:02<00:57,  1.68it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   5%|▌         | 5/100 [00:02<00:55,  1.72it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   6%|▌         | 6/100 [00:03<00:50,  1.86it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   7%|▋         | 7/100 [00:04<00:52,  1.76it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   8%|▊         | 8/100 [00:04<00:47,  1.93it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:   9%|▉         | 9/100 [00:05<00:52,  1.72it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  10%|█         | 10/100 [00:05<00:45,  1.96it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  11%|█         | 11/100 [00:05<00:44,  1.99it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  12%|█▏        | 12/100 [00:06<00:42,  2.09it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  13%|█▎        | 13/100 [00:07<00:45,  1.92it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  14%|█▍        | 14/100 [00:07<00:43,  1.96it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  15%|█▌        | 15/100 [00:07<00:40,  2.07it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  16%|█▌        | 16/100 [00:08<00:43,  1.92it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  17%|█▋        | 17/100 [00:08<00:38,  2.16it/s]4096 none cpu
+2026-05-13 01:26:37.277 | ERROR    | __main__:main:382 - RuntimeError: CG did not converge
+Inference on infer:  18%|█▊        | 18/100 [00:08<00:29,  2.78it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  19%|█▉        | 19/100 [00:10<00:46,  1.76it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  20%|██        | 20/100 [00:10<00:47,  1.69it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  21%|██        | 21/100 [00:11<00:41,  1.89it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  22%|██▏       | 22/100 [00:11<00:42,  1.85it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  23%|██▎       | 23/100 [00:12<00:37,  2.04it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  24%|██▍       | 24/100 [00:12<00:46,  1.62it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  25%|██▌       | 25/100 [00:13<00:44,  1.68it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  26%|██▌       | 26/100 [00:13<00:42,  1.75it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  27%|██▋       | 27/100 [00:14<00:37,  1.95it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  28%|██▊       | 28/100 [00:14<00:37,  1.91it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  29%|██▉       | 29/100 [00:15<00:40,  1.76it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  30%|███       | 30/100 [00:16<00:37,  1.86it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  31%|███       | 31/100 [00:16<00:37,  1.83it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  32%|███▏      | 32/100 [00:17<00:41,  1.64it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  33%|███▎      | 33/100 [00:17<00:37,  1.77it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  34%|███▍      | 34/100 [00:18<00:35,  1.83it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  35%|███▌      | 35/100 [00:18<00:34,  1.87it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  36%|███▌      | 36/100 [00:19<00:34,  1.86it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  37%|███▋      | 37/100 [00:19<00:32,  1.92it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  38%|███▊      | 38/100 [00:20<00:34,  1.78it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  39%|███▉      | 39/100 [00:20<00:31,  1.95it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  40%|████      | 40/100 [00:21<00:32,  1.84it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  41%|████      | 41/100 [00:22<00:33,  1.78it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  42%|████▏     | 42/100 [00:22<00:35,  1.64it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  43%|████▎     | 43/100 [00:23<00:31,  1.81it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  44%|████▍     | 44/100 [00:23<00:29,  1.93it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  45%|████▌     | 45/100 [00:24<00:27,  2.03it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  46%|████▌     | 46/100 [00:24<00:30,  1.77it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  47%|████▋     | 47/100 [00:25<00:29,  1.81it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  48%|████▊     | 48/100 [00:26<00:32,  1.61it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  49%|████▉     | 49/100 [00:26<00:27,  1.85it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  50%|█████     | 50/100 [00:27<00:25,  1.94it/s]4096 none cpu
+2026-05-13 01:26:55.420 | ERROR    | __main__:main:382 - RuntimeError: CG did not converge
+Inference on infer:  51%|█████     | 51/100 [00:27<00:19,  2.53it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  52%|█████▏    | 52/100 [00:27<00:19,  2.44it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  53%|█████▎    | 53/100 [00:28<00:22,  2.08it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  54%|█████▍    | 54/100 [00:28<00:26,  1.77it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  55%|█████▌    | 55/100 [00:29<00:26,  1.71it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+2026-05-13 01:26:58.308 | ERROR    | __main__:main:382 - RuntimeError: check "!(delta_new > 0)" failed at iteration 0, |r|=1.000000, |x|=0.000000, |x0|=0.000000, |b|=0.000007, |d|=-nan, |q|=0.000000, <d,q>=0.000000, alpha=0.000000, delta=-nan
+Inference on infer:  56%|█████▌    | 56/100 [00:30<00:23,  1.88it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  57%|█████▋    | 57/100 [00:30<00:23,  1.83it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  58%|█████▊    | 58/100 [00:31<00:21,  1.93it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  59%|█████▉    | 59/100 [00:31<00:19,  2.05it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  60%|██████    | 60/100 [00:31<00:18,  2.14it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  61%|██████    | 61/100 [00:32<00:18,  2.09it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  62%|██████▏   | 62/100 [00:33<00:19,  1.92it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  63%|██████▎   | 63/100 [00:33<00:19,  1.85it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  64%|██████▍   | 64/100 [00:34<00:18,  2.00it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  65%|██████▌   | 65/100 [00:34<00:19,  1.78it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  66%|██████▌   | 66/100 [00:35<00:18,  1.82it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  67%|██████▋   | 67/100 [00:35<00:18,  1.77it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  68%|██████▊   | 68/100 [00:36<00:19,  1.68it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  69%|██████▉   | 69/100 [00:36<00:17,  1.77it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  70%|███████   | 70/100 [00:37<00:15,  1.88it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  71%|███████   | 71/100 [00:37<00:13,  2.07it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  72%|███████▏  | 72/100 [00:38<00:12,  2.18it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  73%|███████▎  | 73/100 [00:38<00:12,  2.12it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+2026-05-13 01:27:07.431 | ERROR    | __main__:main:382 - RuntimeError: check "!(delta_new > 0)" failed at iteration 0, |r|=1.000000, |x|=0.000000, |x0|=0.000000, |b|=0.000007, |d|=-nan, |q|=0.000000, <d,q>=0.000000, alpha=0.000000, delta=-nan
+Inference on infer:  74%|███████▍  | 74/100 [00:39<00:11,  2.19it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  75%|███████▌  | 75/100 [00:39<00:11,  2.20it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  76%|███████▌  | 76/100 [00:40<00:12,  1.92it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  77%|███████▋  | 77/100 [00:41<00:15,  1.52it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  78%|███████▊  | 78/100 [00:42<00:16,  1.31it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  79%|███████▉  | 79/100 [00:42<00:14,  1.48it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  80%|████████  | 80/100 [00:43<00:12,  1.66it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  81%|████████  | 81/100 [00:43<00:10,  1.80it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  82%|████████▏ | 82/100 [00:44<00:09,  1.86it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  83%|████████▎ | 83/100 [00:44<00:10,  1.56it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  84%|████████▍ | 84/100 [00:45<00:08,  1.80it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  85%|████████▌ | 85/100 [00:45<00:07,  1.95it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  86%|████████▌ | 86/100 [00:46<00:07,  1.94it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  87%|████████▋ | 87/100 [00:46<00:06,  2.02it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  88%|████████▊ | 88/100 [00:47<00:05,  2.12it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  89%|████████▉ | 89/100 [00:47<00:05,  2.00it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  90%|█████████ | 90/100 [00:48<00:04,  2.06it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  91%|█████████ | 91/100 [00:48<00:04,  2.14it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+2026-05-13 01:27:17.387 | ERROR    | __main__:main:382 - RuntimeError: check "!(delta_new > 0)" failed at iteration 0, |r|=1.000000, |x|=0.000000, |x0|=0.000000, |b|=0.000009, |d|=-nan, |q|=0.000000, <d,q>=0.000000, alpha=0.000000, delta=-nan
+Inference on infer:  92%|█████████▏| 92/100 [00:49<00:03,  2.08it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  93%|█████████▎| 93/100 [00:49<00:03,  2.13it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  94%|█████████▍| 94/100 [00:49<00:02,  2.25it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  95%|█████████▌| 95/100 [00:50<00:02,  1.90it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  96%|█████████▌| 96/100 [00:51<00:02,  1.96it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  97%|█████████▋| 97/100 [00:51<00:01,  1.93it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  98%|█████████▊| 98/100 [00:52<00:00,  2.07it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer:  99%|█████████▉| 99/100 [00:52<00:00,  1.83it/s]4096 none cpu
+4096 none cuda
+4096 diagonal cpu
+4096 diagonal cuda
+4096 ainv cpu
+4096 ainv cuda
+4096 ic cpu
+4096 ic cuda
+NeuralPCG
+NeuralPCG+CUDA
+Inference on infer: 100%|██████████| 100/100 [00:53<00:00,  1.52it/s]Inference on infer: 100%|██████████| 100/100 [00:53<00:00,  1.86it/s]
+                           Inference Time Statistics                            
+┏━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃               ┃     Total Time ┃    Solve Time ┃   Precond Time ┃            ┃
+┃ Key           ┃           (ms) ┃          (ms) ┃           (ms) ┃ #Iteration ┃
+┡━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│ PCG-none-cpu  │          45.21 │         45.21 │           0.00 │  1679.1429 │
+│ PCG-none-cuda │         168.26 │        168.17 │           0.09 │  1573.0918 │
+│ PCG-diagonal… │          15.30 │         15.28 │           0.02 │   538.0714 │
+│ PCG-diagonal… │          59.36 │         59.27 │           0.09 │   553.1633 │
+│ PCG-ainv-cpu  │          31.00 │         26.98 │           4.02 │   358.7449 │
+│ PCG-ainv-cuda │          49.04 │         45.17 │           3.87 │   364.7653 │
+│ PCG-ic-cpu    │          16.64 │         15.76 │           0.88 │   176.4388 │
+│ PCG-ic-cuda   │          73.55 │         71.81 │           1.74 │   155.8469 │
+│ Neural        │          28.84 │         27.10 │           1.75 │   395.7895 │
+│ Neural+CUDA   │          51.45 │         49.71 │           1.75 │   395.7895 │
+└───────────────┴────────────────┴───────────────┴────────────────┴────────────┘
+2026-05-13 01:27:21.965 | INFO     | __main__:main:397 - Inference statistics saved to /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_infer_raw_split/infer_generalization_split_generalization_4096_neural_spai_g4096_combo_no_closed_low_g4096_eval_combo_closed_high_6.csv
+2026-05-13 01:27:21.970 | INFO     | __main__:main:402 - All inference statistics saved to /home/osbo/ondemand/fluid-sim/Assets/Scripts/results/lsp_generalization_infer_raw_split/all_infer_generalization_split_generalization_4096_neural_spai_g4096_combo_no_closed_low_g4096_eval_combo_closed_high_6.csv
