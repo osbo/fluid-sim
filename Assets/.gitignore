@@ -12,6 +12,7 @@ Thumbs.db
 # Videos (large; keep out of repo)
 *.mp4
 !Scripts/results/residual_compare_2d_jacobi_neuralspai_amg_ours_16384.mp4
+!Scripts/results/residual_3d_correction_orbit.mp4
 *.mov
 *.avi
 *.mkv
