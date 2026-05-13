@@ -33,6 +33,11 @@ set -euo pipefail
 ROOT="/home/osbo/ondemand/fluid-sim/Assets/Scripts"
 RESULTS_DIR="${ROOT}/results/probe_smoothing_8192"
 WEIGHTS_DIR="${ROOT}/weights"
+BASE_LR="${BASE_LR:-2e-4}"
+# Default retry mode: rerun only smooth_zero at half the original LR.
+ZERO_RETRY_LR="${ZERO_RETRY_LR:-1e-4}"
+RUN_DEFAULT="${RUN_DEFAULT:-0}"
+RUN_ZERO="${RUN_ZERO:-1}"
 
 mkdir -p "${RESULTS_DIR}" "${WEIGHTS_DIR}" "${ROOT}/slurm_logs"
 
@@ -51,6 +56,7 @@ run_case () {
   local case_name="$1"
   local jacobi_steps="$2"
   local jacobi_omega="$3"
+  local lr="$4"
   local weights_out="${WEIGHTS_DIR}/v2_8192_d128_L3_hw_${case_name}.bytes"
   local train_log="${RESULTS_DIR}/train_${case_name}.log"
 
@@ -58,6 +64,7 @@ run_case () {
   echo "----------------------------------------------------------------"
   echo "Case: ${case_name}"
   echo "probe_jacobi_steps=${jacobi_steps}, probe_jacobi_omega=${jacobi_omega}"
+  echo "lr=${lr}"
   echo "weights_out=${weights_out}"
   echo "log=${train_log}"
   echo "----------------------------------------------------------------"
@@ -69,7 +76,7 @@ run_case () {
     --d-model 128 \
     --num-layers 3 \
     --num-heads 8 \
-    --lr 2e-4 \
+    --lr "${lr}" \
     --steps 100000 \
     --weights-out "${weights_out}" \
     --track-training \
@@ -80,8 +87,17 @@ run_case () {
     2>&1 | tee "${train_log}"
 }
 
-run_case "smooth_default" 2 0.6
-run_case "smooth_zero" 0 0.6
+if [[ "${RUN_DEFAULT}" == "1" ]]; then
+  run_case "smooth_default" 2 0.6 "${BASE_LR}"
+else
+  echo "Skipping smooth_default (RUN_DEFAULT=${RUN_DEFAULT})"
+fi
+
+if [[ "${RUN_ZERO}" == "1" ]]; then
+  run_case "smooth_zero" 0 0.6 "${ZERO_RETRY_LR}"
+else
+  echo "Skipping smooth_zero (RUN_ZERO=${RUN_ZERO})"
+fi
 
 python3 -u "${ROOT}/plot_probe_smoothing_grad_balance.py" \
   --default-log "${RESULTS_DIR}/train_smooth_default.log" \

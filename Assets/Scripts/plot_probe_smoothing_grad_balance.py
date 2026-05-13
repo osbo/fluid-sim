@@ -74,6 +74,22 @@ def write_series_csv(path: Path, rows: list[dict[str, float]]) -> None:
             w.writerow(r)
 
 
+def write_combined_csv(
+    path: Path,
+    default_rows: list[dict[str, float]],
+    zero_rows: list[dict[str, float]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["run", "step", "elapsed_s", "on_diag_grad_l2", "off_diag_grad_l2", "off_over_on"]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in default_rows:
+            w.writerow({"run": "default_smoothing", **r})
+        for r in zero_rows:
+            w.writerow({"run": "zero_smoothing", **r})
+
+
 def summarize(rows: list[dict[str, float]], label: str) -> dict[str, str]:
     if not rows:
         return {
@@ -177,6 +193,7 @@ def main() -> None:
 
     write_series_csv(args.out_summary_csv.with_name("gradient_balance_default_series.csv"), default_rows)
     write_series_csv(args.out_summary_csv.with_name("gradient_balance_zero_series.csv"), zero_rows)
+    write_combined_csv(args.out_summary_csv.with_name("gradient_balance_combined_series.csv"), default_rows, zero_rows)
 
     summary_rows = [summarize(default_rows, "default_smoothing"), summarize(zero_rows, "zero_smoothing")]
     args.out_summary_csv.parent.mkdir(parents=True, exist_ok=True)
