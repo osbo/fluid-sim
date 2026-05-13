@@ -306,6 +306,7 @@ def main():
     import numpy as np
     import torch
     import torch.nn.functional as F
+    from MakeMultiphaseFigures import _apply_paper_style_compact
 
     from leafonly.architecture import (
         LeafOnlyNet,
@@ -587,6 +588,7 @@ def main():
         out_path = (_repo_root / "Paper" / "figures" / f"probe_alignment_{inferred_scale or 'unknown'}.png").resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    _apply_paper_style_compact()
     fig = plt.figure(figsize=(15, 7.6))
     if args.transparent_bg:
         fig.patch.set_alpha(0.0)
