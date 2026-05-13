@@ -79,6 +79,12 @@ Paper/supplementary.out
 Paper/supplementary.pdf
 Paper/supplementary.synctex.gz
 
+# FFmpeg two-pass encoding artifacts (can be very large)
+Paper/*pass-0.log
+Paper/*pass-0.log.mbtree
+Paper/ffmpeg2pass-0.log
+Paper/ffmpeg2pass-0.log.mbtree
+
 # Large dev / asset blobs (not for version control; were removed from history)
 Assets/Scripts/Octree
 Assets/Scripts/inspect_model_plot.png
