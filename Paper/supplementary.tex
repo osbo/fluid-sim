@@ -83,9 +83,9 @@ hyperparameter configurations (smoother type, coarsening strategy, maximum level
 and verified that none meaningfully reduces total time relative to the default.
 CPU PyAMG uses its default classical AMG cycle. AMGX SPAI is included as the
 sparse-approximate-inverse data point; we keep its vendor defaults because the
-neural SPAI learned baseline is evaluated separately with per-scale retraining
-on the same benchmark distribution; AMGX SPAI here remains the classical
-sparse-approximate-inverse reference rather than a proxy for the learned model.
+neural SPAI baseline whose public implementation does not currently support our
+problem class (main paper, footnote in \S7.1) would be the natural learned
+comparison, not AMGX SPAI's hand-tuned variants.
 
 \paragraph{Convergence criterion.}
 All reported solve times and iteration counts are to a relative residual tolerance

@@ -64,7 +64,7 @@ class MethodStyle:
 # noisy and not directly comparable to the GPU-resident methods that dominate the
 # interactive regime we evaluate. Numbers are preserved in the supplementary table.
 METHOD_STYLES: dict[tuple[str, str], MethodStyle] = {
-    ("amgx_gpu", "gpu"): MethodStyle("AMGX SPAI (GPU)", C_BLUE, "-"),
+    ("amgx_gpu", "gpu"): MethodStyle("AMGX SPAI (GPU)", C_BROWN, (0, (2, 1, 1, 1))),
     ("ic", "cpu"): MethodStyle("IC+CPU", C_GOLD, "--"),
     ("ic_amgx", "gpu"): MethodStyle("IC+CUDA", "#00BA38", ":"),
     ("jacobi", "gpu"): MethodStyle("Diag+CUDA", C_RED, "--"),
@@ -73,7 +73,7 @@ METHOD_STYLES: dict[tuple[str, str], MethodStyle] = {
     # is loaded from lsp_scale_infer_summary.csv and injected as a synthetic
     # (method, device) tuple in _load_neural_spai_rows below.
     ("neural_spai", "gpu"): MethodStyle("Neural SPAI (GPU)", C_ORANGE, (0, (4, 2))),
-    ("leafonly", "gpu"): MethodStyle("Ours", C_BROWN, (0, (2, 1, 1, 1))),
+    ("leafonly", "gpu"): MethodStyle("Ours", C_BLUE, "-"),
 }
 
 # Frame-budget reference lines (full-frame Poisson+solve budget, single threaded assumption).
@@ -235,9 +235,8 @@ def _print_ablation_leaf_data_audit(kept: pd.DataFrame, excluded: pd.DataFrame, 
 def _load_neural_spai_rows(results_dir: pathlib.Path) -> pd.DataFrame:
     """Read Neural SPAI (CUDA) timings from the lsp_scale_infer_summary CSV.
 
-    Newer summaries include per-scale std columns across frames; when present
-    they are propagated so Neural SPAI receives uncertainty ribbons exactly
-    like the other methods.
+    Newer summaries include per-scale std across frames; when present, propagate
+    those fields so Neural SPAI gets an uncertainty ribbon like other methods.
     """
     p = results_dir / "lsp_scale_infer_summary.csv"
     if not p.exists():
@@ -416,13 +415,15 @@ def _plot_methods_across_scale(df: pd.DataFrame, out_path: pathlib.Path) -> None
         # blowing up the axis (especially on log plots).
         ys = np.minimum(ys, 0.45 * np.maximum(y, 1e-9))
 
+        is_ours = (method == "leafonly" and device == "gpu")
         line, = ax.plot(
             x,
             y,
             color=sty.color,
             linestyle=sty.linestyle,
             label=sty.label,
-            zorder=3,
+            linewidth=2.6 if is_ours else 1.8,
+            zorder=5 if is_ours else 3,
         )
         lo = np.maximum(1e-6, y - ys)
         hi = y + ys
