@@ -39,6 +39,9 @@
 \usepackage{float}
 \usepackage{placeins}
 
+% Uniform gutter for Fig.~\ref{fig:teaser}: matches \fboxsep and tabular spacing.
+\newlength{\teasergap}
+
 % Placeholder for visuals that will be supplied later (final renders, modality grid).
 % Renders as a labeled framed box at the requested width/height so the layout is fixed now
 % and the image can be swapped in by replacing the macro call with \includegraphics.
@@ -114,24 +117,23 @@ neural operators, physics simulation, real-time graphics}
 
 \begin{teaserfigure}
   \centering
-  \setlength{\fboxsep}{6pt}
+  \setlength{\teasergap}{3pt}%
+  \setlength{\fboxsep}{\teasergap}%
   \fbox{\begin{minipage}{\dimexpr\linewidth-2\fboxsep-2\fboxrule\relax}
+    \vspace{\teasergap}%
     \centering
-    \begin{tabular}{@{}c@{\hspace{8pt}}c@{\hspace{8pt}}c@{\hspace{8pt}}c@{}}
-      \parbox[c][1.65in][c]{0.22\linewidth}{\centering
-        \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{hmatrix_partition_compact.png}} &
-      \parbox[c][1.65in][c]{0.22\linewidth}{\centering
-        \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{multiphase_m_zoom_strip.png}} &
-      \parbox[c][1.65in][c]{0.22\linewidth}{\centering
-        \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{residual_correction_traces.png}} &
-      \parbox[c][1.65in][c]{0.22\linewidth}{\centering
-        \includegraphics[width=\linewidth,height=1.65in,keepaspectratio]{3 fluid.jpeg}}
-    \end{tabular}
+    \begin{tabular}{@{\hspace{\teasergap}}>{\centering\arraybackslash}m{\dimexpr(\linewidth-5\teasergap)/4\relax}@{\hspace{\teasergap}}>{\centering\arraybackslash}m{\dimexpr(\linewidth-5\teasergap)/4\relax}@{\hspace{\teasergap}}>{\centering\arraybackslash}m{\dimexpr(\linewidth-5\teasergap)/4\relax}@{\hspace{\teasergap}}>{\centering\arraybackslash}m{\dimexpr(\linewidth-5\teasergap)/4\relax}@{\hspace{\teasergap}}}
+      \includegraphics[width=\linewidth,keepaspectratio]{hmatrix_partition_compact.png} &
+      \includegraphics[width=\linewidth,keepaspectratio]{multiphase_m_zoom_strip.png} &
+      \includegraphics[width=\linewidth,keepaspectratio]{residual_correction_traces.png} &
+      \includegraphics[width=\linewidth,keepaspectratio]{3 fluid.jpeg}
+    \end{tabular}%
+    \vspace{\teasergap}%
   \end{minipage}}
   \caption{Teaser. Hierarchical neural preconditioning for interactive multiphase Poisson
     solves: (a) weak-admissibility $\mathcal{H}$-matrix prior, (b) learned preconditioner
     $M\!\approx\!A^{-1}$, (c) multiscale residual transport induced by $M$, and
-    (d) 3D multiphase application context.}
+    (d) 3D multiphase fluid simulation application context.}
   \label{fig:teaser}
 \end{teaserfigure}
 
@@ -420,58 +422,36 @@ applied, which is the subject of Sec.~\ref{sec:method}.
 \label{sec:background}
 % ===========================================================================
 
-\paragraph{Conjugate gradient and the role of the spectrum.}
-CG's convergence is dictated by how the eigenvalues of $A$ are arranged on the real line.
-Concretely, the error after $k$ iterations satisfies
+CG converges through the polynomial bound
 \begin{equation}
   \|\mathbf{e}_k\|_A
   \;\le\; \|\mathbf{e}_0\|_A\,\min_{p\in\mathcal{P}_k,\,p(0)=1}\;
           \max_{\lambda\in\sigma(A)}|p(\lambda)|,
   \label{eq:cg-poly}
 \end{equation}
-so CG only ``sees'' $A$ through how small a polynomial that is $1$ at the origin can be made
-on $\sigma(A)$. Two consequences of \eqref{eq:cg-poly} drive every preconditioner choice in
-this paper. \emph{First}, the textbook bound in terms of the condition number
-$\kappa\!=\!\lambda_{\max}/\lambda_{\min}$ is loose: it assumes the eigenvalues fill the
-interval $[\lambda_{\min},\lambda_{\max}]$, whereas in practice the \emph{distribution}
-matters more than the ratio. \emph{Second}, a degree-$k$ polynomial can vanish on $k$
-clusters at once, so if $\sigma(A)$ collapses to $c$ tight clusters CG converges in
-$\sim\!c$ iterations regardless of where the clusters live on the line. A few isolated
-outlier eigenvalues only cost one extra iteration each. The preconditioning objective is
-therefore not ``make $MA$ close to $I$,'' but ``make $\sigma(MA)$ a handful of tight clusters
-away from zero'' --- the absolute location of those clusters is essentially free. This
-objective is classical preconditioning theory, not a novelty claim of this paper; our
-novelty is the fixed-structure neural realization that achieves it under strict real-time
-GPU constraints.
+so CG only sees $A$ through how small a polynomial fixed to $1$ at the origin can be made on
+$\sigma(A)$. The practical consequence we lean on is that when $\sigma(MA)$ collapses to $c$
+tight clusters away from zero, CG converges in $\sim\!c$ iterations regardless of where on
+the real line those clusters sit. The preconditioning objective is therefore ``cluster
+$\sigma(MA)$,'' not ``make $MA$ close to $I$,'' with cluster \emph{location} essentially
+free --- the property our cosine loss exploits.
 
-\paragraph{Hierarchical matrices.}
 An $\mathcal{H}$-matrix~\cite{hackbusch1999sparse,hackbusch2002adaptive,borm2003introduction}
-represents a dense matrix as a recursive block partition in which diagonal blocks stay
-dense, off-diagonal blocks are stored as low-rank factors $UV^\top$, and the admissible rank
-decreases as the blocks sit further off the diagonal. Two flavors of admissibility appear
-in the literature: \emph{strong admissibility}~\cite{hackbusch1999sparse} produces many
-small geometrically separated blocks, and \emph{weak admissibility}~\cite{hackbusch2002adaptive}
-produces fewer, larger ones --- a trade we lean on because larger uniform blocks are exactly
-what a GPU likes to batch (see also HODLR~\cite{Hartland2023hodlr}). The structural
-justification for low-rank off-diagonal blocks is that the underlying Green's function is
-smooth away from the diagonal, so an off-diagonal block needs only $O(\log^d\varepsilon^{-1})$
-columns to capture the interaction to accuracy $\varepsilon$ --- a rank that grows with
-precision, not block size. Classical $\mathcal{H}$-matrix arithmetic runs in $O(N\log N)$
-to $O(N\log^2 N)$.
+represents a dense matrix as a recursive block partition: dense diagonal blocks plus
+off-diagonal blocks stored as low-rank factors $UV^\top$, with admissible rank shrinking
+off the diagonal because the underlying Green's function is smooth there. We use the
+\emph{weak-admissibility} variant~\cite{hackbusch2002adaptive,Hartland2023hodlr}, whose
+fewer, larger off-diagonal tiles batch well on a GPU; classical $\mathcal{H}$-matrix
+arithmetic costs $O(N\log N)$, our learned realization runs at $\Theta(N)$ thanks to the
+fixed coarse-token count in~$\hyperref[intro:hierarchical]{\textsc{c1}}$.
 
-\paragraph{Hutchinson trace estimation and probe spectra.}
-Any random probe $\mathbf{z}\in\mathbb{R}^N$ with $\mathbb{E}[\mathbf{z}\mathbf{z}^\top]\!=\!I$
-satisfies the Hutchinson identity
-$\mathbb{E}_\mathbf{z}[\mathbf{z}^\top B\mathbf{z}]\!=\!\operatorname{tr}(B)$~\cite{hutchinson1989stochastic},
-which is the conventional reason for using such probes. The reason we use them is different.
-Decompose $\mathbf{z}$ in the eigenbasis of $B$ as $\mathbf{z}\!=\!\sum_i\alpha_i\mathbf{u}_i$;
-isotropy gives $\mathbb{E}[\alpha_i^2]\!=\!1$ for every $i$. That is, an isotropic probe
-puts the same expected energy on every eigenmode of $B$. Any scalar built from
-$(\mathbf{z},B\mathbf{z})$ therefore measures $B$'s action across the entire spectrum
-uniformly, with no bias toward smooth or oscillatory modes. This \emph{spectral whiteness}
-is the property that makes the cosine probe loss of
-\hyperref[intro:loss]{paragraph \textsc{c3}} a faithful global indicator of preconditioner
-quality.
+The training loss uses Hutchinson-style probes $\mathbf{z}$ with
+$\mathbb{E}[\mathbf{z}\mathbf{z}^\top]\!=\!I$~\cite{hutchinson1989stochastic}, but not as a
+trace estimator. The property we use is \emph{spectral whiteness}: isotropy gives
+$\mathbb{E}[(\mathbf{u}_i^\top\mathbf{z})^2]\!=\!1$ for every eigenvector $\mathbf{u}_i$ of
+$MA$, so a scalar built from $(\mathbf{z},MA\mathbf{z})$ weighs every eigenmode equally
+rather than favoring smooth or oscillatory ones --- the property that makes the cosine loss
+of \hyperref[intro:loss]{\textsc{c3}} a faithful global indicator of preconditioner quality.
 
 % ===========================================================================
 \section{Method}
@@ -1603,7 +1583,7 @@ approach conventional sparse-algebra baselines.
 
 \begin{figure}[!htbp]
   \centering
-  \includegraphics[width=0.55\linewidth]{solver_spectral_clustering.png}
+  \includegraphics[width=\linewidth]{solver_spectral_clustering.png}
   \caption{Spectra of $MA$ at $N\!=\!1\,024$ on a representative multiphase Poisson frame
     (full eigendecomposition; $y$ jittered). \emph{Top:} unpreconditioned (left) and
     Jacobi (right). \emph{Bottom:} same architecture trained with SAI (left, $16\!\times$
@@ -1617,7 +1597,7 @@ approach conventional sparse-algebra baselines.
 
 \begin{figure}[!htbp]
   \centering
-  \includegraphics[width=0.72\linewidth]{probe_alignment_8192_L3_hw_8k_24k.png}
+  \includegraphics[width=\linewidth]{probe_alignment_8192_L3_hw_8k_24k.png}
   \caption{Probe-alignment dynamics during training at $N\!=\!8\,192$
     ($d\!=\!128$, $n_l\!=\!3$, highways on), computed over checkpoints in the
     $8$k--$24$k step range. The panel links the cosine-Hutchinson objective to
@@ -1630,7 +1610,7 @@ approach conventional sparse-algebra baselines.
 
 \begin{figure}[!htbp]
   \centering
-  \includegraphics[width=0.65\linewidth]{training.png}
+  \includegraphics[width=\linewidth]{training.png}
   \caption{Training profile at $N\!=\!8\,192$ (default config, $d\!=\!128$, $n_l\!=\!3$,
     highways on). Blue: cosine-Hutchinson loss $\mathcal{L}_{\cos}$ on the training set
     (mean $\pm 1\sigma$ over last $100$ steps, linear axis). Green dashed:
