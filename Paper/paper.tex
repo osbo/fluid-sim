@@ -9,8 +9,9 @@
 
 \citestyle{acmauthoryear}
 
-%% Assigned submission ID from the Linklings form (placeholder).
-\acmSubmissionID{0000}
+%% Linklings submission ID (Stage 1). Underscore must be \textunderscore + \protect
+%% so acmart's \MakeUppercase on the anonymous author line does not treat `_' as math.
+\acmSubmissionID{papers\protect\textunderscore{}2115s1}
 
 \setcopyright{none}
 \copyrightyear{2026}
@@ -70,32 +71,29 @@
 \renewcommand{\shortauthors}{Anonymous Author(s)}
 
 \begin{abstract}
-Real-time physics pipelines are bottlenecked by sparse linear solves.
-The required preconditioner must capture long-range coupling while remaining cheap enough
-to apply once per frame on a GPU.
-Existing learned preconditioners follow the nonzero pattern of the system matrix, so
-information between distant unknowns has to crawl through many message-passing layers; the
-classical alternatives that do see globally (incomplete Cholesky, algebraic multigrid)
-serialize on triangular solves or V-cycle barriers and miss the per-frame budget.
-We learn a preconditioner on a hierarchical block partition computed once from the index
-geometry: a transformer keeps dense diagonal blocks at full resolution, and a second
-transformer summarizes every off-diagonal block at a single small token count regardless of
-how big the block is, so total work stays linear in $N$. A cosine-similarity Hutchinson loss
-trains the network without ever asking it to match $A^{-1}$ pointwise --- it only has to
-align the preconditioned image of a probe with the probe itself, leaving the network free to
-park the spectrum of $MA$ wherever convergence is easiest. In a matched-architecture ablation,
-this loss choice is decisive: replacing it with the SAI/Frobenius-style surrogate removes most
-of the speedup (Table~\ref{tab:generalization-vs-baselines}). The PCG iteration runs as a
-single CUDA Graph of batched GEMMs over contiguous tensors, with no triangular solves and
-no data-dependent branching.
-On a stiff multiphase pressure-Poisson benchmark with up to $100\!:\!1$ density contrast,
-the resulting solver runs from $\sim\!143$\,fps at $N\!=\!1{,}024$ to $\sim\!21$\,fps at
-$N\!=\!16\,384$, while every classical and learned GPU baseline we evaluate is below
-$16$\,fps at $N\!=\!16\,384$ (Jacobi $\sim\!15$\,fps; neural SPAI~\cite{Yang2025sparse}
-$\sim\!14$\,fps). At $N\!=\!8{,}192$ we measure a $2.2\times$
-speedup over GPU Jacobi (the fastest classical GPU baseline), $\sim\!28\times$ over GPU
-IC/DILU (AMGX \textsc{multicolor\_dilu}), and $2.7\times$ over the same neural SPAI baseline
-re-trained per scale on this benchmark with its CUDA apply path.
+Neural preconditioners for real-time physics simulation offer promising data-driven priors,
+but they struggle to resolve long-range couplings efficiently because they rely on local
+message passing or inherited sparsity patterns. We introduce the Hierarchical Transformer
+Preconditioner, a neural preconditioner anchored to a weak-admissibility $\mathcal{H}$-matrix
+partition. This structural prior processes the system as a tree of coarsening off-diagonal
+blocks, enabling full-graph approximate-inverse computation in $O(N)$ time. The network models
+the multiscale spectral structure of the inverse, compressing distant interactions into
+low-rank factors. To propagate context between transformer layers, we introduce highway
+connections via axial buffers and a global summary token. At each PCG iteration,
+preconditioner application reduces to batched GEMMs with regular memory access.
+
+Because inference and per-iteration application are dense tensor operations with no sequential
+dependencies, the complete solver is captured as a single CUDA Graph. We train
+self-supervised with a cosine-similarity Hutchinson probe loss that optimizes angular
+alignment of $MA\mathbf{z}$ and $\mathbf{z}$, removing constraints on eigenvalue-cluster
+location and improving preconditioning on irregular spectra.
+
+On highly stiff multiphase Poisson systems (up to $100\!:\!1$ density contrast,
+$N\!=\!1{,}024$--$16{,}384$), our solver runs from $\sim\!143$\,fps to $\sim\!21$\,fps.
+At $N\!=\!8{,}192$, it achieves $17.9$\,ms per frame and is $2.2\times$ faster than GPU
+Jacobi, $\sim\!28\times$ faster than GPU IC/DILU (AMGX \textsc{multicolor\_dilu}), and
+$2.7\times$ faster than neural SPAI re-trained per scale on the same benchmark.
+These results make high-contrast multiphase simulation practical for interactive applications.
 \end{abstract}
 
 \begin{CCSXML}
