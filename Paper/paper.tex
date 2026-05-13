@@ -71,29 +71,29 @@
 \renewcommand{\shortauthors}{Anonymous Author(s)}
 
 \begin{abstract}
-Neural preconditioners for real-time physics simulation offer promising data-driven priors,
-but they struggle to resolve long-range couplings efficiently because they rely on local
-message passing or inherited sparsity patterns. We introduce the Hierarchical Transformer
+Neural preconditioners for real-time physics simulation offer promising data-driven priors, but
+they often fail to capture long-range couplings efficiently because they inherit local message
+passing or sparse-operator access patterns. We introduce the Hierarchical Transformer
 Preconditioner, a neural preconditioner anchored to a weak-admissibility $\mathcal{H}$-matrix
-partition. This structural prior processes the system as a tree of coarsening off-diagonal
-blocks, enabling full-graph approximate-inverse computation in $O(N)$ time. The network models
-the multiscale spectral structure of the inverse, compressing distant interactions into
-low-rank factors. To propagate context between transformer layers, we introduce highway
-connections via axial buffers and a global summary token. At each PCG iteration,
-preconditioner application reduces to batched GEMMs with regular memory access.
+partition. The partition provides a multiscale structural prior (dense diagonal leaves plus
+coarsening off-diagonal tiles) that enables full-graph approximate-inverse computation with
+$O(N)$ scaling at fixed block sizes. The network models the inverse through low-rank far-field
+factors and uses highway connections (axial buffers plus a global summary token) to propagate
+context across transformer depth. At each PCG iteration, preconditioner application reduces to
+batched dense GEMMs with regular memory access.
 
-Because inference and per-iteration application are dense tensor operations with no sequential
-dependencies, the complete solver is captured as a single CUDA Graph. We train
-self-supervised with a cosine-similarity Hutchinson probe loss that optimizes angular
-alignment of $MA\mathbf{z}$ and $\mathbf{z}$, removing constraints on eigenvalue-cluster
-location and improving preconditioning on irregular spectra.
+The key training contribution is a cosine-Hutchinson probe objective that learns the action of
+$MA$ on convergence-critical spectral subspaces, optimizing angular alignment of $MA\mathbf{z}$
+with $\mathbf{z}$ rather than forcing eigenvalue clusters to a prescribed location. This removes
+unnecessary spectral-placement constraints from SAI-style objectives and improves conditioning on
+irregular spectra. Because both inference and apply are dense, dependency-free tensor programs,
+the full solve loop is captured as a single CUDA Graph.
 
-On highly stiff multiphase Poisson systems (up to $100\!:\!1$ density contrast,
-$N\!=\!1{,}024$--$16{,}384$), our solver runs from $\sim\!143$\,fps to $\sim\!21$\,fps.
-At $N\!=\!8{,}192$, it achieves $17.9$\,ms per frame and is $2.2\times$ faster than GPU
-Jacobi, $\sim\!28\times$ faster than GPU IC/DILU (AMGX \textsc{multicolor\_dilu}), and
-$2.7\times$ faster than neural SPAI re-trained per scale on the same benchmark.
-These results make high-contrast multiphase simulation practical for interactive applications.
+On stiff multiphase Poisson systems (up to $100\!:\!1$ density contrast,
+$N\!=\!1{,}024$--$16{,}384$), the solver runs from $\sim\!143$ to $\sim\!21$ fps. At
+$N\!=\!8{,}192$, it reaches $17.9$ ms/frame, with $2.2\times$ speedup over GPU Jacobi,
+$\sim\!28\times$ over GPU IC/DILU (AMGX \textsc{multicolor\_dilu}), and $2.7\times$ over
+neural SPAI retrained per scale on the same benchmark.
 \end{abstract}
 
 \begin{CCSXML}
@@ -127,7 +127,7 @@ neural operators, physics simulation, real-time graphics}
       \includegraphics[width=\linewidth,keepaspectratio]{hmatrix_partition_compact.png} &
       \includegraphics[width=\linewidth,keepaspectratio]{multiphase_m_zoom_strip.png} &
       \includegraphics[width=\linewidth,keepaspectratio]{residual_correction_traces.png} &
-      \includegraphics[width=\linewidth,keepaspectratio]{3 fluid.jpeg}
+      \includegraphics[width=\linewidth,keepaspectratio]{3_fluid.jpeg}
     \end{tabular}%
     \vspace{\teasergap}%
   \end{minipage}}
@@ -210,7 +210,7 @@ free to cluster the spectrum of $MA$ wherever angular alignment is easiest, with
 implicit demand that the cluster live near any particular eigenvalue
 (Prop.~\ref{prop:cos-subspace}; spectral evidence in Fig.~\ref{fig:loss:eigenvalues}).
 Empirically, this is not a minor objective tweak: with architecture and training split fixed,
-the loss swap alone accounts for the dominant quality gap in Table~\ref{tab:generalization-vs-baselines}.
+the loss swap alone accounts for a major quality gap in Table~\ref{tab:generalization-vs-baselines}.
 
 \paragraph{One CUDA Graph for the whole iteration.}\label{intro:cudagraph}\hypertarget{intro:cudagraph}{}%
 The choices above together remove the data dependencies that normally fragment a CG
@@ -248,11 +248,11 @@ pattern, GPU throughput limit, and whether the apply admits single-CUDA-Graph ca
 the PCG inner loop. $\mathrm{nnz}$ is the nonzero count of the relevant factor.
 ``$L_s$'' is our fixed coarse-token count per off-diagonal tile.}
 \label{tab:apply_complexity}
-\footnotesize\setlength{\tabcolsep}{3pt}
-\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.21\linewidth}
-  >{\raggedright\arraybackslash}p{0.12\linewidth}
+\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.20\linewidth}
+  >{\raggedright\arraybackslash}p{0.14\linewidth}
   >{\raggedright\arraybackslash}X
-  >{\raggedright\arraybackslash}p{0.19\linewidth}
+  >{\raggedright\arraybackslash}p{0.18\linewidth}
   c@{}}
 \toprule
 Method & FLOPs & Memory access & GPU bottleneck & Graph \\
@@ -420,7 +420,10 @@ emit per-leaf bridges $\tilde U_k, \tilde V_k\!\in\!\mathbb{R}^{L\times L_s}$ be
 node resolution and coarse tile resolution. A small learned per-node Jacobi gate
 $\lambda_i$ adds a diagonal correction $\mathrm{diag}(\boldsymbol\lambda)\mathrm{diag}(A)^{-1}$
 that absorbs gradient early in training and decays toward zero as the structured
-branches take over (Supplementary~\ref{SX-supp:architecture}). All factors pack into a
+branches take over (Supplementary~\ref{SX-supp:architecture}). In reported runs we do
+not explicitly enforce strict SPD and did not observe instability; if a strict guarantee
+is required, one can add a tiny positive diagonal shift (e.g., softplus-parameterized,
+as in prior learned preconditioners~\cite{Yang2025sparse}). All factors pack into a
 single tensor of width $P\!=\!KL^2+M_{\mathcal{H}}L_s^2+2NL_s+N$ that the apply consumes
 without ever materializing $M$.
 
@@ -496,9 +499,10 @@ data movement explicit:
                     +  \tilde V_k\,{\textstyle\sum_{m:k\in\mathcal{C}_m}\!\mathbf{t}^{\mathrm{c}}_m}
   && \text{(prolongation).}
 \end{align}
-Stages 1/3/4 are batched GEMMs of shapes $(K,L,L_s),(M_{\mathcal{H}},L_s,L_s),(K,L,L_s)$;
+Stages 1/3/4 are batched GEMMs of shapes $(K,L,L_s)$ and
+$(M_{\mathcal{H}},L_s,L_s)$ (with $(K,L,L_s)$ reused in prolongation);
 stage 2 is two partition-indexed scatter-adds. (iii) The CSR SpMV for $A\mathbf{r}$ is the
-inner-loop's only sparse operation; the space-filling-curve ordering keeps its gathers nearly
+inner loop's only sparse operation, and the space-filling-curve ordering keeps gathers nearly
 banded. Total apply cost is $O(N(L+L_s))$ FLOPs. Supplementary~\ref{SX-supp:architecture}
 contains the same equations with full shape progression notes.
 
@@ -514,9 +518,8 @@ need level-by-level barriers, so neither is single-graph capturable in the same 
 Among learned alternatives, neural SPAI~\cite{Yang2025sparse} is graph-capturable but
 applies $\mathbf{y}\!=\!G^\top(G\mathbf{r})$ as two SpMVs against a sparse $G$ whose
 nonzero pattern follows $A$, so its apply remains bandwidth-bound on irregular gathers;
-ours replaces those with dense block GEMMs on the partition and is compute-bound on
-Tensor Cores. The relevant access patterns and throughput limits per family are
-summarized in Table~\ref{tab:apply_complexity}.
+in contrast, our factorized approximate-inverse preconditioner apply reduces to dense
+block GEMMs on the partition and is compute-bound on Tensor Cores.
 
 % ===========================================================================
 \section{Training}
@@ -878,16 +881,15 @@ $\mathrm{rtol}\!=\!10^{-8}$). ``Jacobi ms'' is the baseline denominator used to
 compute speedup. Our model and the SAI-loss ablation are trained on the
 \emph{complement} of each eval cell (held-out OOD setup); neural
 SPAI~\cite{Yang2025sparse} is trained with the same split protocol
-(train on the corresponding restricted distribution for each eval row).
-\textbf{Bold} marks the best speedup in each row.}
+(train on the corresponding restricted distribution for each eval row).}
 \label{tab:generalization-vs-baselines}
 \scriptsize\setlength{\tabcolsep}{3pt}
 \begin{tabular}{@{}l r rr rr rr@{}}
 \toprule
 & Jacobi
-& \multicolumn{2}{c}{\shortstack[c]{\textbf{Ours}\\(cosine loss)\\(matched train)}}
-& \multicolumn{2}{c}{\shortstack[c]{Ours arch + SAI loss\\\cite{Yang2025sparse}\\(matched train)}}
-& \multicolumn{2}{c}{\shortstack[c]{Neural SPAI\\\cite{Yang2025sparse}\\(matched train)}} \\
+& \multicolumn{2}{c}{\shortstack[c]{\textbf{Ours}\\(cosine loss)}}
+& \multicolumn{2}{c}{\shortstack[c]{Ours arch + SAI loss\\\cite{Yang2025sparse}}}
+& \multicolumn{2}{c}{\shortstack[c]{Neural SPAI\\\cite{Yang2025sparse}}} \\
 \cmidrule(lr){2-2}\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
 Eval distribution         & ms & iters & speedup & iters & speedup & iters & speedup \\
 \midrule
@@ -1009,7 +1011,7 @@ decay with separation.
     \S\ref{sec:results:training} --- the model keeps reducing the cosine objective and
     the PCG iteration count after the SAI surrogate has bottomed out and started to
     climb. Orange: PCG iterations to $\mathrm{rtol}\!=\!10^{-8}$ on that frame (log).
-    Bottom axis: wall-clock minutes; top axis: optimizer steps. Horizontal grey:
+    Bottom axis: wall-clock minutes; top axis: optimizer steps. Grey:
     unpreconditioned CG and Jacobi baselines.}
   \label{fig:training:dynamics}
 \end{figure}
@@ -1028,10 +1030,8 @@ decay with separation.
     baseline (neural SPAI~\cite{Yang2025sparse}, re-trained per scale on our benchmark with
     its CUDA apply path) covers $\sim\!54$ down to $\sim\!14$\,fps. AMGX SPAI and GPU IC
     sit above $40$\,ms across all scales despite much lower iteration counts, dominated
-    by unparallelizable triangular solves or V-cycle synchronization. PyAMG (CPU) is
-    omitted: its setup cost scales nonlinearly with contrast under stiff multiphase
-    systems, making its curve noisy and not directly comparable to GPU-resident methods;
-    full per-method times and iteration counts appear in Table~\ref{tab:full_perf_table_main}.}
+    by unparallelizable triangular solves or V-cycle synchronization. Full per-method times
+    and iteration counts appear in Table~\ref{tab:full_perf_table_main}.}
   \label{fig:scale_methods}
 \end{figure}
 

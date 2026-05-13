@@ -43,9 +43,7 @@
 This document collects the implementation details, dataset construction,
 per-scale performance numbers, full train$\,\times\,$eval generalization grid
 behind Table~6, and the precision/apply-path discussion that did not fit the
-main-paper page budget. Section numbering is independent of the main paper;
-cross-references in either direction use \texttt{xr-hyper} (prefix \texttt{SX-}
-when read from the main PDF).
+main-paper page budget. Section numbering is independent of the main paper.
 
 % ===========================================================================
 \section{Experimental Setup --- Full Details}
@@ -172,7 +170,7 @@ $\lambda_i$.
 \paragraph{Apply-path tensor layout.}
 The decoder outputs are concatenated into a single packed tensor of width
 $P\!=\!KL^2 + M_{\mathcal{H}} L_s^2 + 2NL_s + N$ with strides aligned to the
-$\mathcal{H}$-matrix partition. With the weak-admissibility HODLR partition at
+$\mathcal{H}$-matrix partition. With the weak-admissibility $\mathcal{H}$-matrix partition at
 admissibility parameter $\eta\!=\!1$, the number of \emph{unique} off-diagonal
 tiles satisfies $M_{\mathcal{H}}\!=\!K\!-\!1$ (geometric sum
 $K/2 + K/4 + \cdots + 1$ over the strict upper triangle); the symmetric lower
@@ -259,9 +257,7 @@ paper Fig.~4.
 % ===========================================================================
 
 This appendix gives the precise procedure for generating each frame of the
-multiphase Poisson benchmark used throughout the main paper. The full generator
-is \verb|generate_dataset.py| in the released code (see that script for
-dataset-type flags).
+multiphase Poisson benchmark used throughout the main paper.
 
 \paragraph{Grid and ordering.}
 Each frame targets $N$ degrees of freedom on a 2D structured grid of dimensions
@@ -311,16 +307,6 @@ For each of five scales, spanning $N=1\,024$ to $N=16\,384$, we generate
 $100$ training frames and $20$ test frames with disjoint seeds.
 Training and test split the same generator distribution.
 
-\paragraph{Why this benchmark stresses the architecture.}
-Three axes of randomization --- contrast, topology, and orientation --- combine
-to make this benchmark a stress test for any preconditioner with a fixed
-structural prior. Closed barriers in particular produce sub-domains coupled
-\emph{only} through near-zero conductance: information about the pressure jump
-has to travel from one chamber to the other in a single step, which local
-message passing on $\mathrm{nnz}(A)$ cannot do at the depths typical of
-practical neural preconditioners but an $\mathcal{H}$-matrix far-block
-representation can.
-
 % ===========================================================================
 \section{Per-frame Iteration-count Variability}
 \label{supp:full_perf_table}
@@ -360,15 +346,7 @@ AMG (CPU)                    & $5\!\pm\!6$     & $9\!\pm\!6$     & $5\!\pm\!7$  
 The neural SPAI baseline is re-trained per scale (one network per $N$) using
 the SAI loss of~\cite{Yang2025sparse} on the same training distribution as
 ours; the row reports mean$\pm$std across the same per-scale test-frame
-evaluation as the other methods. CPU AMG and GPU AMGX achieve very low
-iteration counts ($\le\!10$) but pay for it in per-iteration V-cycle
-synchronization, putting them above the interactive budget at every scale
-(main paper, Fig.~5). GPU IC/DILU sits at $11$--$40$ iterations, with each
-iteration carrying a sequential triangular solve. Jacobi and unpreconditioned
-CG show $\sigma/\mu$ approaching unity at the larger $N$ because individual
-frames span the full $[5, 100]$ contrast range and stiff frames inflate
-iteration counts disproportionately; our $\sigma/\mu$ stays at $\le\!21\%$
-across all scales.
+evaluation as the other methods.
 
 % ===========================================================================
 \section{Generalization Robustness}
@@ -377,7 +355,7 @@ across all scales.
 
 Table~6 in the main paper reports four cells of a wider train$\,\times\,$eval
 grid that probes within-family robustness at $N\!=\!4\,096$.
-Table~\ref{tab:supp_generalization} reports the full grid for \emph{our}
+Table~\ref{supp-tab:generalization} reports the full grid for \emph{our}
 method, adding both the in-distribution row (\emph{Full} training,
 evaluated on closed-only and high-contrast subsets) and a fourth,
 compositional training distribution that excludes closed barriers
@@ -393,7 +371,7 @@ duplicate the leftmost column). The fourth training row is a compositional
 distribution that excludes closed barriers \emph{and} restricts contrast to
 $\rho_{\text{heavy}}\!\in\![5,25]$; the rightmost column evaluates it on the
 joint shift (closed barriers $+$ high contrast).}
-\label{tab:supp_generalization}
+\label{supp-tab:generalization}
 \footnotesize\setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}l cccc@{}}
 \toprule
@@ -418,42 +396,11 @@ in-distribution cell of the same training row (lower is better). Row~1
 (\emph{Full}) is included so the in-distribution operating point is on the
 same page as the OOD numbers; we omit its trivial OOD columns.
 
-\paragraph{Topology shift is essentially free.}
-Excluding closed barriers from training (row~2) does not raise iteration count
-at evaluation on closed-barrier frames: $\Delta_{\text{OOD}}\!=\!0.87$, slightly
-\emph{below} the same model's in-distribution number. Closed barriers create
-near-disconnected sub-regions whose pressures couple only through long-range
-modes, and the model handles them without ever having seen one because the
-$\mathcal{H}$-matrix partition is keyed purely to spatial indexing and encodes
-no barrier geometry.
-
-\paragraph{Contrast shift is the dominant OOD cost.}
-The contrast cells (high contrast at evaluation, low at training) show
-$\Delta_{\text{OOD}}\!\in\![1.55, 1.82]$, with variance growing roughly fivefold
-($\sigma\!\approx\!100$ vs.\ $\sim\!20$ in-distribution). The mechanism is
-structural: the scale-invariance of $\mathcal{L}_{\cos}$ absorbs any global
-amplitude growth automatically, but high-contrast frames also push far-field
-interactions across sharp density interfaces into a regime carrying
-qualitatively more weight than in any training frame. The model generalizes within the
-contrast range it has seen and degrades smoothly past it; even at the worst
-compositional cell (closed barriers $+$ high contrast, trained without
-either), $\Delta_{\text{OOD}}\!=\!1.55$ still gives a $1.9\!\times$
-Jacobi-relative speedup --- the same as the contrast-only cell.
-
-\paragraph{Compositional OOD shows no additional penalty.}
-The compositional cell (last row) sits between the contrast and topology cells
-rather than compounding them: contrast shift dominates, topology shift is
-absorbed. The architecture's geometric prior covers the topology axis; the
-learned spectral cluster covers the contrast axis up to its training range.
-
-\paragraph{What the grid does \emph{not} show.}
-Cross-family transfer (cloth, contact stiffness, electromagnetic operators) and
-discretization-refinement scaling ($N\!\gg\!10^4$ at fixed domain, requiring
-larger $S_{\max}$) lie outside this evaluation. Both are discussed as
-future-work axes in main paper~\S8; the supplementary code release includes the
-training/evaluation scripts for the four train distributions in
-Table~\ref{tab:supp_generalization} so those extensions can use the same
-protocol.
+The grid shows that topology shift is inexpensive
+($\Delta_{\text{OOD}}\!=\!0.87$--$0.94$), while contrast shift is the dominant
+OOD cost ($\Delta_{\text{OOD}}\!=\!1.55$--$1.82$). Even in the compositional
+shift cell (closed $+$ high contrast), the model remains at $1.9\times$
+Jacobi-relative speedup.
 
 % ===========================================================================
 \section{Precision and Hardware Efficiency}
@@ -521,11 +468,7 @@ diagonal even though it covers $1\!-\!1/K$ of the matrix.
 Main paper Table~3 reports the kernel-family split at $N\!=\!8\,192$: CUTLASS
 Tensor-Op GEMMs ($31\%$) plus CUTLASS fused attention ($14\%$) account for
 $\sim\!45\%$ of device time; the remaining $\sim\!55\%$ is elementwise
-operations, layout reshapes, and small bookkeeping kernels. No SpMV or
-indexed-gather kernel appears in the top families, which is the ``Ours''
-row of main paper Table~1 (``compute, Tensor Cores'' bottleneck) at the
-kernel level: every operand's address arithmetic is a single stride, and
-every nontrivial kernel saturates Tensor Cores rather than DRAM bandwidth.
+operations, layout reshapes, and small bookkeeping kernels.
 
 \paragraph{What would have to change for tighter tolerance.}
 The float32 apply path supports $\mathrm{rtol}\!\le\!10^{-8}$ across all scales
@@ -542,9 +485,10 @@ not implement either since they fall outside the regime we target.
 \label{supp:floats}
 % ===========================================================================
 
-For space, several explanatory figures and detailed-breakdown tables that the
-main paper points to live here. The main-paper cross-references resolve to the
-\emph{Figure}/\emph{Table} number that appears next to each caption below.
+This section provides optional figures and detailed-breakdown tables for
+readers who want additional clarity on the method and results. Main-paper
+cross-references resolve to the \emph{Figure}/\emph{Table} number shown next to
+each caption below.
 
 % --- partition + highways graphic (was Fig. 2 in earlier drafts) ---
 \begin{figure}[H]
@@ -597,47 +541,6 @@ main paper points to live here. The main-paper cross-references resolve to the
   \label{supp-fig:bench-frame}
 \end{figure}
 
-% --- subsystem breakdown (was main-paper Table 2) ---
-\begin{table}[H]
-\centering
-\caption{Subsystem breakdown of the forward pass at $N\!=\!8\,192$. Attention
-layers scale with $n_l$; everything else is independent of depth.}
-\label{supp-tab:breakdown-subsystem}
-\footnotesize\setlength{\tabcolsep}{4pt}
-\begin{tabular}{@{}lrl@{}}
-\toprule
-Subsystem & \% device time & Scales with \\
-\midrule
-Diagonal attention stack     & $36\%$ & $n_l$ \\
-Off-diagonal attention stack & $23\%$ & $n_l$ \\
-Decoder heads                & $18\%$ & --- \\
-Encoder (MLP + GCN)          & $16\%$ & --- \\
-Layout helpers / scatter     & $<\!4\%$ & --- \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-% --- kernel breakdown (was main-paper Table 3) ---
-\begin{table}[H]
-\centering
-\caption{Kernel-level breakdown at $N\!=\!8\,192$. Dominant kernels are
-compute-bound Tensor-Core GEMMs and fused attention; no SpMV or indexed-gather
-kernel appears.}
-\label{supp-tab:breakdown-kernel}
-\footnotesize\setlength{\tabcolsep}{4pt}
-\begin{tabular}{@{}lr@{}}
-\toprule
-Kernel family & \% device time \\
-\midrule
-CUTLASS Tensor-Op GEMMs (\texttt{s1688gemm}, \texttt{sm90\_xmma}, TF32) & $31\%$ \\
-CUTLASS fused attention (\texttt{fmha\_cutlassF}) & $14\%$ \\
-Elementwise / normalization                       & $17\%$ \\
-Copies / reshapes / layout                        & $17\%$ \\
-Other                                             & $21\%$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
 % --- hyperparameter ablation (main-paper Table 5 core rows; full grid here) ---
 \begin{table}[H]
 \centering
@@ -666,29 +569,6 @@ $d{=}128,\;n_l{=}3$, hw    & 16.2 & 3.4 & 168 & 17.9 & ---      \\
 \multicolumn{6}{l}{\emph{Highways} ($N\!=\!2048$):}\\
 $d{=}128,\;n_l{=}3$, hw    &  6.0 & 3.3 &  66 &  8.8 & ---      \\
 $d{=}128,\;n_l{=}3$, no-hw &  4.8 & 2.2 & 149 & 13.8 & $+58\%$  \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-% --- generalization summary (main-paper Table 6; full grid here) ---
-\begin{table}[H]
-\centering
-\caption{Within-family deployment robustness across restricted training
-distributions at $N\!=\!4\,096$ (GPU; $\mathrm{rtol}\!=\!10^{-8}$). Speedup is
-Jacobi / Ours total-time ratio.}
-\label{supp-tab:generalization}
-\footnotesize\setlength{\tabcolsep}{3.5pt}
-\begin{tabular}{@{}ll rr rr c@{}}
-\toprule
-Train distribution & Eval distribution
-  & \multicolumn{2}{c}{Ours (GPU)} & \multicolumn{2}{c}{Jacobi (GPU)} & Speedup \\
-\cmidrule(lr){3-4}\cmidrule(lr){5-6}
- & & Iters & ms & Iters & ms & \\
-\midrule
-Full                           & Full (in-dist.)          &  82 &  8.8 & 758 & 29.4 & $3.4\times$ \\
-Excl.\ closed barriers         & Closed barriers only     &  68 &  7.4 & 662 & 24.7 & $3.3\times$ \\
-Low contrast                   & High contrast            & 142 & 13.1 & 650 & 24.4 & $1.9\times$ \\
-Excl.\ closed $+$ low $\rho$  & Closed $+$ high contrast & 147 & 13.5 & 671 & 25.1 & $1.9\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
