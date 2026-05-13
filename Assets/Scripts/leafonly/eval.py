@@ -864,6 +864,8 @@ def evaluate_gradient_interference(args, runtime):
     args.use_jacobi = True
     use_jacobi = True
     attention_layout = str(args.attention_layout)
+    probe_jacobi_steps = max(0, int(getattr(args, "probe_jacobi_steps", HUTCHINSON_PROBE_JACOBI_STEPS)))
+    probe_jacobi_omega = float(getattr(args, "probe_jacobi_omega", HUTCHINSON_PROBE_JACOBI_OMEGA))
     if not runtime_use_gcn:
         raise ValueError("Runtime has use_gcn=False, but the fixed architecture requires 2 GCN layers.")
     requested_gcn_layers = 2
@@ -872,8 +874,8 @@ def evaluate_gradient_interference(args, runtime):
 
     print(f"\n--- Starting Gradient Interference Analysis on {device} ---")
     print(
-        f"Hutchinson probes: Z is low-passed with {HUTCHINSON_PROBE_JACOBI_STEPS} damped-Jacobi sweeps "
-        f"(ω={HUTCHINSON_PROBE_JACOBI_OMEGA}) before the loss, matching training."
+        f"Hutchinson probes: Z is low-passed with {probe_jacobi_steps} damped-Jacobi sweeps "
+        f"(ω={probe_jacobi_omega}) before the loss, matching training."
     )
 
     if save_path.exists():
@@ -982,6 +984,8 @@ def evaluate_gradient_interference(args, runtime):
                 [n_orig],
                 n_pad,
                 az_mul,
+                num_steps=probe_jacobi_steps,
+                omega=probe_jacobi_omega,
             )
             AZ = az_mul(Z)
             MAZ = apply_block_diagonal_M(
@@ -1458,12 +1462,14 @@ def evaluate_gradient_interference(args, runtime):
                 [n_orig],
                 n_pad,
                 az_prof,
+                num_steps=probe_jacobi_steps,
+                omega=probe_jacobi_omega,
             )
 
         ms_probe_z = _timed_ms(_bench_probe_z, device)
         timing_rows.append(
             [
-                f"Probe Z (+ Jacobi {HUTCHINSON_PROBE_JACOBI_STEPS}×ω={HUTCHINSON_PROBE_JACOBI_OMEGA})",
+                f"Probe Z (+ Jacobi {probe_jacobi_steps}×ω={probe_jacobi_omega})",
                 ms_probe_z,
             ]
         )
@@ -1476,6 +1482,8 @@ def evaluate_gradient_interference(args, runtime):
             [n_orig],
             n_pad,
             az_prof,
+            num_steps=probe_jacobi_steps,
+            omega=probe_jacobi_omega,
         )
         ms_AZ = _timed_ms(lambda: az_prof(Z), device)
         timing_rows.append(["A @ Z (post-smooth)", ms_AZ])
@@ -1564,6 +1572,8 @@ def evaluate_estimator_variance(args, runtime):
     args.use_jacobi = True
     use_jacobi = True
     attention_layout = str(args.attention_layout)
+    probe_jacobi_steps = max(0, int(getattr(args, "probe_jacobi_steps", HUTCHINSON_PROBE_JACOBI_STEPS)))
+    probe_jacobi_omega = float(getattr(args, "probe_jacobi_omega", HUTCHINSON_PROBE_JACOBI_OMEGA))
     if not runtime_use_gcn:
         raise ValueError("Runtime has use_gcn=False, but the fixed architecture requires 2 GCN layers.")
 
@@ -1644,7 +1654,7 @@ def evaluate_estimator_variance(args, runtime):
     print(
         f"Sampling Z {num_samples} times with {batch_vectors} vectors each on FIXED frame index {frame_idx} "
         f"(probe_vectors arg: {pv if pv > 0 else 'default 64'}); "
-        f"each Z gets {HUTCHINSON_PROBE_JACOBI_STEPS} damped-Jacobi sweeps (ω={HUTCHINSON_PROBE_JACOBI_OMEGA}), "
+        f"each Z gets {probe_jacobi_steps} damped-Jacobi sweeps (ω={probe_jacobi_omega}), "
         "matching training."
     )
 
@@ -1673,6 +1683,8 @@ def evaluate_estimator_variance(args, runtime):
             [n_orig],
             n_pad,
             az_ev,
+            num_steps=probe_jacobi_steps,
+            omega=probe_jacobi_omega,
         )
         AZ = az_ev(Z)
         MAZ = apply_block_diagonal_M(

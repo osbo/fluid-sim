@@ -416,10 +416,16 @@ def train_leaf_only(args, runtime):
     _az_desc = "sparse block-diagonal A@Z (all devices; dense bmm only if context cache has use_dense_A)"
     print(f"  Probe MAZ path: --leafonly-pcg={leafonly_pcg} (A@Z: {_az_desc}; {_pcg_tail})")
     _loss_mode = str(getattr(args, "loss_mode", "hutchinson"))
+    _probe_jacobi_steps = max(0, int(getattr(args, "probe_jacobi_steps", 2)))
+    _probe_jacobi_omega = float(getattr(args, "probe_jacobi_omega", 0.6))
     if _loss_mode == "sai":
         print(f"  Loss mode: sai (mean_k ||M(A w_k) - w_k||^2 = Hutchinson ||MA-I||_F^2; --loss-mode sai)")
     else:
         print(f"  Loss mode: hutchinson (cosine-similarity probe; --loss-mode hutchinson)")
+        print(
+            f"  Probe Jacobi smoothing: steps={_probe_jacobi_steps}, "
+            f"omega={_probe_jacobi_omega:.3f}"
+        )
     ms_startup_to_loop = (time.perf_counter() - t_wall0) * 1000.0
     if print_timing:
         print("\n=== Startup timing (wall clock, ms) ===")
@@ -707,6 +713,8 @@ def train_leaf_only(args, runtime):
                 n_orig_list,
                 max_n_pad_step,
                 _az_probe,
+                num_steps=_probe_jacobi_steps,
+                omega=_probe_jacobi_omega,
             )
 
             if do_detailed:

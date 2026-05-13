@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import csv
 import math
 import os
 import sys
@@ -871,6 +872,116 @@ def _build_amg_apply(A):
         z = ml.solve(r_flat, x0=x0, maxiter=1, cycle='V', tol=1e-6)
         return np.asarray(z, dtype=np.float64).ravel()
     return apply_amg
+
+
+def _find_neural_spai_checkpoint(scale: int, summary_csv: Path) -> str:
+    exp = f"multiphase_v2_{int(scale)}"
+    with Path(summary_csv).open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("exp_name", "") != exp:
+                continue
+            method = row.get("method", "")
+            status = row.get("status", "")
+            ckpt = row.get("checkpoint", "")
+            if method in ("Neural", "Neural+CUDA") and status == "ok" and ckpt:
+                return ckpt
+    raise RuntimeError(
+        f"Could not find a NeuralSPAI checkpoint for scale={scale} in {summary_csv}."
+    )
+
+
+class NeuralSPAIPreconditioner:
+    """Load LearningSparsePreconditioner4GPU checkpoint and expose apply_M(r)."""
+
+    def __init__(self, info, checkpoint_path: str, lsp_repo: str):
+        self.info = info
+        self.checkpoint_path = Path(checkpoint_path)
+        self.lsp_repo = Path(lsp_repo)
+        if not self.checkpoint_path.is_file():
+            raise FileNotFoundError(f"NeuralSPAI checkpoint not found: {self.checkpoint_path}")
+        if not self.lsp_repo.is_dir():
+            raise FileNotFoundError(f"LSP repo not found: {self.lsp_repo}")
+        self._bootstrap()
+
+    def _bootstrap(self):
+        if str(self.lsp_repo) not in sys.path:
+            sys.path.insert(0, str(self.lsp_repo))
+
+        import torch
+        from torch_geometric.data import Data
+        from neural_cg.workspace import SimpleTrainingWorkspace
+        from neural_cg.scaled_workspace import ScaledTrainingWorkspace
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+        model = None
+        for workspace_cls in (SimpleTrainingWorkspace, ScaledTrainingWorkspace):
+            try:
+                model = workspace_cls.load_from_checkpoint(str(self.checkpoint_path), map_location=device)
+                break
+            except Exception:
+                continue
+        if model is None:
+            raise RuntimeError(f"Failed to load NeuralSPAI workspace from {self.checkpoint_path}")
+        model = model.to(device)
+        model.eval()
+
+        A_csr = self.info["A"].tocsr().astype(np.float64)
+        coo = A_csr.tocoo()
+        N = int(self.info["N"])
+
+        edge_index = torch.tensor(np.vstack((coo.row, coo.col)), dtype=torch.long, device=device)
+        edge_vals = coo.data.astype(np.float32)
+        edge_attr = torch.tensor(edge_vals.reshape(-1, 1), dtype=torch.float32, device=device)
+        matrix_values = torch.tensor(edge_vals.reshape(-1, 1, 1), dtype=torch.float32, device=device)
+
+        diag = A_csr.diagonal().astype(np.float32).reshape(-1, 1)
+        inv_diag = np.ones_like(diag, dtype=np.float32)
+        rsqrt_diag = np.ones_like(diag, dtype=np.float32)
+        ok = np.abs(diag) > 1e-6
+        inv_diag[ok] = 1.0 / diag[ok]
+        rsqrt_diag[ok] = 1.0 / np.sqrt(diag[ok])
+        mask = np.ones((N, 1), dtype=np.float32)
+        ones = np.ones((N, 1), dtype=np.float32)
+
+        sample = Data(
+            x=torch.tensor(ones, dtype=torch.float32, device=device),
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            matrix_values=matrix_values,
+            mask=torch.tensor(mask, dtype=torch.float32, device=device),
+            diagonal=torch.tensor(diag, dtype=torch.float32, device=device),
+            inv_diag=torch.tensor(inv_diag, dtype=torch.float32, device=device),
+            rsqrt_diag=torch.tensor(rsqrt_diag, dtype=torch.float32, device=device),
+            residual=torch.tensor(ones, dtype=torch.float32, device=device),
+        )
+
+        with torch.no_grad():
+            M = model.precondition(sample, A_csr.toarray())
+        self._M = np.asarray(M, dtype=np.float64)
+
+    def apply_M(self, r):
+        rr = np.asarray(r, dtype=np.float64).ravel()
+        return (self._M @ rr).astype(np.float64, copy=False)
+
+
+def _pressure_velocity_fields(info):
+    """Return pressure field P and velocity magnitude from buoyancy RHS on this frame."""
+    b = buoyancy_rhs(info)
+    ml = amg_solver(info["A"])
+    p = ml.solve(b, tol=1e-8, accel="cg", maxiter=2000).astype(np.float64)
+    p -= p.mean()
+
+    rho = info["mass_grid"].astype(np.float64) + 1e-6
+    P = gridify(p, info)
+    dpdx = np.zeros_like(P)
+    dpdy = np.zeros_like(P)
+    dpdx[:, 1:-1] = 0.5 * (P[:, 2:] - P[:, :-2])
+    dpdy[1:-1, :] = 0.5 * (P[2:, :] - P[:-2, :])
+    vx = -dpdx / rho
+    vy = -dpdy / rho
+    return b, P, vx, vy, np.hypot(vx, vy)
 
 
 def _shared_log_abs_limits(
@@ -2327,6 +2438,9 @@ def make_convergence(
     override_frame=None,
     rtol=1e-8,
     max_iter=5000,
+    neuralspai_checkpoint=None,
+    lsp_repo="/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU",
+    lsp_summary_csv=None,
 ):
     """Multi-method convergence figure. Two-column-wide; top row is rho + b (the *problem*),
     then five method rows each showing five |r_k| snapshots taken at geometrically-spaced
@@ -2353,7 +2467,7 @@ def make_convergence(
     b = buoyancy_rhs(info)
 
     # Build every preconditioner up front (so a setup failure aborts before any solve).
-    print(f"[conv] building baselines: identity / Jacobi / IC / AMG …")
+    print(f"[conv] building baselines: identity / Jacobi / IC / AMG / NeuralSPAI …")
     apply_identity = _build_identity_apply(info["N"])
     apply_jacobi = _build_jacobi_apply(A)
     apply_ic, ic_backend = _build_ic_apply(A)
@@ -2370,12 +2484,20 @@ def make_convergence(
             file=sys.stderr,
         )
 
+    if neuralspai_checkpoint is None:
+        if lsp_summary_csv is None:
+            lsp_summary_csv = SCRIPTS_DIR / "results" / "lsp_scale_infer_summary.csv"
+        neuralspai_checkpoint = _find_neural_spai_checkpoint(int(scale), Path(lsp_summary_csv))
+    print(f"[conv] loading NeuralSPAI checkpoint {neuralspai_checkpoint}")
+    neural_spai = NeuralSPAIPreconditioner(info, neuralspai_checkpoint, lsp_repo=lsp_repo)
+
     # Methods listed top → bottom. Display labels match the paper text.
     methods = [
         ("Unpreconditioned", apply_identity),
         ("Jacobi", apply_jacobi),
         ("IC", apply_ic),
         ("AMG", apply_amg_fn),
+        ("NeuralSPAI", neural_spai.apply_M),
         ("Ours", ours.apply_M),
     ]
     n_methods = len(methods)
@@ -2441,20 +2563,29 @@ def make_convergence(
     fig_h = cell_in * (1 + n_methods) + 0.9
     fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=True)
 
-    outer = GridSpec(2, 2, figure=fig,
-                     height_ratios=(1.0, float(n_methods)),
-                     width_ratios=(1.0, 0.025),
-                     hspace=0.05, wspace=0.012)
+    outer = GridSpec(
+        1,
+        2,
+        figure=fig,
+        width_ratios=(1.0, 0.025),
+        wspace=0.012,
+    )
+    # Single shared grid: guarantees top-row columns align exactly with residual columns.
+    all_grid = GridSpecFromSubplotSpec(
+        1 + n_methods,
+        n_panels_per_method,
+        outer[0, 0],
+        wspace=0.04,
+        hspace=0.10,
+        height_ratios=(1.0,) + tuple(1.0 for _ in range(n_methods)),
+    )
 
-    # --- Top strip: rho on the left half, b on the right half ---
-    top_inner = GridSpecFromSubplotSpec(1, n_panels_per_method, outer[0, 0], wspace=0.04)
-    # Place rho and b in the middle three slots so they aren't squashed: rho at col 1, b at col 3.
-    ax_rho = fig.add_subplot(top_inner[0, 1])
-    ax_b = fig.add_subplot(top_inner[0, 3])
-    # Spacer axes (blank) to keep the visual rhythm with the residual grid below.
-    for j in (0, 2, 4):
-        ax_blank = fig.add_subplot(top_inner[0, j])
-        ax_blank.axis("off")
+    # --- Top strip: rho, b, pressure, velocity, learned M ---
+    ax_rho = fig.add_subplot(all_grid[0, 0])
+    ax_b = fig.add_subplot(all_grid[0, 1])
+    ax_p = fig.add_subplot(all_grid[0, 2])
+    ax_v = fig.add_subplot(all_grid[0, 3])
+    ax_m = fig.add_subplot(all_grid[0, 4])
 
     imshow_density(
         ax_rho,
@@ -2479,23 +2610,98 @@ def make_convergence(
     ax_b.set_yticks([])
     ax_b.set_title(r"Input $b$  (RHS)")
     ax_b.set_box_aspect(1)
-    for ax in (ax_rho, ax_b):
+
+    b_top, P_top, vx_top, vy_top, mag_top = _pressure_velocity_fields(info)
+    _ = b_top  # same RHS; keep for explicit pairing with pressure/velocity helper.
+    active = _active_mask(info)
+
+    p_abs = max(float(np.percentile(np.abs(P_top[active]), 99.0)) if active.any() else 1e-6, 1e-6)
+    cmap_p = matplotlib.colormaps["RdBu_r"].copy()
+    cmap_p.set_bad(color="lightgray")
+    ax_p.imshow(
+        np.where(active, P_top, np.nan),
+        origin="lower",
+        cmap=cmap_p,
+        vmin=-p_abs,
+        vmax=p_abs,
+        interpolation="nearest",
+        aspect="equal",
+    )
+    ax_p.set_xticks([])
+    ax_p.set_yticks([])
+    ax_p.set_title(r"Pressure $p$")
+    ax_p.set_box_aspect(1)
+
+    mag_masked = np.where(active, mag_top, np.nan)
+    if active.any():
+        v_hi = max(float(np.percentile(mag_top[active], 99.5)), 1e-12)
+        v_pos = mag_top[active & (mag_top > 0)]
+        v_lo = float(np.percentile(v_pos, 5.0)) if v_pos.size else v_hi * 1e-3
+        v_lo = max(min(v_lo, v_hi * 0.5), v_hi * 1e-3)
+    else:
+        v_hi = max(float(np.nanmax(mag_top)), 1e-12)
+        v_lo = v_hi * 1e-3
+    cmap_v = matplotlib.colormaps["viridis"].copy()
+    cmap_v.set_bad(color="lightgray")
+    ax_v.imshow(
+        mag_masked,
+        origin="lower",
+        cmap=cmap_v,
+        norm=LogNorm(vmin=v_lo, vmax=v_hi),
+        interpolation="nearest",
+        aspect="equal",
+    )
+    ax_v.set_xticks([])
+    ax_v.set_yticks([])
+    ax_v.set_title(r"Velocity $|v|$")
+    # White stream arrows to mirror the hero-panel velocity rendering.
+    H, W = vx_top.shape
+    Yg, Xg = np.mgrid[0:H, 0:W]
+    vx_safe = np.where(active, vx_top, 0.0)
+    vy_safe = np.where(active, vy_top, 0.0)
+    try:
+        ax_v.streamplot(
+            Xg,
+            Yg,
+            vx_safe,
+            vy_safe,
+            color="white",
+            linewidth=0.7,
+            density=1.4,
+            arrowsize=0.7,
+        )
+    except Exception as e:
+        print(f"  [conv] velocity streamplot failed ({e}); skipping arrows", file=sys.stderr)
+    ax_v.set_xlim(-0.5, W - 0.5)
+    ax_v.set_ylim(-0.5, H - 0.5)
+    ax_v.set_box_aspect(1)
+
+    M_dense = ours.assembled_dense_M_numpy()
+    mc = max(16, min(256, int(M_dense.shape[0])))
+    _imshow_matrix_log10_abs(
+        ax_m,
+        M_dense,
+        rf"Learned $M$" + "\n" + rf"top-left ${mc}\times{mc}$",
+        crop=mc,
+        cmap="magma",
+        rank_normalize=True,
+    )
+    ax_m.set_box_aspect(1)
+
+    for ax in (ax_rho, ax_b, ax_p, ax_v, ax_m):
         ttl = ax.title
         if ttl.get_text():
             ttl.set_fontsize(_t_top)
             ttl.set_linespacing(0.92)
 
     # --- Method grid: n_methods rows × n_panels_per_method cols ---
-    grid = GridSpecFromSubplotSpec(
-        n_methods, n_panels_per_method, outer[1, 0], wspace=0.04, hspace=0.10,
-    )
-    cax = fig.add_subplot(outer[:, 1])
+    cax = fig.add_subplot(outer[0, 1])
 
     im_last = None
     for mi, run in enumerate(method_runs):
         keys = run["iters_chosen"]
         for j in range(n_panels_per_method):
-            ax = fig.add_subplot(grid[mi, j])
+            ax = fig.add_subplot(all_grid[mi + 1, j])
             if j < len(keys):
                 k = keys[j]
                 r_grid = np.abs(gridify(run["snaps"][k], info)) + 1e-30
@@ -2608,6 +2814,12 @@ def main():
                    help="PCG stopping tolerance on ||r||_2 / ||b||_2.")
     p.add_argument("--conv-max-iter", type=int, default=5000,
                    help="Per-method max PCG iterations (unpreconditioned/Jacobi can be slow on stiff frames).")
+    p.add_argument("--neuralspai-checkpoint", default=None,
+                   help="Optional explicit NeuralSPAI checkpoint for convergence figure.")
+    p.add_argument("--lsp-repo", default="/orcd/home/002/osbo/ondemand/LearningSparsePreconditioner4GPU",
+                   help="Path to LearningSparsePreconditioner4GPU repo (for NeuralSPAI loading).")
+    p.add_argument("--lsp-summary-csv", default=str(SCRIPTS_DIR / "results" / "lsp_scale_infer_summary.csv"),
+                   help="CSV used to auto-resolve NeuralSPAI checkpoint by scale when --neuralspai-checkpoint is not set.")
     p.add_argument("--ours-weights", default=None,
                    help="Required for matrices/convergence/m-zoom-strip/residual-3d: trained .bytes checkpoint.")
 
@@ -2790,6 +3002,9 @@ def main():
             override_frame=conv_override,
             rtol=args.conv_rtol,
             max_iter=args.conv_max_iter,
+            neuralspai_checkpoint=args.neuralspai_checkpoint,
+            lsp_repo=args.lsp_repo,
+            lsp_summary_csv=args.lsp_summary_csv,
         )
 
 

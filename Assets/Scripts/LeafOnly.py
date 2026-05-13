@@ -60,7 +60,13 @@ if __name__ == "__main__":
     _bootstrap_leafonly_problem_shape_from_argv()
 
 from leafonly.architecture import attention_layout_choices, default_attention_layout
-from leafonly.config import LEAF_SIZE, fixed_runtime_config, require_cuda_or_mps_device
+from leafonly.config import (
+    HUTCHINSON_PROBE_JACOBI_OMEGA,
+    HUTCHINSON_PROBE_JACOBI_STEPS,
+    LEAF_SIZE,
+    fixed_runtime_config,
+    require_cuda_or_mps_device,
+)
 from leafonly.eval import evaluate_estimator_variance, evaluate_gradient_interference
 from leafonly.train import train_leaf_only as _train_leaf_only_impl
 
@@ -204,6 +210,26 @@ def _build_parser():
             "Default -1: use max(64, ceil(sqrt(n_pad))) as before. "
             "Smaller K (e.g. 64, 128) speeds AZ/MAZ and backward roughly linearly; noisier gradient. "
             "With --evaluate-gradients, the fixed-frame Hutchinson variance probe uses K=64 when this is -1."
+        ),
+    )
+    parser.add_argument(
+        "--probe-jacobi-steps",
+        type=int,
+        default=HUTCHINSON_PROBE_JACOBI_STEPS,
+        metavar="N",
+        help=(
+            "Number of damped-Jacobi smoothing sweeps applied to Hutchinson probes before the "
+            "cosine loss. Default: 2 (paper baseline). Set 0 to disable probe smoothing."
+        ),
+    )
+    parser.add_argument(
+        "--probe-jacobi-omega",
+        type=float,
+        default=HUTCHINSON_PROBE_JACOBI_OMEGA,
+        metavar="W",
+        help=(
+            "Damping factor for probe Jacobi smoothing. Default: 0.6 (paper baseline). "
+            "Only used when --probe-jacobi-steps > 0."
         ),
     )
     parser.add_argument(
