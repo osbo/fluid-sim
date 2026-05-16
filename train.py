@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
-LEAF_ONLY = REPO / "Assets" / "Scripts" / "LeafOnly.py"
+LEAF_ONLY = REPO / "python" / "LeafOnly.py"
 
 
 def _remap_argv(argv: list[str]) -> list[str]:
