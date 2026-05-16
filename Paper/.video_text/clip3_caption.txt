@@ -1,0 +1,1 @@
+Integrated in a full simulation loop at 60 fps, showing the preconditioner operating on dynamic high-contrast flows.

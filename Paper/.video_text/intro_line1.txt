@@ -1,0 +1,1 @@
+Headline result: fastest end-to-end GPU solver in our benchmark

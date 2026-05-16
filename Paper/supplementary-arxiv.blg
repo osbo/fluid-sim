@@ -7,11 +7,11 @@ Reallocated singl_function (elt_size=4) to 100 items from 50.
 Reallocated wiz_functions (elt_size=4) to 6000 items from 3000.
 Database file #1: references.bib
 Reallocated singl_function (elt_size=4) to 100 items from 50.
-Reallocated wiz_functions (elt_size=4) to 9000 items from 6000.
 Reallocated glb_str_ptr (elt_size=4) to 20 items from 10.
 Reallocated global_strs (elt_size=200001) to 20 items from 10.
 Reallocated glb_str_end (elt_size=4) to 20 items from 10.
 Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated wiz_functions (elt_size=4) to 9000 items from 6000.
 Warning--empty publisher in kipf2017semi
 Warning--empty address in kipf2017semi
 Warning--page numbers missing in both pages and numpages fields in kipf2017semi
@@ -22,35 +22,35 @@ Warning--empty address in vaswani2017attention
 Warning--no number and no volume in Yang2025sparse
 Warning--page numbers missing in both pages and numpages fields in Yang2025sparse
 You've used 4 entries,
-            6273 wiz_defined-function locations,
-            1540 strings with 19150 characters,
-and the built_in function-call counts, 5057 in all, are:
-= -- 600
+            6056 wiz_defined-function locations,
+            1506 strings with 18874 characters,
+and the built_in function-call counts, 5039 in all, are:
+= -- 598
 > -- 228
 < -- 0
 + -- 80
 - -- 80
-* -- 398
+* -- 396
 := -- 516
 add.period$ -- 19
 call.type$ -- 4
 change.case$ -- 40
 chr.to.int$ -- 4
 cite$ -- 13
-duplicate$ -- 405
-empty$ -- 289
+duplicate$ -- 403
+empty$ -- 287
 format.name$ -- 96
-if$ -- 1206
+if$ -- 1200
 int.to.chr$ -- 2
 int.to.str$ -- 1
 missing$ -- 18
 newline$ -- 77
 num.names$ -- 28
-pop$ -- 204
+pop$ -- 202
 preamble$ -- 1
 purify$ -- 72
 quote$ -- 0
-skip$ -- 138
+skip$ -- 136
 stack$ -- 0
 substring$ -- 273
 swap$ -- 28

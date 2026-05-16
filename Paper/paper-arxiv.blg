@@ -7,11 +7,11 @@ Reallocated singl_function (elt_size=4) to 100 items from 50.
 Reallocated wiz_functions (elt_size=4) to 6000 items from 3000.
 Database file #1: references.bib
 Reallocated singl_function (elt_size=4) to 100 items from 50.
-Reallocated wiz_functions (elt_size=4) to 9000 items from 6000.
 Reallocated glb_str_ptr (elt_size=4) to 20 items from 10.
 Reallocated global_strs (elt_size=200001) to 20 items from 10.
 Reallocated glb_str_end (elt_size=4) to 20 items from 10.
 Reallocated singl_function (elt_size=4) to 100 items from 50.
+Reallocated wiz_functions (elt_size=4) to 9000 items from 6000.
 Warning--empty address in borm2003introduction
 Warning--no number and no volume in chen2024gnp
 Warning--page numbers missing in both pages and numpages fields in chen2024gnp
@@ -62,35 +62,35 @@ Warning--page numbers missing in both pages and numpages fields in Xu2025neural
 Warning--no number and no volume in Yang2025sparse
 Warning--page numbers missing in both pages and numpages fields in Yang2025sparse
 You've used 39 entries,
-            6273 wiz_defined-function locations,
-            1742 strings with 26362 characters,
-and the built_in function-call counts, 43841 in all, are:
-= -- 6023
+            6056 wiz_defined-function locations,
+            1708 strings with 26086 characters,
+and the built_in function-call counts, 43688 in all, are:
+= -- 6006
 > -- 1554
 < -- 0
 + -- 537
 - -- 527
-* -- 3221
+* -- 3204
 := -- 4196
 add.period$ -- 196
 call.type$ -- 39
 change.case$ -- 310
 chr.to.int$ -- 38
 cite$ -- 88
-duplicate$ -- 3650
-empty$ -- 2613
+duplicate$ -- 3633
+empty$ -- 2596
 format.name$ -- 662
-if$ -- 11036
+if$ -- 10985
 int.to.chr$ -- 3
 int.to.str$ -- 1
 missing$ -- 151
 newline$ -- 413
 num.names$ -- 272
-pop$ -- 1580
+pop$ -- 1563
 preamble$ -- 1
 purify$ -- 619
 quote$ -- 0
-skip$ -- 1213
+skip$ -- 1196
 stack$ -- 0
 substring$ -- 2795
 swap$ -- 296

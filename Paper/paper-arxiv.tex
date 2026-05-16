@@ -1,23 +1,16 @@
-% SIGGRAPH Asia 2026 Technical Papers (dual-track / Conference + Journal).
-% Format per https://asia.siggraph.org/2026/submissions/technical-papers/
+% arXiv preprint — uses ACM acmtog template for layout (fonts, margins, columns)
+% but without TOG journal metadata (conference name, copyright, submission IDs)
+% per SIGGRAPH Asia 2026 anonymity policy.
 % Requires acmart.cls version 2.16 or newer (ACM Primary Article Template).
-%
-% Length policy: 7 pages excluding references and up to 2 figures-only pages.
-% Detailed tables and dataset construction live in supplementary.tex; the main
-% body links to them via xr-hyper (same submission bundle).
 \documentclass[acmtog]{acmart}
 
 \citestyle{acmauthoryear}
 
 \setcopyright{none}
-\copyrightyear{2026}
-\acmYear{2026}
-\acmDOI{10.1145/nnnnnnn.nnnnnnn}
-\acmJournal{TOG}
-\acmVolume{45}
-\acmNumber{6}
-\acmArticle{1}
-\acmMonth{12}
+\settopmatter{printacmref=false, printccs=false, printfolios=true}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+% Suppress the acmtog running footer (Vol./No./Article/Publication date)
+\AtBeginDocument{\pagestyle{plain}}
 
 \usepackage{amsmath}
 \usepackage{amsthm}
@@ -154,6 +147,7 @@ neural operators, physics simulation, real-time graphics}
 \end{teaserfigure}
 
 \maketitle
+\thispagestyle{plain}
 
 % ===========================================================================
 \section{Introduction}

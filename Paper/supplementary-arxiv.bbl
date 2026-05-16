@@ -38,24 +38,16 @@
 
 \bibitem[Kipf and Welling(2017)]%
         {kipf2017semi}
-\bibfield{author}{\bibinfo{person}{Thomas~N. Kipf} {and} \bibinfo{person}{Max
-  Welling}.} \bibinfo{year}{2017}\natexlab{}.
-\newblock \showarticletitle{Semi-Supervised Classification with Graph
-  Convolutional Networks}. In \bibinfo{booktitle}{\emph{International
-  Conference on Learning Representations (ICLR)}}.
+\bibfield{author}{\bibinfo{person}{Thomas~N. Kipf} {and} \bibinfo{person}{Max Welling}.} \bibinfo{year}{2017}\natexlab{}.
+\newblock \showarticletitle{Semi-Supervised Classification with Graph Convolutional Networks}. In \bibinfo{booktitle}{\emph{International Conference on Learning Representations (ICLR)}}.
 \newblock
 
 
 \bibitem[Liu et~al\mbox{.}(2021)]%
         {Liu2021swin}
-\bibfield{author}{\bibinfo{person}{Ze Liu}, \bibinfo{person}{Yutong Lin},
-  \bibinfo{person}{Yue Cao}, \bibinfo{person}{Han Hu}, \bibinfo{person}{Yixuan
-  Wei}, \bibinfo{person}{Zheng Zhang}, \bibinfo{person}{Stephen Lin}, {and}
-  \bibinfo{person}{Baining Guo}.} \bibinfo{year}{2021}\natexlab{}.
-\newblock \showarticletitle{{Swin} Transformer: Hierarchical Vision Transformer
-  using Shifted Windows}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2103.14030}}
-  (\bibinfo{year}{2021}).
+\bibfield{author}{\bibinfo{person}{Ze Liu}, \bibinfo{person}{Yutong Lin}, \bibinfo{person}{Yue Cao}, \bibinfo{person}{Han Hu}, \bibinfo{person}{Yixuan Wei}, \bibinfo{person}{Zheng Zhang}, \bibinfo{person}{Stephen Lin}, {and} \bibinfo{person}{Baining Guo}.} \bibinfo{year}{2021}\natexlab{}.
+\newblock \showarticletitle{{Swin} Transformer: Hierarchical Vision Transformer using Shifted Windows}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2103.14030}} (\bibinfo{year}{2021}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2103.14030}
@@ -65,27 +57,16 @@
 
 \bibitem[Vaswani et~al\mbox{.}(2017)]%
         {vaswani2017attention}
-\bibfield{author}{\bibinfo{person}{Ashish Vaswani}, \bibinfo{person}{Noam
-  Shazeer}, \bibinfo{person}{Niki Parmar}, \bibinfo{person}{Jakob Uszkoreit},
-  \bibinfo{person}{Llion Jones}, \bibinfo{person}{Aidan~N. Gomez},
-  \bibinfo{person}{{\L}ukasz Kaiser}, {and} \bibinfo{person}{Illia
-  Polosukhin}.} \bibinfo{year}{2017}\natexlab{}.
-\newblock \showarticletitle{Attention Is All You Need}. In
-  \bibinfo{booktitle}{\emph{Advances in Neural Information Processing Systems
-  30 (NIPS 2017)}}. \bibinfo{pages}{5998--6008}.
+\bibfield{author}{\bibinfo{person}{Ashish Vaswani}, \bibinfo{person}{Noam Shazeer}, \bibinfo{person}{Niki Parmar}, \bibinfo{person}{Jakob Uszkoreit}, \bibinfo{person}{Llion Jones}, \bibinfo{person}{Aidan~N. Gomez}, \bibinfo{person}{{\L}ukasz Kaiser}, {and} \bibinfo{person}{Illia Polosukhin}.} \bibinfo{year}{2017}\natexlab{}.
+\newblock \showarticletitle{Attention Is All You Need}. In \bibinfo{booktitle}{\emph{Advances in Neural Information Processing Systems 30 (NIPS 2017)}}. \bibinfo{pages}{5998--6008}.
 \newblock
 
 
 \bibitem[Yang et~al\mbox{.}(2025)]%
         {Yang2025sparse}
-\bibfield{author}{\bibinfo{person}{Zherui Yang}, \bibinfo{person}{Zhehao Li},
-  \bibinfo{person}{Kangbo Lyu}, \bibinfo{person}{Yixuan Li},
-  \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Ligang Liu}.}
-  \bibinfo{year}{2025}\natexlab{}.
-\newblock \showarticletitle{Learning Sparse Approximate Inverse Preconditioners
-  for Conjugate Gradient Solvers on {GPUs}}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2510.27517}}
-  (\bibinfo{year}{2025}).
+\bibfield{author}{\bibinfo{person}{Zherui Yang}, \bibinfo{person}{Zhehao Li}, \bibinfo{person}{Kangbo Lyu}, \bibinfo{person}{Yixuan Li}, \bibinfo{person}{Tao Du}, {and} \bibinfo{person}{Ligang Liu}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Learning Sparse Approximate Inverse Preconditioners for Conjugate Gradient Solvers on {GPUs}}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2510.27517}} (\bibinfo{year}{2025}).
 \newblock
 \urldef\tempurl%
 \url{https://arxiv.org/abs/2510.27517}

@@ -1,18 +1,15 @@
 % Supplementary material for "Hierarchical Transformer Preconditioning for Interactive Physics Simulation"
-% Per SIGGRAPH Asia 2026 rules, appendices must be standalone supplementary documents,
-% not part of the main paper.tex.
+% arXiv preprint — uses ACM acmtog template for layout (fonts, margins, columns)
+% but without TOG journal metadata (conference name, copyright, submission IDs)
+% per SIGGRAPH Asia 2026 anonymity policy.
 \documentclass[acmtog]{acmart}
 
 \citestyle{acmauthoryear}
 \setcopyright{none}
-\copyrightyear{2026}
-\acmYear{2026}
-\acmDOI{10.1145/nnnnnnn.nnnnnnn}
-\acmJournal{TOG}
-\acmVolume{45}
-\acmNumber{6}
-\acmArticle{1}
-\acmMonth{12}
+\settopmatter{printacmref=false, printccs=false, printfolios=true}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+% Suppress the acmtog running footer (Vol./No./Article/Publication date)
+\AtBeginDocument{\pagestyle{plain}}
 
 \usepackage{amsmath}
 \usepackage{graphicx}
@@ -57,6 +54,7 @@
 \renewcommand{\shortauthors}{Osborne et al.}
 
 \maketitle
+\thispagestyle{plain}
 
 This document collects the implementation details, dataset construction,
 per-scale performance numbers, full train$\,\times\,$eval generalization grid

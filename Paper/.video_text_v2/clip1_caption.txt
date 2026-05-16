@@ -1,0 +1,1 @@
+Ours converges with global residual propagation while delivering the fastest end-to-end solve in this benchmark.

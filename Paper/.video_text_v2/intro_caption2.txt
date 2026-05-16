@@ -1,0 +1,1 @@
+Subspace-oriented cosine-Hutchinson training aligns MAz with z on convergence-critical modes.
