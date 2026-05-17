@@ -1877,7 +1877,8 @@ def _run_amgx_pcg_session(
     pcg_max_iter: int,
     preconditioner_block: dict,
     *,
-    num_warmup: int = 3,
+    amgx_max_iter: int = 2000,
+    num_warmup: int = 1,
     warn_fn=None,
     session_label: str = "AMGX",
 ) -> tuple[float, float, int]:
@@ -1934,7 +1935,7 @@ def _run_amgx_pcg_session(
                 "exception_handling": 1,
                 "solver": {
                     "solver": "PCG",
-                    "max_iters": pcg_max_iter,
+                    "max_iters": min(pcg_max_iter, amgx_max_iter),
                     "convergence": "RELATIVE_INI",
                     "tolerance": float(pcg_tol),
                     "monitor_residual": 1,
@@ -2019,6 +2020,11 @@ def main():
             "(Unpreconditioned, Jacobi, IC, AMGX MULTICOLOR_DILU, AMG, AMGX (GPU) [PCG + AMG]). "
             "Implies --test-only (LeafOnly-dependent plots/profiling are unavailable)."
         ),
+    )
+    parser.add_argument(
+        "--skip-amgx",
+        action="store_true",
+        help="Skip all AMGX (GPU) solves (MULTICOLOR_DILU and AMG). Useful when pyamgx hangs on a given matrix.",
     )
     parser.add_argument(
         "--leafonly-pcg",
@@ -2210,10 +2216,7 @@ def main():
         n_requested = num_nodes_real
         n_pad = num_nodes_real
         viz_n = num_nodes_real
-        print(
-            f"  Physical system {viz_n}×{viz_n} (full frame; --skip-leafonly bypasses leaf alignment + "
-            f"MAX_MIXED_SIZE={int(lo_config.MAX_MIXED_SIZE)})"
-        )
+        print(f"  Physical system {viz_n}×{viz_n} (full frame; --skip-leafonly bypasses leaf alignment + MAX_MIXED_SIZE)")
     else:
         n_requested = problem_padded_num_nodes(num_nodes_real)
         n_pad = int(n_requested)
@@ -2783,7 +2786,8 @@ def main():
     amgx_amg_setup_ms = 0.0
     amgx_amg_solve_ms = 0.0
     amgx_amg_iters = 0
-    if HAS_AMGX and device.type == 'cuda':
+    skip_amgx = getattr(args, "skip_amgx", False)
+    if HAS_AMGX and device.type == 'cuda' and not skip_amgx:
         A_amgx_csr = csr_matrix(A_viz_n.astype(np.float64))
         A_amgx_csr.indptr = np.ascontiguousarray(A_amgx_csr.indptr.astype(np.int32))
         A_amgx_csr.indices = np.ascontiguousarray(A_amgx_csr.indices.astype(np.int32))
@@ -2852,7 +2856,7 @@ def main():
             f"  Setup: {ic_setup_ms:.2f} ms, solve (CPU): {solve_ic_cpu_ms:.2f} ms, {iters_ic_cpu} iterations "
             f"(IC factorization unavailable; try pip install ilupp)"
         )
-    if HAS_AMGX and device.type == "cuda":
+    if HAS_AMGX and device.type == "cuda" and not skip_amgx:
         print(
             f"  Setup: {amgx_ilu_setup_ms:.2f} ms, solve (GPU): {amgx_ilu_solve_ms:.2f} ms, {amgx_ilu_iters} iterations, "
             f"total: {total_amgx_ilu_ms:.2f} ms  [AMGX MULTICOLOR_DILU]"
@@ -2865,13 +2869,13 @@ def main():
         )
     print("AMG (CPU):")
     print(f"  Setup: {amg_setup_ms:.2f} ms, solve: {solve_amg_ms:.2f} ms, {iters_amg} iterations, total: {total_amg_ms:.2f} ms")
-    if HAS_AMGX and device.type == "cuda":
+    if HAS_AMGX and device.type == "cuda" and not skip_amgx:
         print("AMGX (GPU) [PCG + AMG]:")
         print(
             f"  Setup: {amgx_amg_setup_ms:.2f} ms, solve: {amgx_amg_solve_ms:.2f} ms, {amgx_amg_iters} iterations, "
             f"total: {total_amgx_amg_ms:.2f} ms"
         )
-    elif device.type == "cuda":
+    elif device.type == "cuda" and not skip_amgx:
         _why = AMGX_IMPORT_ERROR or "pyamgx not importable"
         print(f"AMGX (GPU): skipped — {_why}")
         for _ln in _amgx_skip_followup_lines(_why):

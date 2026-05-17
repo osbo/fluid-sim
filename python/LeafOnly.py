@@ -309,7 +309,7 @@ def _build_parser():
     parser.add_argument(
         "--auto-stop",
         action="store_true",
-        default=False,
+        default=True,
         help=(
             "Stop training when the loss plateaus while already at min_lr. Uses the same relative "
             "threshold as the LR scheduler (5e-3) but 2× the patience (10 vs 5 log steps = 1000 "
