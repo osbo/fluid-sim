@@ -12,6 +12,7 @@ Builds/
 # Visual Studio / Rider
 .vs/
 .idea/
+.vscode/
 *.csproj
 *.sln
 *.unityproj
@@ -125,3 +126,8 @@ python/.freq_rank_cache.npz
 
 # LeafOnly training context shards (often multi-GB; regenerate locally)
 **/.leafonly_training_context_cache/
+
+# arxiv submission artifacts — tracked for the website to fetch.
+!Paper/video_small.mp4
+!Paper/paper-arxiv.bbl
+!Paper/supplementary-arxiv.bbl
